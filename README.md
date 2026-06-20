@@ -5,8 +5,8 @@
 <br />
 
 <div align="center">
-  <strong>A Rust-native forge for local LLM orchestration.</strong><br/>
-  Multi-agent sessions, GPU terminal, full OTel traceability — built the way it should have been from the start.
+  <strong>A Rust-native forge for multi-agent AI orchestration.</strong><br/>
+  Route across local models, cloud APIs, and specialist roles — with a GPU terminal, full OTel traceability, and a wire protocol that keeps everything interoperable.
 </div>
 
 <br />
