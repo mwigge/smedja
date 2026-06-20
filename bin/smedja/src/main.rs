@@ -4,7 +4,7 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(name = "smedja", about = "smedja terminal client")]
 struct Cli {
-    /// smdjad socket path (default: $XDG_RUNTIME_DIR/smdjad.sock)
+    /// smdjad socket path (default: `$XDG_RUNTIME_DIR/smdjad.sock`)
     #[arg(long, env = "SMEDJA_SOCK")]
     sock: Option<String>,
 

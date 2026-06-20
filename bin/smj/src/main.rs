@@ -27,36 +27,60 @@ enum Cmd {
     },
     /// Audit log queries
     Audit {
-        #[arg(long)] session: Option<String>,
-        #[arg(long)] since:   Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
     },
     /// Cost ledger
     Cost {
-        #[arg(long)] session: Option<String>,
-        #[arg(long)] since:   Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
     },
 }
 
 #[derive(Subcommand)]
-enum DaemonCmd { Start, Stop, Restart, Status }
+enum DaemonCmd {
+    Start,
+    Stop,
+    Restart,
+    Status,
+}
 
 #[derive(Subcommand)]
 enum SessionCmd {
     List,
-    Show   { id: String },
-    Fork   { id: String, #[arg(long)] turn: Option<u32> },
-    Rollback { id: String, turn: u32 },
+    Show {
+        id: String,
+    },
+    Fork {
+        id: String,
+        #[arg(long)]
+        turn: Option<u32>,
+    },
+    Rollback {
+        id: String,
+        turn: u32,
+    },
 }
 
 #[derive(Subcommand)]
 enum WorkspaceCmd {
     Agents,
-    Skills { #[command(subcommand)] action: SkillsCmd },
+    Skills {
+        #[command(subcommand)]
+        action: SkillsCmd,
+    },
     Index,
 }
 
 #[derive(Subcommand)]
-enum SkillsCmd { List, Add { path: String } }
+enum SkillsCmd {
+    List,
+    Add { path: String },
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
