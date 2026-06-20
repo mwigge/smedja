@@ -1,0 +1,8 @@
+/target/
+Cargo.lock
+.env
+*.db
+*.db-shm
+*.db-wal
+/tmp/smedja-tasks/
+.DS_Store

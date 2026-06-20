@@ -1,0 +1,17 @@
+[package]
+name        = "smedja-sre"
+description = "SRE agent tools: otel_query, metric_query, log_tail, alert webhook"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+smedja-rpc = { path = "../smedja-rpc" }
+tokio      = { workspace = true }
+reqwest    = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+anyhow     = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }

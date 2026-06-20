@@ -1,0 +1,14 @@
+[package]
+name        = "smedja-methodology"
+description = "TDD gate, ponytail gate, spec-first enforcement, OpenSpec integration"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+smedja-rpc = { path = "../smedja-rpc" }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+anyhow     = { workspace = true }
+tracing    = { workspace = true }

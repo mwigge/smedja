@@ -1,0 +1,22 @@
+[package]
+name        = "smj"
+description = "smedja control CLI — lifecycle, sessions, workspace, audit"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "smj"
+path = "src/main.rs"
+
+[dependencies]
+smedja-rpc   = { path = "../../crates/smedja-rpc" }
+smedja-ingot = { path = "../../crates/smedja-ingot" }
+tokio        = { workspace = true }
+clap         = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+anyhow       = { workspace = true }
+tracing      = { workspace = true }
+tracing-subscriber = { workspace = true }

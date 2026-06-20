@@ -1,0 +1,15 @@
+[package]
+name        = "st-glyph"
+description = "smedja-term: st-glyph"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+smedja-rpc   = { path = "../../../crates/smedja-rpc" }
+smedja-ingot = { path = "../../../crates/smedja-ingot" }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+anyhow       = { workspace = true }
+tracing      = { workspace = true }

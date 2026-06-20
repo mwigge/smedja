@@ -1,0 +1,33 @@
+[package]
+name        = "smdjad"
+description = "smedja daemon — Tokio supervision tree, runner orchestration"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "smdjad"
+path = "src/main.rs"
+
+[dependencies]
+smedja-rpc         = { path = "../../crates/smedja-rpc" }
+smedja-memory      = { path = "../../crates/smedja-memory" }
+smedja-adapter     = { path = "../../crates/smedja-adapter" }
+smedja-assayer     = { path = "../../crates/smedja-assayer" }
+smedja-bellows     = { path = "../../crates/smedja-bellows" }
+smedja-vault       = { path = "../../crates/smedja-vault" }
+smedja-ingot       = { path = "../../crates/smedja-ingot" }
+smedja-methodology = { path = "../../crates/smedja-methodology" }
+smedja-graph       = { path = "../../crates/smedja-graph" }
+smedja-sre         = { path = "../../crates/smedja-sre" }
+tokio              = { workspace = true }
+axum               = { workspace = true }
+tower              = { workspace = true }
+tower-http         = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid               = { workspace = true }

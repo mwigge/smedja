@@ -1,0 +1,15 @@
+[package]
+name        = "smedja-assayer"
+description = "Model routing by role × complexity × tier (replaces sommelier)"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+smedja-rpc  = { path = "../smedja-rpc" }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+toml        = { workspace = true }
+anyhow      = { workspace = true }
+tracing     = { workspace = true }

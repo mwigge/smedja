@@ -1,0 +1,28 @@
+[package]
+name        = "smedja-term"
+description = "smedja GPU-accelerated terminal emulator (wgpu, block model, native daemon integration)"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "smedja-term"
+path = "src/main.rs"
+
+[dependencies]
+st-render    = { path = "../../crates/st-render" }
+st-pty       = { path = "../../crates/st-pty" }
+st-config    = { path = "../../crates/st-config" }
+st-statusbar = { path = "../../crates/st-statusbar" }
+st-blocks    = { path = "../../crates/st-blocks" }
+st-glyph     = { path = "../../crates/st-glyph" }
+st-agent     = { path = "../../crates/st-agent" }
+smedja-rpc   = { path = "../../../crates/smedja-rpc" }
+smedja-ingot = { path = "../../../crates/smedja-ingot" }
+tokio        = { workspace = true }
+winit        = { workspace = true }
+wgpu         = { workspace = true }
+anyhow       = { workspace = true }
+tracing      = { workspace = true }
+tracing-subscriber = { workspace = true }
