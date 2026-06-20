@@ -1,11 +1,10 @@
 use anyhow::Result;
-use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::{Request, Response};
 
-/// Length-prefixed newline-delimited JSON framing over a Unix socket.
+/// Newline-delimited JSON framing over a Unix socket.
 pub struct Codec {
     stream: BufReader<UnixStream>,
 }
@@ -19,16 +18,49 @@ impl Codec {
 
     /// # Errors
     /// Returns an error if serialisation or the socket write fails.
-    pub async fn send(&mut self, req: &Request) -> Result<()> {
-        let mut line = serde_json::to_string(req)?;
-        line.push('\n');
-        self.stream.get_mut().write_all(line.as_bytes()).await?;
-        Ok(())
+    pub async fn send_request(&mut self, req: &Request) -> Result<()> {
+        self.write_line(&serde_json::to_string(req)?).await
+    }
+
+    /// # Errors
+    /// Returns an error if serialisation or the socket write fails.
+    pub async fn send_response(&mut self, resp: &Response) -> Result<()> {
+        self.write_line(&serde_json::to_string(resp)?).await
     }
 
     /// # Errors
     /// Returns an error if the socket read or JSON deserialisation fails.
-    pub async fn recv(&mut self) -> Result<Option<Value>> {
+    /// Returns `Ok(None)` on EOF.
+    pub async fn recv_request(&mut self) -> Result<Option<Request>> {
+        self.read_line_as().await
+    }
+
+    /// # Errors
+    /// Returns an error if the socket read or JSON deserialisation fails.
+    /// Returns `Ok(None)` on EOF.
+    pub async fn recv_response(&mut self) -> Result<Option<Response>> {
+        self.read_line_as().await
+    }
+
+    /// Send a request and wait for the response.
+    ///
+    /// # Errors
+    /// Returns an error if send, recv, or deserialisation fails, or if the connection closes.
+    pub async fn call(&mut self, req: &Request) -> Result<Response> {
+        self.send_request(req).await?;
+        self.recv_response()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("connection closed"))
+    }
+
+    async fn write_line(&mut self, s: &str) -> Result<()> {
+        let mut buf = s.to_owned();
+        buf.push('\n');
+        self.stream.get_mut().write_all(buf.as_bytes()).await?;
+        Ok(())
+    }
+
+    async fn read_line_as<T: serde::de::DeserializeOwned>(&mut self) -> Result<Option<T>> {
         let mut line = String::new();
         let n = self.stream.read_line(&mut line).await?;
         if n == 0 {
@@ -36,15 +68,85 @@ impl Codec {
         }
         Ok(Some(serde_json::from_str(line.trim_end())?))
     }
+}
 
-    /// # Errors
-    /// Returns an error if the send, recv, or response deserialisation fails, or if the connection closes.
-    pub async fn call(&mut self, req: &Request) -> Result<Response> {
-        self.send(req).await?;
-        let raw = self
-            .recv()
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("connection closed"))?;
-        Ok(serde_json::from_value(raw)?)
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tokio::net::UnixStream;
+
+    use super::*;
+    use crate::{Request, Response, RpcError as Error};
+
+    #[tokio::test]
+    async fn send_recv_request_roundtrip() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut client = Codec::new(a);
+        let mut server = Codec::new(b);
+
+        let req = Request::new(1_i64, "ping", json!({"x": 1}));
+        client.send_request(&req).await.unwrap();
+
+        let got = server.recv_request().await.unwrap().unwrap();
+        assert_eq!(got.method, "ping");
+        assert_eq!(got.id, Some(json!(1)));
+        assert_eq!(got.params["x"], 1);
+    }
+
+    #[tokio::test]
+    async fn send_recv_response_roundtrip() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut server = Codec::new(a);
+        let mut client = Codec::new(b);
+
+        let resp = Response::ok(Some(json!(1)), json!("pong"));
+        server.send_response(&resp).await.unwrap();
+
+        let got = client.recv_response().await.unwrap().unwrap();
+        assert_eq!(got.result, Some(json!("pong")));
+        assert!(got.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn recv_returns_none_on_eof() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut codec = Codec::new(a);
+        drop(b);
+        assert!(codec.recv_request().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn call_returns_response() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut client = Codec::new(a);
+        let mut server = Codec::new(b);
+
+        tokio::spawn(async move {
+            let req = server.recv_request().await.unwrap().unwrap();
+            let resp = Response::ok(req.id, json!("pong"));
+            server.send_response(&resp).await.unwrap();
+        });
+
+        let req = Request::new(1_i64, "ping", json!({}));
+        let resp = client.call(&req).await.unwrap();
+        assert_eq!(resp.result, Some(json!("pong")));
+    }
+
+    #[tokio::test]
+    async fn call_propagates_rpc_error() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut client = Codec::new(a);
+        let mut server = Codec::new(b);
+
+        tokio::spawn(async move {
+            let req = server.recv_request().await.unwrap().unwrap();
+            let resp = Response::err(req.id, Error::new(-32601, "method not found"));
+            server.send_response(&resp).await.unwrap();
+        });
+
+        let req = Request::new(1_i64, "unknown", json!({}));
+        let resp = client.call(&req).await.unwrap();
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, -32601);
     }
 }

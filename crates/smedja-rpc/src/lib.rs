@@ -1,4 +1,8 @@
+pub mod client;
 pub mod codec;
+pub mod codes;
+pub mod router;
+pub mod server;
 pub mod types;
 
 pub use types::{Error as RpcError, Request, Response};
