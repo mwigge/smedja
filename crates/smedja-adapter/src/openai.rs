@@ -1,0 +1,165 @@
+//! `OpenAI` streaming chat-completion adapter.
+
+use reqwest::Client;
+use serde_json::json;
+use tokio_stream::{wrappers::ReceiverStream, StreamExt as _};
+
+use crate::{
+    sse::parse_openai_line, AdapterError, CallOptions, Delta, DeltaStream, Message, Provider, Role,
+};
+
+/// `OpenAI`-compatible streaming chat-completion provider.
+///
+/// Sends requests to the `/v1/chat/completions` endpoint and translates the
+/// SSE response into a [`DeltaStream`].
+pub struct OpenAiProvider {
+    client: Client,
+    base_url: String,
+    api_key: String,
+}
+
+impl OpenAiProvider {
+    /// Creates a new [`OpenAiProvider`].
+    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+        Self {
+            client: Client::new(),
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+        }
+    }
+
+    /// Creates a new [`OpenAiProvider`] with a pre-configured [`reqwest::Client`].
+    pub fn with_client(
+        client: Client,
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            client,
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+        }
+    }
+}
+
+fn role_to_str(role: &Role) -> &'static str {
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    }
+}
+
+impl Provider for OpenAiProvider {
+    fn stream_chat(&self, messages: &[Message], opts: &CallOptions) -> DeltaStream {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let auth = format!("Bearer {}", self.api_key);
+        let client = self.client.clone();
+
+        // Build the messages array; prepend system if provided via `CallOptions`.
+        let mut msg_array: Vec<serde_json::Value> = Vec::new();
+        if let Some(sys) = &opts.system {
+            msg_array.push(json!({"role": "system", "content": sys}));
+        }
+        for m in messages {
+            msg_array.push(json!({
+                "role": role_to_str(&m.role),
+                "content": m.content,
+            }));
+        }
+
+        let mut body = json!({
+            "model": opts.model,
+            "messages": msg_array,
+            "stream": true,
+        });
+        if let Some(mt) = opts.max_tokens {
+            body["max_tokens"] = json!(mt);
+        }
+        if let Some(temp) = opts.temperature {
+            body["temperature"] = json!(temp);
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Delta, AdapterError>>(64);
+
+        tokio::spawn(async move {
+            let resp = match client
+                .post(&url)
+                .header("Authorization", &auth)
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(AdapterError::Http(e))).await;
+                    return;
+                }
+            };
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                let _ = tx
+                    .send(Err(AdapterError::InvalidResponse(format!(
+                        "HTTP {status}: {text}"
+                    ))))
+                    .await;
+                return;
+            }
+
+            let mut bytes_stream = resp.bytes_stream();
+            let mut buf = String::new();
+
+            while let Some(chunk) = bytes_stream.next().await {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(Err(AdapterError::Http(e))).await;
+                        return;
+                    }
+                };
+
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+
+                // Process all complete newline-terminated lines.
+                while let Some(nl) = buf.find('\n') {
+                    let line = buf[..nl].trim_end_matches('\r').to_owned();
+                    buf.drain(..=nl);
+
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        match parse_openai_line(data) {
+                            Ok(Some(delta)) => {
+                                if tx.send(Ok(delta)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                let _ = tx.send(Err(e)).await;
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Flush any remaining partial line (no trailing newline).
+            let leftover = buf.trim_end_matches('\r').trim_end_matches('\n');
+            if let Some(data) = leftover.strip_prefix("data: ") {
+                match parse_openai_line(data) {
+                    Ok(Some(delta)) => {
+                        let _ = tx.send(Ok(delta)).await;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                    }
+                }
+            }
+        });
+
+        Box::pin(ReceiverStream::new(rx))
+    }
+}

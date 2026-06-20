@@ -1,1 +1,28 @@
-//! `smedja-adapter` — see the smedja workspace README for the role of this crate.
+//! HTTP streaming adapters for LLM providers (`OpenAI`, Anthropic, Gemini).
+//!
+//! # Overview
+//!
+//! Each provider implements the [`Provider`] trait, which exposes a single
+//! method [`Provider::stream_chat`] that returns a [`DeltaStream`] — an
+//! async stream of [`Delta`] items representing incremental model output.
+//!
+//! # Providers
+//!
+//! | Struct | API |
+//! |--------|-----|
+//! | [`OpenAiProvider`] | `OpenAI` chat completions (streaming) |
+//! | [`AnthropicProvider`] | Anthropic Messages API (streaming) |
+
+pub mod anthropic;
+pub mod error;
+pub mod openai;
+pub mod provider;
+pub mod types;
+
+pub(crate) mod sse;
+
+pub use anthropic::AnthropicProvider;
+pub use error::AdapterError;
+pub use openai::OpenAiProvider;
+pub use provider::{DeltaStream, Provider};
+pub use types::{CallOptions, Delta, Message, Role};
