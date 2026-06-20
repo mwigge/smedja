@@ -1,1 +1,15 @@
-//! `smedja-memory` — see the smedja workspace README for the role of this crate.
+//! Working memory for smedja agent sessions.
+//!
+//! Provides [`WorkingMemory`] — the ordered message store for a single session —
+//! together with a stable-prefix KV-cache guard, hot/warm/cold retention strata,
+//! and a naive token-budget estimator.
+
+pub mod budget;
+pub mod error;
+pub mod memory;
+pub mod types;
+
+pub use budget::{estimate_messages_tokens, estimate_tokens};
+pub use error::MemoryError;
+pub use memory::{WorkingMemory, HOT_WINDOW, WARM_WINDOW};
+pub use types::{Message, Role, Stratum};
