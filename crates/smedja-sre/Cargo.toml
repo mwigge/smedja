@@ -7,11 +7,11 @@ license.workspace    = true
 repository.workspace = true
 
 [dependencies]
-smedja-rpc = { path = "../smedja-rpc" }
-tokio      = { workspace = true }
+anyhow     = { workspace = true }
 reqwest    = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
-anyhow     = { workspace = true }
+smedja-rpc = { path = "../smedja-rpc" }
 thiserror  = { workspace = true }
+tokio      = { workspace = true }
 tracing    = { workspace = true }

@@ -7,9 +7,9 @@ license.workspace    = true
 repository.workspace = true
 
 [dependencies]
-smedja-rpc   = { path = "../../../crates/smedja-rpc" }
-smedja-ingot = { path = "../../../crates/smedja-ingot" }
+anyhow       = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
-anyhow       = { workspace = true }
+smedja-ingot = { path = "../../../crates/smedja-ingot" }
+smedja-rpc   = { path = "../../../crates/smedja-rpc" }
 tracing      = { workspace = true }

@@ -7,8 +7,8 @@ license.workspace    = true
 repository.workspace = true
 
 [dependencies]
-smedja-rpc = { path = "../smedja-rpc" }
+anyhow     = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
-anyhow     = { workspace = true }
+smedja-rpc = { path = "../smedja-rpc" }
 tracing    = { workspace = true }

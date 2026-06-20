@@ -11,12 +11,12 @@ name = "smj"
 path = "src/main.rs"
 
 [dependencies]
-smedja-rpc   = { path = "../../crates/smedja-rpc" }
-smedja-ingot = { path = "../../crates/smedja-ingot" }
-tokio        = { workspace = true }
+anyhow       = { workspace = true }
 clap         = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
-anyhow       = { workspace = true }
+smedja-ingot = { path = "../../crates/smedja-ingot" }
+smedja-rpc   = { path = "../../crates/smedja-rpc" }
+tokio        = { workspace = true }
 tracing      = { workspace = true }
 tracing-subscriber = { workspace = true }

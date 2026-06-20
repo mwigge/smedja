@@ -1,26 +1,26 @@
 [workspace]
 members = [
-    "crates/smedja-rpc",
-    "crates/smedja-memory",
+    "bin/smdjad",
+    "bin/smedja",
+    "bin/smj",
     "crates/smedja-adapter",
     "crates/smedja-assayer",
-    "crates/smedja-vault",
-    "crates/smedja-ingot",
     "crates/smedja-bellows",
-    "crates/smedja-methodology",
     "crates/smedja-graph",
+    "crates/smedja-ingot",
+    "crates/smedja-memory",
+    "crates/smedja-methodology",
+    "crates/smedja-rpc",
     "crates/smedja-sre",
-    "bin/smedja",
-    "bin/smdjad",
-    "bin/smj",
-    "term/crates/st-render",
-    "term/crates/st-pty",
-    "term/crates/st-config",
-    "term/crates/st-statusbar",
-    "term/crates/st-blocks",
-    "term/crates/st-glyph",
-    "term/crates/st-agent",
+    "crates/smedja-vault",
     "term/bin/smedja-term",
+    "term/crates/st-agent",
+    "term/crates/st-blocks",
+    "term/crates/st-config",
+    "term/crates/st-glyph",
+    "term/crates/st-pty",
+    "term/crates/st-render",
+    "term/crates/st-statusbar",
 ]
 resolver = "2"
 
@@ -32,68 +32,68 @@ repository = "https://github.com/mwigge/smedja"
 rust-version = "1.82"
 
 [workspace.dependencies]
-# async runtime
-tokio        = { version = "1",    features = ["full"] }
-tokio-stream = "0.1"
-
-# serialisation
-serde        = { version = "1",    features = ["derive"] }
-serde_json   = "1"
-serde_yaml   = "0.9"
-toml         = "0.8"
 
 # error handling
 anyhow       = "1"
-thiserror    = "2"
-
-# cli
-clap         = { version = "4",    features = ["derive", "env"] }
 
 # http
-axum         = { version = "0.8",  features = ["ws"] }
+axum         = { version = "0.8", features = ["ws"] }
+chrono       = { version = "0.4", features = ["serde"] }
+
+# cli
+clap         = { version = "4", features = ["derive", "env"] }
+cosmic-text  = "0.12"
+
+# terminal (client + term emulator)
+crossterm    = "0.28"
+once_cell    = "1"
+opentelemetry          = "0.27"
+opentelemetry-otlp     = { version = "0.27", features = ["grpc-tonic", "http-proto"] }
+opentelemetry-semantic-conventions = "0.27"
+opentelemetry_sdk      = { version = "0.27", features = ["rt-tokio"] }
+parking_lot  = "0.12"
+
+# PTY (smedja-term)
+portable-pty = "0.8"
+ratatui      = "0.29"
+
+# concurrency / utilities
+rayon        = "1"
 reqwest      = { version = "0.12", features = ["json", "stream"] }
-tower        = "0.5"
-tower-http   = { version = "0.6",  features = ["trace", "cors"] }
 
 # storage
 rusqlite     = { version = "0.32", features = ["bundled"] }
+rustyline    = "14"
+
+# serialisation
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+serde_yaml   = "0.9"
+
+# layout
+taffy        = "0.5"
+thiserror    = "2"
+# async runtime
+tokio        = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+
+# testing
+tokio-test   = "0.4"
+toml         = "0.8"
+tower        = "0.5"
+tower-http   = { version = "0.6", features = ["trace", "cors"] }
 
 # observability
 tracing                = "0.1"
 tracing-subscriber     = { version = "0.3", features = ["env-filter", "json"] }
-opentelemetry          = "0.27"
-opentelemetry_sdk      = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp     = { version = "0.27", features = ["grpc-tonic", "http-proto"] }
-opentelemetry-semantic-conventions = "0.27"
-
-# ids / time
-uuid         = { version = "1",    features = ["v4", "serde"] }
-chrono       = { version = "0.4",  features = ["serde"] }
-
-# concurrency / utilities
-rayon        = "1"
-once_cell    = "1"
-parking_lot  = "0.12"
-
-# terminal (client + term emulator)
-crossterm    = "0.28"
-ratatui      = "0.29"
-rustyline    = "14"
-
-# GPU rendering (smedja-term)
-wgpu         = "22"
-winit        = "0.30"
-cosmic-text  = "0.12"
-
-# PTY (smedja-term)
-portable-pty = "0.8"
-vte          = "0.13"
 
 # code graph
 tree-sitter  = "0.24"
 
-# layout
-taffy        = "0.5"
+# ids / time
+uuid         = { version = "1", features = ["v4", "serde"] }
+vte          = "0.13"
 
-# testing
-tokio-test   = "0.4"
+# GPU rendering (smedja-term)
+wgpu         = "22"
+winit        = "0.30"
