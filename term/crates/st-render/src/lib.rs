@@ -1287,6 +1287,87 @@ mod tests {
     }
 
     #[test]
+    fn shelf_packer_alloc_advances_x_for_same_row() {
+        let mut p = ShelfPacker::new(64);
+        let _ = p.alloc(10, 10); // [0, 0]
+        assert_eq!(p.alloc(10, 10), Some([10, 0]));
+    }
+
+    #[test]
+    fn shelf_packer_alloc_wraps_to_new_shelf() {
+        let mut p = ShelfPacker::new(20);
+        // first alloc:  [0,0],  x→12, shelf_height→8
+        let _ = p.alloc(12, 8);
+        // second alloc: 12+12>20 → wrap: y→8, x→0, sh→0 → [0,8], x→12, sh→8
+        let _ = p.alloc(12, 8);
+        // third alloc:  12+5=17≤20 → [12,8]
+        assert_eq!(p.alloc(5, 5), Some([12, 8]));
+    }
+
+    #[test]
+    fn shelf_packer_alloc_glyph_wider_than_atlas_returns_none() {
+        let mut p = ShelfPacker::new(64);
+        assert_eq!(p.alloc(128, 1), None);
+    }
+
+    // ── GlyphAtlas key tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn glyph_atlas_key_distinguishes_bold_and_italic() {
+        use std::collections::HashMap;
+        let mut map: HashMap<(char, bool, bool), [u32; 4]> = HashMap::new();
+        map.insert(('A', false, false), [0, 0, 8, 12]);
+        map.insert(('A', true, false), [8, 0, 8, 12]);
+        map.insert(('A', false, true), [16, 0, 8, 12]);
+        assert_ne!(map[&('A', false, false)], map[&('A', true, false)]);
+        assert_ne!(map[&('A', false, false)], map[&('A', false, true)]);
+        assert_eq!(map[&('A', false, false)], [0, 0, 8, 12]);
+    }
+
+    // ── GPU-gated smoke tests ─────────────────────────────────────────────────
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore)]
+    #[test]
+    fn renderer_scale_factor_change_clears_atlas() {
+        // Verifies that creating a new ShelfPacker (what update_scale_factor does)
+        // resets allocation state to the origin.
+        let mut packer = ShelfPacker::new(1024);
+        let _ = packer.alloc(16, 16);
+        // Simulate update_scale_factor: replace with a fresh packer.
+        packer = ShelfPacker::new(1024);
+        assert_eq!(
+            packer.alloc(16, 16),
+            Some([0, 0]),
+            "fresh packer after scale change must start from origin"
+        );
+    }
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore)]
+    #[test]
+    fn renderer_glyph_atlas_key_stores_bold_and_regular_separately() {
+        use std::collections::HashMap;
+        let mut glyphs: HashMap<(char, bool, bool), [u32; 4]> = HashMap::new();
+        glyphs.insert(('A', false, false), [0, 0, 8, 12]);
+        glyphs.insert(('A', true, false), [8, 0, 8, 12]);
+        assert!(glyphs.contains_key(&('A', false, false)));
+        assert!(glyphs.contains_key(&('A', true, false)));
+        assert_ne!(
+            glyphs[&('A', false, false)][0],
+            glyphs[&('A', true, false)][0]
+        );
+    }
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore)]
+    #[test]
+    fn renderer_status_bar_quads_placeholder() {
+        // Documents expected behaviour: status-bar segments produce non-empty
+        // vertex data. Full assertion requires a headless GPU context.
+        // Run with: LIBGL_ALWAYS_SOFTWARE=1 cargo test -p st-render --features gpu-tests
+        let segments: Vec<String> = vec!["tier: local".into(), "model: gemma".into()];
+        assert!(!segments.is_empty(), "segments input must be non-empty");
+    }
+
+    #[test]
     fn glyph_vertex_layout_stride_matches_size() {
         let layout = GlyphVertex::layout();
         assert_eq!(

@@ -804,7 +804,32 @@ impl vte::Perform for VtHandler {
     fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _c: char) {}
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
-    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
+
+    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+        let mut grid = self.grid.lock();
+        match byte {
+            b'D' => {
+                // Index: move cursor down one row, scroll if at last row.
+                let last_row = grid.rows.saturating_sub(1);
+                if grid.cursor.1 >= last_row {
+                    grid.scroll_up(1);
+                } else {
+                    grid.cursor.1 += 1;
+                }
+            }
+            b'M' => {
+                // Reverse Index: move cursor up one row, scroll down if at first row.
+                if grid.cursor.1 == 0 {
+                    grid.scroll_down(1);
+                } else {
+                    grid.cursor.1 -= 1;
+                }
+            }
+            _ => {
+                debug!("unhandled esc_dispatch byte: 0x{:02x}", byte);
+            }
+        }
+    }
 }
 
 /// Applies SGR parameters to the grid's current SGR state.
@@ -1457,5 +1482,132 @@ mod tests {
         assert!(parse_osc777("toast;oops").is_none());
         assert!(parse_osc777("").is_none());
         assert!(parse_osc777("notify;only-title").is_none());
+    }
+
+    // ── CellGrid::resize ──────────────────────────────────────────────────────
+
+    #[test]
+    fn resize_growing_preserves_content() {
+        let mut grid = make_grid(4, 4);
+        grid.cells[0][0].ch = 'X';
+        grid.resize(8, 8);
+        assert_eq!(grid.cols, 8);
+        assert_eq!(grid.rows, 8);
+        assert_eq!(grid.cells[0][0].ch, 'X');
+        assert_eq!(grid.cells.len(), 8);
+        assert_eq!(grid.cells[0].len(), 8);
+    }
+
+    #[test]
+    fn resize_shrinking_clips_content() {
+        let mut grid = make_grid(8, 8);
+        grid.cells[0][0].ch = 'A';
+        grid.resize(4, 4);
+        assert_eq!(grid.cols, 4);
+        assert_eq!(grid.rows, 4);
+        assert_eq!(grid.cells[0][0].ch, 'A');
+        assert_eq!(grid.cells.len(), 4);
+        assert_eq!(grid.cells[0].len(), 4);
+    }
+
+    #[test]
+    fn resize_clamps_cursor_to_new_bounds() {
+        let mut grid = make_grid(10, 10);
+        grid.cursor = (9, 9);
+        grid.resize(4, 4);
+        assert!(grid.cursor.0 < 4);
+        assert!(grid.cursor.1 < 4);
+    }
+
+    // ── scroll on last row ────────────────────────────────────────────────────
+
+    #[test]
+    fn newline_at_last_row_scrolls_without_panic() {
+        let grid = Arc::new(Mutex::new(make_grid(4, 3)));
+        let mut handler = VtHandler { grid: grid.clone() };
+        handler.execute(b'\n');
+        handler.execute(b'\n');
+        handler.execute(b'\n'); // cursor now at last row
+        handler.execute(b'\n'); // should scroll, not panic
+        let g = grid.lock();
+        assert!(g.cursor.1 < g.rows, "cursor.1 must be within grid bounds");
+    }
+
+    // ── VTE sequence dispatch ─────────────────────────────────────────────────
+
+    #[test]
+    fn vte_cursor_home_csi_h() {
+        let grid = Arc::new(Mutex::new(make_grid(20, 10)));
+        {
+            let mut g = grid.lock();
+            g.cursor = (10, 5);
+        }
+        let mut handler = VtHandler { grid: grid.clone() };
+        // \x1b[H — cursor home, no params → row=0, col=0
+        let params = vte::Params::default();
+        handler.csi_dispatch(&params, &[], false, 'H');
+        let g = grid.lock();
+        assert_eq!(g.cursor, (0, 0));
+    }
+
+    #[test]
+    fn vte_cursor_home_no_args() {
+        let grid = Arc::new(Mutex::new(make_grid(20, 10)));
+        {
+            let mut g = grid.lock();
+            g.cursor = (5, 3);
+        }
+        let mut handler = VtHandler { grid: grid.clone() };
+        let params = vte::Params::default();
+        handler.csi_dispatch(&params, &[], false, 'H');
+        let g = grid.lock();
+        assert_eq!(g.cursor, (0, 0));
+    }
+
+    #[test]
+    fn vte_delete_line_csi_m() {
+        let grid = Arc::new(Mutex::new(make_grid(10, 5)));
+        {
+            let mut g = grid.lock();
+            g.cells[2][0].ch = 'Z';
+            g.cursor = (0, 2);
+        }
+        let mut handler = VtHandler { grid: grid.clone() };
+        // \x1b[M — delete current line
+        let params = vte::Params::default();
+        handler.csi_dispatch(&params, &[], false, 'M');
+        let g = grid.lock();
+        // Grid still has the same number of rows.
+        assert_eq!(g.cells.len(), 5);
+        // Row 2 (the cursor row) should now be blank — the original 'Z' row was removed.
+        assert_eq!(g.cells[2][0].ch, ' ');
+    }
+
+    #[test]
+    fn vte_index_esc_d_moves_cursor_down() {
+        let grid = Arc::new(Mutex::new(make_grid(10, 5)));
+        {
+            let mut g = grid.lock();
+            g.cursor = (3, 2);
+        }
+        let mut handler = VtHandler { grid: grid.clone() };
+        // ESC D — Index: move cursor down one row (or scroll if at bottom).
+        handler.esc_dispatch(&[], false, b'D');
+        let g = grid.lock();
+        assert_eq!(g.cursor.1, 3, "cursor should move down one row");
+    }
+
+    #[test]
+    fn vte_reverse_index_esc_m_moves_cursor_up() {
+        let grid = Arc::new(Mutex::new(make_grid(10, 5)));
+        {
+            let mut g = grid.lock();
+            g.cursor = (3, 2);
+        }
+        let mut handler = VtHandler { grid: grid.clone() };
+        // ESC M — Reverse Index: move cursor up one row (or scroll down if at top).
+        handler.esc_dispatch(&[], false, b'M');
+        let g = grid.lock();
+        assert_eq!(g.cursor.1, 1, "cursor should move up one row");
     }
 }

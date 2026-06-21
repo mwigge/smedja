@@ -6,6 +6,12 @@ edition.workspace    = true
 license.workspace    = true
 repository.workspace = true
 
+[features]
+gpu-tests = []
+
+[dev-dependencies]
+tracing-test = "0.2"
+
 [dependencies]
 anyhow       = { workspace = true }
 bytemuck     = { version = "1", features = ["derive"] }
