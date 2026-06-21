@@ -3,10 +3,15 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use smedja_plugins::SkillRegistry;
+use smedja_rpc::client::Client;
 
 #[derive(Parser)]
 #[command(name = "smj", about = "smedja control CLI")]
 struct Cli {
+    /// smdjad socket path (overrides `XDG_RUNTIME_DIR`)
+    #[arg(long, env = "SMEDJA_SOCK", global = true)]
+    sock: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Cmd,
 }
@@ -51,9 +56,13 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum DaemonCmd {
+    /// Start smdjad in the background
     Start,
+    /// Stop a running smdjad
     Stop,
+    /// Restart smdjad
     Restart,
+    /// Check whether smdjad is running
     Status,
 }
 
@@ -108,14 +117,29 @@ enum SkillCmd {
     },
 }
 
+fn default_socket_path() -> PathBuf {
+    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(base).join("smdjad.sock")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
+    let sock = cli.sock.unwrap_or_else(default_socket_path);
+
     match cli.command {
         Cmd::Daemon { action } => match action {
-            DaemonCmd::Status => println!("smdjad: not yet implemented"),
-            _ => println!("smj daemon: not yet implemented"),
+            DaemonCmd::Status => cmd_daemon_status(&sock).await?,
+            DaemonCmd::Start => cmd_daemon_start()?,
+            _ => println!(
+                "smj daemon {}: not yet implemented",
+                match action {
+                    DaemonCmd::Stop => "stop",
+                    DaemonCmd::Restart => "restart",
+                    _ => unreachable!(),
+                }
+            ),
         },
         Cmd::Skill { action } => {
             let registry = SkillRegistry::new(SkillRegistry::default_path());
@@ -129,6 +153,47 @@ async fn main() -> Result<()> {
         }
         _ => println!("smj: not yet implemented"),
     }
+    Ok(())
+}
+
+async fn cmd_daemon_status(sock: &std::path::Path) -> Result<()> {
+    match Client::connect(sock).await {
+        Err(_) => {
+            println!(
+                "smdjad: not running (socket not found at {})",
+                sock.display()
+            );
+            std::process::exit(1);
+        }
+        Ok(mut client) => {
+            let resp = client
+                .call("ping", serde_json::Value::Null)
+                .await
+                .with_context(|| "ping failed")?;
+            println!("smdjad: running ({})", sock.display());
+            println!("response: {resp}");
+            Ok(())
+        }
+    }
+}
+
+fn cmd_daemon_start() -> Result<()> {
+    // Locate smdjad relative to this binary.
+    let exe = std::env::current_exe().context("cannot determine own path")?;
+    let smdjad = exe
+        .parent()
+        .map(|p| p.join("smdjad"))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from("smdjad"));
+
+    std::process::Command::new(&smdjad)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", smdjad.display()))?;
+
+    println!("smdjad started");
     Ok(())
 }
 
