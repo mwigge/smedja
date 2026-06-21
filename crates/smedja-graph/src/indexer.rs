@@ -8,10 +8,11 @@ use uuid::Uuid;
 use crate::error::GraphError;
 use crate::types::SymbolKind;
 
-/// tree-sitter S-expression query that captures all named symbol definitions.
+/// tree-sitter query for Rust source files.
 ///
-/// Each alternative binds the name node to `@name` and the parent definition
-/// node to `@def`, enabling robust line-range extraction.
+/// Captures function items, struct/enum/trait/impl definitions, constants,
+/// and type aliases.  Each alternative binds the name node to `@name` and
+/// the enclosing definition node to `@def`.
 const RUST_QUERY: &str = r"
 (function_item   name: (identifier)      @name) @def
 (struct_item     name: (type_identifier) @name) @def
@@ -22,33 +23,96 @@ const RUST_QUERY: &str = r"
 (type_item       name: (type_identifier) @name) @def
 ";
 
-/// Returns the [`Language`] for Rust provided by `tree-sitter-rust`.
-fn rust_language() -> Language {
-    tree_sitter_rust::LANGUAGE.into()
+/// tree-sitter query for Go source files.
+///
+/// Captures top-level function and method declarations.
+const GO_QUERY: &str = r"
+(function_declaration name: (identifier)   @name) @def
+(method_declaration   name: (field_identifier) @name) @def
+";
+
+/// tree-sitter query for Python source files.
+///
+/// Captures function and class definitions.
+const PYTHON_QUERY: &str = r"
+(function_definition name: (identifier) @name) @def
+(class_definition    name: (identifier) @name) @def
+";
+
+/// tree-sitter query for TypeScript/TSX source files.
+///
+/// Captures function declarations, class declarations, and interface
+/// declarations.
+const TYPESCRIPT_QUERY: &str = r"
+(function_declaration name: (identifier)      @name) @def
+(class_declaration    name: (type_identifier) @name) @def
+(interface_declaration name: (type_identifier) @name) @def
+";
+
+/// File extensions that the indexer recognises, paired with their language
+/// and query string.
+///
+/// Returning `None` for an extension means the file is silently skipped.
+pub(crate) fn lang_and_query_for_ext(ext: &str) -> Option<(Language, &'static str)> {
+    match ext {
+        "rs" => Some((tree_sitter_rust::LANGUAGE.into(), RUST_QUERY)),
+        "go" => Some((tree_sitter_go::LANGUAGE.into(), GO_QUERY)),
+        "py" => Some((tree_sitter_python::LANGUAGE.into(), PYTHON_QUERY)),
+        "ts" | "tsx" => Some((
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            TYPESCRIPT_QUERY,
+        )),
+        _ => None,
+    }
 }
 
-/// Parses a single `.rs` source file and inserts all discovered symbols into
-/// the `symbols` table.
+/// Parses a single Rust (`.rs`) source file and inserts all discovered symbols
+/// into the `symbols` table.
 ///
-/// `file_path` is the relative path stored in the database.  `source` is the
-/// raw UTF-8 text of the file.  Returns the number of symbols inserted.
+/// Convenience wrapper around [`index_file_with_lang`] that selects the Rust
+/// grammar and query automatically.  `file_path` is the relative path stored
+/// in the database.  `source` is the raw UTF-8 text of the file.  Returns the
+/// number of symbols inserted.
 ///
 /// # Errors
 ///
 /// - [`GraphError::ParseFailed`] when `tree-sitter` reports a syntax error or
 ///   returns `None` from [`Parser::parse`].
 /// - [`GraphError::Db`] when any `SQLite` INSERT fails.
+#[cfg(test)]
 pub(crate) fn index_file(
     conn: &Connection,
     file_path: &str,
     source: &str,
     workspace_id: &str,
 ) -> Result<usize, GraphError> {
-    let lang = rust_language();
+    let lang: Language = tree_sitter_rust::LANGUAGE.into();
+    index_file_with_lang(conn, file_path, source, workspace_id, &lang, RUST_QUERY)
+}
 
+/// Parses a source file with an explicit [`Language`] and query string and
+/// inserts all discovered symbols into the `symbols` table.
+///
+/// Used by [`index_directory`] to dispatch the correct grammar per file
+/// extension.  Returns the number of symbols inserted, or 0 when the query
+/// compiles but matches nothing.
+///
+/// # Errors
+///
+/// - [`GraphError::ParseFailed`] when tree-sitter fails to parse or the query
+///   string is invalid.
+/// - [`GraphError::Db`] on any `SQLite` INSERT failure.
+pub(crate) fn index_file_with_lang(
+    conn: &Connection,
+    file_path: &str,
+    source: &str,
+    workspace_id: &str,
+    lang: &Language,
+    query_str: &str,
+) -> Result<usize, GraphError> {
     let mut parser = Parser::new();
     parser
-        .set_language(&lang)
+        .set_language(lang)
         .map_err(|_| GraphError::ParseFailed {
             path: file_path.to_owned(),
         })?;
@@ -59,9 +123,14 @@ pub(crate) fn index_file(
             path: file_path.to_owned(),
         })?;
 
-    let query = Query::new(&lang, RUST_QUERY).map_err(|_| GraphError::ParseFailed {
-        path: file_path.to_owned(),
-    })?;
+    // If the query fails to compile (e.g. a node type that doesn't exist in
+    // this grammar version) treat it as a parse failure — the file is skipped,
+    // not the whole directory walk.
+    let Ok(query) = Query::new(lang, query_str) else {
+        return Err(GraphError::ParseFailed {
+            path: file_path.to_owned(),
+        });
+    };
 
     let name_idx = query
         .capture_index_for_name("name")
@@ -146,17 +215,22 @@ pub(crate) fn index_file(
 /// Maps a tree-sitter node kind string to a [`SymbolKind`].
 ///
 /// Unknown node kinds are treated as [`SymbolKind::Function`] — the query
-/// pattern constrains what can arrive here so this branch is unreachable in
-/// practice.
+/// patterns constrain what can arrive here and function-like constructs are
+/// the most common match.
 fn kind_for_node(node_kind: &str) -> SymbolKind {
     match node_kind {
-        "struct_item" => SymbolKind::Struct,
+        // Rust
         "enum_item" => SymbolKind::Enum,
-        "trait_item" => SymbolKind::Trait,
         "impl_item" => SymbolKind::Impl,
         "const_item" => SymbolKind::Const,
         "type_item" => SymbolKind::TypeAlias,
-        _ => SymbolKind::Function, // "function_item" and anything unexpected
+        // Struct-like: Rust structs, Python/TypeScript classes
+        "struct_item" | "class_definition" | "class_declaration" => SymbolKind::Struct,
+        // Trait-like: Rust traits, TypeScript interfaces
+        "trait_item" | "interface_declaration" => SymbolKind::Trait,
+        // Everything else (function_item, function_declaration, method_declaration,
+        // function_definition) is treated as a function.
+        _ => SymbolKind::Function,
     }
 }
 
@@ -170,15 +244,19 @@ fn build_snippet(source_lines: &[&str], start_line: u32, end_line: u32) -> Strin
     source_lines[start..capped].join("\n")
 }
 
-/// Walks all `.rs` files under `root` and delegates to [`index_file`].
+/// Walks source files under `root`, detects language by extension, and
+/// delegates to [`index_file_with_lang`].
+///
+/// Recognised extensions: `.rs`, `.go`, `.py`, `.ts`, `.tsx`.
+/// All other file extensions are silently skipped.
 ///
 /// Returns the total number of symbols inserted across all files.
 ///
 /// # Errors
 ///
-/// Propagates any [`GraphError`] from filesystem I/O errors or database
-/// errors.  [`GraphError::ParseFailed`] is logged and skipped — it is not
-/// propagated so that a single bad file does not abort the whole index run.
+/// Propagates any [`GraphError`] from filesystem I/O or database errors.
+/// [`GraphError::ParseFailed`] is logged and skipped — it is not propagated
+/// so that a single bad file does not abort the whole index run.
 pub(crate) fn index_directory(
     conn: &Connection,
     root: &Path,
@@ -190,9 +268,15 @@ pub(crate) fn index_directory(
         .follow_links(false)
         .into_iter()
         .filter_map(std::result::Result::ok)
-        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "rs"))
+        .filter(|e| e.file_type().is_file())
     {
         let abs_path = entry.path();
+        let ext = abs_path.extension().and_then(|s| s.to_str()).unwrap_or("");
+
+        let Some((lang, query_str)) = lang_and_query_for_ext(ext) else {
+            continue;
+        };
+
         let rel_path = abs_path.strip_prefix(root).map_or_else(
             |_| abs_path.to_string_lossy().into_owned(),
             |p| p.to_string_lossy().into_owned(),
@@ -200,7 +284,7 @@ pub(crate) fn index_directory(
 
         let source = std::fs::read_to_string(abs_path)?;
 
-        match index_file(conn, &rel_path, &source, workspace_id) {
+        match index_file_with_lang(conn, &rel_path, &source, workspace_id, &lang, query_str) {
             Ok(n) => {
                 total += n;
                 tracing::debug!(file = %rel_path, symbols = n, "indexed");
@@ -237,6 +321,8 @@ mod tests {
         .unwrap();
         conn
     }
+
+    // ── Rust ──────────────────────────────────────────────────────────────────
 
     #[test]
     fn index_file_counts_function() {
@@ -280,6 +366,104 @@ mod tests {
         let n = index_file(&conn, "test.rs", "type MyVec = Vec<i32>;\n", "ws").unwrap();
         assert_eq!(n, 1);
     }
+
+    // ── Go ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn index_go_file_finds_function() {
+        let conn = in_memory_conn();
+        let source = "package main\n\nfunc Hello() string { return \"hi\" }\n";
+        let lang = tree_sitter_go::LANGUAGE.into();
+        let n = index_file_with_lang(&conn, "main.go", source, "ws-go", &lang, GO_QUERY).unwrap();
+        assert!(n >= 1, "expected ≥ 1 Go symbol, got {n}");
+    }
+
+    #[test]
+    fn index_go_method_finds_method() {
+        let conn = in_memory_conn();
+        let source = "package main\ntype T struct{}\nfunc (t T) Run() error { return nil }\n";
+        let lang = tree_sitter_go::LANGUAGE.into();
+        let n =
+            index_file_with_lang(&conn, "method.go", source, "ws-go-m", &lang, GO_QUERY).unwrap();
+        assert!(n >= 1, "expected ≥ 1 Go method symbol, got {n}");
+    }
+
+    // ── Python ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn index_python_file_finds_function() {
+        let conn = in_memory_conn();
+        let source = "def greet(name):\n    return f\"hello {name}\"\n";
+        let lang = tree_sitter_python::LANGUAGE.into();
+        let n =
+            index_file_with_lang(&conn, "hello.py", source, "ws-py", &lang, PYTHON_QUERY).unwrap();
+        assert!(n >= 1, "expected ≥ 1 Python symbol, got {n}");
+    }
+
+    #[test]
+    fn index_python_file_finds_class() {
+        let conn = in_memory_conn();
+        let source = "class MyService:\n    pass\n";
+        let lang = tree_sitter_python::LANGUAGE.into();
+        let n = index_file_with_lang(
+            &conn,
+            "service.py",
+            source,
+            "ws-py-class",
+            &lang,
+            PYTHON_QUERY,
+        )
+        .unwrap();
+        assert!(n >= 1, "expected ≥ 1 Python class symbol, got {n}");
+    }
+
+    // ── TypeScript ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn index_typescript_file_finds_function() {
+        let conn = in_memory_conn();
+        let source = "function add(a: number, b: number): number { return a + b; }\n";
+        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let n = index_file_with_lang(&conn, "add.ts", source, "ws-ts", &lang, TYPESCRIPT_QUERY)
+            .unwrap();
+        assert!(n >= 1, "expected ≥ 1 TypeScript symbol, got {n}");
+    }
+
+    #[test]
+    fn index_typescript_file_finds_class() {
+        let conn = in_memory_conn();
+        let source = "class Agent { run(): void {} }\n";
+        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let n = index_file_with_lang(
+            &conn,
+            "agent.ts",
+            source,
+            "ws-ts-class",
+            &lang,
+            TYPESCRIPT_QUERY,
+        )
+        .unwrap();
+        assert!(n >= 1, "expected ≥ 1 TypeScript class symbol, got {n}");
+    }
+
+    #[test]
+    fn index_typescript_file_finds_interface() {
+        let conn = in_memory_conn();
+        let source = "interface Runner { run(): void; }\n";
+        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let n = index_file_with_lang(
+            &conn,
+            "runner.ts",
+            source,
+            "ws-ts-iface",
+            &lang,
+            TYPESCRIPT_QUERY,
+        )
+        .unwrap();
+        assert!(n >= 1, "expected ≥ 1 TypeScript interface symbol, got {n}");
+    }
+
+    // ── build_snippet ─────────────────────────────────────────────────────────
 
     #[test]
     fn build_snippet_caps_at_10_lines() {

@@ -1,7 +1,9 @@
+pub mod action_log;
 mod blocks;
 mod context_rail;
 mod staging;
 mod statusbar;
+pub mod theme;
 
 use std::io::stdout;
 use std::path::PathBuf;
