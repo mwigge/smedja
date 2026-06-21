@@ -1,12 +1,33 @@
-use anyhow::Result;
+use std::io::stdout;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
 use clap::Parser;
+use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use crossterm::{event, execute};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::Terminal;
+use serde_json::json;
+use smedja_rpc::client::Client;
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
 
 #[derive(Parser)]
 #[command(name = "smedja", about = "smedja terminal client")]
 struct Cli {
     /// smdjad socket path (default: `$XDG_RUNTIME_DIR/smdjad.sock`)
     #[arg(long, env = "SMEDJA_SOCK")]
-    sock: Option<String>,
+    sock: Option<PathBuf>,
 
     /// Agent mode (impl|review|test|sre|explain)
     #[arg(long, short = 'm')]
@@ -17,11 +38,267 @@ struct Cli {
     tier: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Domain types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum Role {
+    User,
+    System,
+}
+
+#[derive(Debug, Clone)]
+struct Message {
+    role: Role,
+    text: String,
+}
+
+#[derive(Debug)]
+struct AppState {
+    session_id: String,
+    mode: Option<String>,
+    tier: Option<String>,
+    messages: Vec<Message>,
+    input: String,
+    quit: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Socket path resolution
+// ---------------------------------------------------------------------------
+
+fn socket_path(override_path: Option<PathBuf>) -> PathBuf {
+    override_path.unwrap_or_else(|| {
+        let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+        PathBuf::from(base).join("smdjad.sock")
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Submit a user turn to the daemon
+// ---------------------------------------------------------------------------
+
+async fn submit(input: &str, state: &mut AppState, client: &mut Client) -> Result<()> {
+    let text = input.trim().to_owned();
+    if text.is_empty() {
+        return Ok(());
+    }
+    state.messages.push(Message {
+        role: Role::User,
+        text: text.clone(),
+    });
+    let resp = client
+        .call(
+            "turn.submit",
+            json!({
+                "session_id": state.session_id,
+                "content": text,
+            }),
+        )
+        .await;
+    let reply = match resp {
+        Ok(v) => format!("queued (task: {})", v["task_id"].as_str().unwrap_or("?")),
+        Err(e) => format!("error: {e}"),
+    };
+    state.messages.push(Message {
+        role: Role::System,
+        text: reply,
+    });
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Key handler
+// ---------------------------------------------------------------------------
+
+async fn handle_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut AppState,
+    client: &mut Client,
+) -> Result<()> {
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.quit = true;
+        }
+        KeyCode::Esc => {
+            state.quit = true;
+        }
+        KeyCode::Backspace => {
+            state.input.pop();
+        }
+        KeyCode::Enter => {
+            let input = std::mem::take(&mut state.input);
+            submit(&input, state, client).await?;
+        }
+        KeyCode::Char(c) => {
+            state.input.push(c);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Render
+// ---------------------------------------------------------------------------
+
+fn render(frame: &mut ratatui::Frame, state: &AppState) {
+    let area = frame.area();
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(3),
+    ])
+    .split(area);
+
+    // -- Title bar ----------------------------------------------------------
+    let mode_str = state.mode.as_deref().unwrap_or("impl");
+    let tier_str = state.tier.as_deref().unwrap_or("fast");
+    let title_text = format!(
+        " smedja  [session: {}]  [mode: {}]  [tier: {}]",
+        truncate(&state.session_id, 8),
+        mode_str,
+        tier_str,
+    );
+    let title = Paragraph::new(title_text).style(Style::default().add_modifier(Modifier::BOLD));
+    frame.render_widget(title, chunks[0]);
+
+    // -- Messages area ------------------------------------------------------
+    let inner_height = chunks[1].height.saturating_sub(2) as usize; // subtract borders
+
+    let all_lines: Vec<Line> = state
+        .messages
+        .iter()
+        .map(|m| {
+            let prefix = match m.role {
+                Role::User => Span::styled("you: ", Style::default().add_modifier(Modifier::BOLD)),
+                Role::System => Span::raw("smdjad: "),
+            };
+            Line::from(vec![prefix, Span::raw(m.text.clone())])
+        })
+        .collect();
+
+    // Pin to bottom: take the last `inner_height` lines.
+    let visible_lines: Vec<Line> = if all_lines.len() > inner_height {
+        all_lines[all_lines.len() - inner_height..].to_vec()
+    } else {
+        all_lines
+    };
+
+    let messages = Paragraph::new(visible_lines)
+        .block(Block::default().borders(Borders::ALL))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(messages, chunks[1]);
+
+    // -- Input box ----------------------------------------------------------
+    let input_display = format!("> {}_", state.input);
+    let input_widget = Paragraph::new(input_display).block(Block::default().borders(Borders::ALL));
+    frame.render_widget(input_widget, chunks[2]);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Returns the first `max_chars` characters of `s`, or `s` itself if shorter.
+fn truncate(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup guard — always restores terminal even on panic
+// ---------------------------------------------------------------------------
+
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        // Best-effort: ignore errors during cleanup.
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout(), LeaveAlternateScreen);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    let _cli = Cli::parse();
-    // TODO: initialise ratatui layout, connect to smdjad, start chat loop
-    println!("smedja — coming soon");
+
+    let cli = Cli::parse();
+    let sock = socket_path(cli.sock);
+
+    // Connect before entering raw mode so errors surface cleanly.
+    let mut client = Client::connect(&sock).await.with_context(|| {
+        format!(
+            "smdjad is not running — start it with: smj daemon start\n(tried socket: {})",
+            sock.display()
+        )
+    })?;
+
+    // Create a session.
+    let session_resp = client
+        .call("session.create", json!({ "title": "smedja" }))
+        .await
+        .map_err(|e| anyhow::anyhow!("session.create failed: {e}"))?;
+    let session_id = session_resp["session_id"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_owned();
+
+    tracing::debug!(session_id = %session_id, "session created");
+
+    let mut state = AppState {
+        session_id,
+        mode: cli.mode,
+        tier: cli.tier,
+        messages: Vec::new(),
+        input: String::new(),
+        quit: false,
+    };
+
+    // Enter alternate screen and raw mode — guard restores on drop.
+    enable_raw_mode().context("enable raw mode")?;
+    execute!(stdout(), EnterAlternateScreen).context("enter alternate screen")?;
+    let _guard = TerminalGuard;
+
+    let backend = CrosstermBackend::new(stdout());
+    let mut terminal = Terminal::new(backend).context("create terminal")?;
+
+    // Event loop — poll for crossterm events with a short timeout so the
+    // loop stays responsive without burning CPU.
+    loop {
+        terminal.draw(|f| render(f, &state))?;
+
+        // Block in a spawn_blocking call so the async runtime stays free.
+        // poll() with 100 ms timeout gives ≤100 ms input latency.
+        let event_available =
+            tokio::task::spawn_blocking(|| event::poll(Duration::from_millis(100)))
+                .await
+                .context("poll task panicked")??;
+
+        if event_available {
+            let ev = tokio::task::spawn_blocking(event::read)
+                .await
+                .context("read task panicked")??;
+
+            // All other events (resize, focus, mouse, …) cause a redraw on the next tick.
+            if let Event::Key(key) = ev {
+                handle_key(key, &mut state, &mut client).await?;
+            }
+        }
+
+        if state.quit {
+            break;
+        }
+    }
+
     Ok(())
 }
