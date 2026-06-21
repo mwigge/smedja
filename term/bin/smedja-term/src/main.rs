@@ -317,10 +317,15 @@ impl ApplicationHandler<UserEvent> for App {
         // Compute initial grid size from window dimensions and font metrics.
         // Reserve the status bar height from the usable area so the terminal
         // grid never draws into the bottom strip.
+        // Font size is scaled by scale_factor so the PTY grid matches the
+        // physical cell size used by the renderer on HiDPI displays.
         let size = window.inner_size();
-        let sb_h = status_bar_height_for_font(self.config.font.size);
+        let scale_factor = window.scale_factor();
+        #[allow(clippy::cast_possible_truncation)]
+        let eff_font = self.config.font.size * scale_factor as f32;
+        let sb_h = status_bar_height_for_font(eff_font);
         let grid_h = size.height.saturating_sub(sb_h);
-        let (cols, rows) = st_glyph::pixel_size_to_grid(size.width, grid_h, self.config.font.size);
+        let (cols, rows) = st_glyph::pixel_size_to_grid(size.width, grid_h, eff_font);
 
         // Each pane gets a stable UUID injected as SMEDJA_TERM_PANE so smdjad
         // can route agent events back to the correct window.
@@ -384,23 +389,31 @@ impl ApplicationHandler<UserEvent> for App {
                     renderer.resize(new_size);
                 }
                 if let Some(pty) = &mut self.pty {
-                    // Use grid_height_px() from the renderer when available;
-                    // fall back to the same formula so PTY stays out of the
-                    // status bar strip.
+                    let sf = self.renderer.as_ref().map_or(1.0_f64, |r| r.scale_factor);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let eff_font = self.config.font.size * sf as f32;
                     let grid_h = self.renderer.as_ref().map_or_else(
                         || {
                             new_size
                                 .height
-                                .saturating_sub(status_bar_height_for_font(self.config.font.size))
+                                .saturating_sub(status_bar_height_for_font(eff_font))
                         },
                         st_render::Renderer::grid_height_px,
                     );
                     let (cols, rows) =
-                        st_glyph::pixel_size_to_grid(new_size.width, grid_h, self.config.font.size);
-                    // Resize errors are non-fatal; the PTY may have exited.
+                        st_glyph::pixel_size_to_grid(new_size.width, grid_h, eff_font);
                     if let Err(e) = pty.resize(cols, rows) {
                         debug!("PTY resize error: {}", e);
                     }
+                }
+            }
+
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.update_scale_factor(scale_factor);
+                    // Trigger a resize with the new physical size.
+                    let new_size = renderer.size;
+                    renderer.resize(new_size);
                 }
             }
 

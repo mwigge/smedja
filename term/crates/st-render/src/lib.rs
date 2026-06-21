@@ -504,6 +504,8 @@ pub struct Renderer {
     pub size: winit::dpi::PhysicalSize<u32>,
     /// Status bar segments to overlay at the bottom of the window.
     status_bar_segments: Vec<Segment>,
+    /// Device pixel ratio for this window (1.0 on non-HiDPI, 2.0 on 2× displays).
+    pub scale_factor: f64,
 }
 
 impl Renderer {
@@ -523,6 +525,7 @@ impl Renderer {
         window: std::sync::Arc<winit::window::Window>,
         config: &st_config::Config,
     ) -> anyhow::Result<Self> {
+        let scale_factor = window.scale_factor();
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -604,12 +607,13 @@ impl Renderer {
             ],
         });
 
+        // Nearest filtering for crisp glyph rendering — linear blurs sub-pixel text.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas_sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
 
@@ -748,7 +752,20 @@ impl Renderer {
             },
             size,
             status_bar_segments: Vec::new(),
+            scale_factor,
         })
+    }
+
+    /// Updates the device pixel ratio and clears the glyph atlas.
+    ///
+    /// Must be called when the window moves to a display with a different DPI.
+    /// Clears cached glyphs so they are re-rasterised at the new scale.
+    pub fn update_scale_factor(&mut self, sf: f64) {
+        if (self.scale_factor - sf).abs() > f64::EPSILON {
+            self.scale_factor = sf;
+            self.atlas.glyphs.clear();
+            self.atlas.packer = ShelfPacker::new(ATLAS_SIZE);
+        }
     }
 
     /// Handles a window resize event.
@@ -765,12 +782,20 @@ impl Renderer {
 
     /// Updates the cell grid from a slice of [`Cell`]s.
     pub fn update_cells(&mut self, cells: &[Cell]) {
-        let font_size = self.config.font.size;
-        for cell in cells {
-            if cell.ch != ' ' {
-                // Ensure the glyph is in the atlas before the next render pass.
-                // On cache miss get_or_insert rasterises via cosmic-text and
-                // uploads to the GPU texture; on hit it returns immediately.
+        self.cells.clear();
+        self.cells.extend_from_slice(cells);
+    }
+
+    /// Rasterises any glyphs in `self.cells` that are not yet in the atlas.
+    ///
+    /// Must be called at the start of [`Self::render`], before the command
+    /// encoder is created, so that [`wgpu::Queue::write_texture`] completes
+    /// before the draw calls are submitted.
+    fn ensure_cell_glyphs(&mut self) {
+        let font_size = self.config.font.size * self.scale_factor as f32;
+        for cell in &self.cells {
+            // Skip spaces and already-cached glyphs (fast HashMap check).
+            if cell.ch != ' ' && !self.atlas.glyphs.contains_key(&(cell.ch, false, false)) {
                 let _ = self.atlas.get_or_insert(
                     &self.device,
                     &self.queue,
@@ -781,8 +806,6 @@ impl Renderer {
                 );
             }
         }
-        self.cells.clear();
-        self.cells.extend_from_slice(cells);
     }
 
     /// Sets the block decorations for the next render pass.
@@ -836,6 +859,10 @@ impl Renderer {
     /// Returns [`RenderError::Frame`] if the surface texture cannot be
     /// acquired.
     pub fn render(&mut self) -> anyhow::Result<()> {
+        // Rasterise any glyphs not yet in the atlas before the command encoder
+        // is created — queue.write_texture must complete before draw calls.
+        self.ensure_cell_glyphs();
+
         let output = self.surface.get_current_texture()?;
         let view = output
             .texture
@@ -914,12 +941,13 @@ impl Renderer {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    /// Estimates cell size based on font metrics and window size.
+    /// Estimates cell size in physical pixels.
+    ///
+    /// Font size is multiplied by `scale_factor` so each cell occupies the
+    /// correct number of physical pixels on `HiDPI` displays.
     fn cell_size(&self) -> (f32, f32) {
-        // Simple approximation: font_size × 0.6 wide, font_size × 1.2 tall.
-        let w = self.config.font.size * 0.6;
-        let h = self.config.font.size * 1.2;
-        (w, h)
+        let eff = self.config.font.size * self.scale_factor as f32;
+        (eff * 0.6, eff * 1.2)
     }
 
     fn cell_to_ndc(&self, col: u16, row: u16, cell_w: f32, cell_h: f32) -> (f32, f32, f32, f32) {
