@@ -583,7 +583,7 @@ impl Renderer {
         };
         surface.configure(&device, &surface_config);
 
-        let atlas = GlyphAtlas::new(&device);
+        let mut atlas = GlyphAtlas::new(&device);
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("atlas_bind_group_layout"),
@@ -712,21 +712,17 @@ impl Renderer {
             cache: None,
         });
 
-        // Pre-populate with "hello smedja" as an initial test render.
-        let fg = config.colors.foreground;
-        let bg_color = config.colors.background;
-        let hello = "hello smedja";
-        let initial_cells: Vec<Cell> = hello
-            .chars()
-            .enumerate()
-            .map(|(i, ch)| Cell {
-                ch,
-                fg,
-                bg: bg_color,
-                col: i as u16,
-                row: 0,
-            })
-            .collect();
+        // Pre-warm the glyph atlas with printable ASCII (0x20–0x7E).
+        // This runs during the already-blocking Renderer::new() so there is no
+        // additional wall-clock cost — the font system is initialised once here
+        // and first-frame ensure_cell_glyphs() finds everything already cached.
+        let eff_font_size = config.font.size * scale_factor as f32;
+        for cp in 0x20u8..=0x7Eu8 {
+            let ch = cp as char;
+            atlas.get_or_insert(&device, &queue, ch, eff_font_size, false, false);
+        }
+
+        let initial_cells: Vec<Cell> = Vec::new();
 
         Ok(Self {
             surface,

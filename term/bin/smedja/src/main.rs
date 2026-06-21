@@ -824,9 +824,14 @@ fn main() -> anyhow::Result<()> {
 
     let config = st_config::Config::load().unwrap_or_default();
 
-    let shell = args
-        .shell
-        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()));
+    // Default to smedja-tui so opening smedja goes straight into the agent
+    // dashboard. Fall back to $SHELL for raw terminal access (smedja --shell fish).
+    let shell = args.shell.unwrap_or_else(|| {
+        which::which("smedja-tui").map_or_else(
+            |_| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+            |p| p.to_string_lossy().into_owned(),
+        )
+    });
 
     let launch_entries = load_launch_entries();
     info!("loaded {} launch menu entries", launch_entries.len());
