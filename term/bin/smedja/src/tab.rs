@@ -1,4 +1,4 @@
-//! `tab.rs` — Tab bar, pane model, and tab navigation for smedja-term.
+//! `tab.rs` — Tab bar, pane model, and tab navigation for smedja.
 //!
 //! A [`TabBar`] owns zero or more [`Tab`]s, each of which contains one or more
 //! [`Pane`]s split via a [`crate::split::SplitLayout`].  The invariant is that

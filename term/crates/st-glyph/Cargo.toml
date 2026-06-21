@@ -1,6 +1,6 @@
 [package]
 name        = "st-glyph"
-description = "smedja-term: glyph shaping utilities and grid sizing"
+description = "smedja: glyph shaping utilities and grid sizing"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true

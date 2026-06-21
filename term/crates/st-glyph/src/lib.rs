@@ -1,4 +1,4 @@
-//! `st-glyph` — glyph shaping utilities and Glyph Protocol implementation for smedja-term.
+//! `st-glyph` — glyph shaping utilities and Glyph Protocol implementation for smedja.
 //!
 //! This crate provides:
 //! - Basic font metric helpers (`char_advance_width`, `line_height`, `pixel_size_to_grid`)

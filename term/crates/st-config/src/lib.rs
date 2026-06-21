@@ -1,6 +1,6 @@
-//! `st-config` — configuration for smedja-term.
+//! `st-config` — configuration for smedja.
 //!
-//! Loads `~/.config/smedja-term/config.toml` when present; otherwise returns
+//! Loads `~/.config/smedja/config.toml` when present; otherwise returns
 //! the built-in `forged_terminal` theme defaults.
 
 pub mod contrast;
@@ -204,7 +204,7 @@ impl Default for AccessibilityConfig {
     }
 }
 
-/// Top-level smedja-term configuration.
+/// Top-level smedja configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     /// Font settings.
@@ -285,7 +285,7 @@ fn default_key_bindings() -> Vec<KeyBinding> {
 }
 
 impl Config {
-    /// Loads configuration from `~/.config/smedja-term/config.toml`.
+    /// Loads configuration from `~/.config/smedja/config.toml`.
     ///
     /// Falls back to [`Config::default`] (the `forged_terminal` theme) when the
     /// file is absent.  Returns an error only when the file exists but cannot be
@@ -396,11 +396,11 @@ impl Config {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Returns the path `~/.config/smedja-term/config.toml`.
+/// Returns the path `~/.config/smedja/config.toml`.
 fn config_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("~/.config"))
-        .join("smedja-term")
+        .join("smedja")
         .join("config.toml")
 }
 

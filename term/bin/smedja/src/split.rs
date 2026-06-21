@@ -1,4 +1,4 @@
-//! `split.rs` — Taffy-based pane split layout for smedja-term.
+//! `split.rs` — Taffy-based pane split layout for smedja.
 //!
 //! [`SplitLayout`] maintains a flexbox layout tree (via [`taffy`]) that maps
 //! pane IDs to screen rectangles.  Each split operation inserts a new flex

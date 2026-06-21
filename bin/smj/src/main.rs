@@ -93,7 +93,7 @@ enum Cmd {
         #[command(subcommand)]
         action: PricesCmd,
     },
-    /// smedja-term utilities
+    /// smedja utilities
     Term {
         #[command(subcommand)]
         action: TermCmd,
@@ -382,7 +382,7 @@ enum SandboxCmd {
 
 #[derive(Subcommand)]
 enum TermCmd {
-    /// Migrate a `WezTerm` Lua config to smedja-term TOML format
+    /// Migrate a `WezTerm` Lua config to smedja TOML format
     Migrate {
         /// Path to the `WezTerm` Lua config file (e.g. ~/.wezterm.lua)
         #[arg(long)]
@@ -391,7 +391,7 @@ enum TermCmd {
         #[arg(long)]
         out: Option<std::path::PathBuf>,
     },
-    /// Download and install smedja-term to ~/.local/bin
+    /// Download and install smedja to ~/.local/bin
     Install {
         /// URL to download the binary from (auto-detected by OS if omitted)
         #[arg(long)]
@@ -1174,9 +1174,9 @@ async fn main() -> Result<()> {
                 let url = bin_path.unwrap_or_else(|| {
                     let os = std::env::consts::OS;
                     if os == "macos" {
-                        "https://github.com/mwigge/smedja/releases/latest/download/smedja-term-x86_64-apple-darwin".to_owned()
+                        "https://github.com/mwigge/smedja/releases/latest/download/smedja-macos-x86_64.tar.gz".to_owned()
                     } else {
-                        "https://github.com/mwigge/smedja/releases/latest/download/smedja-term-x86_64-unknown-linux-musl".to_owned()
+                        "https://github.com/mwigge/smedja/releases/latest/download/smedja-linux-x86_64.tar.gz".to_owned()
                     }
                 });
                 let prefix_clone = prefix.clone();
@@ -1431,8 +1431,8 @@ fn cmd_term_install(url: &str, prefix: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(prefix)
         .with_context(|| format!("cannot create prefix directory {}", prefix.display()))?;
 
-    let dest = prefix.join("smedja-term");
-    println!("Downloading smedja-term from {url} ...");
+    let dest = prefix.join("smedja");
+    println!("Downloading smedja from {url} ...");
 
     let bytes = reqwest::blocking::get(url)
         .with_context(|| format!("download failed: {url}"))?
@@ -1447,16 +1447,16 @@ fn cmd_term_install(url: &str, prefix: &std::path::Path) -> Result<()> {
     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
         .with_context(|| format!("cannot chmod +x {}", dest.display()))?;
 
-    println!("Installed smedja-term to {}", dest.display());
+    println!("Installed smedja to {}", dest.display());
 
     // On Linux, write a .desktop file.
     if std::env::consts::OS == "linux" {
         if let Ok(home) = std::env::var("HOME") {
             let apps_dir = PathBuf::from(&home).join(".local/share/applications");
             let _ = std::fs::create_dir_all(&apps_dir);
-            let desktop_path = apps_dir.join("smedja-term.desktop");
+            let desktop_path = apps_dir.join("smedja.desktop");
             let desktop = format!(
-                "[Desktop Entry]\nVersion=1.0\nType=Application\nName=smedja-term\nExec={}\nIcon=utilities-terminal\nTerminal=false\nCategories=System;TerminalEmulator;\n",
+                "[Desktop Entry]\nVersion=1.0\nType=Application\nName=smedja\nExec={}\nIcon=utilities-terminal\nTerminal=false\nCategories=System;TerminalEmulator;\n",
                 dest.display()
             );
             if let Ok(mut f) = std::fs::File::create(&desktop_path) {

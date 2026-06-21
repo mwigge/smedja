@@ -1,7 +1,7 @@
-//! `WezTerm` → smedja-term config migration.
+//! `WezTerm` → smedja config migration.
 //!
 //! Evaluates a `WezTerm` Lua config file with a stubbed `wezterm` API and
-//! converts the captured field assignments into a smedja-term TOML config
+//! converts the captured field assignments into a smedja TOML config
 //! string.
 
 use std::fmt::Write as _;
@@ -13,7 +13,7 @@ use mlua::{Lua, Table, Value};
 /// Output of a successful migration run.
 #[derive(Debug)]
 pub struct MigrationResult {
-    /// Generated smedja-term TOML config string.
+    /// Generated smedja TOML config string.
     pub toml: String,
     /// Fields that could not be mapped (human-readable descriptions).
     pub unsupported: Vec<String>,
@@ -56,7 +56,7 @@ impl From<mlua::Error> for MigrationError {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Evaluate a `WezTerm` Lua config source string and produce a smedja-term
+/// Evaluate a `WezTerm` Lua config source string and produce a smedja
 /// TOML config with a list of unsupported field names and a human-readable
 /// summary.
 ///

@@ -1,4 +1,4 @@
-//! `st-blocks` — block model for smedja-term.
+//! `st-blocks` — block model for smedja.
 //!
 //! A *block* represents a single unit of terminal output: a shell command and
 //! its output, an agent response, or a system message.  Blocks are persisted

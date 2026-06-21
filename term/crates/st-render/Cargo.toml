@@ -1,6 +1,6 @@
 [package]
 name        = "st-render"
-description = "smedja-term: wgpu cell-grid renderer with glyph atlas"
+description = "smedja: wgpu cell-grid renderer with glyph atlas"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true

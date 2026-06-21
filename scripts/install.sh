@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install smedja: smdjad, smj, smedja TUI, and smedja-term GPU terminal.
+# Install smedja: smdjad, smj, smedja (GPU terminal), and smedja-tui (agent dashboard).
 # Usage:
 #   curl -fsSL https://github.com/mwigge/smedja/releases/latest/download/install.sh | sh
 #   SMEDJA_VERSION=v0.1.0 ... | sh   # pin a version
@@ -48,7 +48,7 @@ else
   echo "error: curl or wget required" >&2; exit 1
 fi
 
-for bin in smdjad smj smedja smedja-term; do
+for bin in smdjad smj smedja smedja-tui; do
   src="$TMP/smedja-$OS-$ARCH/$bin"
   if [ -f "$src" ]; then
     install -m755 "$src" "$INSTALL_DIR/$bin"
@@ -56,15 +56,15 @@ for bin in smdjad smj smedja smedja-term; do
   fi
 done
 
-# register smedja-term as a .desktop app (Linux only)
-if [ "$OS" = "linux" ] && [ -f "$INSTALL_DIR/smedja-term" ]; then
+# register smedja as a .desktop app (Linux only)
+if [ "$OS" = "linux" ] && [ -f "$INSTALL_DIR/smedja" ]; then
   DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
   mkdir -p "$DESKTOP_DIR"
-  cat > "$DESKTOP_DIR/smedja-term.desktop" <<EOF
+  cat > "$DESKTOP_DIR/smedja.desktop" <<EOF
 [Desktop Entry]
-Name=smedja-term
+Name=smedja
 Comment=smedja GPU terminal
-Exec=$INSTALL_DIR/smedja-term
+Exec=$INSTALL_DIR/smedja
 Icon=utilities-terminal
 Type=Application
 Categories=System;TerminalEmulator;
@@ -72,9 +72,9 @@ StartupNotify=true
 EOF
   # register as default terminal handler if update-alternatives is available
   if command -v update-alternatives >/dev/null 2>&1; then
-    update-alternatives --install /usr/bin/x-terminal-emulator x-terminal-emulator "$INSTALL_DIR/smedja-term" 50 2>/dev/null || true
+    update-alternatives --install /usr/bin/x-terminal-emulator x-terminal-emulator "$INSTALL_DIR/smedja" 50 2>/dev/null || true
   fi
-  echo "  smedja-term.desktop → $DESKTOP_DIR"
+  echo "  smedja.desktop → $DESKTOP_DIR"
 fi
 
 # add to PATH if not already there
@@ -97,7 +97,7 @@ echo ""
 echo "installed:"
 echo "  smdjad      — AI orchestration daemon"
 echo "  smj         — control CLI (smj --help)"
-echo "  smedja      — TUI session interface"
-echo "  smedja-term — GPU terminal emulator"
+echo "  smedja      — GPU terminal emulator"
+echo "  smedja-tui  — agent dashboard TUI (run inside smedja)"
 echo ""
-echo "quickstart: smdjad & && smedja-term"
+echo "quickstart: smdjad & && smedja"
