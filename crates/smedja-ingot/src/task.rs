@@ -56,24 +56,22 @@ pub(crate) fn list(
     conn: &rusqlite::Connection,
     status: Option<&str>,
 ) -> Result<Vec<Task>, IngotError> {
-    let rows: Vec<Task> = if let Some(st) = status {
-        let mut stmt = conn.prepare(
-            "SELECT id, title, description, status, created_at, session_id, response \
-             FROM tasks WHERE status = ?1 ORDER BY created_at ASC",
-        )?;
-        let collected: Result<Vec<Task>, _> = stmt
-            .query_map(rusqlite::params![st], row_to_task)?
-            .collect();
-        collected?
-    } else {
-        let mut stmt = conn.prepare(
-            "SELECT id, title, description, status, created_at, session_id, response \
-             FROM tasks ORDER BY created_at ASC",
-        )?;
-        let collected: Result<Vec<Task>, _> = stmt.query_map([], row_to_task)?.collect();
-        collected?
+    // A single query handles both the filtered and unfiltered cases.
+    // When `status_param` is NULL, the `?1 IS NULL` branch matches every row.
+    let status_param: rusqlite::types::Value = match status {
+        Some(s) => rusqlite::types::Value::Text(s.to_owned()),
+        None => rusqlite::types::Value::Null,
     };
-    Ok(rows)
+    let mut stmt = conn.prepare(
+        "SELECT id, title, description, status, created_at, session_id, response \
+         FROM tasks \
+         WHERE (?1 IS NULL OR status = ?1) \
+         ORDER BY created_at ASC",
+    )?;
+    let collected: Result<Vec<Task>, _> = stmt
+        .query_map(rusqlite::params![status_param], row_to_task)?
+        .collect();
+    Ok(collected?)
 }
 
 /// Retrieves a single [`Task`] by `id`, returning `None` when not found.

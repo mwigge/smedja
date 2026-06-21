@@ -216,11 +216,14 @@ impl WorkingMemory {
     /// # Note
     ///
     /// Full semantic retrieval requires a vector index over cold messages.
-    /// This stub returns an empty slice. Activate when a vector store is
+    /// This stub returns an empty `Vec`. Activate when a vector store is
     /// wired into [`WorkingMemory`].
-    // ponytail: cold retrieval deferred; returns empty until vector store added
-    #[must_use]
-    pub fn cold_context(&self, _query: &str) -> Vec<crate::types::Message> {
+    ///
+    /// The signature is `async` so callers can `await` it without a breaking
+    /// change once real vector-store I/O is added.
+    // ponytail: cold retrieval stub — returns empty until vector search is wired
+    #[allow(clippy::unused_async)] // async is intentional: callers await this without a breaking change once I/O is added
+    pub async fn cold_context(&self, _query: &str) -> Vec<crate::types::Message> {
         Vec::new()
     }
 }
@@ -296,8 +299,8 @@ impl StrataConfig {
     #[must_use]
     pub fn deep() -> Self {
         Self {
-            hot_depth: 5,
-            warm_depth: 30,
+            hot_depth: HOT_WINDOW,
+            warm_depth: WARM_WINDOW,
         }
     }
 
@@ -541,8 +544,28 @@ mod tests {
 
     #[test]
     fn cold_context_stub_returns_empty() {
+        // cold_context is async but contains no real await points — drive it to
+        // completion with a minimal single-poll executor so the test stays sync.
+        use std::future::Future as _;
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn noop_wake(_: *const ()) {}
+        fn noop_wake_ref(_: *const ()) {}
+        fn noop_clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTABLE)
+        }
+        fn noop_drop(_: *const ()) {}
+        static VTABLE: RawWakerVTable =
+            RawWakerVTable::new(noop_clone, noop_wake, noop_wake_ref, noop_drop);
+        // SAFETY: vtable functions are all no-ops and the data pointer is never
+        // dereferenced — this waker is only used to drive a stub future that
+        // returns Poll::Ready on the first poll.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
         let m = make_mem(50);
-        let ctx = m.cold_context("some query string");
+        let mut fut = std::pin::pin!(m.cold_context("some query string"));
+        let Poll::Ready(ctx) = fut.as_mut().poll(&mut cx) else {
+            panic!("cold_context stub must resolve on first poll");
+        };
         assert!(ctx.is_empty());
     }
 }
