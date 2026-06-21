@@ -699,6 +699,7 @@ fn find_json_end(s: &str) -> Option<usize> {
 ///
 /// Supported tools: `bash`, `run_command`, `read_file`, `list_files`.
 /// Unknown tools return a formatted error string.
+#[allow(clippy::too_many_lines)]
 async fn execute_tool(
     tool_name: &str,
     tool_input: &str,
@@ -762,7 +763,8 @@ async fn execute_tool(
         }
         "smedja_vault_search" => {
             let query = input.get("query").and_then(Value::as_str).unwrap_or("");
-            let k = input.get("k").and_then(Value::as_u64).unwrap_or(5) as usize;
+            let k =
+                usize::try_from(input.get("k").and_then(Value::as_u64).unwrap_or(5)).unwrap_or(5);
             // ponytail: vault not yet wired; stub returns empty results
             tracing::warn!(
                 query,
@@ -774,21 +776,19 @@ async fn execute_tool(
         "smedja_retrieve" => {
             let hash = input.get("hash").and_then(Value::as_str).unwrap_or("");
             let store = retrieve_store().lock().await;
-            match store.get(hash) {
-                Some(content) => {
-                    // ponytail: audit deferred; log the retrieval.
-                    tracing::info!(hash, "smedja_retrieve hit");
-                    content.clone()
-                }
-                None => {
-                    tracing::debug!(hash, "smedja_retrieve: hash not found");
-                    format!("error: hash not found: {hash}")
-                }
+            if let Some(content) = store.get(hash) {
+                // ponytail: audit deferred; log the retrieval.
+                tracing::info!(hash, "smedja_retrieve hit");
+                content.clone()
+            } else {
+                tracing::debug!(hash, "smedja_retrieve: hash not found");
+                format!("error: hash not found: {hash}")
             }
         }
         "graph_query" => {
             let query = input.get("query").and_then(Value::as_str).unwrap_or("");
-            let depth = input.get("depth").and_then(Value::as_u64).unwrap_or(2) as u8;
+            let depth =
+                u8::try_from(input.get("depth").and_then(Value::as_u64).unwrap_or(2)).unwrap_or(2);
             let graph_db_path = workspace.join(".smedja").join("graph.db");
             if !graph_db_path.exists() {
                 tracing::debug!("graph.db not found; returning empty symbols");

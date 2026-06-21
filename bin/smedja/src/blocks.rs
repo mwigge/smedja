@@ -1,5 +1,8 @@
 //! Turn block rendering — framed blocks with state machine for streaming turns.
 
+use ratatui::text::{Line, Text};
+use ratatui::widgets::{Paragraph, Widget};
+
 /// State of a turn block in the rendering pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)] // ToolCall variant is constructed by the future streaming RPC path
@@ -171,6 +174,17 @@ impl BlockStore {
     }
 }
 
+impl Widget for TurnBlock {
+    fn render(self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
+        let lines: Vec<Line<'_>> = self
+            .render_lines(area.width as usize)
+            .into_iter()
+            .map(Line::raw)
+            .collect();
+        Paragraph::new(Text::from(lines)).render(area, buf);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +283,15 @@ mod tests {
     fn is_empty_on_new() {
         let store = BlockStore::new();
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn inline_diff_preserves_prefixes() {
+        let mut b = TurnBlock::new(1);
+        b.push_tool_call("edit_file".into(), "a.rs".into());
+        b.set_tool_outcome("@@ -1,2 +1,2 @@\n-old\n+new".into());
+        let lines = b.inline_diff(0, 20).unwrap();
+        assert!(lines.iter().any(|l| l.starts_with('-')));
+        assert!(lines.iter().any(|l| l.starts_with('+')));
     }
 }

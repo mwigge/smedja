@@ -255,6 +255,30 @@ pub fn load_workspace_skills(dir: &std::path::Path) -> Result<Vec<String>, std::
     Ok(skills)
 }
 
+/// Injects workspace skills into `WorkingMemory` as a single system message
+/// before `seal_prefix` is called.
+///
+/// Skips injection when no skills are found. Returns the number of skills injected.
+///
+/// # Errors
+///
+/// Returns an error if the skills directory exists but cannot be read.
+pub fn inject_workspace_skills(
+    memory: &mut WorkingMemory,
+    workspace_dir: &std::path::Path,
+) -> Result<usize, std::io::Error> {
+    let skills = load_workspace_skills(workspace_dir)?;
+    if skills.is_empty() {
+        return Ok(0);
+    }
+    let count = skills.len();
+    let combined = skills.join("\n\n---\n\n");
+    memory.push(crate::types::Message::system(format!(
+        "[workspace skills]\n\n{combined}"
+    )));
+    Ok(count)
+}
+
 /// Reads `AGENTS.md` from the workspace root, if present.
 ///
 /// Returns `None` when the file is absent — not an error.
@@ -540,6 +564,28 @@ mod tests {
         let prompt_full = m.build_prompt(100_000);
         // With a tight budget, we get fewer messages than with a full budget.
         assert!(prompt_tight.len() <= prompt_full.len());
+    }
+
+    #[test]
+    fn inject_workspace_skills_pushes_system_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join(".smedja").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(skills_dir.join("skill.md"), "do something").unwrap();
+        let mut mem = WorkingMemory::new(4096);
+        let n = inject_workspace_skills(&mut mem, tmp.path()).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(mem.len(), 1);
+        assert!(mem.messages()[0].content.contains("workspace skills"));
+    }
+
+    #[test]
+    fn inject_workspace_skills_empty_dir_no_push() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mem = WorkingMemory::new(4096);
+        let n = inject_workspace_skills(&mut mem, tmp.path()).unwrap();
+        assert_eq!(n, 0);
+        assert!(mem.is_empty());
     }
 
     #[test]
