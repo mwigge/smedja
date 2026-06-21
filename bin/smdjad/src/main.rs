@@ -817,6 +817,71 @@ fn build_router(
         }
     });
 
+    // ── session.fork ────────────────────────────────────────────────────────
+    let ig = Arc::clone(ingot);
+    router.register("session.fork", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        async move {
+            let session_id = params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| missing_param("session_id"))?;
+
+            let mut guard = ig.lock().await;
+
+            let parent = guard
+                .get_session(session_id)
+                .map_err(|e| ingot_err(&e))?
+                .ok_or_else(|| {
+                    RpcError::new(
+                        codes::INTERNAL_ERROR,
+                        format!("session not found: {session_id}"),
+                    )
+                })?;
+
+            let latest_cp = guard
+                .latest_checkpoint(session_id)
+                .map_err(|e| ingot_err(&e))?;
+
+            let now = now_epoch();
+            let new_id = Uuid::new_v4().to_string();
+
+            guard
+                .create_session(&Session {
+                    id: Uuid::parse_str(&new_id).map_err(|e| {
+                        RpcError::new(codes::INTERNAL_ERROR, format!("uuid error: {e}"))
+                    })?,
+                    created_at: now,
+                    updated_at: now,
+                    status: "active".into(),
+                    task_id: None,
+                    mode: parent.mode.clone(),
+                    cowork_mode: parent.cowork_mode,
+                    workspace_root: parent.workspace_root.clone(),
+                })
+                .map_err(|e| ingot_err(&e))?;
+
+            let has_checkpoint = latest_cp.is_some();
+            if let Some(cp) = latest_cp {
+                guard
+                    .save_checkpoint(&Checkpoint {
+                        id: Uuid::new_v4(),
+                        session_id: new_id.clone(),
+                        turn_n: cp.turn_n,
+                        messages_json: cp.messages_json,
+                        created_at: now,
+                    })
+                    .map_err(|e| ingot_err(&e))?;
+            }
+
+            Ok(json!({
+                "session_id": new_id,
+                "forked_from": session_id,
+                "has_checkpoint": has_checkpoint,
+            }))
+        }
+    });
+
     // ── task.get ────────────────────────────────────────────────────────────
     let ig = Arc::clone(ingot);
     router.register("task.get", move |params: Value| {
@@ -1428,6 +1493,94 @@ fn build_router(
         }
     });
 
+    // ── loop.create ──────────────────────────────────────────────────────────
+    let ig = Arc::clone(ingot);
+    router.register("loop.create", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        async move {
+            let change_name = params["change_name"]
+                .as_str()
+                .ok_or_else(|| missing_param("change_name"))?
+                .to_owned();
+            let now = now_epoch();
+            let rec = smedja_ingot::LoopRecord {
+                id: Uuid::new_v4().to_string(),
+                change_name,
+                status: "planned".to_owned(),
+                current_slice: 0,
+                attempt: 1,
+                created_at: now,
+                updated_at: now,
+            };
+            let loop_id = rec.id.clone();
+            ig.lock()
+                .await
+                .create_loop(&rec)
+                .map_err(|e| ingot_err(&e))?;
+            Ok(json!({ "loop_id": loop_id }))
+        }
+    });
+
+    // ── loop.status ──────────────────────────────────────────────────────────
+    let ig = Arc::clone(ingot);
+    router.register("loop.status", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        async move {
+            let loop_id = params["loop_id"]
+                .as_str()
+                .ok_or_else(|| missing_param("loop_id"))?
+                .to_owned();
+            let rec = ig
+                .lock()
+                .await
+                .get_loop(&loop_id)
+                .map_err(|e| ingot_err(&e))?
+                .ok_or_else(|| {
+                    RpcError::new(codes::INVALID_PARAMS, format!("loop not found: {loop_id}"))
+                })?;
+            Ok(serde_json::to_value(&rec).unwrap_or(Value::Null))
+        }
+    });
+
+    // ── loop.cancel ──────────────────────────────────────────────────────────
+    let ig = Arc::clone(ingot);
+    router.register("loop.cancel", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        async move {
+            let loop_id = params["loop_id"]
+                .as_str()
+                .ok_or_else(|| missing_param("loop_id"))?
+                .to_owned();
+            ig.lock()
+                .await
+                .update_loop_status(&loop_id, "cancelled", now_epoch())
+                .map_err(|e| ingot_err(&e))?;
+            Ok(json!({ "loop_id": loop_id, "status": "cancelled" }))
+        }
+    });
+
+    // ── loop.list ────────────────────────────────────────────────────────────
+    let ig = Arc::clone(ingot);
+    router.register("loop.list", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        async move {
+            let change_name = params["change_name"]
+                .as_str()
+                .ok_or_else(|| missing_param("change_name"))?
+                .to_owned();
+            let loops = ig
+                .lock()
+                .await
+                .list_loops(&change_name)
+                .map_err(|e| ingot_err(&e))?;
+            let loops_json: Vec<Value> = loops
+                .into_iter()
+                .map(|r| serde_json::to_value(&r).unwrap_or(Value::Null))
+                .collect();
+            Ok(json!({ "loops": loops_json }))
+        }
+    });
+
     router
 }
 
@@ -1482,6 +1635,14 @@ async fn main() -> anyhow::Result<()> {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| anyhow::anyhow!("failed to set socket permissions: {e}"))?;
     }
+
+    // Write PID file so `smj daemon stop` can send SIGTERM.
+    let pid_path = {
+        let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+        std::path::PathBuf::from(base).join("smdjad.pid")
+    };
+    std::fs::write(&pid_path, std::process::id().to_string())
+        .unwrap_or_else(|e| tracing::warn!(error = %e, "failed to write PID file"));
 
     info!(path = %path.display(), "smdjad listening");
 
@@ -1624,6 +1785,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("smdjad stopped");
+    let _ = std::fs::remove_file(&pid_path);
     let _ = std::fs::remove_file(&path);
 
     Ok(())
