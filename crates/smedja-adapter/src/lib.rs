@@ -15,17 +15,23 @@
 //! | [`LocalProvider`] | Local rs-llmctl instance (OpenAI-compatible) |
 
 pub mod anthropic;
+pub mod claude_cli;
+pub mod codex_cli;
 pub mod error;
 pub mod local;
 pub mod openai;
 pub mod provider;
+pub mod subprocess;
 pub mod types;
 
 pub(crate) mod sse;
 
 pub use anthropic::AnthropicProvider;
+pub use claude_cli::ClaudeCliProvider;
+pub use codex_cli::CodexCliProvider;
 pub use error::AdapterError;
 pub use local::{LocalCapability, LocalProvider};
 pub use openai::OpenAiProvider;
 pub use provider::{DeltaStream, Provider};
+pub use subprocess::SubprocessProvider;
 pub use types::{CallOptions, Delta, Message, Role};
