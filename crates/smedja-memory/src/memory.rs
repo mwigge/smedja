@@ -588,6 +588,50 @@ mod tests {
         assert!(mem.is_empty());
     }
 
+    // --- smoke test equivalent (L66) ---
+
+    #[test]
+    fn smoke_l66_skill_injected_before_stable_prefix_watermark() {
+        // Smoke L66: smj workspace skills add docs/conventions.md; start session;
+        // skill content appears before stable_prefix watermark.
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join(".smedja").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("conventions.md"),
+            "## Coding Conventions\nUse snake_case.",
+        )
+        .unwrap();
+
+        let mut mem = WorkingMemory::new(4096);
+        // Inject skills before sealing, as the session-start flow does.
+        let n = super::inject_workspace_skills(&mut mem, tmp.path()).unwrap();
+        assert_eq!(n, 1, "one skill file must be injected");
+        // Seal the prefix to mark the stable boundary.
+        mem.seal_prefix();
+        // Push a user turn to simulate session activity.
+        mem.push(Message::user("hello"));
+
+        // The skill message must be at index 0 (before the watermark).
+        let msgs = mem.messages();
+        assert!(
+            msgs[0].content.contains("Coding Conventions"),
+            "skill content must appear in the first message (before stable_prefix)"
+        );
+        // stable_prefix == 1 means the skill message is the only frozen entry.
+        assert_eq!(
+            mem.stable_prefix(),
+            1,
+            "stable_prefix must be 1 (skill message sealed before user turns)"
+        );
+        // The mutable window must not contain the skill content.
+        let mutable = mem.mutable_window();
+        assert!(
+            !mutable[0].content.contains("Coding Conventions"),
+            "skill must not appear in the mutable window after sealing"
+        );
+    }
+
     #[test]
     fn cold_context_stub_returns_empty() {
         // cold_context is async but contains no real await points — drive it to

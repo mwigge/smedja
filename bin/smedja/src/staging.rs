@@ -126,4 +126,44 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert!(q.items.is_empty());
     }
+
+    // --- smoke test equivalent (L67) ---
+
+    #[test]
+    fn smoke_l67_stage_edit_file_run_dispatches_correct_args() {
+        // Smoke L67: /stage edit_file foo.rs "a" "b" → /run → tool called with correct args.
+        let mut q = StagingQueue::new();
+        // Stage an edit_file action with file, old and new args as a JSON object.
+        let msg = q
+            .stage("edit_file", r#"{"file":"foo.rs","old":"a","new":"b"}"#)
+            .unwrap();
+        assert!(
+            msg.contains("edit_file"),
+            "staged message must name the tool"
+        );
+        assert_eq!(q.items.len(), 1, "queue must hold exactly one item");
+
+        // /run drains the queue.
+        let dispatched = q.drain();
+        assert_eq!(dispatched.len(), 1, "drain must return one item");
+        assert!(q.items.is_empty(), "queue must be empty after drain");
+
+        let action = &dispatched[0];
+        assert_eq!(action.tool, "edit_file", "tool name must be edit_file");
+        assert_eq!(
+            action.args["file"].as_str(),
+            Some("foo.rs"),
+            "args must contain file=foo.rs"
+        );
+        assert_eq!(
+            action.args["old"].as_str(),
+            Some("a"),
+            "args must contain old=a"
+        );
+        assert_eq!(
+            action.args["new"].as_str(),
+            Some("b"),
+            "args must contain new=b"
+        );
+    }
 }
