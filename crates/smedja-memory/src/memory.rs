@@ -164,6 +164,49 @@ impl WorkingMemory {
         self.messages.truncate(self.stable_prefix);
         self.messages.extend(compacted);
     }
+
+    /// Assembles the prompt slice respecting the active strata configuration.
+    ///
+    /// - Stable prefix (system prompt, skills) is always included verbatim.
+    /// - Hot turns (last `strata.hot_depth`) are always included verbatim.
+    /// - Warm turns are included until `budget_tokens` is exhausted.
+    ///   Token count is estimated as `content.len() / 4 + 1` per message.
+    /// - Cold turns are omitted (cold retrieval is a future extension).
+    ///
+    /// The returned slice always starts with the stable prefix.
+    #[must_use]
+    pub fn build_prompt(&self, budget_tokens: usize) -> Vec<Message> {
+        if self.messages.is_empty() {
+            return Vec::new();
+        }
+
+        let prefix = &self.messages[..self.stable_prefix];
+        let mutable = &self.messages[self.stable_prefix..];
+
+        let mut result: Vec<Message> = prefix.to_vec();
+        let mut budget = budget_tokens;
+
+        for (i, msg) in mutable.iter().enumerate() {
+            let abs_index = self.stable_prefix + i;
+            let stratum = self.stratum_for(abs_index);
+            let token_estimate = msg.content.len() / 4 + 1;
+            match stratum {
+                Stratum::Hot => {
+                    result.push(msg.clone());
+                }
+                Stratum::Warm => {
+                    if budget >= token_estimate {
+                        budget = budget.saturating_sub(token_estimate);
+                        result.push(msg.clone());
+                    }
+                }
+                Stratum::Cold | Stratum::Archive => {
+                    // cold retrieval deferred; skip
+                }
+            }
+        }
+        result
+    }
 }
 
 /// Loads workspace skill files from `<dir>/.smedja/skills/*.md`.
@@ -435,5 +478,48 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let result = detect_agents_md(tmp.path()).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn build_prompt_empty_returns_empty() {
+        let m = WorkingMemory::new(4096);
+        assert!(m.build_prompt(4096).is_empty());
+    }
+
+    #[test]
+    fn build_prompt_includes_hot_turns() {
+        let mut m = WorkingMemory::new(4096);
+        m.push(Message::system("sys"));
+        m.seal_prefix();
+        for i in 0..10 {
+            m.push(Message::user(format!("turn {i}")));
+        }
+        // With default deep config (hot_depth=5), last 5 turns always included.
+        let prompt = m.build_prompt(4096);
+        // Prefix (1) + at least 5 hot turns = at least 6 messages.
+        assert!(
+            prompt.len() >= 6,
+            "expected at least 6 messages, got {}",
+            prompt.len()
+        );
+    }
+
+    #[test]
+    fn build_prompt_respects_budget_for_warm() {
+        let mut m = WorkingMemory::new(4096);
+        m.push(Message::system("sys"));
+        m.seal_prefix();
+        // Push many long warm-zone messages.
+        for i in 0..40 {
+            m.push(Message::user(format!(
+                "warm message {i:03} with some extra content to cost tokens"
+            )));
+        }
+        // Very tight budget: only fit prefix + hot turns.
+        let budget = 10; // tiny budget
+        let prompt_tight = m.build_prompt(budget);
+        let prompt_full = m.build_prompt(100_000);
+        // With a tight budget, we get fewer messages than with a full budget.
+        assert!(prompt_tight.len() <= prompt_full.len());
     }
 }

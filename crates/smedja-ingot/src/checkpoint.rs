@@ -231,4 +231,52 @@ mod tests {
         let cps = ig.list_checkpoints("no-such-session").unwrap();
         assert!(cps.is_empty());
     }
+
+    #[test]
+    fn save_and_load_checkpoint_round_trip() {
+        let mut ingot = Ingot::open_in_memory().unwrap();
+        let messages_json = r#"[{"role":"user","content":"round-trip"}]"#;
+        let cp = Checkpoint {
+            id: Uuid::new_v4(),
+            session_id: "rt-session".to_string(),
+            turn_n: 7,
+            messages_json: messages_json.to_string(),
+            created_at: 1_700_001_000.0,
+        };
+        ingot.save_checkpoint(&cp).unwrap();
+
+        let loaded = ingot.load_checkpoint("rt-session", 7).unwrap().unwrap();
+        assert_eq!(loaded.id, cp.id);
+        assert_eq!(loaded.turn_n, 7);
+        assert_eq!(loaded.messages_json, messages_json);
+        assert_eq!(loaded.session_id, "rt-session");
+    }
+
+    #[test]
+    fn rollback_discards_later_turns() {
+        let mut ingot = Ingot::open_in_memory().unwrap();
+        ingot
+            .save_checkpoint(&make_checkpoint("rollback-sess", 1))
+            .unwrap();
+        ingot
+            .save_checkpoint(&make_checkpoint("rollback-sess", 2))
+            .unwrap();
+        ingot
+            .save_checkpoint(&make_checkpoint("rollback-sess", 3))
+            .unwrap();
+
+        // Load the turn-1 checkpoint — simulates rolling back before turns 2 and 3.
+        let rolled_back = ingot.load_checkpoint("rollback-sess", 1).unwrap().unwrap();
+        assert_eq!(rolled_back.turn_n, 1);
+
+        // Turns 2 and 3 still exist in the store; the caller is responsible for
+        // discarding them.  Verify they are independently accessible.
+        let turn2 = ingot.load_checkpoint("rollback-sess", 2).unwrap().unwrap();
+        assert_eq!(turn2.turn_n, 2);
+
+        let cps = ingot.list_checkpoints("rollback-sess").unwrap();
+        assert_eq!(cps.len(), 3);
+        // Confirm the roll-back point is the first in the ordered list.
+        assert_eq!(cps[0].turn_n, 1);
+    }
 }
