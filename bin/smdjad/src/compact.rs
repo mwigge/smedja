@@ -28,7 +28,7 @@ mod tests {
 
     #[test]
     fn json_array_returns_some() {
-        let input = r#"[1, 2, 3]"#;
+        let input = "[1, 2, 3]";
         let result = extract_json_structure(input);
         assert!(result.is_some());
     }

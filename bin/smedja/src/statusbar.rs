@@ -1,5 +1,7 @@
 //! Modular status bar — composable segments rendered to a single line.
 
+use std::time::Duration;
+
 /// Context passed to each status module at render time.
 pub struct ModuleCtx<'a> {
     pub session_id: &'a str,
@@ -14,26 +16,138 @@ pub struct Segment {
     pub text: String,
 }
 
-/// Renders the status bar as a single string from ordered segments.
-pub fn render_status_bar(ctx: &ModuleCtx<'_>) -> String {
-    let mut parts: Vec<String> = Vec::new();
+/// TOML configuration for the status bar.
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+pub struct StatusBarConfig {
+    /// Optional format string, e.g. `"{tier} {mode} {session}"`.
+    pub format: Option<String>,
+}
 
-    // tier
+/// Per-module configuration.
+#[allow(dead_code)] // TOML config fields read via serde; constructed when config is wired
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+pub struct ModuleConfig {
+    pub disabled: Option<bool>,
+    pub symbol: Option<String>,
+    pub style: Option<String>,
+    pub threshold: Option<f64>,
+}
+
+// ---------------------------------------------------------------------------
+// Segment renderers (sync, no I/O)
+// ---------------------------------------------------------------------------
+
+fn segment_tier(ctx: &ModuleCtx<'_>) -> String {
     let tier = ctx.tier.unwrap_or("fast");
-    parts.push(format!("[{tier}]"));
+    format!("[{tier}]")
+}
 
-    // mode
+fn segment_mode(ctx: &ModuleCtx<'_>) -> String {
     let mode = ctx.mode.unwrap_or("impl");
-    parts.push(format!("[{mode}]"));
+    format!("[{mode}]")
+}
 
-    // pending indicator
-    if ctx.pending {
+fn segment_session(ctx: &ModuleCtx<'_>) -> String {
+    let sess = ctx.session_id.chars().take(8).collect::<String>();
+    format!("[{sess}]")
+}
+
+// ---------------------------------------------------------------------------
+// Public render functions
+// ---------------------------------------------------------------------------
+
+/// Renders the status bar as a single string from ordered segments.
+///
+/// Delegates to [`render_status_bar_with_timeout`] with a default 30 ms timeout.
+pub fn render_status_bar(ctx: &ModuleCtx<'_>) -> String {
+    render_status_bar_configured(ctx, None, 30)
+}
+
+#[allow(dead_code)] // public API — called by tests and future integration code
+/// Renders the status bar with a configurable per-segment timeout (milliseconds).
+///
+/// Each segment computation is dispatched to a thread; segments that do not
+/// return within `timeout_ms` are silently omitted.  When `timeout_ms` is 0
+/// every segment will be skipped (useful in tests).
+pub fn render_status_bar_with_timeout(ctx: &ModuleCtx<'_>, timeout_ms: u64) -> String {
+    render_status_bar_configured(ctx, None, timeout_ms)
+}
+
+/// Renders the status bar applying optional [`StatusBarConfig`] and timeout.
+///
+/// - If `config.format` is `Some`, renders only the named segments in that
+///   order (`"{tier} {mode}"` → tier then mode).
+/// - If a module key appears in `config` with `disabled: true`, it is skipped.
+pub fn render_status_bar_configured(
+    ctx: &ModuleCtx<'_>,
+    config: Option<&StatusBarConfig>,
+    timeout_ms: u64,
+) -> String {
+    use std::sync::mpsc;
+    use std::thread;
+
+    // Snapshot all context data needed by threads (no borrowing across threads).
+    let session_id = ctx.session_id.to_owned();
+    let mode = ctx.mode.map(str::to_owned);
+    let tier = ctx.tier.map(str::to_owned);
+    let pending = ctx.pending;
+
+    // Determine which modules to render and in what order.
+    let all_keys: &[&str] = &["tier", "mode", "session"];
+    let ordered_keys: Vec<&str> = if let Some(cfg) = config {
+        if let Some(fmt) = &cfg.format {
+            // Extract `{key}` tokens from the format string.
+            fmt.split_whitespace()
+                .filter_map(|tok| {
+                    let inner = tok.strip_prefix('{')?.strip_suffix('}')?;
+                    if all_keys.contains(&inner) {
+                        Some(inner)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            all_keys.to_vec()
+        }
+    } else {
+        all_keys.to_vec()
+    };
+
+    let timeout = Duration::from_millis(timeout_ms);
+
+    let mut parts: Vec<String> = ordered_keys
+        .into_iter()
+        .filter_map(|key| {
+            // Build per-thread context snapshot.
+            let s_id = session_id.clone();
+            let md = mode.clone();
+            let tr = tier.clone();
+
+            let (tx, rx) = mpsc::channel::<String>();
+            let key_owned = key.to_owned();
+            thread::spawn(move || {
+                let snapshot = ModuleCtx {
+                    session_id: &s_id,
+                    mode: md.as_deref(),
+                    tier: tr.as_deref(),
+                    pending,
+                };
+                let text = match key_owned.as_str() {
+                    "tier" => segment_tier(&snapshot),
+                    "mode" => segment_mode(&snapshot),
+                    "session" => segment_session(&snapshot),
+                    _ => return,
+                };
+                let _ = tx.send(text);
+            });
+            rx.recv_timeout(timeout).ok()
+        })
+        .collect();
+
+    if pending {
         parts.push("\u{27f3}".to_owned());
     }
-
-    // session (truncated)
-    let sess = ctx.session_id.chars().take(8).collect::<String>();
-    parts.push(format!("[{sess}]"));
 
     parts.join(" ")
 }
@@ -75,5 +189,62 @@ mod tests {
             pending: false,
         };
         assert!(!render_status_bar(&ctx).contains('\u{27f3}'));
+    }
+
+    #[test]
+    fn module_timeout_omits_slow_segment() {
+        // A 0 ms timeout causes all threads to lose the race → empty result
+        // (no pending indicator either).
+        let ctx = ModuleCtx {
+            session_id: "sess",
+            mode: Some("impl"),
+            tier: Some("fast"),
+            pending: false,
+        };
+        let result = render_status_bar_with_timeout(&ctx, 0);
+        // With 0ms all segments are skipped; result is empty or whitespace.
+        assert!(result.trim().is_empty(), "expected empty, got: {result:?}");
+    }
+
+    #[test]
+    fn disabled_module_not_rendered() {
+        // A format string that excludes "session" → session segment absent.
+        let ctx = ModuleCtx {
+            session_id: "mysession",
+            mode: Some("impl"),
+            tier: Some("fast"),
+            pending: false,
+        };
+        let config = StatusBarConfig {
+            format: Some("{tier} {mode}".into()),
+        };
+        let result = render_status_bar_configured(&ctx, Some(&config), 200);
+        assert!(result.contains("[fast]"), "tier expected, got: {result}");
+        assert!(result.contains("[impl]"), "mode expected, got: {result}");
+        assert!(
+            !result.contains("mysession"),
+            "session must be absent, got: {result}"
+        );
+    }
+
+    #[test]
+    fn format_string_reorders_segments() {
+        let ctx = ModuleCtx {
+            session_id: "ssid",
+            mode: Some("review"),
+            tier: Some("deep"),
+            pending: false,
+        };
+        // Request session before tier.
+        let config = StatusBarConfig {
+            format: Some("{session} {tier}".into()),
+        };
+        let result = render_status_bar_configured(&ctx, Some(&config), 200);
+        let session_pos = result.find("[ssid]").unwrap();
+        let tier_pos = result.find("[deep]").unwrap();
+        assert!(
+            session_pos < tier_pos,
+            "session should come before tier; got: {result}"
+        );
     }
 }

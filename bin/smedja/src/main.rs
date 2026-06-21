@@ -1,4 +1,6 @@
 mod blocks;
+mod context_rail;
+mod staging;
 mod statusbar;
 
 use std::io::stdout;
@@ -77,6 +79,22 @@ struct AppState {
     turn_submitted_at: Option<std::time::Instant>,
     /// The turn block being assembled for the current in-flight turn.
     current_block: Option<blocks::TurnBlock>,
+    /// Completed turn block history.
+    block_store: blocks::BlockStore,
+    /// Whether the block browser overlay is open.
+    block_browser_open: bool,
+    /// Cursor position within the block browser.
+    block_browser_cursor: usize,
+    /// In-memory clipboard (no system clipboard).
+    clipboard: Option<String>,
+    /// Full diff overlay: (`tool_entry_idx`, `diff_lines`).
+    diff_overlay: Option<(usize, Vec<String>)>,
+    /// Scroll offset within the diff overlay.
+    diff_scroll: usize,
+    /// Staging queue for batched tool dispatch.
+    staging_queue: staging::StagingQueue,
+    /// Whether the context rail sidebar is visible.
+    context_rail_visible: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +153,7 @@ async fn submit(input: &str, state: &mut AppState, client: &mut Client) -> Resul
 // Key handler
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)] // key dispatch table for TUI; splitting would obscure the flow
 async fn handle_key(
     key: crossterm::event::KeyEvent,
     state: &mut AppState,
@@ -144,12 +163,133 @@ async fn handle_key(
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.quit = true;
         }
-        KeyCode::Esc => {
-            state.quit = true;
+
+        // Ctrl-R: toggle context rail
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.context_rail_visible = !state.context_rail_visible;
         }
+
+        KeyCode::Esc => {
+            if state.diff_overlay.is_some() {
+                state.diff_overlay = None;
+            } else if state.block_browser_open {
+                state.block_browser_open = false;
+            } else {
+                state.quit = true;
+            }
+        }
+
+        KeyCode::Up => {
+            if state.block_browser_open {
+                state.block_browser_cursor = state.block_browser_cursor.saturating_sub(1);
+            }
+        }
+
+        KeyCode::Down => {
+            if state.block_browser_open {
+                let max = state.block_store.len().saturating_sub(1);
+                if state.block_browser_cursor < max {
+                    state.block_browser_cursor += 1;
+                }
+            }
+        }
+
         KeyCode::Backspace => {
             state.input.pop();
         }
+
+        KeyCode::Char('b') => {
+            // Toggle block browser.
+            state.block_browser_open = !state.block_browser_open;
+            if state.block_browser_open {
+                state.block_browser_cursor = 0;
+            }
+        }
+
+        KeyCode::Char('c') => {
+            if state.block_browser_open {
+                // Copy selected block text to in-memory clipboard.
+                if let Some(block) = state.block_store.blocks().nth(state.block_browser_cursor) {
+                    state.clipboard = Some(block.render_lines(80).join("\n"));
+                }
+            } else {
+                state.input.push('c');
+            }
+        }
+
+        KeyCode::Char('r') => {
+            if state.block_browser_open {
+                // Resubmit the selected block's first user-visible content.
+                // Extract the content string while the borrow on block_store is
+                // limited to this scope so the mutable borrow for submit() can
+                // follow.
+                let content: Option<String> = {
+                    let cursor = state.block_browser_cursor;
+                    state
+                        .block_store
+                        .blocks()
+                        .nth(cursor)
+                        .map(|b| b.content.clone())
+                        .filter(|c| !c.is_empty())
+                };
+                if let Some(content) = content {
+                    submit(&content, state, client).await?;
+                }
+            } else {
+                state.input.push('r');
+            }
+        }
+
+        KeyCode::Char('D') => {
+            // Full diff overlay for first tool_call with a diff in selected block.
+            if state.block_browser_open {
+                if let Some(block) = state.block_store.blocks().nth(state.block_browser_cursor) {
+                    let diff_lines: Option<Vec<String>> = block
+                        .tool_calls
+                        .iter()
+                        .enumerate()
+                        .find_map(|(i, entry)| {
+                            entry
+                                .diff
+                                .as_ref()
+                                .map(|d| (i, d.lines().map(str::to_owned).collect::<Vec<_>>()))
+                        })
+                        .map(|(i, lines)| {
+                            state.diff_scroll = 0;
+                            // Return sentinel index + lines; capture i via closure.
+                            let _ = i;
+                            lines
+                        });
+                    // Find the tool entry index separately.
+                    let entry_idx = block
+                        .tool_calls
+                        .iter()
+                        .position(|e| e.diff.is_some())
+                        .unwrap_or(0);
+                    if let Some(lines) = diff_lines {
+                        state.diff_overlay = Some((entry_idx, lines));
+                        state.diff_scroll = 0;
+                    }
+                }
+            }
+        }
+
+        KeyCode::Char('d') => {
+            // Toggle inline diff overlay (up to 20 lines).
+            if state.diff_overlay.is_some() {
+                state.diff_overlay = None;
+            } else if state.block_browser_open {
+                if let Some(block) = state.block_store.blocks().nth(state.block_browser_cursor) {
+                    if let Some(lines) = block.inline_diff(0, 20) {
+                        state.diff_overlay = Some((0, lines));
+                        state.diff_scroll = 0;
+                    }
+                }
+            } else {
+                state.input.push('d');
+            }
+        }
+
         KeyCode::Enter => {
             let input = std::mem::take(&mut state.input);
             if let Some(rest) = input.trim().strip_prefix("/task create ") {
@@ -206,13 +346,67 @@ async fn handle_key(
                         });
                     }
                 }
+            } else if let Some(rest) = input.trim().strip_prefix("/stage ") {
+                // /stage <tool> <json-args>
+                if let Some((tool, json_args)) = rest.split_once(' ') {
+                    let msg = match state.staging_queue.stage(tool, json_args) {
+                        Ok(s) => s,
+                        Err(e) => e,
+                    };
+                    state.messages.push(Message {
+                        role: Role::System,
+                        text: msg,
+                    });
+                } else {
+                    state.messages.push(Message {
+                        role: Role::System,
+                        text: "usage: /stage <tool> <json-args>".into(),
+                    });
+                }
+            } else if let Some(rest) = input.trim().strip_prefix("/unstage") {
+                // /unstage [N]
+                let n: Option<usize> = rest.trim().parse().ok();
+                let msg = state.staging_queue.unstage(n);
+                state.messages.push(Message {
+                    role: Role::System,
+                    text: msg,
+                });
+                for item in state.staging_queue.list() {
+                    state.messages.push(Message {
+                        role: Role::System,
+                        text: item,
+                    });
+                }
+            } else if input.trim() == "/run" {
+                let actions = state.staging_queue.drain();
+                if actions.is_empty() {
+                    state.messages.push(Message {
+                        role: Role::System,
+                        text: "no staged actions".into(),
+                    });
+                } else {
+                    for action in actions {
+                        let payload = json!({"tool": action.tool, "args": action.args});
+                        let result = client.call("tool.call", payload).await;
+                        let text = match result {
+                            Ok(v) => format!("\u{25b8} {v}"),
+                            Err(e) => format!("\u{25b8} error: {e}"),
+                        };
+                        state.messages.push(Message {
+                            role: Role::System,
+                            text,
+                        });
+                    }
+                }
             } else {
                 submit(&input, state, client).await?;
             }
         }
+
         KeyCode::Char(c) => {
             state.input.push(c);
         }
+
         _ => {}
     }
     Ok(())
@@ -225,14 +419,26 @@ async fn handle_key(
 fn render(frame: &mut ratatui::Frame, state: &AppState) {
     let area = frame.area();
 
+    // Split horizontally if wide enough and context rail is visible.
+    let (main_area, rail_area) = if state.context_rail_visible && area.width >= 100 {
+        let cols = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(context_rail::ContextRail::WIDTH),
+        ])
+        .split(area);
+        (cols[0], Some(cols[1]))
+    } else {
+        (area, None)
+    };
+
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
         Constraint::Length(3),
     ])
-    .split(area);
+    .split(main_area);
 
-    // -- Status bar (replaces old title bar) --------------------------------
+    // -- Status bar -----------------------------------------------------------
     let ctx = ModuleCtx {
         session_id: &state.session_id,
         mode: state.mode.as_deref(),
@@ -243,8 +449,8 @@ fn render(frame: &mut ratatui::Frame, state: &AppState) {
     let status = Paragraph::new(status_text).style(Style::default().add_modifier(Modifier::BOLD));
     frame.render_widget(status, chunks[0]);
 
-    // -- Messages area ------------------------------------------------------
-    let inner_height = chunks[1].height.saturating_sub(2) as usize; // subtract borders
+    // -- Messages area --------------------------------------------------------
+    let inner_height = chunks[1].height.saturating_sub(2) as usize;
 
     let all_lines: Vec<Line> = state
         .messages
@@ -258,7 +464,6 @@ fn render(frame: &mut ratatui::Frame, state: &AppState) {
         })
         .collect();
 
-    // Pin to bottom: take the last `inner_height` lines.
     let visible_lines: Vec<Line> = if all_lines.len() > inner_height {
         all_lines[all_lines.len() - inner_height..].to_vec()
     } else {
@@ -270,10 +475,55 @@ fn render(frame: &mut ratatui::Frame, state: &AppState) {
         .wrap(Wrap { trim: false });
     frame.render_widget(messages, chunks[1]);
 
-    // -- Input box ----------------------------------------------------------
+    // -- Input box ------------------------------------------------------------
     let input_display = format!("> {}_", state.input);
     let input_widget = Paragraph::new(input_display).block(Block::default().borders(Borders::ALL));
     frame.render_widget(input_widget, chunks[2]);
+
+    // -- Context rail ---------------------------------------------------------
+    if let Some(rail_rect) = rail_area {
+        // Build placeholder slots (real data wired when WorkingMemory is exposed).
+        let slots = vec![context_rail::ContextSlot {
+            name: "context".into(),
+            used: 0,
+            total: 200_000,
+        }];
+        let rail = context_rail::ContextRail::new(slots);
+        frame.render_widget(rail, rail_rect);
+    }
+
+    // -- Diff overlay ---------------------------------------------------------
+    if let Some((_idx, ref lines)) = state.diff_overlay {
+        // Centre 80% of the main area.
+        // Truncation is intentional: pixel-aligned terminal dimensions are
+        // always well within u16 range; f32 precision is fine for rounding.
+        #[allow(
+            clippy::cast_lossless,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let ow = (f32::from(main_area.width) * 0.8) as u16;
+        #[allow(
+            clippy::cast_lossless,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let oh = (f32::from(main_area.height) * 0.8) as u16;
+        let ox = main_area.x + (main_area.width.saturating_sub(ow)) / 2;
+        let oy = main_area.y + (main_area.height.saturating_sub(oh)) / 2;
+        let overlay_rect = ratatui::layout::Rect::new(ox, oy, ow, oh);
+
+        let visible: Vec<Line<'_>> = lines
+            .iter()
+            .skip(state.diff_scroll)
+            .take(oh as usize)
+            .map(|l| Line::raw(l.clone()))
+            .collect();
+
+        let diff_widget =
+            Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title("diff"));
+        frame.render_widget(diff_widget, overlay_rect);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -284,7 +534,6 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        // Best-effort: ignore errors during cleanup.
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), LeaveAlternateScreen);
     }
@@ -302,7 +551,6 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let sock = socket_path(cli.sock);
 
-    // Connect before entering raw mode so errors surface cleanly.
     let mut client = Client::connect(&sock).await.with_context(|| {
         format!(
             "smdjad is not running — start it with: smj daemon start\n(tried socket: {})",
@@ -310,7 +558,6 @@ async fn main() -> Result<()> {
         )
     })?;
 
-    // Create a session.
     let session_resp = client
         .call("session.create", json!({ "title": "smedja" }))
         .await
@@ -334,9 +581,16 @@ async fn main() -> Result<()> {
         turn_n: 0,
         turn_submitted_at: None,
         current_block: None,
+        block_store: blocks::BlockStore::new(),
+        block_browser_open: false,
+        block_browser_cursor: 0,
+        clipboard: None,
+        diff_overlay: None,
+        diff_scroll: 0,
+        staging_queue: staging::StagingQueue::new(),
+        context_rail_visible: true,
     };
 
-    // Enter alternate screen and raw mode — guard restores on drop.
     enable_raw_mode().context("enable raw mode")?;
     execute!(stdout(), EnterAlternateScreen).context("enter alternate screen")?;
     let _guard = TerminalGuard;
@@ -344,13 +598,9 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend).context("create terminal")?;
 
-    // Event loop — poll for crossterm events with a short timeout so the
-    // loop stays responsive without burning CPU.
     loop {
         terminal.draw(|f| render(f, &state))?;
 
-        // Block in a spawn_blocking call so the async runtime stays free.
-        // poll() with 100 ms timeout gives ≤100 ms input latency.
         let event_available =
             tokio::task::spawn_blocking(|| event::poll(Duration::from_millis(100)))
                 .await
@@ -361,7 +611,6 @@ async fn main() -> Result<()> {
                 .await
                 .context("read task panicked")??;
 
-            // All other events (resize, focus, mouse, …) cause a redraw on the next tick.
             if let Event::Key(key) = ev {
                 handle_key(key, &mut state, &mut client).await?;
             }
@@ -392,6 +641,8 @@ async fn main() -> Result<()> {
                                     text: line,
                                 });
                             }
+                            // Store completed block in history.
+                            state.block_store.push(block);
                         } else {
                             state.messages.push(Message {
                                 role: Role::System,
@@ -409,6 +660,8 @@ async fn main() -> Result<()> {
                                     text: line,
                                 });
                             }
+                            // Store failed block in history too.
+                            state.block_store.push(block);
                         } else {
                             state.messages.push(Message {
                                 role: Role::System,
@@ -418,7 +671,6 @@ async fn main() -> Result<()> {
                         state.pending_task_id = None;
                         state.last_poll = None;
                     }
-                    // else: still planned or in_progress — keep polling
                 }
             }
         }

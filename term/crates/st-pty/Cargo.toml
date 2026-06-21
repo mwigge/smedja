@@ -1,6 +1,6 @@
 [package]
 name        = "st-pty"
-description = "smedja-term: st-pty"
+description = "smedja-term: PTY session, VT emulation, scrollback, copy mode"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
@@ -8,8 +8,10 @@ repository.workspace = true
 
 [dependencies]
 anyhow       = { workspace = true }
-serde        = { workspace = true }
-serde_json   = { workspace = true }
-smedja-ingot = { path = "../../../crates/smedja-ingot" }
-smedja-rpc   = { path = "../../../crates/smedja-rpc" }
+arboard      = "3"
+parking_lot  = { workspace = true }
+portable-pty = { workspace = true }
+thiserror    = { workspace = true }
+tokio        = { workspace = true }
 tracing      = { workspace = true }
+vte          = { workspace = true }
