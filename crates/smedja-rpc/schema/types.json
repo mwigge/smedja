@@ -1,0 +1,19 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SmedjaRpcTypes",
+  "description": "Newtype ID wrappers for the smedja JSON-RPC protocol.",
+  "definitions": {
+    "SessionId": {
+      "description": "Opaque identifier for an interactive session.",
+      "type": "string"
+    },
+    "TurnId": {
+      "description": "Opaque identifier for a single turn within a session.",
+      "type": "string"
+    },
+    "TaskId": {
+      "description": "Opaque identifier for an async task tracked in smedja-ingot.",
+      "type": "string"
+    }
+  }
+}
