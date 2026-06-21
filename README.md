@@ -23,29 +23,9 @@ smedja is a Rust rewrite and evolution of [milliways](https://github.com/mwigge/
 
 ## Workspace
 
-```
-smedja/
-├── crates/
-│   ├── smedja-rpc          JSON-RPC 2.0 types + UDS framing codec
-│   ├── smedja-memory       WorkingMemory, hot/warm/cold strata, BuildPrompt
-│   ├── smedja-adapter      Provider streaming (OpenAI SSE, Gemini, Codex, local)
-│   ├── smedja-assayer      Role × complexity → (runner, tier) routing
-│   ├── smedja-vault        Vector KV cold store — cosine-sim, SQLite-backed
-│   ├── smedja-ingot        Audit log, cost ledger, checkpoints, task history
-│   ├── smedja-bellows      Turn lifecycle and event dispatch
-│   ├── smedja-methodology  TDD gate, ponytail gate, spec-first enforcement
-│   ├── smedja-graph        tree-sitter indexer, graph_query built-in tool
-│   └── smedja-sre          SRE tools (otel_query, metric_query, log_tail)
-│
-├── bin/
-│   ├── smedja              ratatui TUI client
-│   ├── smdjad              Tokio supervision daemon, UDS server
-│   └── smj                 Control CLI (lifecycle, sessions, audit, cost)
-│
-└── term/
-    ├── crates/             st-render, st-pty, st-blocks, st-statusbar, st-glyph …
-    └── bin/smedja-term     GPU terminal emulator — wgpu, block model, WezTerm replacement
-```
+<div align="center">
+  <img src="assets/diagrams/readme-workspace.png" alt="smedja workspace layout" width="900" />
+</div>
 
 The kitchen/restaurant theme from milliways is retired. Metalworking instead:
 
@@ -64,20 +44,9 @@ The kitchen/restaurant theme from milliways is retired. Metalworking instead:
 
 `smdjad` runs multiple agent roles in parallel, each isolated in its own git worktree, coordinated by an orchestrator that understands role dependencies.
 
-```
-/parallel "Add OAuth to the API" --roles impl,test,review
-
-smdjad orchestrator
-  │
-  ├── worktree: task/<id>/impl  ──▶  assayer: role=impl, runner=local
-  │                                   model: Qwen3-14B, tools: full
-  │
-  ├── worktree: task/<id>/test  ──▶  assayer: role=test, runner=local
-  │   (unblocks when impl done)       model: Qwen3-14B, tools: bash + edit
-  │
-  └── worktree: task/<id>/review ──▶ assayer: role=review, runner=claude
-      (unblocks when test done)       model: claude-sonnet, tools: read-only
-```
+<div align="center">
+  <img src="assets/diagrams/readme-multi-agent-architecture.png" alt="multi-agent architecture with isolated worktrees" width="900" />
+</div>
 
 Roles and their defaults live in `.smedja/agents.toml` — committed to the repo, portable across machines, not tied to any specific harness:
 
@@ -102,24 +71,35 @@ The assayer routes by **role + complexity**, not just complexity. A simple fix s
 
 ---
 
+## Loop Pipeline
+
+`smj loop run` takes one OpenSpec task at a time through planning, red/green implementation, deterministic verification, read-only review, and bounded fix retries.
+
+<div align="center">
+  <img src="assets/diagrams/loop-pipeline.png" alt="smj loop pipeline from orchestrator through test, implementation, verification, review, and fix retries" width="760" />
+</div>
+
+The loop router keeps planning on the strongest tier while pushing mechanical red/green/fix work to local runners.
+
+<div align="center">
+  <img src="assets/diagrams/loop-tier-routing.png" alt="tier routing table for loop roles" width="900" />
+</div>
+
+The new `smedja-loop` concept binds `.smedja/loop.json` to OpenSpec task state, mines failures into role guides, and keeps evaluators separate from generators through runner configuration.
+
+<div align="center">
+  <img src="assets/diagrams/smedja-loop-concept.png" alt="smedja-loop concept overview" width="900" />
+</div>
+
+---
+
 ## Session Memory and Sharing Between Agents
 
 Every session runs through three memory strata. Context budget is allocated per runner tier — a `fast` runner gets hot + top-K warm; a `deep` runner gets everything.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  HOT    current turn + last 5 turns                         │
-│         always in context, never compacted                  │
-├─────────────────────────────────────────────────────────────┤
-│  WARM   turns 6–30 — structured JSON compact                │
-│         in context when space allows                        │
-├─────────────────────────────────────────────────────────────┤
-│  COLD   turns 31+ — vector embeddings in smedja-vault       │
-│         fetched on demand, top-5 cosine-sim retrieval       │
-├─────────────────────────────────────────────────────────────┤
-│  ARCHIVE  completed sessions — smedja-ingot SQLite only     │
-└─────────────────────────────────────────────────────────────┘
-```
+<div align="center">
+  <img src="assets/diagrams/readme-session-memory.png" alt="session memory strata: hot, warm, cold, and archive" width="760" />
+</div>
 
 Compaction produces structured JSON, not a free-text summary. Each compacted turn becomes a structured object that can be expanded and replayed — `smj session rollback <id> <turn>` reconstructs any point in history.
 
@@ -127,19 +107,9 @@ Compaction produces structured JSON, not a free-text summary. Each compacted tur
 
 When tasks fan out to parallel worktrees, agents share **read** access to `smedja-vault` (cold store) but write to isolated working trees. The orchestrator merges vault writes on task completion:
 
-```
-        smedja-vault (shared read)
-         ↑ retrieve(query, k=5)        ↑ retrieve(query, k=5)
-         │                              │
-  agent: impl                    agent: review
-  (sees prior session context)   (cross-references prior decisions)
-         │                              │
-  worktree/impl (isolated)       worktree/review (isolated)
-         │                              │
-         └──────── orchestrator ─────────┘
-                        │
-                  merge + open PRs
-```
+<div align="center">
+  <img src="assets/diagrams/readme-parallel-memory.png" alt="parallel agents share read access to smedja-vault while writing to isolated worktrees" width="760" />
+</div>
 
 Both agents pull from the same cold memory — they know what was decided in previous sessions — but neither one touches the other's working tree.
 
@@ -163,18 +133,9 @@ Before each request hits the provider, `smedja-adapter` runs three transforms:
 
 Agent output is structured, not a flat scroll. Each turn is a discrete `TurnBlock`:
 
-```
-┌─ turn 14 ── local · Qwen3-14B ── 1,240 → 312 tok ── 2.1s ───────────────┐
-│                                                                            │
-│  The softcap needs to drop from 50.0 to 30.0 per the Gemma 4 spec.       │
-│                                                                            │
-│  ▸ read_file  crates/native/src/lib.rs       → 412 lines                 │
-│  ▸ edit_file  crates/native/src/lib.rs       → +1/-1  (L432)             │
-│    - softcap: f32 = 50.0,                                                 │
-│    + softcap: f32 = 30.0,                                                 │
-│                                                                            │
-└────────────────────────────────── ✓ complete — trace: 4bf92f3a ───────────┘
-```
+<div align="center">
+  <img src="assets/diagrams/readme-turn-block.png" alt="terminal turn block with model, token count, tool calls, and trace footer" width="900" />
+</div>
 
 Blocks are selectable (`↑↓`), copyable (`c`), replayable (`r`). The `trace:` in the footer is a W3C `traceparent` — open it in your OTel backend to see the full span tree for that turn.
 
@@ -182,10 +143,9 @@ Blocks are selectable (`↑↓`), copyable (`c`), replayable (`r`). The `trace:`
 
 Modules evaluated in parallel (rayon) on every render tick, < 50ms target:
 
-```
-[local · RDNA4]  [Qwen3-14B]  [ctx: ████░░ 44%]  [tdd · ponytail]  [main ✓]  14:22
-    tier              model        context fill          modes          git     time
-```
+<div align="center">
+  <img src="assets/diagrams/readme-status-bar.png" alt="modular status bar showing tier, model, context fill, modes, git state, and time" width="900" />
+</div>
 
 TOML-configured, Starship-compatible module format. The milliways-specific modules (`tier`, `model`, `context_pct`, `milliways_task`) sit alongside the standard set with the same detection + format + style fields — existing Starship config is portable.
 
@@ -193,15 +153,9 @@ TOML-configured, Starship-compatible module format. The milliways-specific modul
 
 In cowork mode, every tool call pauses for approval — not just Codex, every runner:
 
-```
-┌─ cowork — step 2 of 4 ──────────────────────────────────────────────────┐
-│  tool:    edit_file                                                       │
-│  file:    crates/native/src/lib.rs                                       │
-│  reason:  reducing softcap from 50.0 to 30.0 per Gemma 4 spec           │
-│                                                                           │
-│  [a] approve    [d] deny    [m] modify                                   │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+<div align="center">
+  <img src="assets/diagrams/readme-cowork-gate.png" alt="cowork approval gate for an edit_file tool call" width="900" />
+</div>
 
 Deny sends the reason back as a tool error — the agent re-plans from there. Modify replaces the arguments before execution. Every decision is recorded in `smedja-ingot` as an audit event with `tool_name`, `decision`, and `agent_reasoning`.
 
@@ -209,17 +163,9 @@ Deny sends the reason back as a tool error — the agent re-plans from there. Mo
 
 `Ctrl-R` opens a right panel showing context slot fill live:
 
-```
-CONTEXT RAIL
-system       ████                   8%
-skills       ████                  12%
-code-graph   ████                  10%
-history      ██████                18%
-tools        ██████                16%
-working      ████████████          40%
-──────────────────────────────────────
-remaining    ███                  (52k tok)
-```
+<div align="center">
+  <img src="assets/diagrams/readme-context-rail.png" alt="context rail showing live context slot fill" width="760" />
+</div>
 
 Green < 60%, yellow 60–80%, red > 80%. The slot breakdown matches the `stablePrefix` model — you see exactly what's locked in the KV cache prefix and what's competing for the remaining budget.
 
@@ -229,23 +175,9 @@ Green < 60%, yellow 60–80%, red > 80%. The slot breakdown matches the `stableP
 
 Every span follows `gen_ai.*` semantic conventions. Every outbound HTTP request — provider API calls, MCP server requests, ACP callbacks — carries a W3C `traceparent`. You can follow a user message from the TUI keystroke through model inference and back to the audit log in a single trace.
 
-```
-smedja TUI keystroke
-  │  traceparent injected
-  ▼
-smdjad: turn handler              [gen_ai.operation.name = "chat"]
-  │                                [gen_ai.request.model  = "Qwen3-14B"]
-  │                                [gen_ai.system         = "local"]
-  ├── smedja-assayer route
-  │
-  ├── smedja-adapter POST ──▶ provider
-  │   ↳ model inference             [gen_ai.usage.input_tokens  = 1240]
-  │                                 [gen_ai.usage.output_tokens = 312]
-  ├── tool: edit_file               [tool.name = "edit_file"]
-  │
-  └── smedja-ingot write            [audit.action = "tool_exec"]
-                                    [task.id      = "…"]
-```
+<div align="center">
+  <img src="assets/diagrams/readme-observability.png" alt="observability trace from TUI keystroke through model inference and audit log" width="900" />
+</div>
 
 `smj session cost` reads `smedja-ingot` and prints a per-session cost breakdown by model and runner. `prices.toml` ships bundled — no external API call required.
 
@@ -255,27 +187,9 @@ smdjad: turn handler              [gen_ai.operation.name = "chat"]
 
 `smedja-methodology` enforces a workflow before the agent can touch files. The gate is a compile-time `Mode` enum — not a runtime plugin, not optional in CI.
 
-```
-OpenSpec change active?
-        │
-        ▼
-  spec/ directory exists?
-      no ──▶ agent drafts spec first (cannot emit edit_file)
-        │
-       yes
-        │
-        ▼
-  CoworkGate approves spec
-        │
-        ▼
-  TddGate: failing test must exist before first edit_file
-        │
-        ▼
-  impl role executes
-        │
-        ▼
-  review role (read-only tools only)
-```
+<div align="center">
+  <img src="assets/diagrams/readme-spec-first-methodology.png" alt="spec-first methodology gate from OpenSpec through review" width="760" />
+</div>
 
 `--no-spec-gate` disables it per session for quick patches. In normal operation the sequence is: spec → approval → test → implementation → review.
 
@@ -289,20 +203,9 @@ The difference from WezTerm: `smedja-term` knows what a smdjad session is. Agent
 
 Custom glyphs (tier badges, status icons, block decorations) register via the **Glyph Protocol** — APC sequences that map vector shapes to Unicode PUA codepoints. No Nerd Font patches required.
 
-```
-smedja-term window
-├── tab: shell
-│     Block [ls -la]          Block [cargo build]
-│     ✓ 0ms                   ✓ 4.2s
-│
-├── tab: milliways session
-│     AgentBlock [turn 12]    AgentBlock [turn 13]
-│                              ┌─ cowork gate ──────────────┐
-│                              │  tool: edit_file            │
-│                              │  [a] approve  [d] deny      │
-│                              └─────────────────────────────┘
-└── status bar: [local · RDNA4]  [Qwen3-14B]  [ctx: 44%]  [main ✓]
-```
+<div align="center">
+  <img src="assets/diagrams/readme-smedja-term.png" alt="smedja-term window with shell blocks, agent blocks, cowork gate, and status bar" width="900" />
+</div>
 
 Config is TOML. A migration tool converts existing WezTerm Lua config.
 
