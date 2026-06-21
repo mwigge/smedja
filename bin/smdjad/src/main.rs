@@ -15,8 +15,9 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use smedja_adapter::types::{Message as AdapterMessage, Role as AdapterRole};
 use smedja_adapter::{
-    AnthropicProvider, BergetProvider, CallOptions, CopilotProvider, Delta, LocalProvider,
-    MinimaxProvider, OpenAiProvider, PoolsideProvider, Provider,
+    AnthropicProvider, BergetProvider, CallOptions, ClaudeCliProvider, CodexCliProvider,
+    CopilotProvider, Delta, LocalProvider, MinimaxProvider, OpenAiProvider, PoolsideProvider,
+    Provider,
 };
 use smedja_assayer::{BashArity, WorktreePool};
 use smedja_bellows::{Dispatcher, TurnEvent};
@@ -84,23 +85,32 @@ fn missing_param(name: &str) -> RpcError {
 /// Selects the LLM provider from environment variables and installed CLIs.
 ///
 /// Priority order (stops at the first that resolves):
-/// 1. `ANTHROPIC_API_KEY` → [`AnthropicProvider`]
-/// 2. `OPENAI_API_KEY` → [`OpenAiProvider`]
+/// 1. `claude` binary on `$PATH` → [`ClaudeCliProvider`] (subscription, no API key)
+/// 2. `codex` binary on `$PATH` → [`CodexCliProvider`] (subscription, no API key)
 /// 3. `gh` binary + copilot extension (or `GITHUB_TOKEN`) → [`CopilotProvider`]
 /// 4. `poolside` binary → [`PoolsideProvider`]
-/// 5. `MINIMAX_API_KEY` → [`MinimaxProvider`]
-/// 6. `BERGET_API_KEY` → [`BergetProvider`]
-/// 7. Local rs-llmctl endpoint health check → [`LocalProvider`]
+/// 5. `ANTHROPIC_API_KEY` → [`AnthropicProvider`] (API key fallback)
+/// 6. `OPENAI_API_KEY` → [`OpenAiProvider`] (API key fallback)
+/// 7. `MINIMAX_API_KEY` → [`MinimaxProvider`]
+/// 8. `BERGET_API_KEY` → [`BergetProvider`]
+/// 9. Local rs-llmctl endpoint health check → [`LocalProvider`]
 ///
 /// Returns `Err(reason)` only when all options are unavailable.
 async fn build_provider() -> Result<Box<dyn Provider>, String> {
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        info!(provider = "anthropic", "provider selected");
-        return Ok(Box::new(AnthropicProvider::new(key)));
+    // CLI subscription providers take priority over API key providers.
+    if let Some(p) = ClaudeCliProvider::detect(None) {
+        info!(
+            provider = "claude-cli",
+            "provider selected via claude CLI subscription"
+        );
+        return Ok(Box::new(p));
     }
-    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        info!(provider = "openai", "provider selected");
-        return Ok(Box::new(OpenAiProvider::new("https://api.openai.com", key)));
+    if let Some(p) = CodexCliProvider::detect(None) {
+        info!(
+            provider = "codex-cli",
+            "provider selected via codex CLI subscription"
+        );
+        return Ok(Box::new(p));
     }
     if let Some(p) = CopilotProvider::detect() {
         info!(provider = "copilot", "provider selected");
@@ -109,6 +119,15 @@ async fn build_provider() -> Result<Box<dyn Provider>, String> {
     if let Some(p) = PoolsideProvider::detect() {
         info!(provider = "poolside", "provider selected");
         return Ok(Box::new(p));
+    }
+    // API key providers as fallback from CLI subscription providers.
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        info!(provider = "anthropic", "provider selected");
+        return Ok(Box::new(AnthropicProvider::new(key)));
+    }
+    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+        info!(provider = "openai", "provider selected");
+        return Ok(Box::new(OpenAiProvider::new("https://api.openai.com", key)));
     }
     if let Some(p) = MinimaxProvider::detect() {
         info!(provider = "minimax", "provider selected");
@@ -2195,5 +2214,114 @@ mod tests {
         let result = super::build_provider().await;
         // Result may be Ok if local endpoint happens to be up; just verify no panic.
         drop(result);
+    }
+
+    /// Returns the provider name that `build_provider` would select given the
+    /// detection results for each candidate, encoding the subscription-first
+    /// priority order without touching the network or filesystem.
+    ///
+    /// Priority (index 0 = highest):
+    /// 0. claude CLI binary present
+    /// 1. codex CLI binary present
+    /// 2. copilot detected
+    /// 3. poolside detected
+    /// 4. `ANTHROPIC_API_KEY` set
+    /// 5. `OPENAI_API_KEY` set
+    /// 6. minimax detected
+    /// 7. berget detected
+    #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+    fn provider_priority(
+        claude_cli: bool,
+        codex_cli: bool,
+        copilot: bool,
+        poolside: bool,
+        anthropic_key: bool,
+        openai_key: bool,
+        minimax: bool,
+        berget: bool,
+    ) -> &'static str {
+        if claude_cli {
+            return "claude-cli";
+        }
+        if codex_cli {
+            return "codex-cli";
+        }
+        if copilot {
+            return "copilot";
+        }
+        if poolside {
+            return "poolside";
+        }
+        if anthropic_key {
+            return "anthropic";
+        }
+        if openai_key {
+            return "openai";
+        }
+        if minimax {
+            return "minimax";
+        }
+        if berget {
+            return "berget";
+        }
+        "none"
+    }
+
+    #[test]
+    fn cli_wins_over_api_key_when_both_present() {
+        // CLI subscription beats API key — the fundamental invariant of L20.
+        assert_eq!(
+            provider_priority(true, false, false, false, true, true, false, false),
+            "claude-cli"
+        );
+        assert_eq!(
+            provider_priority(false, true, false, false, false, true, false, false),
+            "codex-cli"
+        );
+    }
+
+    #[test]
+    fn api_key_selected_when_no_cli_available() {
+        assert_eq!(
+            provider_priority(false, false, false, false, true, false, false, false),
+            "anthropic"
+        );
+        assert_eq!(
+            provider_priority(false, false, false, false, false, true, false, false),
+            "openai"
+        );
+    }
+
+    #[test]
+    fn cli_providers_ordered_before_copilot_and_poolside() {
+        // Even copilot (subscription-like) comes after the CLI runners.
+        assert_eq!(
+            provider_priority(false, true, true, true, false, false, false, false),
+            "codex-cli"
+        );
+    }
+
+    #[test]
+    fn anthropic_key_before_openai_key() {
+        assert_eq!(
+            provider_priority(false, false, false, false, true, true, false, false),
+            "anthropic"
+        );
+    }
+
+    #[test]
+    fn minimax_and_berget_are_lowest_priority_before_local() {
+        assert_eq!(
+            provider_priority(false, false, false, false, false, false, true, false),
+            "minimax"
+        );
+        assert_eq!(
+            provider_priority(false, false, false, false, false, false, false, true),
+            "berget"
+        );
+        assert_eq!(
+            provider_priority(false, false, false, false, false, false, false, false),
+            "none"
+        );
     }
 }
