@@ -1,7 +1,8 @@
-//! `smedja-graph` — tree-sitter Rust symbol indexer and name-based `graph_query` tool.
+//! `smedja-graph` — multi-language tree-sitter symbol indexer and `graph_query` tool.
 //!
-//! Walks Rust source files, parses them with `tree-sitter-rust`, extracts named
-//! symbols (functions, structs, enums, traits, impls, consts, type aliases), stores
+//! Walks source files with recognised extensions (`.rs`, `.go`, `.py`, `.ts`, `.tsx`),
+//! parses them with the appropriate tree-sitter grammar, extracts named symbols
+//! (functions, classes, structs, enums, traits, impls, consts, type aliases), stores
 //! them in `SQLite`, and answers [`GraphStore::graph_query`] queries by name substring.
 
 pub mod error;
@@ -252,6 +253,72 @@ mod tests {
         assert!(
             !results.is_empty(),
             "graph_query(WorkingMemory) must return at least one symbol"
+        );
+    }
+
+    // ── 14. Go grammar ────────────────────────────────────────────────────────
+
+    #[test]
+    fn index_go_snippet_finds_function() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("main.go"),
+            "package main\n\nfunc RunServer() error { return nil }\n",
+        )
+        .expect("write");
+
+        let mut store = GraphStore::open_in_memory().expect("open_in_memory");
+        let count = store.index_workspace(dir.path(), "ws-go").unwrap();
+        assert!(count >= 1, "expected ≥ 1 Go symbol, got {count}");
+
+        let results = store.graph_query("RunServer", 10, 0).unwrap();
+        assert!(
+            results.iter().any(|s| s.name == "RunServer"),
+            "did not find RunServer in results: {results:?}"
+        );
+    }
+
+    // ── 15. Python grammar ────────────────────────────────────────────────────
+
+    #[test]
+    fn index_python_snippet_finds_function() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("service.py"),
+            "def process_request(req):\n    return req\n",
+        )
+        .expect("write");
+
+        let mut store = GraphStore::open_in_memory().expect("open_in_memory");
+        let count = store.index_workspace(dir.path(), "ws-py").unwrap();
+        assert!(count >= 1, "expected ≥ 1 Python symbol, got {count}");
+
+        let results = store.graph_query("process_request", 10, 0).unwrap();
+        assert!(
+            results.iter().any(|s| s.name == "process_request"),
+            "did not find process_request in results: {results:?}"
+        );
+    }
+
+    // ── 16. TypeScript grammar ────────────────────────────────────────────────
+
+    #[test]
+    fn index_typescript_snippet_finds_function() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("agent.ts"),
+            "function executeAgent(task: string): void {}\n",
+        )
+        .expect("write");
+
+        let mut store = GraphStore::open_in_memory().expect("open_in_memory");
+        let count = store.index_workspace(dir.path(), "ws-ts").unwrap();
+        assert!(count >= 1, "expected ≥ 1 TypeScript symbol, got {count}");
+
+        let results = store.graph_query("executeAgent", 10, 0).unwrap();
+        assert!(
+            results.iter().any(|s| s.name == "executeAgent"),
+            "did not find executeAgent in results: {results:?}"
         );
     }
 }

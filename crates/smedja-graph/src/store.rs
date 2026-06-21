@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::Connection;
 
 use crate::error::GraphError;
-use crate::indexer::{index_directory, index_file};
+use crate::indexer::{index_directory, index_file_with_lang, lang_and_query_for_ext};
 use crate::types::{Symbol, SymbolKind};
 
 /// Persistent store for code-graph symbols.
@@ -134,11 +134,15 @@ impl GraphStore {
             .follow_links(false)
             .into_iter()
             .filter_map(std::result::Result::ok)
-            .filter(|e| {
-                e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "rs")
-            })
+            .filter(|e| e.file_type().is_file())
         {
             let abs_path = entry.path();
+
+            let ext = abs_path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            let Some((lang, query_str)) = lang_and_query_for_ext(ext) else {
+                continue;
+            };
+
             let rel_path = abs_path.strip_prefix(root).map_or_else(
                 |_| abs_path.to_string_lossy().into_owned(),
                 |p| p.to_string_lossy().into_owned(),
@@ -182,7 +186,14 @@ impl GraphStore {
 
             // Re-index the file.
             let source = std::fs::read_to_string(abs_path)?;
-            match index_file(&self.conn, &rel_path, &source, workspace_id) {
+            match index_file_with_lang(
+                &self.conn,
+                &rel_path,
+                &source,
+                workspace_id,
+                &lang,
+                query_str,
+            ) {
                 Ok(n) => {
                     total_new += n;
                     tracing::debug!(file = %rel_path, symbols = n, "incremental: indexed");
