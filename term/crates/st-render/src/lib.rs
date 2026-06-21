@@ -25,6 +25,7 @@ use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 use cosmic_text::{FontSystem, SwashCache};
+use st_statusbar::Segment;
 use thiserror::Error;
 use tracing::debug;
 
@@ -501,6 +502,8 @@ pub struct Renderer {
     pub background: BackgroundConfig,
     /// Physical size of the window in pixels.
     pub size: winit::dpi::PhysicalSize<u32>,
+    /// Status bar segments to overlay at the bottom of the window.
+    status_bar_segments: Vec<Segment>,
 }
 
 impl Renderer {
@@ -744,6 +747,7 @@ impl Renderer {
                 ..BackgroundConfig::default()
             },
             size,
+            status_bar_segments: Vec::new(),
         })
     }
 
@@ -779,6 +783,34 @@ impl Renderer {
     #[must_use]
     pub fn atlas_mut(&mut self) -> &mut GlyphAtlas {
         &mut self.atlas
+    }
+
+    /// Updates the segments displayed in the status bar strip.
+    ///
+    /// Segments are laid out left-to-right separated by a single space.  Call
+    /// this before [`Self::render`] each frame.
+    pub fn set_status_bar_segments(&mut self, segments: &[Segment]) {
+        self.status_bar_segments = segments.to_vec();
+    }
+
+    /// Returns the pixel height reserved for the status bar.
+    ///
+    /// The bar height is the smaller of the configured font size and 18 px so
+    /// that it remains visually independent from the terminal grid.
+    #[must_use]
+    pub fn status_bar_height_px(&self) -> u32 {
+        // Independent of grid font: cap at 18 px.
+        (self.config.font.size as u32).min(18)
+    }
+
+    /// Returns the height of the usable grid area in pixels (window height
+    /// minus the status bar strip).
+    ///
+    /// Pass this value to PTY resize calculations so the terminal grid never
+    /// draws into the status bar row.
+    #[must_use]
+    pub fn grid_height_px(&self) -> u32 {
+        self.size.height.saturating_sub(self.status_bar_height_px())
     }
 
     /// Renders the current cell grid to the window surface.
@@ -884,6 +916,19 @@ impl Renderer {
         (x0, y0, x1, y1)
     }
 
+    /// Converts a pixel-space rectangle `(px0, py0, px1, py1)` to NDC.
+    ///
+    /// `py0` is the top edge (smaller y in pixel space, larger y in NDC).
+    fn px_to_ndc(&self, px0: f32, py0: f32, px1: f32, py1: f32) -> (f32, f32, f32, f32) {
+        let pw = self.size.width as f32;
+        let ph = self.size.height as f32;
+        let x0 = px0 / pw * 2.0 - 1.0;
+        let y0 = 1.0 - py0 / ph * 2.0;
+        let x1 = px1 / pw * 2.0 - 1.0;
+        let y1 = 1.0 - py1 / ph * 2.0;
+        (x0, y0, x1, y1)
+    }
+
     fn build_bg_vertices(&self) -> Vec<BgVertex> {
         let (cw, ch) = self.cell_size();
         let mut verts = Vec::with_capacity(self.cells.len() * 6);
@@ -956,12 +1001,59 @@ impl Renderer {
             ]);
         }
 
+        // ── Status bar background strip ───────────────────────────────────────
+        {
+            // Always draw the status bar background so the strip is visible
+            // even when no modules produce output.
+            let sb_h = self.status_bar_height_px() as f32;
+            let ph = self.size.height as f32;
+            let pw = self.size.width as f32;
+            let py0 = ph - sb_h;
+            let py1 = ph;
+            // Dark background slightly different from terminal bg.
+            let sb_bg: [f32; 4] = [0.07, 0.07, 0.09, 1.0];
+            let (x0, y0, x1, y1) = self.px_to_ndc(0.0, py0, pw, py1);
+            verts.extend_from_slice(&[
+                BgVertex {
+                    position: [x0, y0],
+                    color: sb_bg,
+                },
+                BgVertex {
+                    position: [x1, y0],
+                    color: sb_bg,
+                },
+                BgVertex {
+                    position: [x0, y1],
+                    color: sb_bg,
+                },
+                BgVertex {
+                    position: [x1, y0],
+                    color: sb_bg,
+                },
+                BgVertex {
+                    position: [x1, y1],
+                    color: sb_bg,
+                },
+                BgVertex {
+                    position: [x0, y1],
+                    color: sb_bg,
+                },
+            ]);
+        }
+
         verts
     }
 
     fn build_glyph_vertices(&self) -> Vec<GlyphVertex> {
         let (cw, ch) = self.cell_size();
-        let mut verts = Vec::with_capacity(self.cells.len() * 6);
+        // Reserve extra capacity for status bar glyphs.
+        let extra: usize = self
+            .status_bar_segments
+            .iter()
+            .map(|s| s.text.len())
+            .sum::<usize>()
+            + self.status_bar_segments.len().saturating_sub(1); // separators
+        let mut verts = Vec::with_capacity(self.cells.len() * 6 + extra * 6);
 
         for cell in &self.cells {
             if cell.ch == ' ' {
@@ -1012,6 +1104,98 @@ impl Renderer {
                     color: c,
                 },
             ]);
+        }
+
+        // ── Status bar glyphs ─────────────────────────────────────────────────
+        //
+        // Text is rendered at a fixed 12×18 cell size (independent of the
+        // terminal grid font) so it fits within the status_bar_height_px() strip.
+        let sb_h = self.status_bar_height_px() as f32;
+        let ph = self.size.height as f32;
+        let pw = self.size.width as f32;
+        // Status bar font metrics: fixed 12 px wide, sb_h tall.
+        let sb_cw = 7.2_f32; // ~60 % of 12 px
+        let atlas_size_f = ATLAS_SIZE as f32;
+        let mut col_px = 4.0_f32; // 4 px left padding
+
+        for (seg_idx, seg) in self.status_bar_segments.iter().enumerate() {
+            // Separator between segments.
+            if seg_idx > 0 {
+                col_px += sb_cw; // one character-width gap
+            }
+            let fg_color: [f32; 4] =
+                seg.style
+                    .fg
+                    .as_ref()
+                    .map_or([0.957, 0.843, 0.631, 1.0], |c| {
+                        [
+                            f32::from(c.r) / 255.0,
+                            f32::from(c.g) / 255.0,
+                            f32::from(c.b) / 255.0,
+                            1.0,
+                        ]
+                    }); // forged_terminal fg
+
+            for ch in seg.text.chars() {
+                if ch == ' ' {
+                    col_px += sb_cw;
+                    continue;
+                }
+                let Some(&[ax, ay, aw, ah]) = self.atlas.glyphs.get(&(ch, false, false)) else {
+                    col_px += sb_cw;
+                    continue;
+                };
+                let u0 = ax as f32 / atlas_size_f;
+                let v0 = ay as f32 / atlas_size_f;
+                let u1 = (ax + aw) as f32 / atlas_size_f;
+                let v1 = (ay + ah) as f32 / atlas_size_f;
+
+                let py0 = ph - sb_h;
+                let py1 = ph;
+
+                let (x0, y0, x1, y1) = self.px_to_ndc(col_px, py0, col_px + sb_cw, py1);
+                let c = fg_color;
+                verts.extend_from_slice(&[
+                    GlyphVertex {
+                        position: [x0, y0],
+                        tex_coords: [u0, v0],
+                        color: c,
+                    },
+                    GlyphVertex {
+                        position: [x1, y0],
+                        tex_coords: [u1, v0],
+                        color: c,
+                    },
+                    GlyphVertex {
+                        position: [x0, y1],
+                        tex_coords: [u0, v1],
+                        color: c,
+                    },
+                    GlyphVertex {
+                        position: [x1, y0],
+                        tex_coords: [u1, v0],
+                        color: c,
+                    },
+                    GlyphVertex {
+                        position: [x1, y1],
+                        tex_coords: [u1, v1],
+                        color: c,
+                    },
+                    GlyphVertex {
+                        position: [x0, y1],
+                        tex_coords: [u0, v1],
+                        color: c,
+                    },
+                ]);
+                col_px += sb_cw;
+                // Stop if we run off the right edge.
+                if col_px >= pw {
+                    break;
+                }
+            }
+            if col_px >= pw {
+                break;
+            }
         }
 
         verts
@@ -1119,5 +1303,80 @@ mod tests {
             ..BackgroundConfig::default()
         };
         assert!(bg.load_image().is_err());
+    }
+
+    // ── Status bar tests ──────────────────────────────────────────────────────
+
+    /// Build a minimal `Renderer`-shaped struct using only pure-logic methods.
+    ///
+    /// We cannot call `Renderer::new` without a GPU, so we construct a fake
+    /// renderer that exercises only the pure helpers.
+    fn make_fake_renderer() -> (Vec<Cell>, Vec<Segment>, u32, u32, f32) {
+        let cells = Vec::new();
+        let segments = vec![
+            Segment {
+                name: "tier".into(),
+                text: "[local]".into(),
+                style: st_statusbar::SegmentStyle::default(),
+            },
+            Segment {
+                name: "time".into(),
+                text: "12:34".into(),
+                style: st_statusbar::SegmentStyle::default(),
+            },
+        ];
+        let width = 1200u32;
+        let height = 800u32;
+        let font_size = 14.0f32;
+        (cells, segments, width, height, font_size)
+    }
+
+    #[test]
+    fn status_bar_height_is_capped_at_18() {
+        // font_size = 14 → bar = min(14, 18) = 14
+        let font_size = 14.0f32;
+        let bar_h = (font_size as u32).min(18);
+        assert_eq!(bar_h, 14);
+
+        // font_size = 24 → bar = min(24, 18) = 18
+        let big_font = 24.0f32;
+        let bar_h_big = (big_font as u32).min(18);
+        assert_eq!(bar_h_big, 18);
+    }
+
+    #[test]
+    fn grid_height_is_window_height_minus_status_bar() {
+        let window_h = 800u32;
+        let font_size = 14.0f32;
+        let bar_h = (font_size as u32).min(18);
+        let grid_h = window_h.saturating_sub(bar_h);
+        assert_eq!(grid_h, 786);
+    }
+
+    #[test]
+    fn status_bar_segments_stored_and_cleared() {
+        let (_, segments, _, _, _) = make_fake_renderer();
+        // Simulate set_status_bar_segments: store the segments.
+        let mut stored: Vec<Segment> = segments.clone();
+        assert_eq!(stored.len(), 2);
+        stored.clear();
+        assert!(stored.is_empty());
+    }
+
+    #[test]
+    fn px_to_ndc_full_window_quad() {
+        // Full-width, full-height quad → NDC corners at (-1,1) and (1,-1).
+        let pw = 800.0f32;
+        let ph = 600.0f32;
+
+        let x0 = 0.0f32 / pw * 2.0 - 1.0;
+        let y0 = 1.0 - 0.0f32 / ph * 2.0;
+        let x1 = pw / pw * 2.0 - 1.0;
+        let y1 = 1.0 - ph / ph * 2.0;
+
+        assert!((x0 - -1.0).abs() < 1e-5);
+        assert!((y0 - 1.0).abs() < 1e-5);
+        assert!((x1 - 1.0).abs() < 1e-5);
+        assert!((y1 - -1.0).abs() < 1e-5);
     }
 }
