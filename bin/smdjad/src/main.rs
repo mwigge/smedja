@@ -5,9 +5,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use smedja_adapter::types::{Message as AdapterMessage, Role as AdapterRole};
-use smedja_adapter::{AnthropicProvider, CallOptions, Delta, OpenAiProvider, Provider};
+use smedja_adapter::{
+    AnthropicProvider, CallOptions, Delta, LocalProvider, OpenAiProvider, Provider,
+};
 use smedja_bellows::{Dispatcher, TurnEvent};
-use smedja_ingot::{Ingot, Session, Task};
+use smedja_ingot::{Checkpoint, CostEntry, Ingot, Session, Task};
 use smedja_rpc::{codes, router::Router, server::Server, RpcError};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -60,16 +62,26 @@ fn missing_param(name: &str) -> RpcError {
 
 /// Selects the LLM provider from environment variables.
 ///
-/// Returns `Ok(provider)` when a key is present, or `Err(reason)` when neither
-/// `ANTHROPIC_API_KEY` nor `OPENAI_API_KEY` is set.
-fn build_provider() -> Result<Box<dyn Provider>, String> {
+/// Priority: `ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → local rs-llmctl endpoint.
+/// Returns `Err(reason)` only when all three options are unavailable.
+async fn build_provider() -> Result<Box<dyn Provider>, String> {
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         return Ok(Box::new(AnthropicProvider::new(key)));
     }
     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         return Ok(Box::new(OpenAiProvider::new("https://api.openai.com", key)));
     }
-    Err("no LLM API key configured".to_owned())
+    // Fall back to the local rs-llmctl endpoint.
+    let local = LocalProvider::connect().await;
+    if local.capability.healthy {
+        info!(
+            model_id = %local.capability.model_id,
+            "using local rs-llmctl endpoint",
+        );
+        return Ok(Box::new(local));
+    }
+    warn!("local tier unavailable — escalating to fast");
+    Err("no LLM API key and local endpoint unreachable".to_owned())
 }
 
 /// Drains `stream`, accumulating text deltas into a single string.
@@ -102,6 +114,7 @@ async fn drain_stream(
 }
 
 /// Executes a single turn: loads the task, calls the LLM, stores the response.
+#[allow(clippy::too_many_lines)] // all turn lifecycle steps live in one function per the spec
 async fn run_turn(
     ingot: Arc<Mutex<Ingot>>,
     dispatcher: Arc<Dispatcher>,
@@ -135,7 +148,7 @@ async fn run_turn(
     };
 
     // 2. Select provider from environment.
-    let provider = match build_provider() {
+    let provider = match build_provider().await {
         Ok(p) => p,
         Err(reason) => {
             warn!("no LLM API key set; turn cannot execute");
@@ -202,6 +215,46 @@ async fn run_turn(
             reason: e.to_string(),
         });
         return;
+    }
+
+    // 6. Record cost entry.
+    {
+        let runner = if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            "anthropic"
+        } else {
+            "openai"
+        };
+        let entry = CostEntry {
+            id: Uuid::new_v4(),
+            session_id: session_id.clone(),
+            turn_n: 0, // ponytail: sequential turn_n tracking not yet implemented
+            runner: runner.to_owned(),
+            model: model.to_owned(),
+            input_tok: 0,
+            output_tok: i64::from(output_tokens),
+            cost_usd: 0.0, // ponytail: pricing table deferred
+            created_at: now_epoch(),
+        };
+        let mut ig = ingot.lock().await;
+        if let Err(e) = ig.insert_cost(&entry) {
+            warn!(error = %e, "failed to record cost entry");
+        }
+    }
+
+    // 7. Save checkpoint.
+    {
+        let cp = Checkpoint {
+            id: Uuid::new_v4(),
+            session_id: session_id.clone(),
+            turn_n: 0, // ponytail: using 0 until turn_n tracking is added
+            messages_json: serde_json::json!([{"role":"assistant","content":full_response}])
+                .to_string(),
+            created_at: now_epoch(),
+        };
+        let mut ig = ingot.lock().await;
+        if let Err(e) = ig.save_checkpoint(&cp) {
+            warn!(error = %e, "failed to save checkpoint");
+        }
     }
 
     dispatcher.publish(TurnEvent::Completed {
@@ -382,6 +435,92 @@ fn build_router(ingot: &Arc<Mutex<Ingot>>, dispatcher: Arc<Dispatcher>) -> Route
         });
     }
 
+    // ── task.list ───────────────────────────────────────────────────────────
+    {
+        let ig = Arc::clone(ingot);
+        router.register("task.list", move |params: Value| {
+            let ig = Arc::clone(&ig);
+            async move {
+                let status = params.get("status").and_then(Value::as_str);
+                let tasks = ig
+                    .lock()
+                    .await
+                    .list_tasks(status)
+                    .map_err(|e| ingot_err(&e))?;
+                let out: Vec<Value> = tasks
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "id": t.id,
+                            "title": t.title,
+                            "status": t.status,
+                            "created_at": t.created_at,
+                            "session_id": t.session_id,
+                        })
+                    })
+                    .collect();
+                Ok(Value::Array(out))
+            }
+        });
+    }
+
+    // ── task.create ─────────────────────────────────────────────────────────
+    {
+        let ig = Arc::clone(ingot);
+        router.register("task.create", move |params: Value| {
+            let ig = Arc::clone(&ig);
+            async move {
+                let title = params
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| missing_param("title"))?
+                    .to_owned();
+                let description = params
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let session_id = params
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let task = Task {
+                    id: Uuid::new_v4(),
+                    title,
+                    description,
+                    status: "planned".to_owned(),
+                    created_at: now_epoch(),
+                    session_id,
+                    response: None,
+                };
+                ig.lock()
+                    .await
+                    .create_task(&task)
+                    .map_err(|e| ingot_err(&e))?;
+                Ok(json!({ "id": task.id, "status": task.status }))
+            }
+        });
+    }
+
+    // ── task.close ──────────────────────────────────────────────────────────
+    {
+        let ig = Arc::clone(ingot);
+        router.register("task.close", move |params: Value| {
+            let ig = Arc::clone(&ig);
+            async move {
+                let id = params
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| missing_param("id"))?;
+                ig.lock()
+                    .await
+                    .update_task_status(id, "complete")
+                    .map_err(|e| ingot_err(&e))?;
+                Ok(json!({ "id": id, "status": "complete" }))
+            }
+        });
+    }
+
     // ── turn.submit ─────────────────────────────────────────────────────────
     {
         let ig = Arc::clone(ingot);
@@ -422,6 +561,83 @@ fn build_router(ingot: &Arc<Mutex<Ingot>>, dispatcher: Arc<Dispatcher>) -> Route
                 });
 
                 Ok(json!({ "task_id": task_id }))
+            }
+        });
+    }
+
+    // ── session.checkpoint.list ─────────────────────────────────────────────
+    {
+        let ig = Arc::clone(ingot);
+        router.register("session.checkpoint.list", move |params: Value| {
+            let ig = Arc::clone(&ig);
+            async move {
+                let session_id = params
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| missing_param("session_id"))?;
+                let cps = ig
+                    .lock()
+                    .await
+                    .list_checkpoints(session_id)
+                    .map_err(|e| ingot_err(&e))?;
+                let out: Vec<Value> = cps
+                    .iter()
+                    .map(|cp| {
+                        json!({
+                            "turn_n": cp.turn_n,
+                            "created_at": cp.created_at,
+                        })
+                    })
+                    .collect();
+                Ok(Value::Array(out))
+            }
+        });
+    }
+
+    // ── session.rollback ────────────────────────────────────────────────────
+    {
+        let ig = Arc::clone(ingot);
+        router.register("session.rollback", move |params: Value| {
+            let ig = Arc::clone(&ig);
+            async move {
+                let session_id = params
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| missing_param("session_id"))?;
+                let turn_n = params
+                    .get("turn_n")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| missing_param("turn_n"))?;
+                // turn_n is stored as i64 in the DB but load_checkpoint takes u32.
+                let turn_u32 = u32::try_from(turn_n)
+                    .map_err(|_| RpcError::new(codes::INVALID_PARAMS, "turn_n out of u32 range"))?;
+                let cp = ig
+                    .lock()
+                    .await
+                    .load_checkpoint(session_id, turn_u32)
+                    .map_err(|e| ingot_err(&e))?
+                    .ok_or_else(|| RpcError::new(codes::INTERNAL_ERROR, "checkpoint not found"))?;
+                Ok(json!({ "turn_n": cp.turn_n, "messages_json": cp.messages_json }))
+            }
+        });
+    }
+
+    // ── session.cost ────────────────────────────────────────────────────────
+    {
+        let ig = Arc::clone(ingot);
+        router.register("session.cost", move |params: Value| {
+            let ig = Arc::clone(&ig);
+            async move {
+                let session_id = params
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| missing_param("session_id"))?;
+                let total_usd = ig
+                    .lock()
+                    .await
+                    .session_cost(session_id)
+                    .map_err(|e| ingot_err(&e))?;
+                Ok(json!({ "session_id": session_id, "total_usd": total_usd }))
             }
         });
     }
