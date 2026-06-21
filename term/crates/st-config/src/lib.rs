@@ -3,6 +3,7 @@
 //! Loads `~/.config/smedja-term/config.toml` when present; otherwise returns
 //! the built-in `forged_terminal` theme defaults.
 
+pub mod contrast;
 pub mod migrate;
 
 use std::path::PathBuf;
@@ -34,6 +35,12 @@ struct RawConfig {
     scrollback_lines: Option<usize>,
     key_bindings: Option<Vec<RawKeyBinding>>,
     launch_menu: Option<Vec<RawLaunchEntry>>,
+    accessibility: Option<RawAccessibilityConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAccessibilityConfig {
+    enforce_contrast: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +188,22 @@ pub struct LaunchEntry {
     pub args: Vec<String>,
 }
 
+/// Accessibility settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AccessibilityConfig {
+    /// When `true`, foreground colours are adjusted to meet WCAG AA (4.5:1)
+    /// contrast ratio against their background before rendering.
+    pub enforce_contrast: bool,
+}
+
+impl Default for AccessibilityConfig {
+    fn default() -> Self {
+        Self {
+            enforce_contrast: true,
+        }
+    }
+}
+
 /// Top-level smedja-term configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
@@ -196,6 +219,8 @@ pub struct Config {
     pub key_bindings: Vec<KeyBinding>,
     /// Launch menu entries shown in the quick-launch overlay.
     pub launch_menu: Vec<LaunchEntry>,
+    /// Accessibility settings.
+    pub accessibility: AccessibilityConfig,
 }
 
 impl Default for Config {
@@ -208,6 +233,7 @@ impl Default for Config {
             scrollback_lines: 10_000,
             key_bindings: default_key_bindings(),
             launch_menu: Vec::new(),
+            accessibility: AccessibilityConfig::default(),
         }
     }
 }
@@ -356,6 +382,12 @@ impl Config {
                     args: re.args,
                 })
                 .collect();
+        }
+
+        if let Some(a) = raw.accessibility {
+            if let Some(v) = a.enforce_contrast {
+                cfg.accessibility.enforce_contrast = v;
+            }
         }
 
         Ok(cfg)

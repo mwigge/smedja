@@ -12,6 +12,7 @@ bytemuck     = { version = "1", features = ["derive"] }
 cosmic-text  = { workspace = true }
 image        = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 st-config    = { path = "../st-config" }
+st-statusbar = { path = "../st-statusbar" }
 thiserror    = { workspace = true }
 tracing      = { workspace = true }
 wgpu         = { workspace = true }

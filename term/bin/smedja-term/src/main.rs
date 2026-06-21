@@ -270,9 +270,12 @@ impl ApplicationHandler for App {
             };
 
         // Compute initial grid size from window dimensions and font metrics.
+        // Reserve the status bar height from the usable area so the terminal
+        // grid never draws into the bottom strip.
         let size = window.inner_size();
-        let (cols, rows) =
-            st_glyph::pixel_size_to_grid(size.width, size.height, self.config.font.size);
+        let sb_h = status_bar_height_for_font(self.config.font.size);
+        let grid_h = size.height.saturating_sub(sb_h);
+        let (cols, rows) = st_glyph::pixel_size_to_grid(size.width, grid_h, self.config.font.size);
 
         // Spawn PTY session.
         let mut pty = match st_pty::PtySession::spawn(cols, rows, &self.shell) {
@@ -314,11 +317,19 @@ impl ApplicationHandler for App {
                     renderer.resize(new_size);
                 }
                 if let Some(pty) = &mut self.pty {
-                    let (cols, rows) = st_glyph::pixel_size_to_grid(
-                        new_size.width,
-                        new_size.height,
-                        self.config.font.size,
+                    // Use grid_height_px() from the renderer when available;
+                    // fall back to the same formula so PTY stays out of the
+                    // status bar strip.
+                    let grid_h = self.renderer.as_ref().map_or_else(
+                        || {
+                            new_size
+                                .height
+                                .saturating_sub(status_bar_height_for_font(self.config.font.size))
+                        },
+                        st_render::Renderer::grid_height_px,
                     );
+                    let (cols, rows) =
+                        st_glyph::pixel_size_to_grid(new_size.width, grid_h, self.config.font.size);
                     // Resize errors are non-fatal; the PTY may have exited.
                     if let Err(e) = pty.resize(cols, rows) {
                         debug!("PTY resize error: {}", e);
@@ -348,6 +359,28 @@ impl ApplicationHandler for App {
                         drop(grid);
                         renderer.update_cells(&cells);
                     }
+
+                    // Evaluate status bar modules and update the renderer.
+                    // The modules run in parallel (rayon + per-module threads)
+                    // within an 8 ms budget.  We use a fixed context for now;
+                    // live agent state will be injected via mt-agent in a future
+                    // phase.
+                    let sb_ctx = st_statusbar::ModuleContext {
+                        tier: None,
+                        model: None,
+                        context_used: 0,
+                        context_window: 0,
+                        active_task: None,
+                    };
+                    let sb_modules: Vec<Box<dyn st_statusbar::StatusModule>> = vec![
+                        Box::new(st_statusbar::TierModule),
+                        Box::new(st_statusbar::ModelModule),
+                        Box::new(st_statusbar::GitBranchModule),
+                        Box::new(st_statusbar::TimeModule),
+                    ];
+                    let segments =
+                        st_statusbar::render_status_bar_parallel(&sb_modules, &sb_ctx, 8);
+                    renderer.set_status_bar_segments(&segments);
 
                     if let Err(e) = renderer.render() {
                         debug!("render error: {}", e);
@@ -491,6 +524,19 @@ impl ApplicationHandler for App {
             w.request_redraw();
         }
     }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Returns the status bar height in pixels for a given font size.
+///
+/// Mirrors the formula in `st_render::Renderer::status_bar_height_px` so that
+/// callers without a renderer can compute the same value.
+fn status_bar_height_for_font(font_size: f32) -> u32 {
+    // Clamp to zero before truncating so negative font sizes don't wrap.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let px = font_size.max(0.0) as u32;
+    px.min(18)
 }
 
 // ── Subcommand handlers ────────────────────────────────────────────────────────
