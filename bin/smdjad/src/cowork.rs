@@ -224,6 +224,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_round_trip_emits_pending_then_resolves() {
+        let gate = Arc::new(CoworkGate::new());
+        let gate_ref = Arc::clone(&gate);
+
+        // Spawn a task that intercepts a tool call.
+        let intercept_handle = tokio::spawn(async move { gate_ref.intercept(prompt(), 5).await });
+
+        // Give intercept time to register the pending entry.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Verify the pending entry is visible.
+        let pending = gate.list_pending().await;
+        assert_eq!(pending.len(), 1, "expected one pending approval");
+        let id = pending[0].0.clone();
+
+        // Approve it.
+        let resolved = gate.approve(&id).await;
+        assert!(resolved, "approve must return true for a known id");
+
+        // The intercepting task should now resolve to Approve.
+        let decision = intercept_handle.await.expect("intercept task panicked");
+        assert!(
+            matches!(decision, Decision::Approve),
+            "expected Decision::Approve after approval"
+        );
+    }
+
+    #[tokio::test]
     async fn intercept_emits_pending_for_any_runner() {
         let gate = Arc::new(CoworkGate::new());
         let gate2 = Arc::clone(&gate);
