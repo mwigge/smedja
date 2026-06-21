@@ -20,6 +20,8 @@ pub struct Session {
     pub mode: Option<String>,
     /// Whether human-in-the-loop cowork gate is active for this session.
     pub cowork_mode: bool,
+    /// Optional filesystem path to the workspace root for this session.
+    pub workspace_root: Option<String>,
 }
 
 /// Inserts a new [`Session`] row.
@@ -29,8 +31,9 @@ pub struct Session {
 /// Returns [`IngotError::Db`] if the INSERT fails (e.g. duplicate primary key).
 pub(crate) fn create(conn: &rusqlite::Connection, session: &Session) -> Result<(), IngotError> {
     conn.execute(
-        "INSERT INTO sessions (id, created_at, updated_at, status, task_id, mode, cowork_mode) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO sessions \
+         (id, created_at, updated_at, status, task_id, mode, cowork_mode, workspace_root) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
             session.id.to_string(),
             session.created_at,
@@ -39,6 +42,7 @@ pub(crate) fn create(conn: &rusqlite::Connection, session: &Session) -> Result<(
             session.task_id,
             session.mode,
             i64::from(session.cowork_mode),
+            session.workspace_root,
         ],
     )?;
     Ok(())
@@ -51,7 +55,7 @@ pub(crate) fn create(conn: &rusqlite::Connection, session: &Session) -> Result<(
 /// Returns [`IngotError::Db`] if the query fails.
 pub(crate) fn get(conn: &rusqlite::Connection, id: &str) -> Result<Option<Session>, IngotError> {
     let result = conn.query_row(
-        "SELECT id, created_at, updated_at, status, task_id, mode, cowork_mode \
+        "SELECT id, created_at, updated_at, status, task_id, mode, cowork_mode, workspace_root \
          FROM sessions WHERE id = ?1",
         rusqlite::params![id],
         |row| {
@@ -72,6 +76,7 @@ pub(crate) fn get(conn: &rusqlite::Connection, id: &str) -> Result<Option<Sessio
                 task_id: row.get(4)?,
                 mode: row.get(5)?,
                 cowork_mode: cowork_raw != 0,
+                workspace_root: row.get(7)?,
             })
         },
     );
@@ -90,7 +95,7 @@ pub(crate) fn get(conn: &rusqlite::Connection, id: &str) -> Result<Option<Sessio
 /// Returns [`IngotError::Db`] if the query fails.
 pub(crate) fn list(conn: &rusqlite::Connection) -> Result<Vec<Session>, IngotError> {
     let mut stmt = conn.prepare(
-        "SELECT id, created_at, updated_at, status, task_id, mode, cowork_mode \
+        "SELECT id, created_at, updated_at, status, task_id, mode, cowork_mode, workspace_root \
          FROM sessions ORDER BY created_at ASC",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -107,6 +112,7 @@ pub(crate) fn list(conn: &rusqlite::Connection) -> Result<Vec<Session>, IngotErr
             task_id: row.get(4)?,
             mode: row.get(5)?,
             cowork_mode: cowork_raw != 0,
+            workspace_root: row.get(7)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(IngotError::Db)
@@ -143,6 +149,57 @@ pub(crate) fn update_status(
     Ok(())
 }
 
+/// Sets the `workspace_root` path for the session identified by `id`.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the UPDATE fails.
+pub(crate) fn update_workspace_root(
+    conn: &rusqlite::Connection,
+    id: &str,
+    workspace_root: &str,
+) -> Result<(), IngotError> {
+    conn.execute(
+        "UPDATE sessions SET workspace_root = ?1 WHERE id = ?2",
+        rusqlite::params![workspace_root, id],
+    )?;
+    Ok(())
+}
+
+/// Links the session identified by `id` to a task by setting `task_id`.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the UPDATE fails.
+pub(crate) fn update_task_id(
+    conn: &rusqlite::Connection,
+    id: &str,
+    task_id: &str,
+) -> Result<(), IngotError> {
+    conn.execute(
+        "UPDATE sessions SET task_id = ?1 WHERE id = ?2",
+        rusqlite::params![task_id, id],
+    )?;
+    Ok(())
+}
+
+/// Enables or disables the cowork gate for the session identified by `id`.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the UPDATE fails.
+pub(crate) fn update_cowork_mode(
+    conn: &rusqlite::Connection,
+    id: &str,
+    enabled: bool,
+) -> Result<(), IngotError> {
+    conn.execute(
+        "UPDATE sessions SET cowork_mode = ?1 WHERE id = ?2",
+        rusqlite::params![i64::from(enabled), id],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +214,7 @@ mod tests {
             task_id: None,
             mode: Some("tdd".to_string()),
             cowork_mode: false,
+            workspace_root: None,
         }
     }
 
@@ -221,11 +279,59 @@ mod tests {
             task_id: Some("task-xyz".to_string()),
             mode: None,
             cowork_mode: false,
+            workspace_root: None,
         };
         ingot.create_session(&s).unwrap();
 
         let fetched = ingot.get_session(&s.id.to_string()).unwrap().unwrap();
         assert_eq!(fetched.task_id.as_deref(), Some("task-xyz"));
         assert!(fetched.mode.is_none());
+    }
+
+    #[test]
+    fn workspace_root_round_trip() {
+        let mut ingot = Ingot::open_in_memory().unwrap();
+        let s = sample_session();
+        ingot.create_session(&s).unwrap();
+
+        ingot
+            .update_session_workspace_root(&s.id.to_string(), "/home/user/projects/myrepo")
+            .unwrap();
+
+        let fetched = ingot.get_session(&s.id.to_string()).unwrap().unwrap();
+        assert_eq!(
+            fetched.workspace_root.as_deref(),
+            Some("/home/user/projects/myrepo")
+        );
+    }
+
+    #[test]
+    fn task_id_link_round_trip() {
+        use crate::Task;
+        let mut ingot = Ingot::open_in_memory().unwrap();
+        let s = sample_session();
+        ingot.create_session(&s).unwrap();
+
+        let task_id = Uuid::new_v4();
+        let task = Task {
+            id: task_id,
+            title: "Test task".to_string(),
+            description: String::new(),
+            status: "planned".to_string(),
+            created_at: 1_700_000_010.0,
+            session_id: Some(s.id.to_string()),
+            response: None,
+        };
+        ingot.create_task(&task).unwrap();
+
+        ingot
+            .update_session_task_id(&s.id.to_string(), &task_id.to_string())
+            .unwrap();
+
+        let fetched = ingot.get_session(&s.id.to_string()).unwrap().unwrap();
+        assert_eq!(
+            fetched.task_id.as_deref(),
+            Some(task_id.to_string().as_str())
+        );
     }
 }

@@ -110,6 +110,15 @@ enum DaemonCmd {
 
 #[derive(Subcommand)]
 enum SessionCmd {
+    /// Start a new session
+    Start {
+        /// Enable cowork mode (human approval for each tool call)
+        #[arg(long)]
+        cowork: bool,
+        /// Create a task linked to this session
+        #[arg(long)]
+        task: Option<String>,
+    },
     List,
     Show {
         id: String,
@@ -386,6 +395,23 @@ async fn main() -> Result<()> {
                     .await
                     .with_context(|| format!("smdjad not running ({})", sock.display()))?;
                 match action {
+                    SessionCmd::Start { cowork, task } => {
+                        let resp = client
+                            .call(
+                                "session.create",
+                                json!({
+                                    "cowork_mode": cowork,
+                                    "task_description": task,
+                                }),
+                            )
+                            .await
+                            .context("session.create failed")?;
+                        let session_id = resp["id"].as_str().unwrap_or("?");
+                        println!("Session: {session_id}");
+                        if let Some(task_id) = resp["task_id"].as_str() {
+                            println!("Task created: {task_id}");
+                        }
+                    }
                     SessionCmd::List => cmd_session_list(&mut client).await?,
                     SessionCmd::Show { id } => cmd_session_show(&mut client, &id).await?,
                     SessionCmd::Rollback { id, turn } => {
@@ -529,11 +555,21 @@ async fn main() -> Result<()> {
                     println!("removed: {name}");
                 }
                 McpCmd::Refresh { name } => {
-                    // ponytail: refresh not yet wired in smdjad; print a stub message
-                    match name {
-                        Some(n) => println!("smj mcp refresh {n}: not yet implemented"),
-                        None => println!("smj mcp refresh: not yet implemented"),
+                    let mut params = serde_json::json!({});
+                    if let Some(n) = name {
+                        params["name"] = serde_json::Value::String(n);
                     }
+                    let result: serde_json::Value = client
+                        .call("mcp.refresh", params)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("mcp.refresh failed: {e}"))?;
+                    println!(
+                        "Refreshed {} server(s)",
+                        result
+                            .get("refreshed")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0)
+                    );
                 }
             }
         }
@@ -764,6 +800,11 @@ async fn cmd_session_show(client: &mut Client, id: &str) -> Result<()> {
         .await
         .context("session.get failed")?;
     println!("{}", serde_json::to_string_pretty(&resp)?);
+    let cowork = resp["cowork_mode"].as_bool().unwrap_or(false);
+    println!("Cowork mode: {}", if cowork { "yes" } else { "no" });
+    if let Some(task_id) = resp["task_id"].as_str() {
+        println!("Active task: {task_id}");
+    }
     Ok(())
 }
 

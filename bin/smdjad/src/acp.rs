@@ -83,6 +83,7 @@ async fn create_session(State(s): State<AcpState>) -> impl IntoResponse {
         cowork_mode: false,
         created_at: now,
         updated_at: now,
+        workspace_root: None,
     };
     match s.ingot.lock().await.create_session(&session) {
         Ok(()) => Json(json!({ "session_id": id })).into_response(),
