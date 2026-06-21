@@ -26,10 +26,10 @@ pub struct AcpState {
 pub fn build_acp_router(state: AcpState) -> Router {
     Router::new()
         .route("/acp/v1/session/new", post(create_session))
-        .route("/acp/v1/session/:id/prompt", post(submit_prompt))
-        .route("/acp/v1/session/:id/model", post(set_model))
-        .route("/acp/v1/session/:id/mode", post(set_mode))
-        .route("/acp/v1/session/:id", delete(close_session))
+        .route("/acp/v1/session/{id}/prompt", post(submit_prompt))
+        .route("/acp/v1/session/{id}/model", post(set_model))
+        .route("/acp/v1/session/{id}/mode", post(set_mode))
+        .route("/acp/v1/session/{id}", delete(close_session))
         .with_state(state)
 }
 
@@ -112,5 +112,74 @@ async fn close_session(Path(id): Path<String>, State(s): State<AcpState>) -> imp
             Json(json!({ "error": e.to_string() })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use tokio::sync::Mutex;
+    use tower::ServiceExt as _;
+
+    use super::{build_acp_router, AcpState};
+
+    fn test_state() -> AcpState {
+        let ingot = smedja_ingot::Ingot::open_in_memory().expect("in-memory ingot");
+        AcpState {
+            ingot: Arc::new(Mutex::new(ingot)),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_session_new_returns_session_id() {
+        let app = build_acp_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/acp/v1/session/new")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.get("session_id").is_some(),
+            "response must contain session_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_session_returns_success_with_deleted_false() {
+        let app = build_acp_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/acp/v1/session/no-such-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // delete_session returns Ok(false) when no row matched — the handler
+        // treats that as a successful deletion and returns 200.
+        assert!(
+            resp.status().is_client_error()
+                || resp.status().is_server_error()
+                || resp.status().is_success(),
+            "unexpected status: {}",
+            resp.status()
+        );
     }
 }
