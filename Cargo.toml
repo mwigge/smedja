@@ -38,6 +38,9 @@ anyhow       = "1"
 
 # http
 axum         = { version = "0.8", features = ["ws"] }
+
+# byte casting (zero-cost f32 ↔ u8 for embedding BLOB serialisation)
+bytemuck     = "1"
 chrono       = { version = "0.4", features = ["serde"] }
 
 # cli

@@ -1,14 +1,13 @@
 [package]
 name        = "smedja-vault"
-description = "Vector KV store for cold memory retrieval (replaces mempalace)"
+description = "Vector KV store for cold memory retrieval"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
 repository.workspace = true
 
 [dependencies]
-anyhow       = { workspace = true }
-serde        = { workspace = true }
-serde_json   = { workspace = true }
-smedja-ingot = { path = "../smedja-ingot" }
-tracing      = { workspace = true }
+bytemuck   = { workspace = true }
+rusqlite   = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
