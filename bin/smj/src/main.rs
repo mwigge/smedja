@@ -325,8 +325,31 @@ async fn main() -> Result<()> {
         Cmd::Daemon { action } => match action {
             DaemonCmd::Status => cmd_daemon_status(&sock).await?,
             DaemonCmd::Start => cmd_daemon_start()?,
-            DaemonCmd::Stop => println!("smj daemon stop: not yet implemented"),
-            DaemonCmd::Restart => println!("smj daemon restart: not yet implemented"),
+            DaemonCmd::Stop => {
+                let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+                let pid_path = std::path::PathBuf::from(base).join("smdjad.pid");
+                let pid = std::fs::read_to_string(&pid_path)
+                    .context("smdjad not running (no PID file)")?
+                    .trim()
+                    .to_owned();
+                std::process::Command::new("kill")
+                    .args(["-TERM", &pid])
+                    .status()
+                    .context("kill -TERM failed")?;
+                println!("smdjad stopped (pid {pid})");
+            }
+            DaemonCmd::Restart => {
+                let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+                let pid_path = std::path::PathBuf::from(base).join("smdjad.pid");
+                if let Ok(pid) = std::fs::read_to_string(&pid_path).map(|s| s.trim().to_owned()) {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-TERM", &pid])
+                        .status();
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                cmd_daemon_start()?;
+                println!("smdjad restarted");
+            }
         },
         Cmd::Skill { action } => {
             let registry = SkillRegistry::new(SkillRegistry::default_path());
@@ -418,7 +441,15 @@ async fn main() -> Result<()> {
                         cmd_session_rollback(&mut client, &id, turn).await?;
                     }
                     SessionCmd::Fork { id, .. } => {
-                        println!("fork: not yet implemented for session {id}");
+                        let resp = client
+                            .call("session.fork", json!({ "session_id": id }))
+                            .await
+                            .context("session.fork failed")?;
+                        println!(
+                            "Forked: {} → {}",
+                            id,
+                            resp["session_id"].as_str().unwrap_or("?")
+                        );
                     }
                     SessionCmd::Checkpoint { id } => {
                         let resp = client
@@ -484,19 +515,62 @@ async fn main() -> Result<()> {
         Cmd::Audit { .. } => {
             println!("smj audit: not yet implemented");
         }
-        Cmd::Loop { action } => match action {
-            LoopCmd::Run { change, max_slices } => {
-                println!(
-                    "smj loop run --change {change} --max-slices {max_slices}: not yet implemented"
-                );
+        Cmd::Loop { action } => {
+            let mut client = Client::connect(&sock)
+                .await
+                .with_context(|| format!("smdjad not running ({})", sock.display()))?;
+            match action {
+                LoopCmd::Run { change, max_slices } => {
+                    let resp = client
+                        .call(
+                            "loop.create",
+                            json!({ "change_name": change, "max_slices": max_slices }),
+                        )
+                        .await
+                        .context("loop.create failed")?;
+                    let loop_id = resp["loop_id"].as_str().unwrap_or("?");
+                    println!("Loop created: {loop_id}");
+                }
+                LoopCmd::Status { change } => {
+                    let resp = client
+                        .call("loop.list", json!({ "change_name": change }))
+                        .await
+                        .context("loop.list failed")?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&resp).unwrap_or_default()
+                    );
+                }
+                LoopCmd::Cancel { change } => {
+                    let resp = client
+                        .call("loop.list", json!({ "change_name": change }))
+                        .await
+                        .context("loop.list failed")?;
+                    let active = resp["loops"]
+                        .as_array()
+                        .and_then(|arr| {
+                            arr.iter().find(|r| {
+                                let status = r["status"].as_str().unwrap_or("");
+                                status != "cancelled" && status != "done"
+                            })
+                        })
+                        .and_then(|r| r["id"].as_str())
+                        .map(str::to_owned);
+                    match active {
+                        Some(loop_id) => {
+                            client
+                                .call("loop.cancel", json!({ "loop_id": loop_id }))
+                                .await
+                                .context("loop.cancel failed")?;
+                            println!("Loop {loop_id} cancelled");
+                        }
+                        None => {
+                            println!("No active loop for change {change}");
+                        }
+                    }
+                }
             }
-            LoopCmd::Status { change } => {
-                println!("smj loop status --change {change}: not yet implemented");
-            }
-            LoopCmd::Cancel { change } => {
-                println!("smj loop cancel --change {change}: not yet implemented");
-            }
-        },
+        }
         Cmd::Sandbox { action } => match action {
             SandboxCmd::Build => {
                 println!("Building smedja-sandbox:latest...");
