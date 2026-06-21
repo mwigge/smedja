@@ -8,7 +8,8 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use smedja_adapter::types::{Message as AdapterMessage, Role as AdapterRole};
 use smedja_adapter::{
-    AnthropicProvider, CallOptions, Delta, LocalProvider, OpenAiProvider, Provider,
+    AnthropicProvider, BergetProvider, CallOptions, CopilotProvider, Delta, LocalProvider,
+    MinimaxProvider, OpenAiProvider, PoolsideProvider, Provider,
 };
 use smedja_bellows::{Dispatcher, TurnEvent};
 use smedja_ingot::{Checkpoint, CostEntry, Ingot, McpServer, Session, Task};
@@ -62,27 +63,54 @@ fn missing_param(name: &str) -> RpcError {
     )
 }
 
-/// Selects the LLM provider from environment variables.
+/// Selects the LLM provider from environment variables and installed CLIs.
 ///
-/// Priority: `ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → local rs-llmctl endpoint.
-/// Returns `Err(reason)` only when all three options are unavailable.
+/// Priority order (stops at the first that resolves):
+/// 1. `ANTHROPIC_API_KEY` → [`AnthropicProvider`]
+/// 2. `OPENAI_API_KEY` → [`OpenAiProvider`]
+/// 3. `gh` binary + copilot extension (or `GITHUB_TOKEN`) → [`CopilotProvider`]
+/// 4. `poolside` binary → [`PoolsideProvider`]
+/// 5. `MINIMAX_API_KEY` → [`MinimaxProvider`]
+/// 6. `BERGET_API_KEY` → [`BergetProvider`]
+/// 7. Local rs-llmctl endpoint health check → [`LocalProvider`]
+///
+/// Returns `Err(reason)` only when all options are unavailable.
 async fn build_provider() -> Result<Box<dyn Provider>, String> {
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        info!(provider = "anthropic", "provider selected");
         return Ok(Box::new(AnthropicProvider::new(key)));
     }
     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+        info!(provider = "openai", "provider selected");
         return Ok(Box::new(OpenAiProvider::new("https://api.openai.com", key)));
+    }
+    if let Some(p) = CopilotProvider::detect() {
+        info!(provider = "copilot", "provider selected");
+        return Ok(Box::new(p));
+    }
+    if let Some(p) = PoolsideProvider::detect() {
+        info!(provider = "poolside", "provider selected");
+        return Ok(Box::new(p));
+    }
+    if let Some(p) = MinimaxProvider::detect() {
+        info!(provider = "minimax", "provider selected");
+        return Ok(Box::new(p));
+    }
+    if let Some(p) = BergetProvider::detect() {
+        info!(provider = "berget", "provider selected");
+        return Ok(Box::new(p));
     }
     // Fall back to the local rs-llmctl endpoint.
     let local = LocalProvider::connect().await;
     if local.capability.healthy {
         info!(
+            provider = "local",
             model_id = %local.capability.model_id,
-            "using local rs-llmctl endpoint",
+            "provider selected",
         );
         return Ok(Box::new(local));
     }
-    warn!("local tier unavailable — escalating to fast");
+    warn!("no provider available — all options exhausted");
     Err("no LLM API key and local endpoint unreachable".to_owned())
 }
 
