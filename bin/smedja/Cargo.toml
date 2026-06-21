@@ -24,6 +24,7 @@ smedja-ingot       = { path = "../../crates/smedja-ingot" }
 smedja-memory      = { path = "../../crates/smedja-memory" }
 smedja-methodology = { path = "../../crates/smedja-methodology" }
 smedja-rpc         = { path = "../../crates/smedja-rpc" }
+syntect            = "5"
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
