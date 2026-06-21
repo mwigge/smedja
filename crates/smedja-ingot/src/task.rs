@@ -18,6 +18,8 @@ pub struct Task {
     pub created_at: f64,
     /// Optional session that owns this task.
     pub session_id: Option<String>,
+    /// Full response text stored once the turn completes.
+    pub response: Option<String>,
 }
 
 /// Inserts a new [`Task`] row.
@@ -56,7 +58,7 @@ pub(crate) fn list(
 ) -> Result<Vec<Task>, IngotError> {
     let rows: Vec<Task> = if let Some(st) = status {
         let mut stmt = conn.prepare(
-            "SELECT id, title, description, status, created_at, session_id \
+            "SELECT id, title, description, status, created_at, session_id, response \
              FROM tasks WHERE status = ?1 ORDER BY created_at ASC",
         )?;
         let collected: Result<Vec<Task>, _> = stmt
@@ -65,13 +67,30 @@ pub(crate) fn list(
         collected?
     } else {
         let mut stmt = conn.prepare(
-            "SELECT id, title, description, status, created_at, session_id \
+            "SELECT id, title, description, status, created_at, session_id, response \
              FROM tasks ORDER BY created_at ASC",
         )?;
         let collected: Result<Vec<Task>, _> = stmt.query_map([], row_to_task)?.collect();
         collected?
     };
     Ok(rows)
+}
+
+/// Retrieves a single [`Task`] by `id`, returning `None` when not found.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the query fails.
+pub(crate) fn get(conn: &rusqlite::Connection, id: &str) -> Result<Option<Task>, IngotError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, description, status, created_at, session_id, response \
+         FROM tasks WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query_map(rusqlite::params![id], row_to_task)?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
 }
 
 /// Updates the `status` field for the task with the given `id`.
@@ -91,6 +110,23 @@ pub(crate) fn update_status(
     Ok(())
 }
 
+/// Stores the full response text and transitions the task to `"complete"`.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the UPDATE fails.
+pub(crate) fn update_response(
+    conn: &rusqlite::Connection,
+    id: &str,
+    response: &str,
+) -> Result<(), IngotError> {
+    conn.execute(
+        "UPDATE tasks SET response = ?1, status = 'complete' WHERE id = ?2",
+        rusqlite::params![response, id],
+    )?;
+    Ok(())
+}
+
 fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let id_str: String = row.get(0)?;
     let id = Uuid::parse_str(&id_str).map_err(|e| {
@@ -103,6 +139,7 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         status: row.get(3)?,
         created_at: row.get(4)?,
         session_id: row.get(5)?,
+        response: row.get(6)?,
     })
 }
 
@@ -119,6 +156,7 @@ mod tests {
             status: status.to_string(),
             created_at: 1_700_000_000.0,
             session_id: None,
+            response: None,
         }
     }
 
@@ -177,5 +215,43 @@ mod tests {
 
         let results = ingot.list_tasks(Some("complete")).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn get_task_returns_task_by_id() {
+        let mut ingot = Ingot::open_in_memory().unwrap();
+        let t = sample_task("planned");
+        ingot.create_task(&t).unwrap();
+
+        let found = ingot.get_task(&t.id.to_string()).unwrap();
+        assert!(found.is_some());
+        let found = found.unwrap();
+        assert_eq!(found.id, t.id);
+        assert_eq!(found.title, "Write tests");
+        assert!(found.response.is_none());
+    }
+
+    #[test]
+    fn get_task_returns_none_for_missing() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let found = ingot
+            .get_task("00000000-0000-0000-0000-000000000000")
+            .unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn set_task_response_stores_response_and_marks_complete() {
+        let mut ingot = Ingot::open_in_memory().unwrap();
+        let t = sample_task("in_progress");
+        ingot.create_task(&t).unwrap();
+
+        ingot
+            .set_task_response(&t.id.to_string(), "The answer is 42.")
+            .unwrap();
+
+        let updated = ingot.get_task(&t.id.to_string()).unwrap().unwrap();
+        assert_eq!(updated.status, "complete");
+        assert_eq!(updated.response.as_deref(), Some("The answer is 42."));
     }
 }

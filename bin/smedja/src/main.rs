@@ -62,6 +62,10 @@ struct AppState {
     messages: Vec<Message>,
     input: String,
     quit: bool,
+    /// Task ID of an in-flight turn being polled for a response.
+    pending_task_id: Option<String>,
+    /// Timestamp of the last poll attempt.
+    last_poll: Option<std::time::Instant>,
 }
 
 // ---------------------------------------------------------------------------
@@ -98,8 +102,13 @@ async fn submit(input: &str, state: &mut AppState, client: &mut Client) -> Resul
         )
         .await;
     let reply = match resp {
-        Ok(v) => format!("queued (task: {})", v["task_id"].as_str().unwrap_or("?")),
-        Err(e) => format!("error: {e}"),
+        Ok(ref v) => {
+            let task_id = v["task_id"].as_str().unwrap_or("?").to_owned();
+            state.pending_task_id = Some(task_id.clone());
+            state.last_poll = Some(std::time::Instant::now());
+            format!("queued (task: {task_id})")
+        }
+        Err(ref e) => format!("error: {e}"),
     };
     state.messages.push(Message {
         role: Role::System,
@@ -262,6 +271,8 @@ async fn main() -> Result<()> {
         messages: Vec::new(),
         input: String::new(),
         quit: false,
+        pending_task_id: None,
+        last_poll: None,
     };
 
     // Enter alternate screen and raw mode — guard restores on drop.
@@ -292,6 +303,36 @@ async fn main() -> Result<()> {
             // All other events (resize, focus, mouse, …) cause a redraw on the next tick.
             if let Event::Key(key) = ev {
                 handle_key(key, &mut state, &mut client).await?;
+            }
+        }
+
+        // Poll for pending task result (every 500 ms).
+        if let Some(task_id) = state.pending_task_id.clone() {
+            let should_poll = state
+                .last_poll
+                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(500));
+            if should_poll {
+                state.last_poll = Some(std::time::Instant::now());
+                if let Ok(v) = client.call("task.get", json!({"id": task_id})).await {
+                    let status = v["status"].as_str().unwrap_or("");
+                    if status == "complete" {
+                        let response = v["response"].as_str().unwrap_or("(no response)").to_owned();
+                        state.messages.push(Message {
+                            role: Role::System,
+                            text: response,
+                        });
+                        state.pending_task_id = None;
+                        state.last_poll = None;
+                    } else if status == "failed" {
+                        state.messages.push(Message {
+                            role: Role::System,
+                            text: "turn failed".to_owned(),
+                        });
+                        state.pending_task_id = None;
+                        state.last_poll = None;
+                    }
+                    // else: still planned or in_progress — keep polling
+                }
             }
         }
 

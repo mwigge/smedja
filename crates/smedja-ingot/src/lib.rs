@@ -103,7 +103,8 @@ impl Ingot {
                 description TEXT NOT NULL DEFAULT '',
                 status      TEXT NOT NULL DEFAULT 'planned',
                 created_at  REAL NOT NULL,
-                session_id  TEXT
+                session_id  TEXT,
+                response    TEXT
             );
 
             CREATE TABLE IF NOT EXISTS checkpoints (
@@ -128,6 +129,12 @@ impl Ingot {
             );
             ",
         )?;
+
+        // Add response column to existing databases — SQLite returns an error if the
+        // column already exists; we suppress it so migrate() stays idempotent.
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE tasks ADD COLUMN response TEXT;");
 
         // Record (or ignore) the schema version marker.
         self.conn.execute(
@@ -250,6 +257,27 @@ impl Ingot {
     #[must_use = "check the Result to confirm the status was updated"]
     pub fn update_task_status(&mut self, id: &str, status: &str) -> Result<(), IngotError> {
         task::update_status(&self.conn, id, status)
+    }
+
+    /// Retrieves a [`Task`] by `id`, returning `None` when not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned task"]
+    pub fn get_task(&self, id: &str) -> Result<Option<Task>, IngotError> {
+        task::get(&self.conn, id)
+    }
+
+    /// Stores `response` text for the task identified by `id` and sets
+    /// `status = "complete"` in the same UPDATE.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the response was stored"]
+    pub fn set_task_response(&mut self, id: &str, response: &str) -> Result<(), IngotError> {
+        task::update_response(&self.conn, id, response)
     }
 
     // ── checkpoints ──────────────────────────────────────────────────────────
