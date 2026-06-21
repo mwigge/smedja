@@ -39,10 +39,10 @@ mod tests {
     #[test]
     fn detect_returns_none_when_no_binary_and_no_key() {
         let provider = CodexCliProvider::detect(None);
-        if !SubprocessProvider::available("codex") {
-            assert!(provider.is_none());
-        } else {
+        if SubprocessProvider::available("codex") {
             assert!(matches!(provider, Some(CodexCliProvider::Cli(_))));
+        } else {
+            assert!(provider.is_none());
         }
     }
 

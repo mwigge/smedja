@@ -105,4 +105,7 @@ walkdir            = "2"
 
 # GPU rendering (smedja-term)
 wgpu         = "22"
+
+# binary detection
+which        = "6"
 winit        = "0.30"
