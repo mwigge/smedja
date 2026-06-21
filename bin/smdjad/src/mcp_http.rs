@@ -73,6 +73,8 @@ impl McpHttpClient {
 
 #[cfg(test)]
 mod tests {
+    use tokio::net::TcpListener;
+
     use super::*;
 
     #[test]
@@ -86,5 +88,47 @@ mod tests {
         let json = r#"{"name":"read_file","description":"Read a file","input_schema":{}}"#;
         let tool: McpTool = serde_json::from_str(json).unwrap();
         assert_eq!(tool.name, "read_file");
+    }
+
+    #[tokio::test]
+    async fn list_tools_against_mock_server() {
+        // Start a minimal mock MCP server on a random port.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::post(|| async {
+                    axum::Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": "read_file",
+                                    "description": "Read a file from the workspace",
+                                    "input_schema": {}
+                                }
+                            ]
+                        }
+                    }))
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Give the server a moment to bind.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let client = McpHttpClient::new(&format!("http://{addr}"), "").unwrap();
+        let tools = client
+            .list_tools()
+            .await
+            .expect("list_tools should succeed");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "read_file");
+        assert_eq!(tools[0].description, "Read a file from the workspace");
     }
 }
