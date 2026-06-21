@@ -118,4 +118,51 @@ mod tests {
         // `/bin/sh` is universally available on Linux/macOS.
         assert!(SubprocessProvider::available("sh"));
     }
+
+    /// Verifies that stdout lines produced by the subprocess are forwarded as
+    /// `Delta::Text` items.  Uses `sh -c` with `echo` so the test is hermetic
+    /// and requires no external binary beyond `/bin/sh`.
+    #[tokio::test]
+    async fn subprocess_provider_echoes_stdout_as_deltas() {
+        let p = SubprocessProvider::new("sh", vec!["-c".into(), "echo hello && echo world".into()]);
+        let messages = vec![crate::Message {
+            role: crate::Role::User,
+            content: "ignored".into(),
+        }];
+        let opts = crate::CallOptions {
+            model: "x".into(),
+            max_tokens: None,
+            temperature: None,
+            system: None,
+            tools: None,
+        };
+        let mut stream = p.stream_chat(&messages, &opts);
+        let mut collected = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(Delta::Text(t)) => collected.push_str(&t),
+                Ok(_) => {}
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert!(
+            collected.contains("hello"),
+            "expected 'hello' in output, got: {collected:?}"
+        );
+        assert!(
+            collected.contains("world"),
+            "expected 'world' in output, got: {collected:?}"
+        );
+    }
+
+    /// Verifies that `available` returns `false` for an absent binary.
+    /// (This complements the existing test with an explicit name for the
+    /// "CLI absent" scenario described in the task spec.)
+    #[test]
+    fn subprocess_provider_falls_back_when_cli_absent() {
+        assert!(
+            !SubprocessProvider::available("__no_such_binary_xyz__"),
+            "non-existent binary should not be detected as available"
+        );
+    }
 }
