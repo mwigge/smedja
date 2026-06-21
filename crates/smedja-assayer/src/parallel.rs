@@ -170,6 +170,43 @@ impl WorktreePool {
         started
     }
 
+    /// Merges the worktree branch for `task_id` back into the workspace root's
+    /// current branch.
+    ///
+    /// Calls `git merge --no-ff <branch>` where `<branch>` is derived from the
+    /// task UUID. The caller is responsible for ensuring the worktree branch
+    /// exists and the working tree is clean.
+    ///
+    /// Returns the merged branch name on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(String)` if the task is unknown, the path cannot be resolved
+    /// as a string, or `git merge` exits non-zero.
+    pub async fn merge(&self, task_id: &str, workspace_root: &Path) -> Result<String, String> {
+        let task = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| format!("task {task_id} not found"))?;
+
+        let branch = format!("smedja/{task_id}");
+        let output = tokio::process::Command::new("git")
+            .args(["merge", "--no-ff", &branch])
+            .current_dir(workspace_root)
+            .output()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if output.status.success() {
+            tracing::info!(task_id, %branch, role = %task.role, "worktree branch merged");
+            Ok(branch)
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            tracing::warn!(task_id, %branch, %stderr, "git merge failed");
+            Err(stderr)
+        }
+    }
+
     /// Removes the git worktree for any task, regardless of its current status.
     ///
     /// Calls `git worktree remove --force <path>`. The operation is
@@ -247,6 +284,37 @@ mod tests {
     fn get_returns_none_for_unknown_id() {
         let pool = WorktreePool::new();
         assert!(pool.get("00000000-0000-0000-0000-000000000000").is_none());
+    }
+
+    #[test]
+    fn set_status_running_updates_pid() {
+        let mut pool = WorktreePool::new();
+        let root = std::path::Path::new("/tmp/ws");
+        let id = pool.register("impl", "feat", root);
+        let updated = pool.set_status(&id, TaskStatus::Running { pid: 42 });
+        assert!(updated);
+        assert_eq!(
+            pool.get(&id).unwrap().status,
+            TaskStatus::Running { pid: 42 }
+        );
+    }
+
+    #[test]
+    fn set_status_unknown_id_returns_false() {
+        let mut pool = WorktreePool::new();
+        assert!(!pool.set_status("no-such-id", TaskStatus::Cancelled));
+    }
+
+    #[test]
+    fn cancel_unknown_id_returns_false() {
+        let mut pool = WorktreePool::new();
+        assert!(!pool.cancel("no-such-id"));
+    }
+
+    #[test]
+    fn tasks_iter_empty_on_new() {
+        let pool = WorktreePool::new();
+        assert_eq!(pool.tasks().count(), 0);
     }
 
     #[test]
