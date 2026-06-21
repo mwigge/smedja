@@ -125,6 +125,52 @@ impl TurnBlock {
     }
 }
 
+/// Ring buffer of completed turn blocks for the current session.
+///
+/// Capacity is fixed at 200; oldest entries are evicted when the limit is
+/// reached.
+#[allow(dead_code)] // session block history; wired to TUI history panel in upcoming story
+#[derive(Debug, Default)]
+pub struct BlockStore {
+    blocks: std::collections::VecDeque<TurnBlock>,
+}
+
+#[allow(dead_code)] // session block history; wired to TUI history panel in upcoming story
+impl BlockStore {
+    /// Creates an empty [`BlockStore`] pre-allocated for 200 entries.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            blocks: std::collections::VecDeque::with_capacity(200),
+        }
+    }
+
+    /// Appends a completed block; evicts the oldest entry if over capacity.
+    pub fn push(&mut self, block: TurnBlock) {
+        if self.blocks.len() >= 200 {
+            self.blocks.pop_front();
+        }
+        self.blocks.push_back(block);
+    }
+
+    /// Returns an iterator over all stored blocks in chronological order.
+    pub fn blocks(&self) -> impl Iterator<Item = &TurnBlock> + '_ {
+        self.blocks.iter()
+    }
+
+    /// Returns the total count of stored blocks.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Returns `true` when no blocks are stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +244,30 @@ mod tests {
         b.set_tool_outcome(format!("@@ -1 +1 @@\n{long_diff}"));
         let lines = b.inline_diff(0, 5).unwrap();
         assert_eq!(lines.len(), 5);
+    }
+
+    #[test]
+    fn push_respects_capacity() {
+        let mut store = BlockStore::new();
+        for i in 0..=200u32 {
+            store.push(TurnBlock::new(i));
+        }
+        assert_eq!(store.len(), 200);
+    }
+
+    #[test]
+    fn push_evicts_oldest() {
+        let mut store = BlockStore::new();
+        for i in 0..=200u32 {
+            store.push(TurnBlock::new(i));
+        }
+        let first = store.blocks().next().expect("store should not be empty");
+        assert_eq!(first.turn_n, 1);
+    }
+
+    #[test]
+    fn is_empty_on_new() {
+        let store = BlockStore::new();
+        assert!(store.is_empty());
     }
 }
