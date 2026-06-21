@@ -1,10 +1,12 @@
 pub mod client;
 pub mod codec;
 pub mod codes;
+pub mod generated;
 pub mod router;
 pub mod server;
 pub mod types;
 
+pub use generated::{SessionId, TaskId, TurnId};
 pub use types::{Error as RpcError, Request, Response};
 
 /// JSON-RPC 2.0 version string.
