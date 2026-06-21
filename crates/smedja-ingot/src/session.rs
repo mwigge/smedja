@@ -78,6 +78,46 @@ pub(crate) fn get(conn: &rusqlite::Connection, id: &str) -> Result<Option<Sessio
     }
 }
 
+/// Returns all [`Session`]s ordered by `created_at` ascending.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the query fails.
+pub(crate) fn list(conn: &rusqlite::Connection) -> Result<Vec<Session>, IngotError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, created_at, updated_at, status, task_id, mode \
+         FROM sessions ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let id_str: String = row.get(0)?;
+        let id = Uuid::parse_str(&id_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+        Ok(Session {
+            id,
+            created_at: row.get(1)?,
+            updated_at: row.get(2)?,
+            status: row.get(3)?,
+            task_id: row.get(4)?,
+            mode: row.get(5)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(IngotError::Db)
+}
+
+/// Deletes the session with the given `id`.
+///
+/// Returns `true` if a row was deleted, `false` if no session with that `id`
+/// existed.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the DELETE fails.
+pub(crate) fn delete(conn: &rusqlite::Connection, id: &str) -> Result<bool, IngotError> {
+    let n = conn.execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params![id])?;
+    Ok(n > 0)
+}
+
 /// Updates the `status` and `updated_at` fields for the session with the given `id`.
 ///
 /// # Errors

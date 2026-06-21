@@ -182,6 +182,29 @@ impl Ingot {
         session::get(&self.conn, id)
     }
 
+    /// Returns all [`Session`]s ordered by `created_at` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned sessions"]
+    pub fn list_sessions(&self) -> Result<Vec<Session>, IngotError> {
+        session::list(&self.conn)
+    }
+
+    /// Deletes the session with the given `id`.
+    ///
+    /// Returns `true` if a row was deleted, `false` if no session with that `id`
+    /// existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the DELETE fails.
+    #[must_use = "check the Result to confirm the session was deleted"]
+    pub fn delete_session(&mut self, id: &str) -> Result<bool, IngotError> {
+        session::delete(&self.conn, id)
+    }
+
     /// Updates the `status` of a session to `status` and records a new `updated_at`
     /// timestamp using the current Unix epoch.
     ///
