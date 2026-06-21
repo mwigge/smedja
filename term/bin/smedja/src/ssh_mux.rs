@@ -1,5 +1,5 @@
 //! SSH multiplexer — connects to a remote host via russh, checks for a remote
-//! `smedja-term-mux` daemon, and forwards the remote smdjad Unix socket to a
+//! `smedja-mux` daemon, and forwards the remote smdjad Unix socket to a
 //! local path via a `direct-streamlocal` channel bridge.
 
 use std::path::Path;
@@ -104,18 +104,18 @@ pub async fn connect(host: &str, port: u16, username: &str) -> anyhow::Result<Ss
 // ── SshMuxClient ──────────────────────────────────────────────────────────────
 
 impl SshMuxClient {
-    /// Runs `which smedja-term-mux` on the remote host.
+    /// Runs `which smedja-mux` on the remote host.
     ///
     /// # Errors
     ///
     /// Returns an error when the SSH exec channel cannot be opened or the
     /// daemon binary is not found on the remote `PATH`.
     pub async fn ensure_mux_daemon(&self) -> anyhow::Result<()> {
-        let output = self.exec("which smedja-term-mux").await?;
+        let output = self.exec("which smedja-mux").await?;
         if output.trim().is_empty() {
-            bail!("smedja-term-mux not found on remote PATH");
+            bail!("smedja-mux not found on remote PATH");
         }
-        info!(path = %output.trim(), "smedja-term-mux found on remote");
+        info!(path = %output.trim(), "smedja-mux found on remote");
         Ok(())
     }
 

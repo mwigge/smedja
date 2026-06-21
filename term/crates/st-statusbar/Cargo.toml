@@ -1,6 +1,6 @@
 [package]
 name        = "st-statusbar"
-description = "smedja-term: st-statusbar"
+description = "smedja: st-statusbar"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true

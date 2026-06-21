@@ -1,6 +1,6 @@
 //! E2E PTY smoke tests — verifies that the host system can spawn a PTY, write
 //! to it, and read back output.  These tests exercise the `portable-pty` layer
-//! rather than the full smedja-term GUI.
+//! rather than the full smedja GUI.
 
 use std::io::Read;
 use std::sync::mpsc;
@@ -21,7 +21,7 @@ fn echo_command_output_appears_in_pty() {
         .expect("openpty failed");
 
     let mut builder = CommandBuilder::new("echo");
-    builder.arg("smedja-term-e2e-marker");
+    builder.arg("smedja-e2e-marker");
     let _child = pair.slave.spawn_command(builder).expect("spawn failed");
 
     // Drop the library's own slave handle so the master reader sees EOF once the
@@ -47,7 +47,7 @@ fn echo_command_output_appears_in_pty() {
     let output = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
     let text = String::from_utf8_lossy(&output);
     assert!(
-        text.contains("smedja-term-e2e-marker"),
+        text.contains("smedja-e2e-marker"),
         "unexpected output: {text:?}"
     );
 }

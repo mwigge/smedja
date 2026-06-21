@@ -1,5 +1,5 @@
 [package]
-name        = "smedja-term"
+name        = "smedja"
 description = "smedja GPU-accelerated terminal emulator (wgpu, block model, native daemon integration)"
 version.workspace    = true
 edition.workspace    = true
@@ -7,7 +7,7 @@ license.workspace    = true
 repository.workspace = true
 
 [[bin]]
-name = "smedja-term"
+name = "smedja"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,6 +1,6 @@
 [package]
 name        = "st-agent"
-description = "smedja-term: st-agent"
+description = "smedja: st-agent"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true

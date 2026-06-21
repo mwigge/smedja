@@ -1,6 +1,6 @@
 [package]
 name        = "st-blocks"
-description = "smedja-term: block model — shell, agent, and system command blocks with SQLite persistence"
+description = "smedja: block model — shell, agent, and system command blocks with SQLite persistence"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true

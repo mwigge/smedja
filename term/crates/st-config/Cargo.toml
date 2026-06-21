@@ -1,6 +1,6 @@
 [package]
 name        = "st-config"
-description = "smedja-term: configuration loading and the forged_terminal built-in theme"
+description = "smedja: configuration loading and the forged_terminal built-in theme"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true

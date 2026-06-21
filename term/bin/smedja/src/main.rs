@@ -1,4 +1,4 @@
-//! `smedja-term` — GPU-accelerated terminal emulator entry point.
+//! `smedja` — GPU-accelerated terminal emulator entry point.
 //!
 //! Initialises the winit event loop, wgpu surface, PTY session, and block model.
 //! Dispatches keyboard input to the PTY and cell-grid updates to the renderer.
@@ -41,7 +41,7 @@ use st_agent::SharedPaneState;
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Parser)]
-#[command(name = "smedja-term", about = "GPU-accelerated terminal emulator")]
+#[command(name = "smedja", about = "GPU-accelerated terminal emulator")]
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
@@ -95,7 +95,7 @@ enum UserEvent {
 // ── Launch menu entry ─────────────────────────────────────────────────────────
 
 /// A single entry in the launch menu, loaded from `[[launch_menu]]` in
-/// `~/.config/smedja-term/config.toml`.
+/// `~/.config/smedja/config.toml`.
 #[derive(Debug, Clone)]
 pub struct LaunchEntry {
     /// Display label shown in the overlay.
@@ -164,7 +164,7 @@ impl App {
     /// Opens a new terminal window and registers it in `self.windows`.
     fn open_window(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
-            .with_title("smedja-term")
+            .with_title("smedja")
             .with_inner_size(winit::dpi::LogicalSize::new(1200u32, 800u32));
 
         match event_loop.create_window(attrs) {
@@ -288,7 +288,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
 
         let attrs = Window::default_attributes()
-            .with_title("smedja-term")
+            .with_title("smedja")
             .with_inner_size(winit::dpi::LogicalSize::new(1200u32, 800u32));
 
         let window = match event_loop.create_window(attrs) {
@@ -355,7 +355,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.windows.insert(window.id(), window);
         self.renderer = Some(renderer);
         self.pty = Some(pty);
-        info!("smedja-term initialised (pane {pane_id})");
+        info!("smedja initialised (pane {pane_id})");
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -675,7 +675,7 @@ fn cmd_ssh(host: String, port: u16) -> anyhow::Result<()> {
         let client = ssh_mux::connect(&hostname, port, &username).await?;
         client.ensure_mux_daemon().await?;
 
-        let local_sock = std::env::temp_dir().join("smedja-term-mux.sock");
+        let local_sock = std::env::temp_dir().join("smedja-mux.sock");
         client.open_local_tunnel(&local_sock)?;
         info!(
             socket = %local_sock.display(),
@@ -697,12 +697,12 @@ fn default_db_path() -> std::path::PathBuf {
         },
         std::path::PathBuf::from,
     );
-    base.join("smedja-term").join("blocks.db")
+    base.join("smedja").join("blocks.db")
 }
 
 // ── Launch menu config loading ─────────────────────────────────────────────────
 
-/// Loads `[[launch_menu]]` entries from the smedja-term config file.
+/// Loads `[[launch_menu]]` entries from the smedja config file.
 ///
 /// The TOML format is:
 /// ```toml
@@ -731,7 +731,7 @@ fn load_launch_entries() -> Vec<LaunchEntry> {
 
     let path = dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
-        .join("smedja-term")
+        .join("smedja")
         .join("config.toml");
 
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -831,7 +831,7 @@ fn main() -> anyhow::Result<()> {
     let launch_entries = load_launch_entries();
     info!("loaded {} launch menu entries", launch_entries.len());
 
-    info!("starting smedja-term with shell={}", shell);
+    info!("starting smedja with shell={}", shell);
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()

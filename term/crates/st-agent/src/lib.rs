@@ -1,4 +1,4 @@
-//! `st-agent` — agent block rendering, smdjad UDS client, and approval flow for smedja-term.
+//! `st-agent` — agent block rendering, smdjad UDS client, and approval flow for smedja.
 //!
 //! Provides the bridge between the smedja daemon (smdjad) and the terminal
 //! renderer: streaming agent responses arrive as events, are accumulated into

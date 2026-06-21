@@ -226,11 +226,11 @@ pub struct Notification {
 /// Parse OSC 9 payload: `OSC 9 ; <message> ST`
 ///
 /// The payload is the raw message string; returns a notification with a
-/// fixed title of `"smedja-term"` and the payload as the body.
+/// fixed title of `"smedja"` and the payload as the body.
 #[must_use]
 pub fn parse_osc9(payload: &str) -> Option<Notification> {
     Some(Notification {
-        title: "smedja-term".into(),
+        title: "smedja".into(),
         body: payload.to_owned(),
     })
 }
@@ -1441,7 +1441,7 @@ mod tests {
     #[test]
     fn parse_osc9_returns_notification_with_payload_as_body() {
         let n = parse_osc9("hello from shell").unwrap();
-        assert_eq!(n.title, "smedja-term");
+        assert_eq!(n.title, "smedja");
         assert_eq!(n.body, "hello from shell");
     }
 

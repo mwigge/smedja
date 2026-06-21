@@ -195,19 +195,21 @@ Every span follows `gen_ai.*` semantic conventions. Every outbound HTTP request 
 
 ---
 
-## smedja-term
+## smedja
 
-A GPU-accelerated terminal emulator built into the portfolio. wgpu on Metal / Vulkan / DX12, `cosmic-text` for font shaping, `taffy` flexbox for split panes.
+A GPU-accelerated terminal emulator. wgpu on Metal / Vulkan / DX12, `cosmic-text` for font shaping, `taffy` flexbox for split panes.
 
-The difference from WezTerm: `smedja-term` knows what a smdjad session is. Agent turns render as `AgentBlock` widgets — tier badge, token count, traceparent, inline cowork gate — not raw byte streams. Shell commands render as standard `Block` units (Warp-style): selectable, copyable, independently scrollable.
+The difference from WezTerm: `smedja` knows what a smdjad session is. Agent turns render as `AgentBlock` widgets — tier badge, token count, traceparent, inline cowork gate — not raw byte streams. Shell commands render as standard `Block` units (Warp-style): selectable, copyable, independently scrollable.
 
 Custom glyphs (tier badges, status icons, block decorations) register via the **Glyph Protocol** — APC sequences that map vector shapes to Unicode PUA codepoints. No Nerd Font patches required.
 
 <div align="center">
-  <img src="assets/diagrams/readme-smedja-term.png" alt="smedja-term window with shell blocks, agent blocks, cowork gate, and status bar" width="900" />
+  <img src="assets/diagrams/readme-smedja-term.png" alt="smedja window with shell blocks, agent blocks, cowork gate, and status bar" width="900" />
 </div>
 
 Config is TOML. A migration tool converts existing WezTerm Lua config.
+
+`smedja-tui` is a ratatui agent dashboard that runs as a normal app inside smedja (or any terminal). Launch it with `smedja-tui` from the shell.
 
 ---
 
@@ -217,7 +219,7 @@ Config is TOML. A migration tool converts existing WezTerm Lua config.
 curl -fsSL https://github.com/mwigge/smedja/releases/latest/download/install.sh | sh
 ```
 
-Installs `smdjad`, `smj`, and `smedja` to `~/.local/bin`. Linux (x86\_64, aarch64) and macOS (x86\_64, aarch64) are supported. Pin a version with `SMEDJA_VERSION=v0.1.0`; change the install directory with `SMEDJA_DIR=/usr/local/bin`.
+Installs `smdjad`, `smj`, `smedja` (GPU terminal), and `smedja-tui` (agent dashboard) to `~/.local/bin`. Linux (x86\_64, aarch64) and macOS (x86\_64, aarch64) are supported. Pin a version with `SMEDJA_VERSION=v0.1.0`; change the install directory with `SMEDJA_DIR=/usr/local/bin`.
 
 ## Getting Started
 
@@ -225,8 +227,11 @@ Installs `smdjad`, `smj`, and `smedja` to `~/.local/bin`. Linux (x86\_64, aarch6
 # start the daemon
 smdjad --sock /run/user/1000/smdjad.sock
 
-# open a session
-smedja --mode impl
+# open the GPU terminal
+smedja
+
+# or launch the agent dashboard TUI inside any terminal
+smedja-tui --mode impl
 
 # control CLI
 smj session list

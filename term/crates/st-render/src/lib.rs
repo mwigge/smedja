@@ -1,4 +1,4 @@
-//! `st-render` — wgpu-based terminal cell-grid renderer for smedja-term.
+//! `st-render` — wgpu-based terminal cell-grid renderer for smedja.
 //!
 //! Renders a grid of [`Cell`]s to a [`winit`] window via a wgpu pipeline that
 //! composites per-cell background fills with glyph textures sampled from a
@@ -548,7 +548,7 @@ impl Renderer {
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
-                    label: Some("smedja-term"),
+                    label: Some("smedja"),
                     required_features: wgpu::Features::empty(),
                     required_limits: wgpu::Limits::downlevel_webgl2_defaults()
                         .using_resolution(adapter.limits()),
@@ -712,10 +712,10 @@ impl Renderer {
             cache: None,
         });
 
-        // Pre-populate with "hello smedja-term" as an initial test render.
+        // Pre-populate with "hello smedja" as an initial test render.
         let fg = config.colors.foreground;
         let bg_color = config.colors.background;
-        let hello = "hello smedja-term";
+        let hello = "hello smedja";
         let initial_cells: Vec<Cell> = hello
             .chars()
             .enumerate()

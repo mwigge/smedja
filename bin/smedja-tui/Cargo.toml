@@ -1,13 +1,13 @@
 [package]
-name        = "smedja"
-description = "smedja terminal client (ratatui TUI)"
+name        = "smedja-tui"
+description = "smedja agent dashboard (ratatui TUI, runs inside the smedja terminal)"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
 repository.workspace = true
 
 [[bin]]
-name = "smedja"
+name = "smedja-tui"
 path = "src/main.rs"
 
 [dependencies]
