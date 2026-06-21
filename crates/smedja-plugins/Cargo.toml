@@ -1,0 +1,17 @@
+[package]
+name        = "smedja-plugins"
+description = "Claude Code skill file manager — reads, installs, updates and removes ~/.claude/skills entries"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+serde      = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+walkdir    = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
