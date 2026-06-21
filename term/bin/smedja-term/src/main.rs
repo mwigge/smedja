@@ -36,6 +36,8 @@ use winit::{
 use crate::split::{SplitDirection, SplitLayout};
 use crate::tab::TabBar;
 
+use st_agent::SharedPaneState;
+
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Parser)]
@@ -130,6 +132,8 @@ struct App {
     launch_menu_open: bool,
     /// Selected entry index in the launch menu overlay.
     launch_menu_selection: usize,
+    /// Live agent state fed from the st-agent UDS listener.
+    pane_state: SharedPaneState,
 }
 
 impl App {
@@ -151,6 +155,7 @@ impl App {
             launch_entries,
             launch_menu_open: false,
             launch_menu_selection: 0,
+            pane_state: SharedPaneState::new(),
         }
     }
 
@@ -317,8 +322,19 @@ impl ApplicationHandler<UserEvent> for App {
         let grid_h = size.height.saturating_sub(sb_h);
         let (cols, rows) = st_glyph::pixel_size_to_grid(size.width, grid_h, self.config.font.size);
 
-        // Spawn PTY session.
-        let mut pty = match st_pty::PtySession::spawn(cols, rows, &self.shell) {
+        // Each pane gets a stable UUID injected as SMEDJA_TERM_PANE so smdjad
+        // can route agent events back to the correct window.
+        let pane_id = self.tab_bar.tabs[0].panes[0].id;
+        let pane_id_str = pane_id.to_string();
+
+        // Spawn PTY session with the pane env var so the shell (and smdjad
+        // child processes) inherit it.
+        let mut pty = match st_pty::PtySession::spawn_with_env(
+            cols,
+            rows,
+            &self.shell,
+            &[("SMEDJA_TERM_PANE", &pane_id_str)],
+        ) {
             Ok(p) => p,
             Err(e) => {
                 error!("PTY spawn failed: {}", e);
@@ -329,10 +345,12 @@ impl ApplicationHandler<UserEvent> for App {
         };
         pty.start_reader_detached();
 
+        spawn_agent_bridge(self.pane_state.clone(), pane_id_str);
+
         self.windows.insert(window.id(), window);
         self.renderer = Some(renderer);
         self.pty = Some(pty);
-        info!("smedja-term initialised");
+        info!("smedja-term initialised (pane {pane_id})");
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -411,15 +429,23 @@ impl ApplicationHandler<UserEvent> for App {
 
                     // Evaluate status bar modules and update the renderer.
                     // The modules run in parallel (rayon + per-module threads)
-                    // within an 8 ms budget.  We use a fixed context for now;
-                    // live agent state will be injected via mt-agent in a future
-                    // phase.
+                    // within an 8 ms budget.  Live agent state comes from the
+                    // st-agent bridge running in its own thread.
+                    let (tier, model, active_task) = {
+                        // Non-blocking try_read: if the lock is contended (agent
+                        // event writing) skip the update this frame.
+                        if let Ok(s) = self.pane_state.0.try_read() {
+                            (s.tier.clone(), s.model.clone(), s.active_task.clone())
+                        } else {
+                            (None, None, None)
+                        }
+                    };
                     let sb_ctx = st_statusbar::ModuleContext {
-                        tier: None,
-                        model: None,
+                        tier,
+                        model,
                         context_used: 0,
                         context_window: 0,
-                        active_task: None,
+                        active_task,
                     };
                     let sb_modules: Vec<Box<dyn st_statusbar::StatusModule>> = vec![
                         Box::new(st_statusbar::TierModule),
@@ -714,6 +740,56 @@ fn load_launch_entries() -> Vec<LaunchEntry> {
             command: e.command,
         })
         .collect()
+}
+
+// ── Agent bridge ─────────────────────────────────────────────────────────────
+
+/// Spawns a background thread that connects to smdjad and streams pane events
+/// into `state`, which the status bar modules read each render frame.
+///
+/// The thread is fire-and-forget: if smdjad is absent or the connection drops,
+/// it exits silently and the status bar simply shows no agent context.
+fn spawn_agent_bridge(state: SharedPaneState, pane_id: String) {
+    std::thread::Builder::new()
+        .name("st-agent".into())
+        .spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            rt.block_on(async move {
+                if !st_agent::socket_exists().await {
+                    debug!("agent bridge: smdjad socket absent — skipping");
+                    return;
+                }
+                let Ok(mut client) = st_agent::SmdjadClient::connect().await else {
+                    return;
+                };
+                if client.subscribe_pane(&pane_id).await.is_err() {
+                    return;
+                }
+                while let Ok(Some(ev)) = client.next_event().await {
+                    let mut s = state.0.write().await;
+                    match ev {
+                        st_agent::PaneEvent::TurnStart { tier, model, .. } => {
+                            s.tier = Some(tier);
+                            s.model = Some(model);
+                            s.is_agent_turn = true;
+                        }
+                        st_agent::PaneEvent::TurnEnd { .. } => {
+                            s.is_agent_turn = false;
+                        }
+                        st_agent::PaneEvent::ToolCall { tool_name, .. } => {
+                            s.active_task = Some(tool_name);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        })
+        .ok();
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────

@@ -1007,6 +1007,23 @@ impl PtySession {
     ///
     /// Returns [`PtyError::Pty`] if the PTY or child process cannot be created.
     pub fn spawn(cols: u16, rows: u16, shell: &str) -> Result<Self, PtyError> {
+        Self::spawn_with_env(cols, rows, shell, &[])
+    }
+
+    /// Spawns a PTY session with additional environment variables injected
+    /// alongside the standard `TERM` and `COLORTERM` entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PtyError::Pty`] if the PTY cannot be opened or the shell
+    /// cannot be spawned, or [`PtyError::Io`] if the master writer cannot be
+    /// extracted.
+    pub fn spawn_with_env(
+        cols: u16,
+        rows: u16,
+        shell: &str,
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self, PtyError> {
         use portable_pty::{CommandBuilder, PtySize};
 
         let pty_system = portable_pty::native_pty_system();
@@ -1023,6 +1040,9 @@ impl PtySession {
         let mut cmd = CommandBuilder::new(shell);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
 
         let child = pair
             .slave

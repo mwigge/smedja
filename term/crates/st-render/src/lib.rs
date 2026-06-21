@@ -765,6 +765,22 @@ impl Renderer {
 
     /// Updates the cell grid from a slice of [`Cell`]s.
     pub fn update_cells(&mut self, cells: &[Cell]) {
+        let font_size = self.config.font.size;
+        for cell in cells {
+            if cell.ch != ' ' {
+                // Ensure the glyph is in the atlas before the next render pass.
+                // On cache miss get_or_insert rasterises via cosmic-text and
+                // uploads to the GPU texture; on hit it returns immediately.
+                let _ = self.atlas.get_or_insert(
+                    &self.device,
+                    &self.queue,
+                    cell.ch,
+                    font_size,
+                    false,
+                    false,
+                );
+            }
+        }
         self.cells.clear();
         self.cells.extend_from_slice(cells);
     }
