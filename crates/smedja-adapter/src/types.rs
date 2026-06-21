@@ -51,6 +51,13 @@ pub struct CallOptions {
     /// Anthropic requires the system prompt to be a top-level field.
     /// `OpenAI` providers prepend it as a `Role::System` message instead.
     pub system: Option<String>,
+    /// MCP tool definitions to expose to the model during this call.
+    ///
+    /// Each element must be a valid JSON object conforming to the provider's
+    /// tool-schema format (Anthropic `tools` array, `OpenAI` `functions` array,
+    /// etc.). Providers that do not yet support tool injection may ignore this
+    /// field.
+    pub tools: Option<Vec<serde_json::Value>>,
 }
 
 /// A single unit of streamed output from a provider.

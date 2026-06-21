@@ -295,33 +295,42 @@ async fn run_turn(
 
     let system_prompt = format!("You are smedja, an AI coding assistant.{task_prefix}");
 
+    // Load registered MCP tool definitions and flatten into a single Vec.
+    let mcp_tools: Vec<serde_json::Value> = {
+        let ig = ingot.lock().await;
+        ig.list_mcp_servers()
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(
+                |s| match serde_json::from_str::<Vec<serde_json::Value>>(&s.tools_json) {
+                    Ok(tools) => tools,
+                    Err(e) => {
+                        tracing::warn!(
+                            server = %s.name,
+                            error = %e,
+                            "failed to deserialize MCP tools_json; skipping server"
+                        );
+                        vec![]
+                    }
+                },
+            )
+            .collect()
+    };
+    if !mcp_tools.is_empty() {
+        tracing::debug!(count = mcp_tools.len(), "injecting MCP tools into turn");
+    }
+
     let opts = CallOptions {
         model: model.clone(),
         max_tokens: Some(2048),
         temperature: Some(0.7),
         system: Some(system_prompt),
+        tools: if mcp_tools.is_empty() {
+            None
+        } else {
+            Some(mcp_tools)
+        },
     };
-
-    // Load registered MCP tool definitions and log the count.
-    // CallOptions does not yet have a `tools` field; injection is deferred
-    // until the adapter exposes tool-use support.
-    {
-        let mcp_tools: Vec<serde_json::Value> = {
-            let ig = ingot.lock().await;
-            ig.list_mcp_servers()
-                .unwrap_or_default()
-                .into_iter()
-                .flat_map(|s| {
-                    serde_json::from_str::<Vec<serde_json::Value>>(&s.tools_json)
-                        .unwrap_or_default()
-                })
-                .collect()
-        };
-        if !mcp_tools.is_empty() {
-            // TODO: inject MCP tools when CallOptions.tools is added to the adapter
-            tracing::debug!(count = mcp_tools.len(), "injecting MCP tools into turn");
-        }
-    }
 
     // 4. Mark in_progress.
     {
@@ -1006,13 +1015,12 @@ fn build_router(
                 )
             })?;
 
-            // Load the target checkpoint; a None result means no checkpoint at that turn.
-            // Deletion of later checkpoints requires ig.rollback_session() which is added
-            // by Track 3. Until then, this call confirms the checkpoint exists and returns it.
+            // Atomically load the target checkpoint and prune all later checkpoints
+            // for this session in a single SQLite transaction.
             let cp = ig
                 .lock()
                 .await
-                .load_checkpoint(&session_id, turn_n_u32)
+                .rollback_session(&session_id, turn_n_u32)
                 .map_err(|e| ingot_err(&e))?;
 
             match cp {
@@ -1300,14 +1308,36 @@ fn build_router(
             }
 
             let mut p = pool.lock().await;
-            let ids: Vec<Value> = roles
+
+            // Register all roles first (synchronous — no await).
+            let registered: Vec<(String, String)> = roles
                 .iter()
                 .map(|role| {
                     let id = p.register(role, &goal, &workspace_root);
-                    json!({ "role": role, "task_id": id })
+                    (role.clone(), id)
                 })
                 .collect();
-            Ok(json!({ "goal": goal, "tasks": ids }))
+
+            // Create the git worktrees for all pending tasks.
+            let started = p.start_worktrees(&workspace_root).await;
+
+            // Build the per-task response, including worktree_path where available.
+            let tasks: Vec<Value> = registered
+                .iter()
+                .map(|(role, task_id)| {
+                    let worktree_path = p
+                        .get(task_id)
+                        .map(|t| t.worktree_path.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    json!({
+                        "role": role,
+                        "task_id": task_id,
+                        "worktree_path": worktree_path,
+                    })
+                })
+                .collect();
+
+            Ok(json!({ "goal": goal, "tasks": tasks, "started": started }))
         }
     });
 

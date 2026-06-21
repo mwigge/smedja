@@ -100,6 +100,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             system: None,
+            tools: None,
         };
         let mut stream = p.stream_chat(&messages, &opts);
         let first = stream.next().await;
