@@ -10,6 +10,7 @@ repository.workspace = true
 anyhow       = { workspace = true }
 bytemuck     = { version = "1", features = ["derive"] }
 cosmic-text  = { workspace = true }
+image        = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 st-config    = { path = "../st-config" }
 thiserror    = { workspace = true }
 tracing      = { workspace = true }

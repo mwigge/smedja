@@ -214,6 +214,44 @@ pub struct BlockMarker {
     pub row: u16,
 }
 
+// ── Desktop notifications (OSC 9 / OSC 777) ──────────────────────────────────
+
+/// Desktop notification from OSC 9 or OSC 777.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Notification {
+    pub title: String,
+    pub body: String,
+}
+
+/// Parse OSC 9 payload: `OSC 9 ; <message> ST`
+///
+/// The payload is the raw message string; returns a notification with a
+/// fixed title of `"smedja-term"` and the payload as the body.
+#[must_use]
+pub fn parse_osc9(payload: &str) -> Option<Notification> {
+    Some(Notification {
+        title: "smedja-term".into(),
+        body: payload.to_owned(),
+    })
+}
+
+/// Parse OSC 777 payload: `OSC 777 ; notify ; <title> ; <body> ST`
+///
+/// Expects the keyword `notify` as the first segment, then title and body.
+/// Returns `None` for any other format.
+#[must_use]
+pub fn parse_osc777(payload: &str) -> Option<Notification> {
+    let parts: Vec<&str> = payload.splitn(3, ';').collect();
+    if parts.first().copied() == Some("notify") && parts.len() == 3 {
+        Some(Notification {
+            title: parts[1].trim().to_owned(),
+            body: parts[2].trim().to_owned(),
+        })
+    } else {
+        None
+    }
+}
+
 // ── CellGrid ──────────────────────────────────────────────────────────────────
 
 /// The full terminal cell grid, including scrollback.
@@ -238,6 +276,8 @@ pub struct CellGrid {
     alt_cursor: (u16, u16),
     /// Shell integration markers.
     pub block_markers: Vec<BlockMarker>,
+    /// Desktop notifications received via OSC 9 or OSC 777.
+    pub notifications: Vec<Notification>,
     /// Current scroll offset: 0 = live view, positive = scrolled back.
     pub scroll_offset: i32,
     /// Current SGR state.
@@ -266,6 +306,7 @@ impl CellGrid {
             alt_cells: Vec::new(),
             alt_cursor: (0, 0),
             block_markers: Vec::new(),
+            notifications: Vec::new(),
             scroll_offset: 0,
             sgr: SgrState::default(),
             palette: DEFAULT_PALETTE,
@@ -727,10 +768,32 @@ impl vte::Perform for VtHandler {
                     _ => {}
                 }
             }
-            "9" | "777" => {
-                // Desktop notifications — log only.
-                let msg = params.get(1).and_then(|b| std::str::from_utf8(b).ok());
-                debug!("notification: {:?}", msg);
+            "9" => {
+                // OSC 9 ; <message> ST
+                let msg = params
+                    .get(1)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .unwrap_or("");
+                if let Some(n) = parse_osc9(msg) {
+                    debug!("OSC 9 notification: {:?}", n.body);
+                    grid.notifications.push(n);
+                }
+            }
+            "777" => {
+                // OSC 777 ; notify ; <title> ; <body> ST
+                // Reconstruct payload as "notify;<title>;<body>"
+                let payload = params[1..]
+                    .iter()
+                    .filter_map(|b| std::str::from_utf8(b).ok())
+                    .collect::<Vec<_>>()
+                    .join(";");
+                if let Some(n) = parse_osc777(&payload) {
+                    debug!(
+                        "OSC 777 notification: title={:?} body={:?}",
+                        n.title, n.body
+                    );
+                    grid.notifications.push(n);
+                }
             }
             _ => {
                 debug!("unhandled OSC: {:?}", command);
@@ -1353,5 +1416,26 @@ mod tests {
                 .any(|m| m.kind == MarkerKind::PromptHeuristic),
             "expected PromptHeuristic marker after printing '$'"
         );
+    }
+
+    #[test]
+    fn parse_osc9_returns_notification_with_payload_as_body() {
+        let n = parse_osc9("hello from shell").unwrap();
+        assert_eq!(n.title, "smedja-term");
+        assert_eq!(n.body, "hello from shell");
+    }
+
+    #[test]
+    fn parse_osc777_valid_payload_extracts_title_and_body() {
+        let n = parse_osc777("notify;My App;Something happened").unwrap();
+        assert_eq!(n.title, "My App");
+        assert_eq!(n.body, "Something happened");
+    }
+
+    #[test]
+    fn parse_osc777_invalid_payload_returns_none() {
+        assert!(parse_osc777("toast;oops").is_none());
+        assert!(parse_osc777("").is_none());
+        assert!(parse_osc777("notify;only-title").is_none());
     }
 }
