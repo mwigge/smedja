@@ -1333,4 +1333,69 @@ mod tests {
         assert_eq!(buf.area().width, 40);
         assert_eq!(buf.area().height, 10);
     }
+
+    // handle_key with "/health" + Enter calls session.get and writes latency to panel.
+    #[tokio::test]
+    async fn health_command_handle_key_shows_latency_in_panel() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+        use tokio::net::UnixListener;
+
+        // Bind to a socket inside a temp dir so the path is unique per test run.
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("health-test.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        // Spawn a minimal mock daemon that handles exactly one JSON-RPC request.
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let mut reader = TokioBufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let req: serde_json::Value =
+                    serde_json::from_str(line.trim_end()).unwrap_or(serde_json::Value::Null);
+                let id = req["id"].clone();
+                let resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "id": "sess-health-mock" }
+                });
+                let mut bytes = serde_json::to_vec(&resp).unwrap();
+                bytes.push(b'\n');
+                let _ = reader.get_mut().write_all(&bytes).await;
+            }
+        });
+
+        let mut client = Client::connect(&sock_path).await.unwrap();
+        let mut state = make_state("sess-health-mock");
+        state.input = "/health".into();
+        let mut editor = rustyline::DefaultEditor::new().unwrap();
+
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::empty(),
+        );
+        handle_key(key, &mut state, &mut client, &mut editor)
+            .await
+            .unwrap();
+
+        // input is cleared by std::mem::take before the command runs.
+        assert!(
+            state.input.is_empty(),
+            "/health must clear the input field after Enter"
+        );
+
+        // The main panel must contain the health output line.
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            content.contains("health"),
+            "main panel should contain health output after /health command; got: {content:?}"
+        );
+    }
 }

@@ -26,8 +26,8 @@ use uuid::Uuid;
 
 /// Returns the path to the smdjad Unix domain socket.
 ///
-/// Uses `$XDG_RUNTIME_DIR/smedja/smdjad.sock` when `XDG_RUNTIME_DIR` is set,
-/// otherwise falls back to `/tmp/smedja/smdjad.sock`.
+/// Uses `$XDG_RUNTIME_DIR/smdjad.sock` when `XDG_RUNTIME_DIR` is set,
+/// otherwise falls back to `/tmp/smdjad.sock`.
 #[must_use]
 pub fn smdjad_socket_path() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
@@ -627,6 +627,24 @@ mod tests {
         let _guard = EnvGuard::set("XDG_RUNTIME_DIR", "/run/user/1000");
         let path = smdjad_socket_path();
         assert_eq!(path, PathBuf::from("/run/user/1000/smdjad.sock"));
+    }
+
+    #[test]
+    fn socket_path_matches_smdjad() {
+        // st-agent and smdjad must agree on the socket path for a given XDG_RUNTIME_DIR.
+        // This test verifies the st-agent path matches the expected format.
+        let _guard = EnvGuard::set("XDG_RUNTIME_DIR", "/run/user/9999");
+        let path = smdjad_socket_path();
+        assert_eq!(
+            path.to_str().unwrap(),
+            "/run/user/9999/smdjad.sock",
+            "socket path must be $XDG_RUNTIME_DIR/smdjad.sock"
+        );
+        // Confirm no subdirectory: path should not contain /smedja/
+        assert!(
+            !path.to_str().unwrap().contains("/smedja/"),
+            "socket path must not contain /smedja/ subdirectory"
+        );
     }
 
     #[test]
