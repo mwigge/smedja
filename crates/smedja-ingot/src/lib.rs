@@ -318,6 +318,16 @@ impl Ingot {
         checkpoint::latest(&self.conn, session_id)
     }
 
+    /// Returns all checkpoints for `session_id`, ordered by turn number ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned checkpoints"]
+    pub fn list_checkpoints(&self, session_id: &str) -> Result<Vec<Checkpoint>, IngotError> {
+        checkpoint::list(&self.conn, session_id)
+    }
+
     // ── cost_ledger ──────────────────────────────────────────────────────────
 
     /// Appends a [`CostEntry`] to the cost ledger.
