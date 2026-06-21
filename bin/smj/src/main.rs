@@ -101,6 +101,11 @@ enum SkillCmd {
         /// Skill name to remove
         name: String,
     },
+    /// Sync all skills from a bundle directory using symlinks
+    Sync {
+        /// Path to a directory of skills (e.g. agent-toolkit-bundle/skills)
+        path: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -119,6 +124,7 @@ async fn main() -> Result<()> {
                 SkillCmd::Install { path } => cmd_skill_install(&registry, &path)?,
                 SkillCmd::Update { name, path } => cmd_skill_update(&registry, &name, &path)?,
                 SkillCmd::Remove { name } => cmd_skill_remove(&registry, &name)?,
+                SkillCmd::Sync { path } => cmd_skill_sync(&registry, &path)?,
             }
         }
         _ => println!("smj: not yet implemented"),
@@ -175,6 +181,24 @@ fn cmd_skill_remove(registry: &SkillRegistry, name: &str) -> Result<()> {
         .remove(name)
         .with_context(|| format!("failed to remove skill `{name}`"))?;
     println!("Removed skill `{name}`");
+    Ok(())
+}
+
+fn cmd_skill_sync(registry: &SkillRegistry, path: &std::path::Path) -> Result<()> {
+    println!("Syncing from {} ...", path.display());
+    let r = registry
+        .sync_from(path)
+        .with_context(|| format!("sync failed from {}", path.display()))?;
+    for (name, reason) in &r.errors {
+        println!("  error:   {name} — {reason}");
+    }
+    println!(
+        "\n{} linked, {} updated, {} skipped, {} error(s)",
+        r.linked,
+        r.updated,
+        r.skipped,
+        r.errors.len()
+    );
     Ok(())
 }
 

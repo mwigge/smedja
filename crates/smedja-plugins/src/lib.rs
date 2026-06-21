@@ -11,5 +11,5 @@ mod types;
 
 pub use error::PluginsError;
 pub use parse::parse_skill;
-pub use registry::SkillRegistry;
+pub use registry::{SkillRegistry, SyncResult};
 pub use types::{Skill, SkillManifest};
