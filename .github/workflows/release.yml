@@ -1,0 +1,100 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            os: linux
+            arch: x86_64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            os: linux
+            arch: aarch64
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            os: darwin
+            arch: x86_64
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            os: darwin
+            arch: aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: install linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            libssl-dev pkg-config lld
+
+      - name: build
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            --bin smdjad --bin smj --bin smedja
+
+      - name: package
+        run: |
+          OUT="smedja-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir "$OUT"
+          for bin in smdjad smj smedja; do
+            cp "target/${{ matrix.target }}/release/$bin" "$OUT/"
+          done
+          tar -czf "$OUT.tar.gz" "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smedja-${{ matrix.os }}-${{ matrix.arch }}
+          path: smedja-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist/
+
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --notes-file - \
+            dist/*.tar.gz \
+            scripts/install.sh <<'EOF'
+          See [README](https://github.com/mwigge/smedja#install) for installation instructions.
+
+          **One-line install:**
+          ```sh
+          curl -fsSL https://github.com/mwigge/smedja/releases/latest/download/install.sh | sh
+          ```
+          EOF

@@ -211,12 +211,17 @@ Config is TOML. A migration tool converts existing WezTerm Lua config.
 
 ---
 
+## Install
+
+```sh
+curl -fsSL https://github.com/mwigge/smedja/releases/latest/download/install.sh | sh
+```
+
+Installs `smdjad`, `smj`, and `smedja` to `~/.local/bin`. Linux (x86\_64, aarch64) and macOS (x86\_64, aarch64) are supported. Pin a version with `SMEDJA_VERSION=v0.1.0`; change the install directory with `SMEDJA_DIR=/usr/local/bin`.
+
 ## Getting Started
 
 ```bash
-# build everything
-cargo build --workspace
-
 # start the daemon
 smdjad --sock /run/user/1000/smdjad.sock
 
@@ -229,7 +234,7 @@ smj session cost
 smj workspace agents
 ```
 
-**Requirements:** Rust stable ≥ 1.82, `lld` on Linux, `cargo-sort` for the pre-commit gate.
+**Build from source:** `cargo build --workspace` — requires Rust stable ≥ 1.82, `lld` on Linux, `cargo-sort` for the pre-commit gate.
 
 ---
 
