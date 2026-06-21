@@ -52,13 +52,13 @@ jobs:
       - name: build
         run: |
           cargo build --release --target ${{ matrix.target }} \
-            --bin smdjad --bin smj --bin smedja
+            --bin smdjad --bin smj --bin smedja --bin smedja-term
 
       - name: package
         run: |
           OUT="smedja-${{ matrix.os }}-${{ matrix.arch }}"
           mkdir "$OUT"
-          for bin in smdjad smj smedja; do
+          for bin in smdjad smj smedja smedja-term; do
             cp "target/${{ matrix.target }}/release/$bin" "$OUT/"
           done
           tar -czf "$OUT.tar.gz" "$OUT"
