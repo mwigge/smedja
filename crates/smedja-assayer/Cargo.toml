@@ -13,3 +13,6 @@ serde_json  = { workspace = true }
 smedja-rpc  = { path = "../smedja-rpc" }
 toml        = { workspace = true }
 tracing     = { workspace = true }
+
+[dev-dependencies]
+tempfile    = "3"

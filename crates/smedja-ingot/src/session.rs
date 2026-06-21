@@ -18,6 +18,8 @@ pub struct Session {
     pub task_id: Option<String>,
     /// Optional operating mode: `"tdd"`, `"ponytail"`, `"spec"`, or `"sre"`.
     pub mode: Option<String>,
+    /// Whether human-in-the-loop cowork gate is active for this session.
+    pub cowork_mode: bool,
 }
 
 /// Inserts a new [`Session`] row.
@@ -27,8 +29,8 @@ pub struct Session {
 /// Returns [`IngotError::Db`] if the INSERT fails (e.g. duplicate primary key).
 pub(crate) fn create(conn: &rusqlite::Connection, session: &Session) -> Result<(), IngotError> {
     conn.execute(
-        "INSERT INTO sessions (id, created_at, updated_at, status, task_id, mode) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO sessions (id, created_at, updated_at, status, task_id, mode, cowork_mode) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
             session.id.to_string(),
             session.created_at,
@@ -36,6 +38,7 @@ pub(crate) fn create(conn: &rusqlite::Connection, session: &Session) -> Result<(
             session.status,
             session.task_id,
             session.mode,
+            i64::from(session.cowork_mode),
         ],
     )?;
     Ok(())
@@ -48,7 +51,7 @@ pub(crate) fn create(conn: &rusqlite::Connection, session: &Session) -> Result<(
 /// Returns [`IngotError::Db`] if the query fails.
 pub(crate) fn get(conn: &rusqlite::Connection, id: &str) -> Result<Option<Session>, IngotError> {
     let result = conn.query_row(
-        "SELECT id, created_at, updated_at, status, task_id, mode \
+        "SELECT id, created_at, updated_at, status, task_id, mode, cowork_mode \
          FROM sessions WHERE id = ?1",
         rusqlite::params![id],
         |row| {
@@ -60,6 +63,7 @@ pub(crate) fn get(conn: &rusqlite::Connection, id: &str) -> Result<Option<Sessio
                     Box::new(e),
                 )
             })?;
+            let cowork_raw: i64 = row.get(6).unwrap_or(0);
             Ok(Session {
                 id,
                 created_at: row.get(1)?,
@@ -67,6 +71,7 @@ pub(crate) fn get(conn: &rusqlite::Connection, id: &str) -> Result<Option<Sessio
                 status: row.get(3)?,
                 task_id: row.get(4)?,
                 mode: row.get(5)?,
+                cowork_mode: cowork_raw != 0,
             })
         },
     );
@@ -85,7 +90,7 @@ pub(crate) fn get(conn: &rusqlite::Connection, id: &str) -> Result<Option<Sessio
 /// Returns [`IngotError::Db`] if the query fails.
 pub(crate) fn list(conn: &rusqlite::Connection) -> Result<Vec<Session>, IngotError> {
     let mut stmt = conn.prepare(
-        "SELECT id, created_at, updated_at, status, task_id, mode \
+        "SELECT id, created_at, updated_at, status, task_id, mode, cowork_mode \
          FROM sessions ORDER BY created_at ASC",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -93,6 +98,7 @@ pub(crate) fn list(conn: &rusqlite::Connection) -> Result<Vec<Session>, IngotErr
         let id = Uuid::parse_str(&id_str).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
         })?;
+        let cowork_raw: i64 = row.get(6).unwrap_or(0);
         Ok(Session {
             id,
             created_at: row.get(1)?,
@@ -100,6 +106,7 @@ pub(crate) fn list(conn: &rusqlite::Connection) -> Result<Vec<Session>, IngotErr
             status: row.get(3)?,
             task_id: row.get(4)?,
             mode: row.get(5)?,
+            cowork_mode: cowork_raw != 0,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(IngotError::Db)
@@ -149,6 +156,7 @@ mod tests {
             status: "active".to_string(),
             task_id: None,
             mode: Some("tdd".to_string()),
+            cowork_mode: false,
         }
     }
 
@@ -212,6 +220,7 @@ mod tests {
             status: "active".to_string(),
             task_id: Some("task-xyz".to_string()),
             mode: None,
+            cowork_mode: false,
         };
         ingot.create_session(&s).unwrap();
 

@@ -58,14 +58,17 @@ impl Assayer {
         let local = || Route {
             runner: Runner::Local,
             tier: Tier::Local,
+            model: None,
         };
         let claude_deep = || Route {
             runner: Runner::Claude,
             tier: Tier::Deep,
+            model: None,
         };
         let claude_fast = || Route {
             runner: Runner::Claude,
             tier: Tier::Fast,
+            model: None,
         };
 
         Self {
@@ -94,6 +97,15 @@ impl Assayer {
         Self { rules }
     }
 
+    /// Prepends `rules` so they take priority over the existing routing table.
+    ///
+    /// After this call the supplied rules are evaluated first; the original
+    /// rules serve as fallbacks.
+    pub fn prepend_rules(&mut self, mut rules: Vec<RoutingRule>) {
+        rules.append(&mut self.rules);
+        self.rules = rules;
+    }
+
     /// Routes `role` × `complexity` to the first matching `Route`.
     ///
     /// Rules are evaluated in insertion order; the first match is returned.
@@ -107,6 +119,7 @@ impl Assayer {
                 Route {
                     runner: Runner::Local,
                     tier: Tier::Local,
+                    model: None,
                 },
                 |r| r.route.clone(),
             )
@@ -123,6 +136,7 @@ mod tests {
         Route {
             runner: Runner::Local,
             tier: Tier::Local,
+            model: None,
         }
     }
 
@@ -130,6 +144,7 @@ mod tests {
         Route {
             runner: Runner::Claude,
             tier: Tier::Deep,
+            model: None,
         }
     }
 
@@ -137,6 +152,7 @@ mod tests {
         Route {
             runner: Runner::Claude,
             tier: Tier::Fast,
+            model: None,
         }
     }
 
@@ -225,12 +241,14 @@ mod tests {
             Route {
                 runner: Runner::Codex,
                 tier: Tier::Fast,
+                model: None,
             },
         )];
         let assayer = Assayer::from_rules(rules);
         let expected = Route {
             runner: Runner::Codex,
             tier: Tier::Fast,
+            model: None,
         };
         assert_eq!(assayer.route(Role::Impl, Complexity::Simple), expected);
         assert_eq!(assayer.route(Role::Impl, Complexity::Coding), expected);
@@ -248,6 +266,7 @@ mod tests {
                 Route {
                     runner: Runner::Copilot,
                     tier: Tier::Deep,
+                    model: None,
                 },
             ),
             RoutingRule::new(
@@ -256,6 +275,7 @@ mod tests {
                 Route {
                     runner: Runner::Local,
                     tier: Tier::Local,
+                    model: None,
                 },
             ),
         ];
@@ -266,6 +286,7 @@ mod tests {
             Route {
                 runner: Runner::Copilot,
                 tier: Tier::Deep,
+                model: None,
             }
         );
         // Simple/Coding should fall through to the wildcard.

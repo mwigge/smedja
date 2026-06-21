@@ -58,6 +58,11 @@ enum Cmd {
         #[command(subcommand)]
         action: TaskCmd,
     },
+    /// Loop engine control
+    Loop {
+        #[command(subcommand)]
+        action: LoopCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -142,6 +147,31 @@ enum TaskCmd {
     Close { id: String },
 }
 
+#[derive(Subcommand)]
+enum LoopCmd {
+    /// Run a loop against an `OpenSpec` change
+    Run {
+        /// Name of the `OpenSpec` change to drive
+        #[arg(long)]
+        change: String,
+        /// Maximum number of task slices to process
+        #[arg(long, default_value = "10")]
+        max_slices: u32,
+    },
+    /// Show loop status for a change
+    Status {
+        /// Name of the `OpenSpec` change to query
+        #[arg(long)]
+        change: String,
+    },
+    /// Cancel a running loop for a change
+    Cancel {
+        /// Name of the `OpenSpec` change to cancel
+        #[arg(long)]
+        change: String,
+    },
+}
+
 fn default_socket_path() -> PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(base).join("smdjad.sock")
@@ -220,9 +250,62 @@ async fn main() -> Result<()> {
             let usd = resp["total_usd"].as_f64().unwrap_or(0.0);
             println!("Session {session_id}: ${usd:.6}");
         }
-        Cmd::Workspace { .. } | Cmd::Audit { .. } => {
-            println!("smj: not yet implemented");
+        Cmd::Workspace { action } => match action {
+            WorkspaceCmd::Agents => cmd_workspace_agents()?,
+            WorkspaceCmd::Index => println!("smj workspace index: not yet implemented"),
+        },
+        Cmd::Audit { .. } => {
+            println!("smj audit: not yet implemented");
         }
+        Cmd::Loop { action } => match action {
+            LoopCmd::Run { change, max_slices } => {
+                println!(
+                    "smj loop run --change {change} --max-slices {max_slices}: not yet implemented"
+                );
+            }
+            LoopCmd::Status { change } => {
+                println!("smj loop status --change {change}: not yet implemented");
+            }
+            LoopCmd::Cancel { change } => {
+                println!("smj loop cancel --change {change}: not yet implemented");
+            }
+        },
+    }
+    Ok(())
+}
+
+fn cmd_workspace_agents() -> Result<()> {
+    use smedja_assayer::{Complexity, Role, Runner, Tier};
+
+    let workspace_dir = std::env::current_dir().context("cannot determine working directory")?;
+    let file_rules = smedja_assayer::load_rules(&workspace_dir).map_err(|e| anyhow::anyhow!(e))?;
+    let mut assayer = smedja_assayer::Assayer::default_rules();
+    assayer.prepend_rules(file_rules);
+
+    println!("{:<15} {:<10} {:<8} MODEL", "ROLE", "RUNNER", "TIER");
+    println!("{}", "-".repeat(55));
+
+    for (role_name, role) in &[
+        ("orchestrator", Role::Orchestrator),
+        ("impl", Role::Impl),
+        ("test", Role::Test),
+        ("review", Role::Review),
+        ("sre", Role::Sre),
+    ] {
+        let route = assayer.route(*role, Complexity::Coding);
+        let runner = match route.runner {
+            Runner::Claude => "claude",
+            Runner::Local => "local",
+            Runner::Codex => "codex",
+            Runner::Copilot => "copilot",
+        };
+        let tier = match route.tier {
+            Tier::Fast => "fast",
+            Tier::Local => "local",
+            Tier::Deep => "deep",
+        };
+        let model = route.model.as_deref().unwrap_or("-");
+        println!("{role_name:<15} {runner:<10} {tier:<8} {model}");
     }
     Ok(())
 }
