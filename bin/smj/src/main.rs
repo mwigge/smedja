@@ -68,6 +68,11 @@ enum Cmd {
         #[command(subcommand)]
         action: McpCmd,
     },
+    /// Docker sandbox management
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -221,6 +226,12 @@ enum McpCmd {
         /// Refresh a specific server only (omit for all)
         name: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum SandboxCmd {
+    /// Build the smedja-sandbox Docker image
+    Build,
 }
 
 fn default_socket_path() -> PathBuf {
@@ -377,6 +388,20 @@ async fn main() -> Result<()> {
             }
             LoopCmd::Cancel { change } => {
                 println!("smj loop cancel --change {change}: not yet implemented");
+            }
+        },
+        Cmd::Sandbox { action } => match action {
+            SandboxCmd::Build => {
+                println!("Building smedja-sandbox:latest...");
+                let status = std::process::Command::new("docker")
+                    .args(["build", "-t", "smedja-sandbox:latest", "scripts/sandbox/"])
+                    .status()
+                    .map_err(|e| anyhow::anyhow!("docker not found: {e}"))?;
+                if status.success() {
+                    println!("Image built successfully.");
+                } else {
+                    anyhow::bail!("docker build failed");
+                }
             }
         },
         Cmd::Mcp { action } => {
