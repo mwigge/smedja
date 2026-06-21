@@ -51,6 +51,7 @@ cosmic-text  = "0.12"
 # terminal (client + term emulator)
 crossterm    = "0.28"
 futures-core = "0.3"
+futures-util = "0.3"
 once_cell    = "1"
 opentelemetry          = "0.27"
 opentelemetry-otlp     = { version = "0.27", features = ["grpc-tonic", "http-proto"] }

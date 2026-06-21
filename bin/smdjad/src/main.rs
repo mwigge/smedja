@@ -2,7 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use futures_util::StreamExt;
 use serde_json::{json, Value};
+use smedja_adapter::types::{Message as AdapterMessage, Role as AdapterRole};
+use smedja_adapter::{AnthropicProvider, CallOptions, Delta, OpenAiProvider, Provider};
 use smedja_bellows::{Dispatcher, TurnEvent};
 use smedja_ingot::{Ingot, Session, Task};
 use smedja_rpc::{codes, router::Router, server::Server, RpcError};
@@ -55,7 +58,181 @@ fn missing_param(name: &str) -> RpcError {
     )
 }
 
-#[allow(clippy::too_many_lines)] // all six RPC methods live in one function per the spec
+/// Selects the LLM provider from environment variables.
+///
+/// Returns `Ok(provider)` when a key is present, or `Err(reason)` when neither
+/// `ANTHROPIC_API_KEY` nor `OPENAI_API_KEY` is set.
+fn build_provider() -> Result<Box<dyn Provider>, String> {
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        return Ok(Box::new(AnthropicProvider::new(key)));
+    }
+    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+        return Ok(Box::new(OpenAiProvider::new("https://api.openai.com", key)));
+    }
+    Err("no LLM API key configured".to_owned())
+}
+
+/// Drains `stream`, accumulating text deltas into a single string.
+///
+/// Returns `Ok((full_response, output_tokens))` on success, or `Err(reason)` if
+/// the stream yields an error item.  Each `Delta::Text` chunk is forwarded to
+/// `dispatcher` as a [`TurnEvent::AssistantDelta`].
+async fn drain_stream(
+    mut stream: smedja_adapter::DeltaStream,
+    dispatcher: &Dispatcher,
+) -> Result<(String, u32), String> {
+    let mut full_response = String::new();
+    let mut output_tokens = 0u32;
+    loop {
+        match stream.next().await {
+            None => break,
+            Some(Ok(Delta::Text(t))) => {
+                full_response.push_str(&t);
+                dispatcher.publish(TurnEvent::AssistantDelta { content: t });
+            }
+            Some(Ok(Delta::Usage {
+                output_tokens: n, ..
+            })) => {
+                output_tokens = n;
+            }
+            Some(Err(e)) => return Err(e.to_string()),
+        }
+    }
+    Ok((full_response, output_tokens))
+}
+
+/// Executes a single turn: loads the task, calls the LLM, stores the response.
+async fn run_turn(
+    ingot: Arc<Mutex<Ingot>>,
+    dispatcher: Arc<Dispatcher>,
+    session_id: String,
+    turn_id: String,
+) {
+    // 1. Load the task to retrieve user content.
+    let task = {
+        let ig = ingot.lock().await;
+        match ig.get_task(&turn_id) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                warn!(turn_id = %turn_id, "task not found; dropping turn");
+                dispatcher.publish(TurnEvent::Failed {
+                    session_id,
+                    turn_id,
+                    reason: "task not found".to_owned(),
+                });
+                return;
+            }
+            Err(e) => {
+                warn!(turn_id = %turn_id, error = %e, "failed to load task");
+                dispatcher.publish(TurnEvent::Failed {
+                    session_id,
+                    turn_id,
+                    reason: e.to_string(),
+                });
+                return;
+            }
+        }
+    };
+
+    // 2. Select provider from environment.
+    let provider = match build_provider() {
+        Ok(p) => p,
+        Err(reason) => {
+            warn!("no LLM API key set; turn cannot execute");
+            let _ = ingot.lock().await.update_task_status(&turn_id, "failed");
+            dispatcher.publish(TurnEvent::Failed {
+                session_id,
+                turn_id,
+                reason,
+            });
+            return;
+        }
+    };
+
+    let model = if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        "claude-haiku-4-5-20251001"
+    } else {
+        "gpt-4o-mini"
+    };
+    let opts = CallOptions {
+        model: model.to_owned(),
+        max_tokens: Some(2048),
+        temperature: Some(0.7),
+        system: Some("You are smedja, an AI coding assistant.".to_owned()),
+    };
+    let messages = vec![AdapterMessage {
+        role: AdapterRole::User,
+        content: task.title.clone(),
+    }];
+
+    // 3. Mark in_progress.
+    {
+        let mut ig = ingot.lock().await;
+        if let Err(e) = ig.update_task_status(&turn_id, "in_progress") {
+            warn!(turn_id = %turn_id, error = %e, "failed to mark task in_progress");
+        }
+    }
+
+    // 4. Stream deltas.
+    let stream = provider.stream_chat(&messages, &opts);
+    let (full_response, output_tokens) = match drain_stream(stream, &dispatcher).await {
+        Ok(pair) => pair,
+        Err(reason) => {
+            warn!(turn_id = %turn_id, error = %reason, "stream error during turn");
+            let _ = ingot.lock().await.update_task_status(&turn_id, "failed");
+            dispatcher.publish(TurnEvent::Failed {
+                session_id,
+                turn_id,
+                reason,
+            });
+            return;
+        }
+    };
+
+    // 5. Persist response and mark complete.
+    if let Err(e) = ingot
+        .lock()
+        .await
+        .set_task_response(&turn_id, &full_response)
+    {
+        warn!(turn_id = %turn_id, error = %e, "failed to store task response");
+        dispatcher.publish(TurnEvent::Failed {
+            session_id,
+            turn_id,
+            reason: e.to_string(),
+        });
+        return;
+    }
+
+    dispatcher.publish(TurnEvent::Completed {
+        session_id,
+        turn_id,
+        output_tokens,
+    });
+}
+
+/// Subscribes to [`TurnEvent::Started`] and spawns a [`run_turn`] task for each.
+fn spawn_worker(ingot: Arc<Mutex<Ingot>>, dispatcher: Arc<Dispatcher>) {
+    tokio::spawn(async move {
+        let mut rx = dispatcher.subscribe();
+        loop {
+            match rx.recv().await {
+                Ok(TurnEvent::Started {
+                    session_id,
+                    turn_id,
+                }) => {
+                    let ig = Arc::clone(&ingot);
+                    let dp = Arc::clone(&dispatcher);
+                    tokio::spawn(run_turn(ig, dp, session_id, turn_id));
+                }
+                Ok(_) => {}      // ignore other events
+                Err(_) => break, // channel closed or lagged
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_lines)] // all RPC methods live in one function per the spec
 fn build_router(ingot: &Arc<Mutex<Ingot>>, dispatcher: Arc<Dispatcher>) -> Router {
     let mut router = Router::new();
 
@@ -175,6 +352,36 @@ fn build_router(ingot: &Arc<Mutex<Ingot>>, dispatcher: Arc<Dispatcher>) -> Route
         });
     }
 
+    // ── task.get ────────────────────────────────────────────────────────────
+    {
+        let ig = Arc::clone(ingot);
+        router.register("task.get", move |params: Value| {
+            let ig = Arc::clone(&ig);
+            async move {
+                let id = params
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| missing_param("id"))?;
+
+                let task = ig
+                    .lock()
+                    .await
+                    .get_task(id)
+                    .map_err(|e| ingot_err(&e))?
+                    .ok_or_else(|| {
+                        RpcError::new(codes::INTERNAL_ERROR, format!("task not found: {id}"))
+                    })?;
+
+                Ok(json!({
+                    "id": task.id,
+                    "status": task.status,
+                    "title": task.title,
+                    "response": task.response,
+                }))
+            }
+        });
+    }
+
     // ── turn.submit ─────────────────────────────────────────────────────────
     {
         let ig = Arc::clone(ingot);
@@ -201,6 +408,7 @@ fn build_router(ingot: &Arc<Mutex<Ingot>>, dispatcher: Arc<Dispatcher>) -> Route
                     status: "planned".to_owned(),
                     created_at: now_epoch(),
                     session_id: Some(session_id.clone()),
+                    response: None,
                 };
 
                 ig.lock()
@@ -238,6 +446,9 @@ async fn main() -> anyhow::Result<()> {
     let dispatcher = Arc::new(Dispatcher::new(32));
 
     let router = build_router(&ingot, Arc::clone(&dispatcher));
+
+    spawn_worker(Arc::clone(&ingot), Arc::clone(&dispatcher));
+
     let server = Server::new(router);
 
     tokio::select! {
