@@ -168,3 +168,12 @@ async fn user_sees_connect_banner_on_startup() {
     // Assert: banner lines present in main_panel after init
     todo!("implement after smedja-tui-ux connect banner is added")
 }
+
+#[tokio::test]
+#[ignore = "requires app event loop integration; enable after task 23 wiring"]
+async fn streaming_deltas_render() {
+    // When MockDaemon returns response_partial on first task.get poll
+    // and full response on second, push_delta should accumulate content.
+    // This test is stubbed until the full event loop harness is wired.
+    todo!("wire after smedja-tui-ux streaming is fully integrated")
+}
