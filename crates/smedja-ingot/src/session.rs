@@ -22,6 +22,9 @@ pub struct Session {
     pub cowork_mode: bool,
     /// Optional filesystem path to the workspace root for this session.
     pub workspace_root: Option<String>,
+    /// Optional model name override; when set, `run_turn` uses this instead of
+    /// the `SMEDJA_MODEL` environment variable.
+    pub model_override: Option<String>,
 }
 
 /// Inserts a new [`Session`] row.
@@ -32,8 +35,8 @@ pub struct Session {
 pub(crate) fn create(conn: &rusqlite::Connection, session: &Session) -> Result<(), IngotError> {
     conn.execute(
         "INSERT INTO sessions \
-         (id, created_at, updated_at, status, task_id, mode, cowork_mode, workspace_root) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (id, created_at, updated_at, status, task_id, mode, cowork_mode, workspace_root, model_override) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             session.id.to_string(),
             session.created_at,
@@ -43,6 +46,7 @@ pub(crate) fn create(conn: &rusqlite::Connection, session: &Session) -> Result<(
             session.mode,
             i64::from(session.cowork_mode),
             session.workspace_root,
+            session.model_override,
         ],
     )?;
     Ok(())
@@ -55,7 +59,7 @@ pub(crate) fn create(conn: &rusqlite::Connection, session: &Session) -> Result<(
 /// Returns [`IngotError::Db`] if the query fails.
 pub(crate) fn get(conn: &rusqlite::Connection, id: &str) -> Result<Option<Session>, IngotError> {
     let result = conn.query_row(
-        "SELECT id, created_at, updated_at, status, task_id, mode, cowork_mode, workspace_root \
+        "SELECT id, created_at, updated_at, status, task_id, mode, cowork_mode, workspace_root, model_override \
          FROM sessions WHERE id = ?1",
         rusqlite::params![id],
         |row| {
@@ -77,6 +81,7 @@ pub(crate) fn get(conn: &rusqlite::Connection, id: &str) -> Result<Option<Sessio
                 mode: row.get(5)?,
                 cowork_mode: cowork_raw != 0,
                 workspace_root: row.get(7)?,
+                model_override: row.get(8)?,
             })
         },
     );
@@ -95,7 +100,7 @@ pub(crate) fn get(conn: &rusqlite::Connection, id: &str) -> Result<Option<Sessio
 /// Returns [`IngotError::Db`] if the query fails.
 pub(crate) fn list(conn: &rusqlite::Connection) -> Result<Vec<Session>, IngotError> {
     let mut stmt = conn.prepare(
-        "SELECT id, created_at, updated_at, status, task_id, mode, cowork_mode, workspace_root \
+        "SELECT id, created_at, updated_at, status, task_id, mode, cowork_mode, workspace_root, model_override \
          FROM sessions ORDER BY created_at ASC",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -113,6 +118,7 @@ pub(crate) fn list(conn: &rusqlite::Connection) -> Result<Vec<Session>, IngotErr
             mode: row.get(5)?,
             cowork_mode: cowork_raw != 0,
             workspace_root: row.get(7)?,
+            model_override: row.get(8)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(IngotError::Db)
@@ -217,6 +223,23 @@ pub(crate) fn update_mode(
     Ok(())
 }
 
+/// Sets the `model_override` field and updates `updated_at` for the session identified by `id`.
+///
+/// # Errors
+///
+/// Returns [`rusqlite::Error`] if the UPDATE fails.
+pub(crate) fn update_model_override(
+    conn: &rusqlite::Connection,
+    id: &str,
+    model: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE sessions SET model_override = ?1, updated_at = ?2 WHERE id = ?3",
+        rusqlite::params![model, crate::now_epoch(), id],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +255,7 @@ mod tests {
             mode: Some("tdd".to_string()),
             cowork_mode: false,
             workspace_root: None,
+            model_override: None,
         }
     }
 
@@ -297,6 +321,7 @@ mod tests {
             mode: None,
             cowork_mode: false,
             workspace_root: None,
+            model_override: None,
         };
         ingot.create_session(&s).unwrap();
 
@@ -334,6 +359,30 @@ mod tests {
 
         let fetched = ingot.get_session(&s.id.to_string()).unwrap().unwrap();
         assert_eq!(fetched.mode.as_deref(), Some("ponytail"));
+    }
+
+    #[test]
+    fn model_override_round_trip() {
+        let mut ingot = Ingot::open_in_memory().unwrap();
+        let s = sample_session();
+        ingot.create_session(&s).unwrap();
+
+        ingot
+            .update_session_model_override(&s.id.to_string(), "gemma4-27b")
+            .unwrap();
+
+        let fetched = ingot.get_session(&s.id.to_string()).unwrap().unwrap();
+        assert_eq!(fetched.model_override.as_deref(), Some("gemma4-27b"));
+    }
+
+    #[test]
+    fn model_override_defaults_to_none() {
+        let mut ingot = Ingot::open_in_memory().unwrap();
+        let s = sample_session();
+        ingot.create_session(&s).unwrap();
+
+        let fetched = ingot.get_session(&s.id.to_string()).unwrap().unwrap();
+        assert!(fetched.model_override.is_none());
     }
 
     #[test]

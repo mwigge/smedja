@@ -250,6 +250,13 @@ async fn run_turn(
         ig.get_session(&session_id).ok().flatten()
     };
 
+    // Apply session model override: if the session has a stored model name, use it
+    // instead of the environment-derived default chosen above.
+    let model = session
+        .as_ref()
+        .and_then(|s| s.model_override.clone())
+        .unwrap_or(model);
+
     // Derive workspace root: prefer session.workspace_root, then SMEDJA_WORKSPACE env, then ".".
     let workspace_root = {
         let p = session
@@ -727,6 +734,7 @@ fn build_router(
                 mode: title.clone(),
                 cowork_mode,
                 workspace_root: None,
+                model_override: None,
             };
 
             ig.lock()
@@ -858,6 +866,7 @@ fn build_router(
                     mode: parent.mode.clone(),
                     cowork_mode: parent.cowork_mode,
                     workspace_root: parent.workspace_root.clone(),
+                    model_override: parent.model_override.clone(),
                 })
                 .map_err(|e| ingot_err(&e))?;
 
@@ -991,6 +1000,9 @@ fn build_router(
     });
 
     // ── turn.submit ─────────────────────────────────────────────────────────
+    // Clone dispatcher before turn.submit moves it, so loop.run can hold its
+    // own Arc without requiring a second clone point after the move.
+    let dispatcher_loop_run = Arc::clone(&dispatcher);
     let ig = Arc::clone(ingot);
     router.register("turn.submit", move |params: Value| {
         let ig = Arc::clone(&ig);
@@ -1578,6 +1590,183 @@ fn build_router(
                 .map(|r| serde_json::to_value(&r).unwrap_or(Value::Null))
                 .collect();
             Ok(json!({ "loops": loops_json }))
+        }
+    });
+
+    // ── audit.list ───────────────────────────────────────────────────────────
+    let ig = Arc::clone(ingot);
+    router.register("audit.list", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        async move {
+            let session_id = params["session_id"]
+                .as_str()
+                .ok_or_else(|| missing_param("session_id"))?
+                .to_owned();
+            let events = ig
+                .lock()
+                .await
+                .list_audit_events(&session_id)
+                .map_err(|e| ingot_err(&e))?;
+            let events_json: Vec<Value> = events
+                .into_iter()
+                .map(|ev| serde_json::to_value(&ev).unwrap_or(Value::Null))
+                .collect();
+            Ok(json!({ "events": events_json }))
+        }
+    });
+
+    // ── loop.run ────────────────────────────────────────────────────────────
+    let ig = Arc::clone(ingot);
+    let gates_run = Arc::clone(&gates);
+    router.register("loop.run", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        let dispatcher = Arc::clone(&dispatcher_loop_run);
+        let _gates = Arc::clone(&gates_run);
+        async move {
+            let loop_id = params["loop_id"]
+                .as_str()
+                .ok_or_else(|| missing_param("loop_id"))?
+                .to_owned();
+
+            // Verify the loop record exists before spawning background work.
+            let rec = ig
+                .lock()
+                .await
+                .get_loop(&loop_id)
+                .map_err(|e| ingot_err(&e))?
+                .ok_or_else(|| {
+                    RpcError::new(codes::INVALID_PARAMS, format!("loop not found: {loop_id}"))
+                })?;
+
+            // Spawn background task — caller gets an immediate response.
+            let bg_ig = Arc::clone(&ig);
+            let bg_dispatcher = Arc::clone(&dispatcher);
+            let bg_loop_id = loop_id.clone();
+            let change_name = rec.change_name.clone();
+            tokio::spawn(async move {
+                let workspace = std::env::var("SMEDJA_WORKSPACE").unwrap_or_else(|_| ".".into());
+                let tasks_path = std::path::PathBuf::from(&workspace)
+                    .join("openspec")
+                    .join("changes")
+                    .join(&change_name)
+                    .join("tasks.md");
+
+                let Ok(tasks_content) = tokio::fs::read_to_string(&tasks_path).await else {
+                    let _ =
+                        bg_ig
+                            .lock()
+                            .await
+                            .update_loop_status(&bg_loop_id, "failed", now_epoch());
+                    return;
+                };
+
+                // Parse pending tasks: lines starting with `- [ ] `.
+                let pending: Vec<String> = tasks_content
+                    .lines()
+                    .filter(|l| l.starts_with("- [ ] "))
+                    .map(|l| l.trim_start_matches("- [ ] ").to_owned())
+                    .collect();
+
+                if pending.is_empty() {
+                    let _ =
+                        bg_ig
+                            .lock()
+                            .await
+                            .update_loop_status(&bg_loop_id, "complete", now_epoch());
+                    return;
+                }
+
+                // Mark loop as slicing.
+                {
+                    let mut guard = bg_ig.lock().await;
+                    let _ = guard.update_loop_status(&bg_loop_id, "slicing", now_epoch());
+                }
+
+                // Create one session for this loop run.
+                let session_id = Uuid::new_v4();
+                let now = now_epoch();
+                let session = Session {
+                    id: session_id,
+                    created_at: now,
+                    updated_at: now,
+                    status: "active".to_owned(),
+                    task_id: None,
+                    mode: Some("loop".to_owned()),
+                    cowork_mode: false,
+                    workspace_root: Some(workspace),
+                    model_override: None,
+                };
+                {
+                    let mut guard = bg_ig.lock().await;
+                    let _ = guard.create_session(&session);
+                }
+
+                // Submit one turn per pending task, poll until done, then mark checkbox.
+                let mut updated_content = tasks_content.clone();
+                for (slice_idx, task_text) in pending.into_iter().enumerate() {
+                    let task_id = Uuid::new_v4();
+                    let task = Task {
+                        id: task_id,
+                        title: task_text.clone(),
+                        description: String::new(),
+                        status: "planned".to_owned(),
+                        created_at: now_epoch(),
+                        session_id: Some(session_id.to_string()),
+                        response: None,
+                    };
+
+                    {
+                        let mut guard = bg_ig.lock().await;
+                        let _ = guard.create_task(&task);
+                    }
+
+                    bg_dispatcher.publish(TurnEvent::Started {
+                        session_id: session_id.to_string(),
+                        turn_id: task_id.to_string(),
+                    });
+
+                    // Poll until the task leaves "planned" / "in_progress".
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        let status = bg_ig
+                            .lock()
+                            .await
+                            .get_task(&task_id.to_string())
+                            .ok()
+                            .flatten()
+                            .map_or_else(|| "unknown".to_owned(), |t| t.status);
+                        if status != "planned" && status != "in_progress" {
+                            break;
+                        }
+                    }
+
+                    // Replace `- [ ] <task>` with `- [x] <task>` in content string.
+                    let unchecked = format!("- [ ] {task_text}");
+                    let checked = format!("- [x] {task_text}");
+                    updated_content = updated_content.replacen(&unchecked, &checked, 1);
+
+                    // Advance current_slice counter.
+                    #[allow(clippy::cast_possible_wrap)]
+                    // slice index never exceeds i64::MAX in practice
+                    let slice_count = (slice_idx + 1) as i64;
+                    let _ =
+                        bg_ig
+                            .lock()
+                            .await
+                            .update_loop_slice(&bg_loop_id, slice_count, now_epoch());
+                }
+
+                // Write updated tasks.md back to disk.
+                let _ = tokio::fs::write(&tasks_path, &updated_content).await;
+
+                // Mark loop complete.
+                let _ = bg_ig
+                    .lock()
+                    .await
+                    .update_loop_status(&bg_loop_id, "complete", now_epoch());
+            });
+
+            Ok(json!({ "loop_id": loop_id, "status": "slicing" }))
         }
     });
 

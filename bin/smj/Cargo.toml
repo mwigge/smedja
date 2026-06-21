@@ -16,6 +16,7 @@ clap            = { workspace = true }
 serde           = { workspace = true }
 serde_json      = { workspace = true }
 smedja-assayer  = { path = "../../crates/smedja-assayer" }
+smedja-graph    = { path = "../../crates/smedja-graph" }
 smedja-ingot    = { path = "../../crates/smedja-ingot" }
 smedja-plugins  = { path = "../../crates/smedja-plugins" }
 smedja-rpc      = { path = "../../crates/smedja-rpc" }

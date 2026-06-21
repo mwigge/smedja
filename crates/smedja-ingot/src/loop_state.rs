@@ -56,6 +56,19 @@ pub(crate) fn update_status(
     Ok(())
 }
 
+pub(crate) fn update_slice(
+    conn: &rusqlite::Connection,
+    id: &str,
+    current_slice: i64,
+    updated_at: f64,
+) -> Result<(), crate::error::IngotError> {
+    conn.execute(
+        "UPDATE loops SET current_slice = ?1, updated_at = ?2 WHERE id = ?3",
+        rusqlite::params![current_slice, updated_at, id],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn get(
     conn: &rusqlite::Connection,
     id: &str,
