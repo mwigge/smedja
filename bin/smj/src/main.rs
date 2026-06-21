@@ -63,6 +63,11 @@ enum Cmd {
         #[command(subcommand)]
         action: LoopCmd,
     },
+    /// MCP server registry
+    Mcp {
+        #[command(subcommand)]
+        action: McpCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -94,6 +99,10 @@ enum SessionCmd {
     },
     /// List stored blocks for a session
     Blocks {
+        id: String,
+    },
+    /// List checkpoints for a session
+    Checkpoint {
         id: String,
     },
 }
@@ -149,6 +158,24 @@ enum TaskCmd {
     },
     /// Mark a task complete
     Close { id: String },
+    /// Start a parallel task across multiple agent roles
+    Parallel {
+        /// Goal description passed to all roles
+        goal: String,
+        /// Comma-separated roles: impl,test,review
+        #[arg(long, value_delimiter = ',')]
+        roles: Vec<String>,
+    },
+    /// Show per-role status of a parallel task
+    Status {
+        /// Parallel task ID returned by `smj task parallel`
+        id: String,
+    },
+    /// Cancel a running parallel task
+    Cancel {
+        /// Parallel task ID to cancel
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -176,11 +203,32 @@ enum LoopCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum McpCmd {
+    /// Register an MCP server
+    Add {
+        name: String,
+        url: String,
+        #[arg(long)]
+        stdio: Option<String>,
+    },
+    /// List registered MCP servers
+    List,
+    /// Remove an MCP server by name
+    Remove { name: String },
+    /// Re-fetch tool lists from registered servers
+    Refresh {
+        /// Refresh a specific server only (omit for all)
+        name: Option<String>,
+    },
+}
+
 fn default_socket_path() -> PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(base).join("smdjad.sock")
 }
 
+#[allow(clippy::too_many_lines)] // all CLI command arms live in one function per the spec
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -221,6 +269,38 @@ async fn main() -> Result<()> {
                     cmd_task_create(&mut client, &title, description.as_deref()).await?;
                 }
                 TaskCmd::Close { id } => cmd_task_close(&mut client, &id).await?,
+                TaskCmd::Parallel { goal, roles } => {
+                    let resp = client
+                        .call("task.parallel", json!({ "goal": goal, "roles": roles }))
+                        .await
+                        .context("task.parallel failed")?;
+                    if let Some(tasks) = resp["tasks"].as_array() {
+                        for t in tasks {
+                            println!(
+                                "{} ({})",
+                                t["task_id"].as_str().unwrap_or("?"),
+                                t["role"].as_str().unwrap_or("?"),
+                            );
+                        }
+                    }
+                }
+                TaskCmd::Status { id } => {
+                    let resp = client
+                        .call("task.get", json!({ "id": id }))
+                        .await
+                        .context("task.get failed")?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&resp).unwrap_or_default()
+                    );
+                }
+                TaskCmd::Cancel { id } => {
+                    client
+                        .call("task.cancel", json!({ "task_id": id }))
+                        .await
+                        .context("task.cancel failed")?;
+                    println!("cancelled: {id}");
+                }
             }
         }
         Cmd::Session { action } => {
@@ -242,6 +322,22 @@ async fn main() -> Result<()> {
                     }
                     SessionCmd::Fork { id, .. } => {
                         println!("fork: not yet implemented for session {id}");
+                    }
+                    SessionCmd::Checkpoint { id } => {
+                        let resp = client
+                            .call("session.checkpoint.list", json!({ "session_id": id }))
+                            .await
+                            .context("session.checkpoint.list failed")?;
+                        if let Some(arr) = resp.as_array() {
+                            for cp in arr {
+                                println!(
+                                    "turn={} ts={} messages={}",
+                                    cp["turn_n"].as_i64().unwrap_or(-1),
+                                    cp["created_at"].as_f64().unwrap_or(0.0),
+                                    cp["message_count"].as_u64().unwrap_or(0),
+                                );
+                            }
+                        }
                     }
                     SessionCmd::Blocks { .. } => unreachable!(),
                 }
@@ -283,6 +379,58 @@ async fn main() -> Result<()> {
                 println!("smj loop cancel --change {change}: not yet implemented");
             }
         },
+        Cmd::Mcp { action } => {
+            let mut client = Client::connect(&sock)
+                .await
+                .with_context(|| format!("smdjad not running ({})", sock.display()))?;
+            match action {
+                McpCmd::Add { name, url, stdio } => {
+                    let resp = client
+                        .call(
+                            "mcp.register",
+                            json!({
+                                "name": name,
+                                "url": url,
+                                "transport": if stdio.is_some() { "stdio" } else { "http" },
+                                "tools_json": null,
+                            }),
+                        )
+                        .await
+                        .context("mcp.register failed")?;
+                    println!("registered: {}", resp["name"].as_str().unwrap_or(&name));
+                }
+                McpCmd::List => {
+                    let servers = client
+                        .call("mcp.list", json!({}))
+                        .await
+                        .context("mcp.list failed")?;
+                    if let Some(arr) = servers.as_array() {
+                        for s in arr {
+                            println!(
+                                "{} {} ({})",
+                                s["name"].as_str().unwrap_or("?"),
+                                s["url"].as_str().unwrap_or(""),
+                                s["transport"].as_str().unwrap_or("?"),
+                            );
+                        }
+                    }
+                }
+                McpCmd::Remove { name } => {
+                    client
+                        .call("mcp.remove", json!({ "name": name }))
+                        .await
+                        .context("mcp.remove failed")?;
+                    println!("removed: {name}");
+                }
+                McpCmd::Refresh { name } => {
+                    // ponytail: refresh not yet wired in smdjad; print a stub message
+                    match name {
+                        Some(n) => println!("smj mcp refresh {n}: not yet implemented"),
+                        None => println!("smj mcp refresh: not yet implemented"),
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }

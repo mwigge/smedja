@@ -11,6 +11,7 @@ use smedja_adapter::{
     AnthropicProvider, BergetProvider, CallOptions, CopilotProvider, Delta, LocalProvider,
     MinimaxProvider, OpenAiProvider, PoolsideProvider, Provider,
 };
+use smedja_assayer::WorktreePool;
 use smedja_bellows::{Dispatcher, TurnEvent};
 use smedja_ingot::{Checkpoint, CostEntry, Ingot, McpServer, Session, Task};
 use smedja_rpc::{codes, router::Router, server::Server, RpcError};
@@ -18,6 +19,8 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+use crate::cowork::CoworkGate;
 
 fn socket_path() -> PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
@@ -318,6 +321,9 @@ fn spawn_worker(ingot: Arc<Mutex<Ingot>>, dispatcher: Arc<Dispatcher>) {
 #[allow(clippy::too_many_lines)] // all RPC methods live in one function per the spec
 fn build_router(ingot: &Arc<Mutex<Ingot>>, dispatcher: Arc<Dispatcher>) -> Router {
     let mut router = Router::new();
+
+    let gate = Arc::new(CoworkGate::new());
+    let pool = Arc::new(Mutex::new(WorktreePool::new()));
 
     // ── ping ────────────────────────────────────────────────────────────────
     router.register("ping", |_| async { Ok(json!("pong")) });
@@ -758,6 +764,138 @@ fn build_router(ingot: &Arc<Mutex<Ingot>>, dispatcher: Arc<Dispatcher>) -> Route
                     })
                     .collect();
                 Ok(Value::Array(out))
+            }
+        });
+    }
+
+    // ── cowork.approve ───────────────────────────────────────────────────────
+    {
+        let gate = Arc::clone(&gate);
+        router.register("cowork.approve", move |params: Value| {
+            let gate = Arc::clone(&gate);
+            async move {
+                let id = params["id"]
+                    .as_str()
+                    .ok_or_else(|| missing_param("id"))?
+                    .to_owned();
+                let found = gate.approve(&id).await;
+                Ok(json!({ "id": id, "resolved": found }))
+            }
+        });
+    }
+
+    // ── cowork.deny ──────────────────────────────────────────────────────────
+    {
+        let gate = Arc::clone(&gate);
+        router.register("cowork.deny", move |params: Value| {
+            let gate = Arc::clone(&gate);
+            async move {
+                let id = params["id"]
+                    .as_str()
+                    .ok_or_else(|| missing_param("id"))?
+                    .to_owned();
+                let reason = params["reason"].as_str().unwrap_or("denied").to_owned();
+                let found = gate.deny(&id, reason).await;
+                Ok(json!({ "id": id, "resolved": found }))
+            }
+        });
+    }
+
+    // ── cowork.modify ────────────────────────────────────────────────────────
+    {
+        let gate = Arc::clone(&gate);
+        router.register("cowork.modify", move |params: Value| {
+            let gate = Arc::clone(&gate);
+            async move {
+                let id = params["id"]
+                    .as_str()
+                    .ok_or_else(|| missing_param("id"))?
+                    .to_owned();
+                let instruction = params["instruction"].as_str().unwrap_or("").to_owned();
+                let found = gate.modify(&id, instruction).await;
+                Ok(json!({ "id": id, "resolved": found }))
+            }
+        });
+    }
+
+    // ── cowork.pending ───────────────────────────────────────────────────────
+    {
+        let gate = Arc::clone(&gate);
+        router.register("cowork.pending", move |_: Value| {
+            let gate = Arc::clone(&gate);
+            async move {
+                let pending = gate.list_pending().await;
+                let out: Vec<Value> = pending
+                    .into_iter()
+                    .map(|(id, tool)| json!({ "id": id, "tool": tool }))
+                    .collect();
+                Ok(Value::Array(out))
+            }
+        });
+    }
+
+    // ── task.parallel ────────────────────────────────────────────────────────
+    {
+        let pool = Arc::clone(&pool);
+        router.register("task.parallel", move |params: Value| {
+            let pool = Arc::clone(&pool);
+            async move {
+                let goal = params["goal"]
+                    .as_str()
+                    .ok_or_else(|| missing_param("goal"))?
+                    .to_owned();
+                let roles: Vec<String> = params["roles"]
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect();
+                // ponytail: workspace root defaults to current dir; real path comes from session config later
+                let workspace_root = std::path::PathBuf::from(".");
+                let mut p = pool.lock().await;
+                let ids: Vec<Value> = roles
+                    .iter()
+                    .map(|role| {
+                        let id = p.register(role, &goal, &workspace_root);
+                        json!({ "role": role, "task_id": id })
+                    })
+                    .collect();
+                Ok(json!({ "goal": goal, "tasks": ids }))
+            }
+        });
+    }
+
+    // ── task.cancel ──────────────────────────────────────────────────────────
+    {
+        let pool = Arc::clone(&pool);
+        router.register("task.cancel", move |params: Value| {
+            let pool = Arc::clone(&pool);
+            async move {
+                let task_id = params["task_id"]
+                    .as_str()
+                    .ok_or_else(|| missing_param("task_id"))?
+                    .to_owned();
+                let found = pool.lock().await.cancel(&task_id);
+                Ok(json!({ "task_id": task_id, "cancelled": found }))
+            }
+        });
+    }
+
+    // ── mcp.remove ───────────────────────────────────────────────────────────
+    {
+        let ig = Arc::clone(ingot);
+        router.register("mcp.remove", move |params: Value| {
+            let ig = Arc::clone(&ig);
+            async move {
+                let name = params["name"]
+                    .as_str()
+                    .ok_or_else(|| missing_param("name"))?
+                    .to_owned();
+                ig.lock()
+                    .await
+                    .remove_mcp_server(&name)
+                    .map_err(|e| ingot_err(&e))?;
+                Ok(json!({ "name": name, "removed": true }))
             }
         });
     }
