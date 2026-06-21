@@ -13,10 +13,13 @@
 //! - `Ctrl+Shift+V` → split vertical
 //! - `Ctrl+Shift+Z` → toggle zoom on active pane
 //! - `Ctrl+Shift+L` → open launch menu overlay
+//! - `Ctrl+N` → open a new window
 
 mod split;
+mod ssh_mux;
 mod tab;
 
+use std::collections::HashMap;
 use std::sync::{atomic::Ordering, Arc};
 
 use anyhow::Context;
@@ -58,6 +61,14 @@ enum Command {
         #[command(subcommand)]
         action: BlockAction,
     },
+    /// Connect to a remote host via SSH and forward the smdjad socket.
+    Ssh {
+        /// Remote host, optionally prefixed with `user@`.
+        host: String,
+        /// SSH port.
+        #[arg(long, default_value = "22")]
+        port: u16,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -67,6 +78,16 @@ enum BlockAction {
         /// The UUID of the block to export.
         block_id: uuid::Uuid,
     },
+}
+
+// ── User events (sent from async tasks to the event loop) ────────────────────
+
+/// Events that async background tasks can post into the winit event loop.
+#[allow(dead_code)] // variants are constructed via EventLoopProxy from background tasks
+#[derive(Debug)]
+enum UserEvent {
+    /// Request that a new terminal window be opened.
+    OpenWindow,
 }
 
 // ── Launch menu entry ─────────────────────────────────────────────────────────
@@ -90,7 +111,8 @@ pub struct LaunchEntry {
 /// through the cloned `Arc<Mutex<CellGrid>>` and `Arc<AtomicBool>` that are
 /// fields of `PtySession` — not through the session itself.
 struct App {
-    window: Option<Arc<Window>>,
+    /// All open windows, keyed by `WindowId`.
+    windows: HashMap<WindowId, Arc<Window>>,
     renderer: Option<st_render::Renderer>,
     pty: Option<st_pty::PtySession>,
     config: st_config::Config,
@@ -118,7 +140,7 @@ impl App {
         let split_layouts = vec![SplitLayout::new(root_pane_id)];
 
         Self {
-            window: None,
+            windows: HashMap::new(),
             renderer: None,
             pty: None,
             config,
@@ -129,6 +151,24 @@ impl App {
             launch_entries,
             launch_menu_open: false,
             launch_menu_selection: 0,
+        }
+    }
+
+    // ── Window helpers ────────────────────────────────────────────────────────
+
+    /// Opens a new terminal window and registers it in `self.windows`.
+    fn open_window(&mut self, event_loop: &ActiveEventLoop) {
+        let attrs = Window::default_attributes()
+            .with_title("smedja-term")
+            .with_inner_size(winit::dpi::LogicalSize::new(1200u32, 800u32));
+
+        match event_loop.create_window(attrs) {
+            Ok(w) => {
+                let w = Arc::new(w);
+                info!("opened window {:?}", w.id());
+                self.windows.insert(w.id(), w);
+            }
+            Err(e) => error!("failed to create window: {}", e),
         }
     }
 
@@ -211,13 +251,13 @@ impl App {
             return;
         }
         // Collect the command string before splitting (borrow ends after the block).
-        let cmd = self
+        let launch_cmd = self
             .launch_entries
             .get(self.launch_menu_selection)
             .map(|e| e.command.clone());
 
-        if let Some(cmd) = cmd {
-            info!("launch: {}", cmd);
+        if let Some(launch_cmd) = launch_cmd {
+            info!("launch: {}", launch_cmd);
             // Split the active pane horizontally to host the new command.
             self.split_active_pane(SplitDirection::Horizontal);
         }
@@ -235,10 +275,10 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        // Create the window on first resume.
-        if self.window.is_some() {
+        // Create the first window on initial resume.
+        if !self.windows.is_empty() {
             return;
         }
 
@@ -264,7 +304,7 @@ impl ApplicationHandler for App {
                     // ponytail: on headless CI wgpu will fail — log and continue
                     // without a renderer so the process at least starts cleanly.
                     error!("renderer init failed (headless CI?): {}", e);
-                    self.window = Some(window);
+                    self.windows.insert(window.id(), window);
                     return;
                 }
             };
@@ -282,30 +322,39 @@ impl ApplicationHandler for App {
             Ok(p) => p,
             Err(e) => {
                 error!("PTY spawn failed: {}", e);
-                self.window = Some(window);
+                self.windows.insert(window.id(), window);
                 self.renderer = Some(renderer);
                 return;
             }
         };
         pty.start_reader_detached();
 
-        self.window = Some(window);
+        self.windows.insert(window.id(), window);
         self.renderer = Some(renderer);
         self.pty = Some(pty);
         info!("smedja-term initialised");
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::OpenWindow => self.open_window(event_loop),
+        }
     }
 
     #[allow(clippy::too_many_lines)]
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
         match event {
             WindowEvent::CloseRequested => {
-                info!("close requested");
-                event_loop.exit();
+                info!("close requested for {:?}", window_id);
+                self.windows.remove(&window_id);
+                if self.windows.is_empty() {
+                    event_loop.exit();
+                }
             }
 
             WindowEvent::ModifiersChanged(mods) => {
@@ -387,8 +436,8 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // Request another frame.
-                if let Some(w) = &self.window {
+                // Request another frame for each open window.
+                for w in self.windows.values() {
                     w.request_redraw();
                 }
             }
@@ -435,6 +484,16 @@ impl ApplicationHandler for App {
                             return;
                         }
                         _ => {}
+                    }
+                }
+
+                // Ctrl+N → open new window
+                if self.ctrl() && !self.shift() {
+                    if let Key::Character(s) = &logical_key {
+                        if s.to_lowercase() == "n" {
+                            self.open_window(event_loop);
+                            return;
+                        }
                     }
                 }
 
@@ -520,7 +579,7 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         // Request a redraw every frame — the renderer will throttle via vsync.
-        if let Some(w) = &self.window {
+        for w in self.windows.values() {
             w.request_redraw();
         }
     }
@@ -567,6 +626,27 @@ fn cmd_block_export(block_id: uuid::Uuid) -> anyhow::Result<()> {
         .with_context(|| format!("block {block_id} not found"))?;
     print!("{output}");
     Ok(())
+}
+
+/// Connects via SSH and forwards the remote smdjad socket locally.
+fn cmd_ssh(host: String, port: u16) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
+    rt.block_on(async move {
+        let (username, hostname) = ssh_mux::parse_host_user(&host);
+        let client = ssh_mux::connect(&hostname, port, &username).await?;
+        client.ensure_mux_daemon().await?;
+
+        let local_sock = std::env::temp_dir().join("smedja-term-mux.sock");
+        client.open_local_tunnel(&local_sock)?;
+        info!(
+            socket = %local_sock.display(),
+            "tunnel active — Ctrl-C to exit"
+        );
+        tokio::signal::ctrl_c()
+            .await
+            .context("waiting for Ctrl-C")?;
+        Ok(())
+    })
 }
 
 fn default_db_path() -> std::path::PathBuf {
@@ -649,6 +729,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Block {
             action: BlockAction::Export { block_id },
         }) => return cmd_block_export(block_id),
+        Some(Command::Ssh { host, port }) => return cmd_ssh(host, port),
         None => {}
     }
 
@@ -663,9 +744,36 @@ fn main() -> anyhow::Result<()> {
 
     info!("starting smedja-term with shell={}", shell);
 
-    let event_loop = EventLoop::new().context("creating event loop")?;
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .context("creating event loop")?;
     let mut app = App::new(config, shell, launch_entries);
     event_loop.run_app(&mut app).context("running event loop")?;
 
     Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::App;
+
+    fn make_app() -> App {
+        let config = st_config::Config::default();
+        App::new(config, "/bin/sh".to_owned(), Vec::new())
+    }
+
+    #[test]
+    fn app_initialises_with_empty_windows() {
+        let app = make_app();
+        assert!(app.windows.is_empty());
+    }
+
+    #[test]
+    fn app_initialises_with_one_tab() {
+        let app = make_app();
+        assert_eq!(app.tab_bar.tabs.len(), 1);
+        assert_eq!(app.split_layouts.len(), 1);
+    }
 }
