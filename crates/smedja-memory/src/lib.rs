@@ -11,5 +11,7 @@ pub mod types;
 
 pub use budget::{estimate_messages_tokens, estimate_tokens};
 pub use error::MemoryError;
-pub use memory::{load_workspace_skills, WorkingMemory, HOT_WINDOW, WARM_WINDOW};
+pub use memory::{
+    detect_agents_md, load_workspace_skills, StrataConfig, WorkingMemory, HOT_WINDOW, WARM_WINDOW,
+};
 pub use types::{Message, Role, Stratum};

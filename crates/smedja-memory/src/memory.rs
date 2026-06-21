@@ -12,6 +12,9 @@ pub const WARM_WINDOW: usize = 30;
 /// Holds the ordered list of conversation messages, a stable-prefix boundary
 /// that guards the provider KV-cache, and a soft token budget used by prompt
 /// assembly.
+///
+/// The hot/warm/cold strata boundaries default to [`StrataConfig::deep`]
+/// (hot=5, warm=30) and can be reconfigured via [`WorkingMemory::set_strata`].
 #[derive(Debug)]
 pub struct WorkingMemory {
     messages: Vec<Message>,
@@ -20,16 +23,22 @@ pub struct WorkingMemory {
     stable_prefix: usize,
     /// Soft limit used by `build_prompt` to budget context.
     max_tokens: usize,
+    /// Per-tier context window boundaries for hot/warm/cold strata.
+    strata: StrataConfig,
 }
 
 impl WorkingMemory {
     /// Creates a new, empty [`WorkingMemory`] with the given soft token limit.
+    ///
+    /// The strata configuration defaults to [`StrataConfig::deep`] (hot=5, warm=30).
+    /// Use [`WorkingMemory::set_strata`] to switch to a different preset.
     #[must_use]
     pub fn new(max_tokens: usize) -> Self {
         Self {
             messages: Vec::new(),
             stable_prefix: 0,
             max_tokens,
+            strata: StrataConfig::deep(),
         }
     }
 
@@ -102,11 +111,25 @@ impl WorkingMemory {
         self.max_tokens
     }
 
+    /// Returns the active strata configuration.
+    #[must_use]
+    pub fn strata(&self) -> StrataConfig {
+        self.strata
+    }
+
+    /// Replaces the strata configuration.
+    ///
+    /// Takes effect immediately; subsequent calls to [`WorkingMemory::stratum_for`]
+    /// use the new boundaries.
+    pub fn set_strata(&mut self, config: StrataConfig) {
+        self.strata = config;
+    }
+
     /// Determines the [`Stratum`] for the message at absolute index `i`.
     ///
-    /// - [`Stratum::Hot`]  — last `HOT_WINDOW` turns from the end.
-    /// - [`Stratum::Warm`] — within `WARM_WINDOW` turns from the end (after hot).
-    /// - [`Stratum::Cold`] — beyond `WARM_WINDOW` turns from the end.
+    /// - [`Stratum::Hot`]  — last `strata.hot_depth` turns from the end.
+    /// - [`Stratum::Warm`] — within `strata.warm_depth` turns from the end (after hot).
+    /// - [`Stratum::Cold`] — beyond `strata.warm_depth` turns from the end.
     ///
     /// [`Stratum::Archive`] is not applicable to in-memory messages; it applies
     /// only to completed sessions stored in smedja-ingot.
@@ -117,9 +140,9 @@ impl WorkingMemory {
             return Stratum::Cold;
         }
         let from_end = len - 1 - index;
-        if from_end < HOT_WINDOW {
+        if from_end < self.strata.hot_depth {
             Stratum::Hot
-        } else if from_end < WARM_WINDOW {
+        } else if from_end < self.strata.warm_depth {
             Stratum::Warm
         } else {
             Stratum::Cold
@@ -168,6 +191,76 @@ pub fn load_workspace_skills(dir: &std::path::Path) -> Result<Vec<String>, std::
     // Sort for deterministic ordering (alphabetical by filename).
     skills.sort();
     Ok(skills)
+}
+
+/// Reads `AGENTS.md` from the workspace root, if present.
+///
+/// Returns `None` when the file is absent — not an error.
+///
+/// # Errors
+///
+/// Returns an error only if the file exists but cannot be read.
+pub fn detect_agents_md(
+    workspace_root: &std::path::Path,
+) -> Result<Option<String>, std::io::Error> {
+    let path = workspace_root.join("AGENTS.md");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&path)?;
+    Ok(Some(content))
+}
+
+/// Per-tier context window boundaries for hot/warm/cold strata.
+///
+/// Callers set this once at session start via [`WorkingMemory::set_strata`];
+/// subsequent calls to [`WorkingMemory::stratum_for`] use the configured values.
+#[derive(Debug, Clone, Copy)]
+pub struct StrataConfig {
+    /// Number of trailing turns that are always included verbatim.
+    pub hot_depth: usize,
+    /// Total trailing turns included when the budget allows (warm ≥ hot).
+    pub warm_depth: usize,
+}
+
+impl StrataConfig {
+    /// Fast tier: hot=5, warm=10.
+    #[must_use]
+    pub fn fast() -> Self {
+        Self {
+            hot_depth: 5,
+            warm_depth: 10,
+        }
+    }
+
+    /// Deep tier: hot=5, warm=30 (the default).
+    #[must_use]
+    pub fn deep() -> Self {
+        Self {
+            hot_depth: 5,
+            warm_depth: 30,
+        }
+    }
+
+    /// Local tier: hot=5, warm=15.
+    #[must_use]
+    pub fn local() -> Self {
+        Self {
+            hot_depth: 5,
+            warm_depth: 15,
+        }
+    }
+
+    /// Selects a preset from a tier string (`"fast"`, `"deep"`, `"local"`).
+    /// Defaults to [`Self::deep`] for unknown strings.
+    #[must_use]
+    pub fn from_tier(tier: &str) -> Self {
+        match tier {
+            "fast" => Self::fast(),
+            "local" => Self::local(),
+            _ => Self::deep(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -305,5 +398,42 @@ mod tests {
         std::fs::write(skills_dir.join("readme.txt"), "txt content").unwrap();
         let result = super::load_workspace_skills(tmp.path()).unwrap();
         assert_eq!(result, vec!["md content"]);
+    }
+
+    #[test]
+    fn strata_config_fast_has_shallow_warm() {
+        let cfg = StrataConfig::fast();
+        assert_eq!(cfg.hot_depth, 5);
+        assert_eq!(cfg.warm_depth, 10);
+    }
+
+    #[test]
+    fn strata_config_from_tier_local() {
+        let cfg = StrataConfig::from_tier("local");
+        assert_eq!(cfg.warm_depth, 15);
+    }
+
+    #[test]
+    fn set_strata_changes_stratum_for_result() {
+        // With fast config (warm_depth=10), turn at index 6 from end=4 is Hot.
+        // With deep config (warm_depth=30), same turn is Warm when there are >10 messages.
+        let mut m = WorkingMemory::new(4096);
+        for _ in 0..20 {
+            m.push(Message::user("x"));
+        }
+        m.set_strata(StrataConfig::fast());
+        // index 9 = from_end=10 → beyond hot(5), beyond warm(10) → Cold under fast
+        assert_eq!(m.stratum_for(9), Stratum::Cold);
+
+        m.set_strata(StrataConfig::deep());
+        // same index → from_end=10 → within warm(30) → Warm under deep
+        assert_eq!(m.stratum_for(9), Stratum::Warm);
+    }
+
+    #[test]
+    fn detect_agents_md_absent_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = detect_agents_md(tmp.path()).unwrap();
+        assert!(result.is_none());
     }
 }

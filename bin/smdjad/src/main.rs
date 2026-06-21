@@ -1,4 +1,7 @@
+pub mod acp;
 pub mod cowork;
+pub mod mcp_http;
+pub mod sandbox;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -922,6 +925,30 @@ async fn main() -> anyhow::Result<()> {
     let router = build_router(&ingot, Arc::clone(&dispatcher));
 
     spawn_worker(Arc::clone(&ingot), Arc::clone(&dispatcher));
+
+    // ACP HTTP server — activated by SMEDJA_ACP_PORT.
+    if let Ok(port_str) = std::env::var("SMEDJA_ACP_PORT") {
+        if let Ok(port) = port_str.parse::<u16>() {
+            let acp_state = acp::AcpState {
+                ingot: Arc::clone(&ingot),
+            };
+            let acp_router = acp::build_acp_router(acp_state);
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            tokio::spawn(async move {
+                info!(%addr, "ACP HTTP server listening");
+                if let Err(e) = axum::serve(
+                    tokio::net::TcpListener::bind(addr)
+                        .await
+                        .expect("ACP bind failed"),
+                    acp_router,
+                )
+                .await
+                {
+                    tracing::error!(error = %e, "ACP server error");
+                }
+            });
+        }
+    }
 
     let server = Server::new(router);
 
