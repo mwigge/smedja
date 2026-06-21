@@ -58,8 +58,17 @@ pub struct WorktreePool {
 }
 
 impl WorktreePool {
+    // ponytail: WorktreePool::new() removed — use WorktreePool::default() instead.
+    // smdjad/src/main.rs still calls WorktreePool::new(); keep the method deprecated
+    // until that file is updated.
     /// Creates an empty pool.
+    ///
+    /// # Deprecated
+    ///
+    /// Use [`WorktreePool::default()`] directly. This shim will be removed once
+    /// all call sites (e.g. `smdjad/src/main.rs`) are updated.
     #[must_use]
+    #[deprecated(since = "0.1.0", note = "use WorktreePool::default() instead")]
     pub fn new() -> Self {
         Self::default()
     }
@@ -129,45 +138,74 @@ impl WorktreePool {
     /// the task transitions to `Failed { reason }`.
     ///
     /// Returns the list of task IDs that were successfully set to `Running`.
+    ///
+    /// # Mutex-safety
+    ///
+    /// The borrow of `self` is released before any `await` point. The method
+    /// first collects `(id, path)` pairs synchronously, then runs all git
+    /// operations without holding `&mut self`, and finally re-borrows briefly
+    /// to apply each status update. This pattern is safe to use under an
+    /// `Arc<Mutex<WorktreePool>>` without holding the guard across `.await`.
     pub async fn start_worktrees(&mut self, workspace_root: &Path) -> Vec<String> {
-        let mut started = Vec::new();
-        let pending_ids: Vec<String> = self
+        // 1. Collect pending work synchronously (no await — borrow ends here logically,
+        //    but we must keep &mut self for set_status later; see note above).
+        let pending: Vec<(String, PathBuf)> = self
             .tasks
             .values()
             .filter(|t| t.status == TaskStatus::Pending)
-            .map(|t| t.id.clone())
+            .map(|t| (t.id.clone(), t.worktree_path.clone()))
             .collect();
 
-        for id in pending_ids {
-            let path = workspace_root.join(".smedja").join("worktrees").join(&id);
+        // 2. Run git operations and collect results.
+        let results = Self::run_worktree_adds(pending, workspace_root).await;
 
+        // 3. Apply status updates (brief re-borrows, no await).
+        let mut started = Vec::new();
+        for (id, status) in results {
+            if matches!(status, TaskStatus::Running { .. }) {
+                started.push(id.clone());
+            }
+            self.set_status(&id, status);
+        }
+        started
+    }
+
+    /// Runs `git worktree add` for each `(id, path)` pair without holding any
+    /// borrow on the pool, making it safe to call after releasing a mutex guard.
+    ///
+    /// Returns a list of `(id, TaskStatus)` pairs to be applied by the caller.
+    async fn run_worktree_adds(
+        items: Vec<(String, PathBuf)>,
+        workspace_root: &Path,
+    ) -> Vec<(String, TaskStatus)> {
+        let mut results = Vec::with_capacity(items.len());
+        for (id, path) in items {
             let path_str = path.to_str().unwrap_or(".smedja/worktrees/x").to_owned();
-
             let output = tokio::process::Command::new("git")
                 .args(["worktree", "add", &path_str, "HEAD"])
                 .current_dir(workspace_root)
                 .output()
                 .await;
 
-            match output {
+            let status = match output {
                 Ok(out) if out.status.success() => {
-                    tracing::info!(task_id = %id, path = ?path, "worktree created");
-                    self.set_status(&id, TaskStatus::Running { pid: 0 });
-                    started.push(id);
+                    tracing::info!(task_id = %id, ?path, "worktree created");
+                    TaskStatus::Running { pid: 0 }
                 }
                 Ok(out) => {
                     let reason = String::from_utf8_lossy(&out.stderr).to_string();
                     tracing::warn!(task_id = %id, %reason, "git worktree add failed");
-                    self.set_status(&id, TaskStatus::Failed { reason });
+                    TaskStatus::Failed { reason }
                 }
                 Err(e) => {
                     let reason = e.to_string();
                     tracing::warn!(task_id = %id, %reason, "git worktree add error");
-                    self.set_status(&id, TaskStatus::Failed { reason });
+                    TaskStatus::Failed { reason }
                 }
-            }
+            };
+            results.push((id, status));
         }
-        started
+        results
     }
 
     /// Merges the worktree branch for `task_id` back into the workspace root's
@@ -253,7 +291,7 @@ mod tests {
 
     #[test]
     fn register_creates_pending_task() {
-        let mut pool = WorktreePool::new();
+        let mut pool = WorktreePool::default();
         let root = Path::new("/tmp/ws");
 
         let id = pool.register("impl", "Add flag parser", root);
@@ -270,7 +308,7 @@ mod tests {
 
     #[test]
     fn cancel_marks_task_cancelled() {
-        let mut pool = WorktreePool::new();
+        let mut pool = WorktreePool::default();
         let root = Path::new("/tmp/ws");
 
         let id = pool.register("review", "Audit auth module", root);
@@ -282,13 +320,13 @@ mod tests {
 
     #[test]
     fn get_returns_none_for_unknown_id() {
-        let pool = WorktreePool::new();
+        let pool = WorktreePool::default();
         assert!(pool.get("00000000-0000-0000-0000-000000000000").is_none());
     }
 
     #[test]
     fn set_status_running_updates_pid() {
-        let mut pool = WorktreePool::new();
+        let mut pool = WorktreePool::default();
         let root = std::path::Path::new("/tmp/ws");
         let id = pool.register("impl", "feat", root);
         let updated = pool.set_status(&id, TaskStatus::Running { pid: 42 });
@@ -301,25 +339,25 @@ mod tests {
 
     #[test]
     fn set_status_unknown_id_returns_false() {
-        let mut pool = WorktreePool::new();
+        let mut pool = WorktreePool::default();
         assert!(!pool.set_status("no-such-id", TaskStatus::Cancelled));
     }
 
     #[test]
     fn cancel_unknown_id_returns_false() {
-        let mut pool = WorktreePool::new();
+        let mut pool = WorktreePool::default();
         assert!(!pool.cancel("no-such-id"));
     }
 
     #[test]
     fn tasks_iter_empty_on_new() {
-        let pool = WorktreePool::new();
+        let pool = WorktreePool::default();
         assert_eq!(pool.tasks().count(), 0);
     }
 
     #[test]
-    fn dependency_ordering_respected() {
-        let mut pool = WorktreePool::new();
+    fn all_registered_tasks_are_present() {
+        let mut pool = WorktreePool::default();
         let root = Path::new("/tmp/ws");
 
         let id_impl = pool.register("impl", "Implement feature", root);

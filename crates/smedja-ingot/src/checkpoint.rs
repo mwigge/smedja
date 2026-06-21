@@ -43,6 +43,20 @@ pub(crate) fn save(conn: &rusqlite::Connection, cp: &Checkpoint) -> Result<(), I
     Ok(())
 }
 
+/// Converts a `rusqlite::Result<Checkpoint>` into the canonical
+/// `Result<Option<Checkpoint>, IngotError>` used by query methods.
+///
+/// - `Ok(cp)` → `Ok(Some(cp))`
+/// - `Err(QueryReturnedNoRows)` → `Ok(None)`
+/// - any other error → `Err(IngotError::Db(e))`
+fn optional_result(r: rusqlite::Result<Checkpoint>) -> Result<Option<Checkpoint>, IngotError> {
+    match r {
+        Ok(cp) => Ok(Some(cp)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(IngotError::Db(e)),
+    }
+}
+
 /// Retrieves a [`Checkpoint`] by `session_id` and `turn_n`, returning `None` if not found.
 ///
 /// # Errors
@@ -53,18 +67,12 @@ pub(crate) fn load(
     session_id: &str,
     turn_n: u32,
 ) -> Result<Option<Checkpoint>, IngotError> {
-    let result = conn.query_row(
+    optional_result(conn.query_row(
         "SELECT id, session_id, turn_n, messages_json, created_at \
          FROM checkpoints WHERE session_id = ?1 AND turn_n = ?2",
         rusqlite::params![session_id, i64::from(turn_n)],
         row_to_checkpoint,
-    );
-
-    match result {
-        Ok(cp) => Ok(Some(cp)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(IngotError::Db(e)),
-    }
+    ))
 }
 
 /// Returns the checkpoint with the highest `turn_n` for `session_id`, or `None` if
@@ -77,19 +85,59 @@ pub(crate) fn latest(
     conn: &rusqlite::Connection,
     session_id: &str,
 ) -> Result<Option<Checkpoint>, IngotError> {
-    let result = conn.query_row(
+    optional_result(conn.query_row(
         "SELECT id, session_id, turn_n, messages_json, created_at \
          FROM checkpoints WHERE session_id = ?1 \
          ORDER BY turn_n DESC LIMIT 1",
         rusqlite::params![session_id],
         row_to_checkpoint,
+    ))
+}
+
+/// Atomically rolls back a session to `turn_n`.
+///
+/// Within a single `SQLite` transaction:
+/// 1. Loads the checkpoint at `turn_n`.
+/// 2. Deletes all checkpoints with `turn_n > N`.
+///
+/// Returns `Ok(Some(checkpoint))` on success, `Ok(None)` when the target turn
+/// does not exist (no changes are made in that case), or `Err` if the database
+/// raises an error.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if any SQL operation fails.
+pub fn rollback_session(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    turn_n: u32,
+) -> Result<Option<Checkpoint>, IngotError> {
+    let tx = conn.unchecked_transaction()?;
+
+    let cp_result: rusqlite::Result<Checkpoint> = tx.query_row(
+        "SELECT id, session_id, turn_n, messages_json, created_at \
+         FROM checkpoints WHERE session_id = ?1 AND turn_n = ?2",
+        rusqlite::params![session_id, i64::from(turn_n)],
+        row_to_checkpoint,
     );
 
-    match result {
-        Ok(cp) => Ok(Some(cp)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(IngotError::Db(e)),
-    }
+    let checkpoint = match cp_result {
+        Ok(c) => c,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            // Nothing to roll back — commit the no-op transaction cleanly.
+            tx.commit()?;
+            return Ok(None);
+        }
+        Err(e) => return Err(IngotError::Db(e)),
+    };
+
+    tx.execute(
+        "DELETE FROM checkpoints WHERE session_id = ?1 AND turn_n > ?2",
+        rusqlite::params![session_id, i64::from(turn_n)],
+    )?;
+
+    tx.commit()?;
+    Ok(Some(checkpoint))
 }
 
 /// Returns all checkpoints for `session_id` ordered by `turn_n` ascending.
@@ -278,5 +326,109 @@ mod tests {
         assert_eq!(cps.len(), 3);
         // Confirm the roll-back point is the first in the ordered list.
         assert_eq!(cps[0].turn_n, 1);
+    }
+
+    /// Builds an in-memory connection with the checkpoints table for direct
+    /// `rollback_session` tests (which call the `pub(crate)` fn without going
+    /// through `Ingot`).
+    fn in_memory_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE IF NOT EXISTS checkpoints (
+                 id            TEXT PRIMARY KEY,
+                 session_id    TEXT NOT NULL,
+                 turn_n        INTEGER NOT NULL,
+                 messages_json TEXT NOT NULL,
+                 created_at    REAL NOT NULL,
+                 UNIQUE(session_id, turn_n)
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn rollback_deletes_later_checkpoints() {
+        let conn = in_memory_conn();
+
+        // Insert turns 1, 2, 3 directly.
+        for turn in 1i64..=3 {
+            let cp = make_checkpoint("sess", turn);
+            conn.execute(
+                "INSERT INTO checkpoints (id, session_id, turn_n, messages_json, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    cp.id.to_string(),
+                    cp.session_id,
+                    cp.turn_n,
+                    cp.messages_json,
+                    cp.created_at,
+                ],
+            )
+            .unwrap();
+        }
+
+        // Roll back to turn 1: turns 2 and 3 must be deleted.
+        let result = rollback_session(&conn, "sess", 1).unwrap();
+        assert!(result.is_some(), "must return the turn-1 checkpoint");
+        assert_eq!(result.unwrap().turn_n, 1);
+
+        // Only turn 1 remains.
+        let remaining: Vec<i64> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT turn_n FROM checkpoints WHERE session_id = 'sess' ORDER BY turn_n ASC",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            remaining,
+            vec![1i64],
+            "only turn 1 must remain after rollback"
+        );
+    }
+
+    #[test]
+    fn rollback_unknown_turn_returns_none() {
+        let conn = in_memory_conn();
+
+        // Insert turn 1 but request rollback to non-existent turn 99.
+        let cp = make_checkpoint("sess2", 1);
+        conn.execute(
+            "INSERT INTO checkpoints (id, session_id, turn_n, messages_json, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                cp.id.to_string(),
+                cp.session_id,
+                cp.turn_n,
+                cp.messages_json,
+                cp.created_at,
+            ],
+        )
+        .unwrap();
+
+        let result = rollback_session(&conn, "sess2", 99).unwrap();
+        assert!(
+            result.is_none(),
+            "unknown turn must return None without modifying data"
+        );
+
+        // Turn 1 must still be intact.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM checkpoints WHERE session_id = 'sess2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "existing checkpoints must be unchanged when target turn not found"
+        );
     }
 }

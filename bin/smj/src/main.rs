@@ -287,6 +287,24 @@ fn default_socket_path() -> PathBuf {
     PathBuf::from(base).join("smdjad.sock")
 }
 
+/// Resolves the XDG config base directory.
+///
+/// Priority order:
+/// 1. `$XDG_CONFIG_HOME` — if set and non-empty
+/// 2. `$HOME/.config` — if `$HOME` is set
+/// 3. `.config` — relative fallback (should not occur in practice)
+fn xdg_config_dir() -> PathBuf {
+    std::env::var("XDG_CONFIG_HOME").map_or_else(
+        |_| {
+            std::env::var("HOME").map_or_else(
+                |_| PathBuf::from(".config"),
+                |h| PathBuf::from(h).join(".config"),
+            )
+        },
+        PathBuf::from,
+    )
+}
+
 #[allow(clippy::too_many_lines)] // all CLI command arms live in one function per the spec
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -298,14 +316,8 @@ async fn main() -> Result<()> {
         Cmd::Daemon { action } => match action {
             DaemonCmd::Status => cmd_daemon_status(&sock).await?,
             DaemonCmd::Start => cmd_daemon_start()?,
-            _ => println!(
-                "smj daemon {}: not yet implemented",
-                match action {
-                    DaemonCmd::Stop => "stop",
-                    DaemonCmd::Restart => "restart",
-                    _ => unreachable!(),
-                }
-            ),
+            DaemonCmd::Stop => println!("smj daemon stop: not yet implemented"),
+            DaemonCmd::Restart => println!("smj daemon restart: not yet implemented"),
         },
         Cmd::Skill { action } => {
             let registry = SkillRegistry::new(SkillRegistry::default_path());
@@ -529,16 +541,7 @@ async fn main() -> Result<()> {
             PricesCmd::Update { file } => {
                 if let Some(src) = file {
                     // ponytail: copy file to daemon config dir; daemon reloads on next request
-                    let config_base = std::env::var("XDG_CONFIG_HOME").map_or_else(
-                        |_| {
-                            std::env::var("HOME").map_or_else(
-                                |_| std::path::PathBuf::from(".config"),
-                                |h| std::path::PathBuf::from(h).join(".config"),
-                            )
-                        },
-                        std::path::PathBuf::from,
-                    );
-                    let dest = config_base.join("smedja").join("prices.toml");
+                    let dest = xdg_config_dir().join("smedja").join("prices.toml");
                     std::fs::copy(&src, &dest)?;
                     println!("prices.toml updated \u{2192} {}", dest.display());
                 } else {
