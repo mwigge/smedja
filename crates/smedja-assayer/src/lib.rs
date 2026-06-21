@@ -26,4 +26,4 @@ pub use assayer::{Assayer, RoutingRule};
 pub use bash_arity::{classify_bash, BashArity};
 pub use config::load_rules;
 pub use parallel::{Task, TaskStatus, WorktreePool};
-pub use types::{Complexity, Role, Route, Runner, Tier};
+pub use types::{Complexity, LoopRole, Role, Route, Runner, Tier, MAX_ROLE_DEPTH};

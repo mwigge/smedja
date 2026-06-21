@@ -1,5 +1,7 @@
 //! Anthropic Messages API streaming adapter.
 
+use std::collections::HashMap;
+
 use reqwest::Client;
 use serde_json::json;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt as _};
@@ -8,6 +10,28 @@ use crate::{
     sse::parse_anthropic_event, AdapterError, CallOptions, Delta, DeltaStream, Message, Provider,
     Role,
 };
+
+/// Injects a W3C `traceparent` header into `headers` using the current `OTel` context.
+///
+/// If no propagator has been installed (e.g. in tests without `OTel` setup), the
+/// function is a no-op.  If the current span context is invalid (background
+/// context), the propagator will not emit a `traceparent` value, so no header is
+/// added.
+fn inject_traceparent(headers: &mut reqwest::header::HeaderMap) {
+    let cx = opentelemetry::Context::current();
+    let mut map: HashMap<String, String> = HashMap::new();
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&cx, &mut map);
+    });
+    for (k, v) in &map {
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+            reqwest::header::HeaderValue::from_str(v),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+}
 
 /// Anthropic streaming chat-completion provider.
 ///
@@ -154,11 +178,24 @@ impl Provider for AnthropicProvider {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Delta, AdapterError>>(64);
 
         tokio::spawn(async move {
+            let mut headers = reqwest::header::HeaderMap::new();
+            // Static header names/values: infallible for these known-good literals.
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(&api_key) {
+                headers.insert("x-api-key", val);
+            }
+            headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                reqwest::header::HeaderValue::from_static("application/json"),
+            );
+            headers.insert(
+                "anthropic-version",
+                reqwest::header::HeaderValue::from_static("2023-06-01"),
+            );
+            inject_traceparent(&mut headers);
+
             let resp = match client
                 .post(BASE_URL)
-                .header("x-api-key", &api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
+                .headers(headers)
                 .json(&body)
                 .send()
                 .await
@@ -191,6 +228,17 @@ impl Provider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inject_traceparent_does_not_panic_with_no_active_span() {
+        // Without an active span the W3C propagator emits nothing; verify no crash.
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+        let mut headers = reqwest::header::HeaderMap::new();
+        inject_traceparent(&mut headers);
+        // No assertion on header presence — background context produces no traceparent.
+        // The test passes as long as no panic occurs.
+    }
 
     fn base_opts() -> CallOptions {
         CallOptions {

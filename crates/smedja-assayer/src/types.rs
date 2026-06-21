@@ -1,3 +1,18 @@
+/// Maximum recursion depth for resumable role sessions.
+///
+/// smdjad refuses to resume a session that already has this many compaction
+/// checkpoints (`turn_n = -1`) to prevent infinite spawning.
+pub const MAX_ROLE_DEPTH: u8 = 4;
+
+/// A role entry for `task.parallel`, optionally resuming a prior session.
+#[derive(Debug, Clone)]
+pub struct LoopRole {
+    /// The role name (e.g. `"impl"`, `"test"`).
+    pub name: String,
+    /// If set, the parallel worker resumes from this session's checkpoint history.
+    pub resume_session_id: Option<String>,
+}
+
 /// The agent role that determines routing behaviour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {

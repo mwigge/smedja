@@ -12,6 +12,32 @@ pub use dispatcher::Dispatcher;
 pub use event::TurnEvent;
 pub use handle::TurnHandle;
 
+/// Drains all immediately-available events from `rx` without blocking.
+///
+/// Uses [`tokio::sync::broadcast::Receiver::try_recv`] in a tight loop until
+/// the channel is empty or closed.  Returns every [`TurnEvent`] collected.
+/// When the channel is already empty this returns an empty [`Vec`] immediately.
+///
+/// Use this after an `rx.recv().await` has already returned the first event
+/// to batch any additional queued events in the same processing round.
+pub fn drain_ready(rx: &mut tokio::sync::broadcast::Receiver<TurnEvent>) -> Vec<TurnEvent> {
+    let mut batch = Vec::new();
+    loop {
+        match rx.try_recv() {
+            Ok(event) => batch.push(event),
+            Err(
+                tokio::sync::broadcast::error::TryRecvError::Empty
+                | tokio::sync::broadcast::error::TryRecvError::Closed,
+            ) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                tracing::warn!(dropped = n, "drain_ready: receiver lagged; events dropped");
+                break;
+            }
+        }
+    }
+    batch
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -170,5 +196,34 @@ mod tests {
                 content: "hello".to_owned(),
             }
         );
+    }
+
+    // ── drain_ready tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn drain_ready_on_empty_returns_empty_vec() {
+        let dispatcher = Dispatcher::new(16);
+        let mut rx = dispatcher.subscribe();
+        let batch = super::drain_ready(&mut rx);
+        assert!(batch.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_ready_collects_queued_events() {
+        let dispatcher = Dispatcher::new(16);
+        let mut rx = dispatcher.subscribe();
+
+        dispatcher.publish(TurnEvent::AssistantDelta {
+            content: "a".to_owned(),
+        });
+        dispatcher.publish(TurnEvent::AssistantDelta {
+            content: "b".to_owned(),
+        });
+        dispatcher.publish(TurnEvent::AssistantDelta {
+            content: "c".to_owned(),
+        });
+
+        let batch = super::drain_ready(&mut rx);
+        assert_eq!(batch.len(), 3);
     }
 }

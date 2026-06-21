@@ -9,21 +9,25 @@ pub mod audit;
 pub mod checkpoint;
 pub mod cost;
 pub mod error;
+pub mod guard;
 pub mod loop_state;
 pub mod mcp;
 pub mod openspec_store;
 pub mod session;
 pub mod task;
+pub mod token_snapshot;
 
 pub use audit::AuditEvent;
 pub use checkpoint::Checkpoint;
 pub use cost::CostEntry;
 pub use error::IngotError;
+pub use guard::{classify as classify_command, is_safe as command_is_safe, CommandRisk};
 pub use loop_state::LoopRecord;
 pub use mcp::McpServer;
 pub use openspec_store::OpenSpecStore;
 pub use session::Session;
 pub use task::Task;
+pub use token_snapshot::TokenSnapshot;
 
 /// The current schema version applied by [`Ingot::migrate`].
 const SCHEMA_VERSION: i64 = 1;
@@ -69,6 +73,7 @@ impl Ingot {
 
     /// Applies all `CREATE TABLE IF NOT EXISTS` statements, making schema bootstrap
     /// fully idempotent.
+    #[allow(clippy::too_many_lines)] // DDL — length is inherent, not complexity
     fn migrate(&self) -> Result<(), IngotError> {
         self.conn.execute_batch(
             "
@@ -154,6 +159,18 @@ impl Ingot {
                 attempt       INTEGER NOT NULL DEFAULT 1,
                 created_at    REAL NOT NULL,
                 updated_at    REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS turn_token_snapshots (
+                id               TEXT PRIMARY KEY,
+                session_id       TEXT NOT NULL,
+                turn_n           INTEGER NOT NULL,
+                input_tok        INTEGER NOT NULL DEFAULT 0,
+                output_tok       INTEGER NOT NULL DEFAULT 0,
+                cumulative_input INTEGER NOT NULL DEFAULT 0,
+                cumulative_output INTEGER NOT NULL DEFAULT 0,
+                created_at       REAL NOT NULL,
+                UNIQUE(session_id, turn_n)
             );
             ",
         )?;
@@ -692,6 +709,32 @@ impl Ingot {
             }
         }
         Ok(imported)
+    }
+
+    // ── token_snapshots ───────────────────────────────────────────────────────
+
+    /// Saves a [`TokenSnapshot`], replacing any existing snapshot for the same
+    /// `(session_id, turn_n)` pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the upsert fails.
+    #[must_use = "check the Result to confirm the snapshot was saved"]
+    pub fn save_token_snapshot(&mut self, snap: &TokenSnapshot) -> Result<(), IngotError> {
+        token_snapshot::save(&self.conn, snap)
+    }
+
+    /// Returns all [`TokenSnapshot`]s for `session_id`, ordered by `turn_n` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned snapshots"]
+    pub fn session_token_snapshots(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<TokenSnapshot>, IngotError> {
+        token_snapshot::list_by_session(&self.conn, session_id)
     }
 
     // ── loops ─────────────────────────────────────────────────────────────────

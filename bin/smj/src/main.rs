@@ -53,10 +53,8 @@ enum Cmd {
     },
     /// Audit log queries
     Audit {
-        #[arg(long)]
-        session: Option<String>,
-        #[arg(long)]
-        since: Option<String>,
+        #[command(subcommand)]
+        action: AuditCmd,
     },
     /// Cost ledger
     Cost {
@@ -115,6 +113,22 @@ enum DaemonCmd {
 }
 
 #[derive(Subcommand)]
+enum AuditCmd {
+    /// Query audit log events
+    Query {
+        /// Filter by session ID
+        #[arg(long)]
+        session: Option<String>,
+        /// Filter by relative duration (e.g. "1h", "24h")
+        #[arg(long)]
+        since: Option<String>,
+        /// Filter by action type
+        #[arg(long)]
+        action: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum SessionCmd {
     /// Start a new session
     Start {
@@ -149,6 +163,16 @@ enum SessionCmd {
     /// Export session cost lineage to JSON
     Export {
         /// Session ID to export
+        id: String,
+    },
+    /// Compact session conversation history
+    Compact {
+        /// Session ID to compact
+        id: String,
+    },
+    /// Show per-turn token usage for a session
+    Tokens {
+        /// Session ID to query
         id: String,
     },
 }
@@ -586,6 +610,37 @@ async fn main() -> Result<()> {
                             .context("session.export failed")?;
                         println!("{}", serde_json::to_string_pretty(&resp)?);
                     }
+                    SessionCmd::Compact { id } => {
+                        let resp = client
+                            .call("session.compact", json!({ "session_id": id }))
+                            .await
+                            .context("session.compact failed")?;
+                        let summary = resp["summary"].as_str().unwrap_or("(no summary)");
+                        println!("Compaction summary for {id}:\n{summary}");
+                    }
+                    SessionCmd::Tokens { id } => {
+                        let resp = client
+                            .call("session.token_usage", json!({ "session_id": id }))
+                            .await
+                            .context("session.token_usage failed")?;
+                        if let Some(arr) = resp.as_array() {
+                            println!(
+                                "{:<8} {:<12} {:<12} {:<16} {:<16}",
+                                "turn_n", "input_tok", "output_tok", "cum_input", "cum_output"
+                            );
+                            println!("{}", "-".repeat(68));
+                            for snap in arr {
+                                println!(
+                                    "{:<8} {:<12} {:<12} {:<16} {:<16}",
+                                    snap["turn_n"].as_i64().unwrap_or(-1),
+                                    snap["input_tok"].as_i64().unwrap_or(0),
+                                    snap["output_tok"].as_i64().unwrap_or(0),
+                                    snap["cumulative_input"].as_i64().unwrap_or(0),
+                                    snap["cumulative_output"].as_i64().unwrap_or(0),
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -658,20 +713,32 @@ async fn main() -> Result<()> {
                 println!("Added path '{}' to {}", path, toml_path.display());
             }
         },
-        Cmd::Audit { session, .. } => {
-            let Some(session_id) = session else {
-                eprintln!("audit requires --session <id>");
-                return Ok(());
-            };
-            let mut client = Client::connect(&sock)
-                .await
-                .with_context(|| format!("smdjad not running ({})", sock.display()))?;
-            let resp = client
-                .call("audit.list", json!({ "session_id": session_id }))
-                .await
-                .context("audit.list failed")?;
-            println!("{}", serde_json::to_string_pretty(&resp)?);
-        }
+        Cmd::Audit { action } => match action {
+            AuditCmd::Query {
+                session,
+                since,
+                action,
+            } => {
+                let mut client = Client::connect(&sock)
+                    .await
+                    .with_context(|| format!("smdjad not running ({})", sock.display()))?;
+                let mut params = serde_json::json!({});
+                if let Some(sid) = session {
+                    params["session_id"] = serde_json::Value::String(sid);
+                }
+                if let Some(s) = since {
+                    params["since"] = serde_json::Value::String(s);
+                }
+                if let Some(a) = action {
+                    params["action_type"] = serde_json::Value::String(a);
+                }
+                let resp = client
+                    .call("audit.list", params)
+                    .await
+                    .context("audit.list failed")?;
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            }
+        },
         Cmd::Loop { action } => {
             let mut client = Client::connect(&sock)
                 .await
