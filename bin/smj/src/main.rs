@@ -95,6 +95,11 @@ enum Cmd {
         #[command(subcommand)]
         action: PricesCmd,
     },
+    /// smedja-term utilities
+    Term {
+        #[command(subcommand)]
+        action: TermCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -308,6 +313,28 @@ enum McpCmd {
 enum SandboxCmd {
     /// Build the smedja-sandbox Docker image
     Build,
+}
+
+#[derive(Subcommand)]
+enum TermCmd {
+    /// Migrate a `WezTerm` Lua config to smedja-term TOML format
+    Migrate {
+        /// Path to the `WezTerm` Lua config file (e.g. ~/.wezterm.lua)
+        #[arg(long)]
+        from: std::path::PathBuf,
+        /// Output path for the generated TOML (stdout if omitted)
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Download and install smedja-term to ~/.local/bin
+    Install {
+        /// URL to download the binary from (auto-detected by OS if omitted)
+        #[arg(long)]
+        bin_path: Option<String>,
+        /// Installation prefix directory (default: ~/.local/bin)
+        #[arg(long)]
+        prefix: Option<PathBuf>,
+    },
 }
 
 /// Returns the default path to the smedja ingot database.
@@ -797,6 +824,53 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Cmd::Term { action } => match action {
+            TermCmd::Migrate { from, out } => {
+                let lua_source = std::fs::read_to_string(&from)
+                    .with_context(|| format!("cannot read {}", from.display()))?;
+                let result = st_config::migrate::migrate_wezterm_config(&lua_source)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                match out {
+                    Some(out_path) => {
+                        std::fs::write(&out_path, &result.toml)
+                            .with_context(|| format!("cannot write {}", out_path.display()))?;
+                    }
+                    None => {
+                        print!("{}", result.toml);
+                    }
+                }
+
+                eprintln!("{}", result.summary);
+                if !result.unsupported.is_empty() {
+                    eprintln!("Unsupported fields:");
+                    for item in &result.unsupported {
+                        eprintln!("  - {item}");
+                    }
+                }
+            }
+            TermCmd::Install { bin_path, prefix } => {
+                let prefix = prefix.unwrap_or_else(|| {
+                    std::env::var("HOME").map_or_else(
+                        |_| PathBuf::from(".local/bin"),
+                        |h| PathBuf::from(h).join(".local/bin"),
+                    )
+                });
+                let url = bin_path.unwrap_or_else(|| {
+                    let os = std::env::consts::OS;
+                    if os == "macos" {
+                        "https://github.com/mwigge/smedja/releases/latest/download/smedja-term-x86_64-apple-darwin".to_owned()
+                    } else {
+                        "https://github.com/mwigge/smedja/releases/latest/download/smedja-term-x86_64-unknown-linux-musl".to_owned()
+                    }
+                });
+                let prefix_clone = prefix.clone();
+                let url_clone = url.clone();
+                tokio::task::spawn_blocking(move || cmd_term_install(&url_clone, &prefix_clone))
+                    .await
+                    .context("install task panicked")??;
+            }
+        },
     }
     Ok(())
 }
@@ -1032,6 +1106,51 @@ async fn cmd_session_rollback(client: &mut Client, session_id: &str, turn: u32) 
         turn,
         serde_json::to_string_pretty(&resp)?
     );
+    Ok(())
+}
+
+fn cmd_term_install(url: &str, prefix: &std::path::Path) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::create_dir_all(prefix)
+        .with_context(|| format!("cannot create prefix directory {}", prefix.display()))?;
+
+    let dest = prefix.join("smedja-term");
+    println!("Downloading smedja-term from {url} ...");
+
+    let bytes = reqwest::blocking::get(url)
+        .with_context(|| format!("download failed: {url}"))?
+        .bytes()
+        .with_context(|| "failed to read response bytes")?;
+
+    let mut file = std::fs::File::create(&dest)
+        .with_context(|| format!("cannot create {}", dest.display()))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("cannot write {}", dest.display()))?;
+
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("cannot chmod +x {}", dest.display()))?;
+
+    println!("Installed smedja-term to {}", dest.display());
+
+    // On Linux, write a .desktop file.
+    if std::env::consts::OS == "linux" {
+        if let Ok(home) = std::env::var("HOME") {
+            let apps_dir = PathBuf::from(&home).join(".local/share/applications");
+            let _ = std::fs::create_dir_all(&apps_dir);
+            let desktop_path = apps_dir.join("smedja-term.desktop");
+            let desktop = format!(
+                "[Desktop Entry]\nVersion=1.0\nType=Application\nName=smedja-term\nExec={}\nIcon=utilities-terminal\nTerminal=false\nCategories=System;TerminalEmulator;\n",
+                dest.display()
+            );
+            if let Ok(mut f) = std::fs::File::create(&desktop_path) {
+                let _ = f.write_all(desktop.as_bytes());
+                println!("Registered {}", desktop_path.display());
+            }
+        }
+    }
+
     Ok(())
 }
 

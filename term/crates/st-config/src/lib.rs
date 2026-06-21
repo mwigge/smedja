@@ -3,6 +3,8 @@
 //! Loads `~/.config/smedja-term/config.toml` when present; otherwise returns
 //! the built-in `forged_terminal` theme defaults.
 
+pub mod migrate;
+
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -30,6 +32,8 @@ struct RawConfig {
     colors: Option<RawColorConfig>,
     window: Option<RawWindowConfig>,
     scrollback_lines: Option<usize>,
+    key_bindings: Option<Vec<RawKeyBinding>>,
+    launch_menu: Option<Vec<RawLaunchEntry>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +60,18 @@ struct RawColorConfig {
 struct RawWindowConfig {
     background_opacity: Option<f32>,
     background_image: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawKeyBinding {
+    key: String,
+    action: KeyAction,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLaunchEntry {
+    label: String,
+    args: Vec<String>,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -128,6 +144,43 @@ impl Default for WindowConfig {
     }
 }
 
+/// A key binding mapping a key combination to an action.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KeyBinding {
+    /// Key combination string, e.g. `"ctrl+t"`, `"ctrl+shift+h"`.
+    pub key: String,
+    /// Action to perform when the key is pressed.
+    pub action: KeyAction,
+}
+
+/// Actions that can be bound to a key combination.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyAction {
+    OpenTab,
+    CloseTab,
+    NextTab,
+    PrevTab,
+    SplitHorizontal,
+    SplitVertical,
+    ZoomPane,
+    OpenLaunchMenu,
+    CopyTo(String),
+    PasteFrom(String),
+    SpawnTab,
+    ScrollUp(u32),
+    ScrollDown(u32),
+}
+
+/// A launch menu entry (a labelled shell command shortcut).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LaunchEntry {
+    /// Display label shown in the launch menu.
+    pub label: String,
+    /// Command arguments to spawn.
+    pub args: Vec<String>,
+}
+
 /// Top-level smedja-term configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
@@ -139,6 +192,10 @@ pub struct Config {
     pub window: WindowConfig,
     /// Maximum number of lines kept in the scrollback buffer.
     pub scrollback_lines: usize,
+    /// Key bindings active in this session.
+    pub key_bindings: Vec<KeyBinding>,
+    /// Launch menu entries shown in the quick-launch overlay.
+    pub launch_menu: Vec<LaunchEntry>,
 }
 
 impl Default for Config {
@@ -149,8 +206,56 @@ impl Default for Config {
             colors: forged_terminal_colors(),
             window: WindowConfig::default(),
             scrollback_lines: 10_000,
+            key_bindings: default_key_bindings(),
+            launch_menu: Vec::new(),
         }
     }
+}
+
+/// Returns the default key bindings.
+fn default_key_bindings() -> Vec<KeyBinding> {
+    vec![
+        KeyBinding {
+            key: "ctrl+t".into(),
+            action: KeyAction::OpenTab,
+        },
+        KeyBinding {
+            key: "ctrl+w".into(),
+            action: KeyAction::CloseTab,
+        },
+        KeyBinding {
+            key: "ctrl+tab".into(),
+            action: KeyAction::NextTab,
+        },
+        KeyBinding {
+            key: "ctrl+shift+tab".into(),
+            action: KeyAction::PrevTab,
+        },
+        KeyBinding {
+            key: "ctrl+shift+h".into(),
+            action: KeyAction::SplitHorizontal,
+        },
+        KeyBinding {
+            key: "ctrl+shift+v".into(),
+            action: KeyAction::SplitVertical,
+        },
+        KeyBinding {
+            key: "ctrl+shift+z".into(),
+            action: KeyAction::ZoomPane,
+        },
+        KeyBinding {
+            key: "ctrl+shift+l".into(),
+            action: KeyAction::OpenLaunchMenu,
+        },
+        KeyBinding {
+            key: "ctrl+c".into(),
+            action: KeyAction::CopyTo("clipboard".into()),
+        },
+        KeyBinding {
+            key: "ctrl+v".into(),
+            action: KeyAction::PasteFrom("clipboard".into()),
+        },
+    ]
 }
 
 impl Config {
@@ -231,6 +336,26 @@ impl Config {
 
         if let Some(v) = raw.scrollback_lines {
             cfg.scrollback_lines = v;
+        }
+
+        if let Some(bindings) = raw.key_bindings {
+            cfg.key_bindings = bindings
+                .into_iter()
+                .map(|rb| KeyBinding {
+                    key: rb.key,
+                    action: rb.action,
+                })
+                .collect();
+        }
+
+        if let Some(entries) = raw.launch_menu {
+            cfg.launch_menu = entries
+                .into_iter()
+                .map(|re| LaunchEntry {
+                    label: re.label,
+                    args: re.args,
+                })
+                .collect();
         }
 
         Ok(cfg)
@@ -404,5 +529,44 @@ mod tests {
         // its contents; either path is acceptable for this contract.
         let result = Config::load();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn default_config_has_open_tab_binding() {
+        let cfg = Config::default();
+        assert!(
+            cfg.key_bindings
+                .iter()
+                .any(|b| b.key == "ctrl+t" && b.action == KeyAction::OpenTab),
+            "expected ctrl+t → OpenTab in default bindings"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_parses_key_binding_section() {
+        let toml = r#"
+[[key_bindings]]
+key = "ctrl+shift+x"
+action = "spawn_tab"
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        // Default bindings are replaced when key_bindings is specified.
+        assert!(cfg
+            .key_bindings
+            .iter()
+            .any(|b| b.key == "ctrl+shift+x" && b.action == KeyAction::SpawnTab));
+    }
+
+    #[test]
+    fn launch_entry_roundtrips_toml() {
+        let toml = r#"
+[[launch_menu]]
+label = "htop"
+args = ["htop"]
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.launch_menu.len(), 1);
+        assert_eq!(cfg.launch_menu[0].label, "htop");
+        assert_eq!(cfg.launch_menu[0].args, vec!["htop"]);
     }
 }
