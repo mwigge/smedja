@@ -495,6 +495,25 @@ impl Ingot {
         checkpoint::list(&self.conn, session_id)
     }
 
+    /// Atomically rolls back a session to `turn_n`, pruning all later checkpoints.
+    ///
+    /// Loads the checkpoint at `turn_n` and, within the same `SQLite` transaction,
+    /// deletes every checkpoint for `session_id` with a turn number greater than
+    /// `turn_n`. Returns `Ok(Some(checkpoint))` on success, or `Ok(None)` when no
+    /// checkpoint exists at the requested turn (no rows are modified in that case).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if any SQL operation fails.
+    #[must_use = "check the Result to confirm the rollback succeeded"]
+    pub fn rollback_session(
+        &mut self,
+        session_id: &str,
+        turn_n: u32,
+    ) -> Result<Option<Checkpoint>, IngotError> {
+        checkpoint::rollback_session(&self.conn, session_id, turn_n)
+    }
+
     // ── cost_ledger ──────────────────────────────────────────────────────────
 
     /// Appends a [`CostEntry`] to the cost ledger.
