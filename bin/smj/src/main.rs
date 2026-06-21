@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
+use serde_json::json;
 use smedja_plugins::SkillRegistry;
 use smedja_rpc::client::Client;
 
@@ -51,6 +52,11 @@ enum Cmd {
     Skill {
         #[command(subcommand)]
         action: SkillCmd,
+    },
+    /// Project task management
+    Task {
+        #[command(subcommand)]
+        action: TaskCmd,
     },
 }
 
@@ -117,6 +123,25 @@ enum SkillCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum TaskCmd {
+    /// List tasks (optionally filtered by status)
+    List {
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Show details of a specific task
+    Show { id: String },
+    /// Create a new project task
+    Create {
+        title: String,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Mark a task complete
+    Close { id: String },
+}
+
 fn default_socket_path() -> PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(base).join("smdjad.sock")
@@ -151,7 +176,53 @@ async fn main() -> Result<()> {
                 SkillCmd::Sync { path } => cmd_skill_sync(&registry, &path)?,
             }
         }
-        _ => println!("smj: not yet implemented"),
+        Cmd::Task { action } => {
+            let mut client = Client::connect(&sock)
+                .await
+                .with_context(|| format!("smdjad not running ({})", sock.display()))?;
+            match action {
+                TaskCmd::List { status } => cmd_task_list(&mut client, status.as_deref()).await?,
+                TaskCmd::Show { id } => cmd_task_show(&mut client, &id).await?,
+                TaskCmd::Create { title, description } => {
+                    cmd_task_create(&mut client, &title, description.as_deref()).await?;
+                }
+                TaskCmd::Close { id } => cmd_task_close(&mut client, &id).await?,
+            }
+        }
+        Cmd::Session { action } => {
+            let mut client = Client::connect(&sock)
+                .await
+                .with_context(|| format!("smdjad not running ({})", sock.display()))?;
+            match action {
+                SessionCmd::List => cmd_session_list(&mut client).await?,
+                SessionCmd::Show { id } => cmd_session_show(&mut client, &id).await?,
+                SessionCmd::Rollback { id, turn } => {
+                    cmd_session_rollback(&mut client, &id, turn).await?;
+                }
+                SessionCmd::Fork { id, .. } => {
+                    println!("fork: not yet implemented for session {id}");
+                }
+            }
+        }
+        Cmd::Cost { session, .. } => {
+            let mut client = Client::connect(&sock)
+                .await
+                .with_context(|| format!("smdjad not running ({})", sock.display()))?;
+            let session_id = session.unwrap_or_default();
+            if session_id.is_empty() {
+                println!("smj cost: --session <session-id> required");
+                return Ok(());
+            }
+            let resp = client
+                .call("session.cost", json!({"session_id": session_id}))
+                .await
+                .context("session.cost failed")?;
+            let usd = resp["total_usd"].as_f64().unwrap_or(0.0);
+            println!("Session {session_id}: ${usd:.6}");
+        }
+        Cmd::Workspace { .. } | Cmd::Audit { .. } => {
+            println!("smj: not yet implemented");
+        }
     }
     Ok(())
 }
@@ -263,6 +334,88 @@ fn cmd_skill_sync(registry: &SkillRegistry, path: &std::path::Path) -> Result<()
         r.updated,
         r.skipped,
         r.errors.len()
+    );
+    Ok(())
+}
+
+async fn cmd_task_list(client: &mut Client, status: Option<&str>) -> Result<()> {
+    let params = match status {
+        Some(s) => serde_json::json!({"status": s}),
+        None => serde_json::Value::Null,
+    };
+    let resp = client
+        .call("task.list", params)
+        .await
+        .context("task.list failed")?;
+    println!("{}", serde_json::to_string_pretty(&resp)?);
+    Ok(())
+}
+
+async fn cmd_task_show(client: &mut Client, id: &str) -> Result<()> {
+    let resp = client
+        .call("task.get", serde_json::json!({"id": id}))
+        .await
+        .context("task.get failed")?;
+    println!("{}", serde_json::to_string_pretty(&resp)?);
+    Ok(())
+}
+
+async fn cmd_task_create(
+    client: &mut Client,
+    title: &str,
+    description: Option<&str>,
+) -> Result<()> {
+    let params = serde_json::json!({
+        "title": title,
+        "description": description.unwrap_or(""),
+    });
+    let resp = client
+        .call("task.create", params)
+        .await
+        .context("task.create failed")?;
+    println!("Created task {}", resp["id"].as_str().unwrap_or("?"));
+    Ok(())
+}
+
+async fn cmd_task_close(client: &mut Client, id: &str) -> Result<()> {
+    client
+        .call("task.close", serde_json::json!({"id": id}))
+        .await
+        .context("task.close failed")?;
+    println!("Task {id} closed");
+    Ok(())
+}
+
+async fn cmd_session_list(client: &mut Client) -> Result<()> {
+    let resp = client
+        .call("session.list", serde_json::Value::Null)
+        .await
+        .context("session.list failed")?;
+    println!("{}", serde_json::to_string_pretty(&resp)?);
+    Ok(())
+}
+
+async fn cmd_session_show(client: &mut Client, id: &str) -> Result<()> {
+    let resp = client
+        .call("session.get", json!({"id": id}))
+        .await
+        .context("session.get failed")?;
+    println!("{}", serde_json::to_string_pretty(&resp)?);
+    Ok(())
+}
+
+async fn cmd_session_rollback(client: &mut Client, session_id: &str, turn: u32) -> Result<()> {
+    let resp = client
+        .call(
+            "session.rollback",
+            json!({"session_id": session_id, "turn_n": turn}),
+        )
+        .await
+        .context("session.rollback failed")?;
+    println!(
+        "Rolled back to turn {}: {}",
+        turn,
+        serde_json::to_string_pretty(&resp)?
     );
     Ok(())
 }

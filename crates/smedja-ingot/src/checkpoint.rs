@@ -92,6 +92,25 @@ pub(crate) fn latest(
     }
 }
 
+/// Returns all checkpoints for `session_id` ordered by `turn_n` ascending.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the query fails.
+pub(crate) fn list(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Vec<Checkpoint>, IngotError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, turn_n, messages_json, created_at \
+         FROM checkpoints WHERE session_id = ?1 ORDER BY turn_n ASC",
+    )?;
+    let rows: Result<Vec<Checkpoint>, _> = stmt
+        .query_map(rusqlite::params![session_id], row_to_checkpoint)?
+        .collect();
+    Ok(rows?)
+}
+
 fn row_to_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<Checkpoint> {
     let id_str: String = row.get(0)?;
     let id = Uuid::parse_str(&id_str).map_err(|e| {
@@ -193,5 +212,23 @@ mod tests {
 
         let latest_b = ingot.latest_checkpoint("session-b").unwrap().unwrap();
         assert_eq!(latest_b.turn_n, 1);
+    }
+
+    #[test]
+    fn list_checkpoints_returns_ordered() {
+        let mut ig = Ingot::open_in_memory().unwrap();
+        ig.save_checkpoint(&make_checkpoint("s1", 2)).unwrap();
+        ig.save_checkpoint(&make_checkpoint("s1", 1)).unwrap();
+        let cps = ig.list_checkpoints("s1").unwrap();
+        assert_eq!(cps.len(), 2);
+        assert_eq!(cps[0].turn_n, 1);
+        assert_eq!(cps[1].turn_n, 2);
+    }
+
+    #[test]
+    fn list_checkpoints_empty_for_unknown_session() {
+        let ig = Ingot::open_in_memory().unwrap();
+        let cps = ig.list_checkpoints("no-such-session").unwrap();
+        assert!(cps.is_empty());
     }
 }
