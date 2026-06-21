@@ -254,4 +254,66 @@ mod tests {
         assert_eq!(updated.status, "complete");
         assert_eq!(updated.response.as_deref(), Some("The answer is 42."));
     }
+
+    #[test]
+    fn task_lifecycle_create_update_get() {
+        use crate::session::Session;
+
+        let mut ingot = Ingot::open_in_memory().unwrap();
+
+        // Create a session so the task carries a meaningful session_id.
+        let session = Session {
+            id: Uuid::new_v4(),
+            created_at: 1_700_000_000.0,
+            updated_at: 1_700_000_000.0,
+            status: "active".to_string(),
+            task_id: None,
+            mode: None,
+            cowork_mode: false,
+        };
+        ingot.create_session(&session).unwrap();
+
+        // Create a task linked to the session.
+        let task = Task {
+            id: Uuid::new_v4(),
+            title: "Fix the softcap".to_string(),
+            description: String::new(),
+            status: "planned".to_string(),
+            created_at: 1_700_000_001.0,
+            session_id: Some(session.id.to_string()),
+            response: None,
+        };
+        ingot.create_task(&task).unwrap();
+
+        // get_task returns the correct task with the expected initial fields.
+        let loaded = ingot
+            .get_task(&task.id.to_string())
+            .unwrap()
+            .expect("task must exist after create");
+        assert_eq!(loaded.title, "Fix the softcap");
+        assert_eq!(loaded.status, "planned");
+        assert_eq!(
+            loaded.session_id.as_deref(),
+            Some(session.id.to_string().as_str())
+        );
+
+        // Update the status to "complete".
+        ingot
+            .update_task_status(&task.id.to_string(), "complete")
+            .unwrap();
+
+        // get_task reflects the updated status.
+        let updated = ingot
+            .get_task(&task.id.to_string())
+            .unwrap()
+            .expect("task must still exist after status update");
+        assert_eq!(updated.status, "complete");
+
+        // list_tasks(None) includes the task; filter by session_id to isolate it.
+        let all_tasks = ingot.list_tasks(None).unwrap();
+        assert!(
+            all_tasks.iter().any(|t| t.title == "Fix the softcap"),
+            "list_tasks must include the created task"
+        );
+    }
 }
