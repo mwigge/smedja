@@ -9,6 +9,9 @@ repository.workspace = true
 [dependencies]
 anyhow       = { workspace = true }
 futures-core = { workspace = true }
+opentelemetry          = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
+opentelemetry_sdk      = { workspace = true }
 reqwest      = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
