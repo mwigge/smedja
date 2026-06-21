@@ -1,6 +1,7 @@
 pub mod acp;
 pub mod cowork;
 pub mod mcp_http;
+pub mod mcp_oauth;
 pub mod sandbox;
 
 use std::path::PathBuf;

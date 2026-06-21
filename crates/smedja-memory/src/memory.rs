@@ -201,11 +201,27 @@ impl WorkingMemory {
                     }
                 }
                 Stratum::Cold | Stratum::Archive => {
-                    // cold retrieval deferred; skip
+                    // ponytail: cold retrieval via cold_context() deferred; skip for now
                 }
             }
         }
         result
+    }
+
+    /// Returns messages from the cold stratum that are relevant to `query`.
+    ///
+    /// Cold retrieval uses semantic similarity between `query` and archived
+    /// message content to surface context from beyond the warm window.
+    ///
+    /// # Note
+    ///
+    /// Full semantic retrieval requires a vector index over cold messages.
+    /// This stub returns an empty slice. Activate when a vector store is
+    /// wired into [`WorkingMemory`].
+    // ponytail: cold retrieval deferred; returns empty until vector store added
+    #[must_use]
+    pub fn cold_context(&self, _query: &str) -> Vec<crate::types::Message> {
+        Vec::new()
     }
 }
 
@@ -521,5 +537,12 @@ mod tests {
         let prompt_full = m.build_prompt(100_000);
         // With a tight budget, we get fewer messages than with a full budget.
         assert!(prompt_tight.len() <= prompt_full.len());
+    }
+
+    #[test]
+    fn cold_context_stub_returns_empty() {
+        let m = make_mem(50);
+        let ctx = m.cold_context("some query string");
+        assert!(ctx.is_empty());
     }
 }

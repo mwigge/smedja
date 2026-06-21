@@ -41,6 +41,10 @@ struct PendingApproval {
 #[derive(Default)]
 pub struct CoworkGate {
     pending: Arc<Mutex<HashMap<ApprovalId, PendingApproval>>>,
+    /// When `true`, [`CoworkGate::intercept`] returns [`Decision::Approve`] immediately.
+    ///
+    /// Used for Codex-backed sessions that manage their own approval loop.
+    bypass: bool,
 }
 
 impl CoworkGate {
@@ -49,11 +53,23 @@ impl CoworkGate {
         Self::default()
     }
 
+    /// Disables the gate for this session — all `intercept` calls return `Decision::Approve` immediately.
+    ///
+    /// Use for Codex-backed sessions that manage their own approval loop.
+    pub fn set_bypass(&mut self, bypass: bool) {
+        self.bypass = bypass;
+    }
+
+    // ponytail: approval gate applies to all runners; Codex is excluded via set_bypass
+
     /// Submits a tool call for approval. Suspends until a decision arrives
     /// or the optional `timeout_secs` (0 = infinite) elapses.
     ///
     /// Returns [`Decision::Approve`] on timeout (with a WARN log).
     pub async fn intercept(&self, prompt: ApprovalPrompt, timeout_secs: u64) -> Decision {
+        if self.bypass {
+            return Decision::Approve;
+        }
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         {
@@ -195,5 +211,38 @@ mod tests {
         assert!(!gate.approve("nonexistent-id").await);
         assert!(!gate.deny("nonexistent-id", "reason".into()).await);
         assert!(!gate.modify("nonexistent-id", "instruction".into()).await);
+    }
+
+    #[tokio::test]
+    async fn bypass_auto_approves() {
+        let mut gate = CoworkGate::new();
+        gate.set_bypass(true);
+        let decision = gate.intercept(prompt(), 0).await;
+        assert!(matches!(decision, Decision::Approve));
+        // No pending entry should have been created.
+        assert!(gate.list_pending().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn intercept_emits_pending_for_any_runner() {
+        let gate = Arc::new(CoworkGate::new());
+        let gate2 = Arc::clone(&gate);
+
+        let handle = tokio::spawn(async move { gate2.intercept(prompt(), 0).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let pending = gate.list_pending().await;
+        assert_eq!(
+            pending.len(),
+            1,
+            "intercept must create a pending entry for any runner"
+        );
+        assert_eq!(pending[0].1, "bash");
+
+        // Clean up: approve so the spawned task can finish.
+        let id = pending[0].0.clone();
+        gate.approve(&id).await;
+        handle.await.unwrap();
     }
 }
