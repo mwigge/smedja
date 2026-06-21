@@ -23,4 +23,5 @@ tracing      = { workspace = true }
 which        = { workspace = true }
 
 [dev-dependencies]
-futures-util = { workspace = true }
+futures-util    = { workspace = true }
+opentelemetry_sdk = { workspace = true }

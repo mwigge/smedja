@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod alert;
 pub mod compact;
 pub mod cowork;
 pub mod local_provider;
@@ -12,6 +13,11 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
+use opentelemetry::{
+    global,
+    trace::{Span as _, Tracer as _},
+    KeyValue,
+};
 use serde_json::{json, Value};
 use smedja_adapter::types::{Message as AdapterMessage, Role as AdapterRole};
 use smedja_adapter::{
@@ -21,7 +27,7 @@ use smedja_adapter::{
 };
 use smedja_assayer::{BashArity, WorktreePool};
 use smedja_bellows::{Dispatcher, TurnEvent};
-use smedja_ingot::{Checkpoint, CostEntry, Ingot, McpServer, Session, Task};
+use smedja_ingot::{Checkpoint, CostEntry, Ingot, McpServer, Session, Task, TokenSnapshot};
 use smedja_rpc::{codes, router::Router, server::Server, RpcError};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -217,6 +223,9 @@ async fn run_turn(
     turn_id: String,
     gates: Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
 ) {
+    let tracer = global::tracer("smedja");
+    let mut turn_span = tracer.start("smedja.turn");
+
     // 1. Load the task to retrieve user content.
     let task = {
         let ig = ingot.lock().await;
@@ -379,7 +388,7 @@ async fn run_turn(
     }
 
     // Builtin tools: smedja_vault_search, smedja_retrieve, graph_query
-    let builtin_tools: Vec<serde_json::Value> = vec![
+    let mut builtin_tools: Vec<serde_json::Value> = vec![
         serde_json::json!({
             "name": "smedja_vault_search",
             "description": "Search the smedja vault for semantically similar entries.",
@@ -415,6 +424,34 @@ async fn run_turn(
             }
         }),
     ];
+    // When session is in SRE mode, inject monitoring tools.
+    let is_sre_mode = session
+        .as_ref()
+        .and_then(|s| s.mode.as_deref())
+        .is_some_and(|m| m == "sre");
+    if is_sre_mode {
+        builtin_tools.push(serde_json::json!({
+            "name": "alert_list",
+            "description": "Drain up to 50 pending alerts from the alert queue.",
+            "input_schema": { "type": "object", "properties": {} }
+        }));
+        builtin_tools.push(serde_json::json!({
+            "name": "otel_query",
+            "description": "Query SigNoz traces API.",
+            "input_schema": { "type": "object", "properties": { "service": { "type": "string" }, "filter": { "type": "string" }, "range_minutes": { "type": "integer" } }, "required": ["service"] }
+        }));
+        builtin_tools.push(serde_json::json!({
+            "name": "metric_query",
+            "description": "Query Prometheus with PromQL.",
+            "input_schema": { "type": "object", "properties": { "promql": { "type": "string" }, "range_minutes": { "type": "integer" } }, "required": ["promql"] }
+        }));
+        builtin_tools.push(serde_json::json!({
+            "name": "log_tail",
+            "description": "Tail logs from Loki.",
+            "input_schema": { "type": "object", "properties": { "service": { "type": "string" }, "filter": { "type": "string" }, "lines": { "type": "integer" } }, "required": ["service"] }
+        }));
+    }
+
     let all_tools: Vec<serde_json::Value> = builtin_tools.into_iter().chain(mcp_tools).collect();
 
     let opts = CallOptions {
@@ -570,7 +607,12 @@ async fn run_turn(
             let tool_result = if let Some(denial) = cowork_denied {
                 denial
             } else {
-                execute_tool(&tool_name, &tool_input, &workspace_root, session.as_ref()).await
+                let mut tool_span = tracer.start("smedja.tool");
+                tool_span.set_attribute(KeyValue::new("smedja.tool.name", tool_name.clone()));
+                let result =
+                    execute_tool(&tool_name, &tool_input, &workspace_root, session.as_ref()).await;
+                tool_span.end();
+                result
             };
 
             // 5e. Append tool result as a user message and continue the loop.
@@ -616,7 +658,7 @@ async fn run_turn(
             id: Uuid::new_v4(),
             session_id: session_id.clone(),
             turn_n,
-            runner,
+            runner: runner.clone(),
             model,
             input_tok: 0,
             output_tok: i64::from(total_output_tokens),
@@ -644,6 +686,49 @@ async fn run_turn(
             warn!(error = %e, "failed to save checkpoint");
         }
     }
+
+    // 9. Save per-turn token snapshot with running cumulative totals.
+    {
+        let output_tok = i64::from(total_output_tokens);
+        let mut ig = ingot.lock().await;
+        // Compute cumulative totals by summing all prior snapshots.
+        let (prior_in, prior_out) =
+            ig.session_token_snapshots(&session_id)
+                .map_or((0, 0), |snaps| {
+                    snaps
+                        .last()
+                        .map_or((0i64, 0i64), |s| (s.cumulative_input, s.cumulative_output))
+                });
+        let snap = TokenSnapshot {
+            id: Uuid::new_v4(),
+            session_id: session_id.clone(),
+            turn_n,
+            input_tok: 0, // ponytail: input token count deferred to adapter usage events
+            output_tok,
+            cumulative_input: prior_in,
+            cumulative_output: prior_out + output_tok,
+            created_at: now_epoch(),
+        };
+        if let Err(e) = ig.save_token_snapshot(&snap) {
+            warn!(error = %e, "failed to save token snapshot");
+        }
+    }
+
+    turn_span.set_attribute(KeyValue::new("gen_ai.usage.input_tokens", 0i64));
+    turn_span.set_attribute(KeyValue::new(
+        "gen_ai.usage.output_tokens",
+        i64::from(total_output_tokens),
+    ));
+    turn_span.set_attribute(KeyValue::new("smedja.tier", runner));
+    turn_span.set_attribute(KeyValue::new(
+        "smedja.agent.kind",
+        session
+            .as_ref()
+            .and_then(|s| s.mode.as_deref())
+            .unwrap_or("impl")
+            .to_owned(),
+    ));
+    turn_span.end();
 
     dispatcher.publish(TurnEvent::Completed {
         session_id,
@@ -841,6 +926,69 @@ async fn execute_tool(
                 }
             }
         }
+        "alert_list" => {
+            let alerts = crate::alert::drain_alerts(50).await;
+            serde_json::to_string(&alerts).unwrap_or_default()
+        }
+        "otel_query" => {
+            let service = input
+                .get("service")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let filter = input.get("filter").and_then(|v| v.as_str());
+            let range = input
+                .get("range_minutes")
+                .and_then(Value::as_i64)
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(60);
+            if let Ok(cfg) = smedja_sre::SreConfig::from_env() {
+                let client = reqwest::Client::new();
+                match smedja_sre::otel_query(&client, &cfg, service, filter, range).await {
+                    Ok(v) => serde_json::to_string(&v).unwrap_or_default(),
+                    Err(e) => format!("error: {e}"),
+                }
+            } else {
+                "SRE config not available (set SMEDJA_OTLP_ENDPOINT)".into()
+            }
+        }
+        "metric_query" => {
+            let promql = input.get("promql").and_then(|v| v.as_str()).unwrap_or("");
+            let range = input
+                .get("range_minutes")
+                .and_then(Value::as_i64)
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(60);
+            if let Ok(cfg) = smedja_sre::SreConfig::from_env() {
+                let client = reqwest::Client::new();
+                match smedja_sre::metric_query(&client, &cfg, promql, range).await {
+                    Ok(v) => serde_json::to_string(&v).unwrap_or_default(),
+                    Err(e) => format!("error: {e}"),
+                }
+            } else {
+                "SRE config not available (set SMEDJA_PROMETHEUS_ENDPOINT)".into()
+            }
+        }
+        "log_tail" => {
+            let service = input
+                .get("service")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let filter = input.get("filter").and_then(|v| v.as_str()).unwrap_or("");
+            let lines = input
+                .get("lines")
+                .and_then(Value::as_i64)
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(100);
+            if let Ok(cfg) = smedja_sre::SreConfig::from_env() {
+                let client = reqwest::Client::new();
+                match smedja_sre::log_tail(&client, &cfg, service, filter, lines).await {
+                    Ok(v) => serde_json::to_string(&v).unwrap_or_default(),
+                    Err(e) => format!("error: {e}"),
+                }
+            } else {
+                "SRE config not available (set SMEDJA_LOKI_ENDPOINT)".into()
+            }
+        }
         other => format!("error: tool '{other}' is not available"),
     }
 }
@@ -854,25 +1002,33 @@ fn spawn_worker(
     tokio::spawn(async move {
         let mut rx = dispatcher.subscribe();
         loop {
-            match rx.recv().await {
-                Ok(TurnEvent::Started {
+            // Block on the first event, then drain any additionally-queued events
+            // to reduce per-delta task spawns during high-rate streaming.
+            let first = match rx.recv().await {
+                Ok(ev) => ev,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::error!(
+                        dropped = n,
+                        "turn worker lagged; events dropped — some turns may be lost",
+                    );
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            let mut batch = vec![first];
+            batch.extend(smedja_bellows::drain_ready(&mut rx));
+            for event in batch {
+                if let TurnEvent::Started {
                     session_id,
                     turn_id,
-                }) => {
+                } = event
+                {
                     let ig = Arc::clone(&ingot);
                     let dp = Arc::clone(&dispatcher);
                     let g = Arc::clone(&gates);
                     tokio::spawn(run_turn(ig, dp, session_id, turn_id, g));
                 }
-                Ok(_) => {} // ignore other events
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::error!(
-                        dropped = n,
-                        "turn worker lagged; events dropped — some turns may be lost"
-                    );
-                    // continue — do not break; the worker stays alive after lag
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                // ignore non-Started events
             }
         }
     });
@@ -1329,6 +1485,114 @@ fn build_router(
         }
     });
 
+    // ── session.compact ──────────────────────────────────────────────────────
+    let ig = Arc::clone(ingot);
+    router.register("session.compact", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        async move {
+            let session_id = params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| missing_param("session_id"))?
+                .to_owned();
+
+            // Load latest checkpoint for conversation history.
+            let messages_json = {
+                let guard = ig.lock().await;
+                guard
+                    .latest_checkpoint(&session_id)
+                    .map_err(|e| ingot_err(&e))?
+                    .map_or_else(|| "[]".to_owned(), |cp| cp.messages_json)
+            };
+
+            // Call provider to produce a summary.
+            let compaction_prompt = format!(
+                "Summarise this conversation in 3–5 bullet points, then state the current goal. \
+                 Be concise.\n\nConversation history:\n{messages_json}"
+            );
+            let provider = build_provider()
+                .await
+                .map_err(|e| RpcError::new(codes::INTERNAL_ERROR, format!("no provider: {e}")))?;
+            let opts = CallOptions {
+                model: std::env::var("SMEDJA_MODEL")
+                    .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_owned()),
+                max_tokens: Some(512),
+                temperature: Some(0.3),
+                system: Some("You are a summarisation assistant.".to_owned()),
+                tools: None,
+            };
+            let stream = provider.stream_chat(
+                &[AdapterMessage {
+                    role: AdapterRole::User,
+                    content: compaction_prompt,
+                }],
+                &opts,
+            );
+            let dispatcher = Dispatcher::new(1);
+            let (summary, _) = drain_stream(stream, &dispatcher).await.map_err(|e| {
+                RpcError::new(codes::INTERNAL_ERROR, format!("compaction failed: {e}"))
+            })?;
+
+            // Save pre-compaction checkpoint tagged with turn_n = -1.
+            let turn_count = {
+                let guard = ig.lock().await;
+                guard
+                    .list_checkpoints(&session_id)
+                    .map_or(0i64, |v| i64::try_from(v.len()).unwrap_or(i64::MAX))
+            };
+            let cp = Checkpoint {
+                id: Uuid::new_v4(),
+                session_id: session_id.clone(),
+                turn_n: -1, // compaction marker
+                messages_json: messages_json.clone(),
+                created_at: now_epoch(),
+            };
+            {
+                let mut guard = ig.lock().await;
+                if let Err(e) = guard.save_checkpoint(&cp) {
+                    warn!(error = %e, "failed to save pre-compaction checkpoint");
+                }
+            }
+
+            Ok(json!({
+                "session_id": session_id,
+                "summary": summary,
+                "turn_count": turn_count,
+                "compaction_checkpoint_saved": true,
+            }))
+        }
+    });
+
+    // ── session.token_usage ──────────────────────────────────────────────────
+    let ig = Arc::clone(ingot);
+    router.register("session.token_usage", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        async move {
+            let session_id = params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| missing_param("session_id"))?;
+            let snaps = ig
+                .lock()
+                .await
+                .session_token_snapshots(session_id)
+                .map_err(|e| ingot_err(&e))?;
+            let rows: Vec<Value> = snaps
+                .iter()
+                .map(|s| {
+                    json!({
+                        "turn_n": s.turn_n,
+                        "input_tok": s.input_tok,
+                        "output_tok": s.output_tok,
+                        "cumulative_input": s.cumulative_input,
+                        "cumulative_output": s.cumulative_output,
+                    })
+                })
+                .collect();
+            Ok(json!({ "session_id": session_id, "turns": rows }))
+        }
+    });
+
     // ── session.cost ────────────────────────────────────────────────────────
     let ig = Arc::clone(ingot);
     router.register("session.cost", move |params: Value| {
@@ -1378,6 +1642,29 @@ fn build_router(
             }
 
             Ok(json!({ "session_id": session_id, "cowork_mode": enabled }))
+        }
+    });
+
+    // ── session.set_mode ────────────────────────────────────────────────────
+    let ig = Arc::clone(ingot);
+    router.register("session.set_mode", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        async move {
+            let session_id = params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| missing_param("session_id"))?
+                .to_owned();
+            let mode = params
+                .get("mode")
+                .and_then(Value::as_str)
+                .ok_or_else(|| missing_param("mode"))?
+                .to_owned();
+            ig.lock()
+                .await
+                .update_session_mode(&session_id, &mode)
+                .map_err(|e| ingot_err(&e))?;
+            Ok(json!({ "session_id": session_id, "mode": mode }))
         }
     });
 
@@ -1571,12 +1858,55 @@ fn build_router(
                 .as_str()
                 .ok_or_else(|| missing_param("goal"))?
                 .to_owned();
-            let roles: Vec<String> = params["roles"]
+            // Roles may be plain strings or `{name, resume_session_id?}` objects.
+            let loop_roles: Vec<smedja_assayer::LoopRole> = params["roles"]
                 .as_array()
                 .unwrap_or(&vec![])
                 .iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
+                .filter_map(|v| {
+                    if let Some(name) = v.as_str() {
+                        Some(smedja_assayer::LoopRole {
+                            name: name.to_owned(),
+                            resume_session_id: None,
+                        })
+                    } else if let Some(obj) = v.as_object() {
+                        obj.get("name").and_then(Value::as_str).map(|name| {
+                            smedja_assayer::LoopRole {
+                                name: name.to_owned(),
+                                resume_session_id: obj
+                                    .get("resume_session_id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                            }
+                        })
+                    } else {
+                        None
+                    }
+                })
                 .collect();
+
+            // Enforce MAX_ROLE_DEPTH: reject any role that tries to resume a session at depth ≥ 4.
+            {
+                let guard = ig.lock().await;
+                for role in &loop_roles {
+                    if let Some(ref resume_sid) = role.resume_session_id {
+                        let cps = guard.list_checkpoints(resume_sid).unwrap_or_default();
+                        let depth = cps.iter().filter(|cp| cp.turn_n == -1).count();
+                        #[allow(clippy::cast_possible_truncation)]
+                        if depth as u8 >= smedja_assayer::MAX_ROLE_DEPTH {
+                            return Err(RpcError::new(
+                                codes::INVALID_PARAMS,
+                                format!(
+                                    "resume depth exceeded for role '{}': max {}",
+                                    role.name,
+                                    smedja_assayer::MAX_ROLE_DEPTH,
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+            let roles: Vec<String> = loop_roles.iter().map(|r| r.name.clone()).collect();
 
             // Derive workspace root: prefer session.workspace_root, then env, then ".".
             let env_workspace = || {

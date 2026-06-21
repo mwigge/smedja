@@ -8,6 +8,7 @@ members = [
     "crates/smedja-bellows",
     "crates/smedja-graph",
     "crates/smedja-ingot",
+    "crates/smedja-loop",
     "crates/smedja-memory",
     "crates/smedja-methodology",
     "crates/smedja-plugins",
@@ -66,6 +67,7 @@ ratatui      = "0.29"
 
 # concurrency / utilities
 rayon        = "1"
+regex        = "1"
 reqwest      = { version = "0.12", features = ["json", "stream"] }
 
 # storage
@@ -79,6 +81,8 @@ schemars     = "0.8"
 serde        = { version = "1", features = ["derive"] }
 serde_json   = "1"
 serde_yaml   = "0.9"
+
+sha2         = "0.10"
 
 # code graph
 streaming-iterator = "0.1"

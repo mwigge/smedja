@@ -518,6 +518,25 @@ async fn handle_key(
                         state.messages.push(msg);
                     }
                 }
+            } else if input.trim() == "/agent sre" {
+                state.mode = Some("sre".into());
+                state.tier = Some("deep".into());
+                let session_id = state.session_id.clone();
+                let _ = client
+                    .call(
+                        "session.set_mode",
+                        json!({
+                            "session_id": session_id,
+                            "mode": "sre",
+                        }),
+                    )
+                    .await;
+                let msg = Message {
+                    role: Role::System,
+                    text: "SRE mode activated (tier: deep)".into(),
+                };
+                state.main_panel.push_line(msg.text.clone());
+                state.messages.push(msg);
             } else {
                 submit(&input, state, client).await?;
             }
@@ -791,22 +810,32 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend).context("create terminal")?;
 
     loop {
-        terminal.draw(|f| render(f, &state))?;
-
+        // Collect all ready crossterm events before drawing — one render per batch.
         let event_available =
             tokio::task::spawn_blocking(|| event::poll(Duration::from_millis(100)))
                 .await
                 .context("poll task panicked")??;
 
         if event_available {
-            let ev = tokio::task::spawn_blocking(event::read)
-                .await
-                .context("read task panicked")??;
-
-            if let Event::Key(key) = ev {
-                handle_key(key, &mut state, &mut client, &mut editor).await?;
+            // Drain every immediately-available event in the same tick.
+            loop {
+                let ev = tokio::task::spawn_blocking(event::read)
+                    .await
+                    .context("read task panicked")??;
+                if let Event::Key(key) = ev {
+                    handle_key(key, &mut state, &mut client, &mut editor).await?;
+                }
+                // Check if more events are ready without blocking.
+                let more = tokio::task::spawn_blocking(|| event::poll(Duration::from_millis(0)))
+                    .await
+                    .context("poll task panicked")??;
+                if !more {
+                    break;
+                }
             }
         }
+
+        terminal.draw(|f| render(f, &state))?;
 
         // Poll for pending task result (every 500 ms).
         if let Some(task_id) = state.pending_task_id.clone() {
