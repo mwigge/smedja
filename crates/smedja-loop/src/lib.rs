@@ -11,5 +11,5 @@ pub mod telemetry;
 pub mod verify;
 
 pub use config::LoopConfig;
-pub use role::{LoopRole, Runner, Tier};
+pub use role::{DataAccess, LoopRole, Runner, Tier};
 pub use state::LoopState;

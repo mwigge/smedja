@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow          = { workspace = true }
+chrono          = { workspace = true }
 clap            = { workspace = true }
 reqwest         = { workspace = true, features = ["blocking"] }
 serde           = { workspace = true }
@@ -25,3 +26,7 @@ st-config       = { path = "../../term/crates/st-config" }
 tokio           = { workspace = true }
 tracing         = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+toml     = { workspace = true }

@@ -30,6 +30,11 @@ pub struct AuditEvent {
     pub traceparent: Option<String>,
     /// Model tier: `"local"`, `"fast"`, or `"deep"`.
     pub tier: Option<String>,
+    /// Deterministic role identity — `SHA-256(loop_id + "-" + role_name)` as a UUID.
+    ///
+    /// `None` for events emitted outside a loop context (e.g. plain sessions).
+    #[serde(default)]
+    pub role_id: Option<String>,
 }
 
 /// Inserts an [`AuditEvent`] into the `audit_events` table.
@@ -42,8 +47,8 @@ pub(crate) fn insert(conn: &rusqlite::Connection, event: &AuditEvent) -> Result<
     conn.execute(
         "INSERT INTO audit_events \
          (id, ts, session_id, turn_id, action_type, actor, tool_name, \
-          input_tok, output_tok, latency_ms, traceparent, tier) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+          input_tok, output_tok, latency_ms, traceparent, tier, role_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         rusqlite::params![
             event.id.to_string(),
             event.ts,
@@ -57,6 +62,7 @@ pub(crate) fn insert(conn: &rusqlite::Connection, event: &AuditEvent) -> Result<
             event.latency_ms,
             event.traceparent,
             event.tier,
+            event.role_id,
         ],
     )?;
     Ok(())
@@ -73,7 +79,7 @@ pub(crate) fn list_by_session(
 ) -> Result<Vec<AuditEvent>, IngotError> {
     let mut stmt = conn.prepare(
         "SELECT id, ts, session_id, turn_id, action_type, actor, tool_name, \
-                input_tok, output_tok, latency_ms, traceparent, tier \
+                input_tok, output_tok, latency_ms, traceparent, tier, role_id \
          FROM audit_events \
          WHERE session_id = ?1 \
          ORDER BY ts ASC",
@@ -97,6 +103,45 @@ pub(crate) fn list_by_session(
             latency_ms: row.get(9)?,
             traceparent: row.get(10)?,
             tier: row.get(11)?,
+            role_id: row.get(12)?,
+        })
+    })?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(IngotError::Db)
+}
+
+/// Returns all [`AuditEvent`]s, ordered by `ts` ascending.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the query fails.
+pub(crate) fn list_all(conn: &rusqlite::Connection) -> Result<Vec<AuditEvent>, IngotError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, ts, session_id, turn_id, action_type, actor, tool_name, \
+                input_tok, output_tok, latency_ms, traceparent, tier, role_id \
+         FROM audit_events \
+         ORDER BY ts ASC",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        let id_str: String = row.get(0)?;
+        let id = Uuid::parse_str(&id_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+        Ok(AuditEvent {
+            id,
+            ts: row.get(1)?,
+            session_id: row.get(2)?,
+            turn_id: row.get(3)?,
+            action_type: row.get(4)?,
+            actor: row.get(5)?,
+            tool_name: row.get(6)?,
+            input_tok: row.get(7)?,
+            output_tok: row.get(8)?,
+            latency_ms: row.get(9)?,
+            traceparent: row.get(10)?,
+            tier: row.get(11)?,
+            role_id: row.get(12)?,
         })
     })?;
 
@@ -122,6 +167,7 @@ mod tests {
             latency_ms: 123,
             traceparent: None,
             tier: Some("fast".to_string()),
+            role_id: None,
         }
     }
 
@@ -177,11 +223,13 @@ mod tests {
             latency_ms: 0,
             traceparent: Some("00-trace-span-01".to_string()),
             tier: None,
+            role_id: Some("test-role-id".to_string()),
         };
         ingot.insert_audit_event(&ev).unwrap();
         let results = ingot.list_audit_events("s").unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].turn_id.is_none());
         assert_eq!(results[0].traceparent.as_deref(), Some("00-trace-span-01"));
+        assert_eq!(results[0].role_id.as_deref(), Some("test-role-id"));
     }
 }

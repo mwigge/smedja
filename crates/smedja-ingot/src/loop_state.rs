@@ -118,6 +118,39 @@ pub(crate) fn list_by_change(
     Ok(rows?)
 }
 
+/// Returns all loops, optionally filtered by `status`, ordered by `created_at` descending.
+pub(crate) fn list_by_status(
+    conn: &rusqlite::Connection,
+    status: Option<&str>,
+) -> Result<Vec<LoopRecord>, crate::error::IngotError> {
+    let map_row = |row: &rusqlite::Row<'_>| {
+        Ok(LoopRecord {
+            id: row.get(0)?,
+            change_name: row.get(1)?,
+            status: row.get(2)?,
+            current_slice: row.get(3)?,
+            attempt: row.get(4)?,
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
+        })
+    };
+    if let Some(s) = status {
+        let mut stmt = conn.prepare(
+            "SELECT id, change_name, status, current_slice, attempt, created_at, updated_at \
+             FROM loops WHERE status = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows: Result<Vec<_>, _> = stmt.query_map(rusqlite::params![s], map_row)?.collect();
+        Ok(rows?)
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT id, change_name, status, current_slice, attempt, created_at, updated_at \
+             FROM loops ORDER BY created_at DESC",
+        )?;
+        let rows: Result<Vec<_>, _> = stmt.query_map([], map_row)?.collect();
+        Ok(rows?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
