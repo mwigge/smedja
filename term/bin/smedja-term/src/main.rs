@@ -2,6 +2,20 @@
 //!
 //! Initialises the winit event loop, wgpu surface, PTY session, and block model.
 //! Dispatches keyboard input to the PTY and cell-grid updates to the renderer.
+//!
+//! # Phase 6 — Tabs, Splits, and Multiplexer
+//!
+//! Key bindings added in this phase:
+//! - `Ctrl+T` → open new tab
+//! - `Ctrl+W` → close active tab
+//! - `Ctrl+Tab` / `Ctrl+Shift+Tab` → next / prev tab
+//! - `Ctrl+Shift+H` → split horizontal
+//! - `Ctrl+Shift+V` → split vertical
+//! - `Ctrl+Shift+Z` → toggle zoom on active pane
+//! - `Ctrl+Shift+L` → open launch menu overlay
+
+mod split;
+mod tab;
 
 use std::sync::{atomic::Ordering, Arc};
 
@@ -10,11 +24,14 @@ use clap::{Parser, Subcommand};
 use tracing::{debug, error, info};
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, KeyEvent, WindowEvent},
+    event::{ElementState, KeyEvent, Modifiers, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{Key, NamedKey},
     window::{Window, WindowId},
 };
+
+use crate::split::{SplitDirection, SplitLayout};
+use crate::tab::TabBar;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -52,6 +69,18 @@ enum BlockAction {
     },
 }
 
+// ── Launch menu entry ─────────────────────────────────────────────────────────
+
+/// A single entry in the launch menu, loaded from `[[launch_menu]]` in
+/// `~/.config/smedja-term/config.toml`.
+#[derive(Debug, Clone)]
+pub struct LaunchEntry {
+    /// Display label shown in the overlay.
+    pub label: String,
+    /// Command to execute in a new pane.
+    pub command: String,
+}
+
 // ── App state ─────────────────────────────────────────────────────────────────
 
 /// Application state threaded through the winit event loop.
@@ -66,17 +95,143 @@ struct App {
     pty: Option<st_pty::PtySession>,
     config: st_config::Config,
     shell: String,
+    /// Tab bar — owns all tabs and the active tab index.
+    tab_bar: TabBar,
+    /// Per-tab split layout.  Keyed by tab index (positional, not UUID) for
+    /// simplicity; rebuilt when tabs are opened or closed.
+    split_layouts: Vec<SplitLayout>,
+    /// Current keyboard modifier state.
+    modifiers: Modifiers,
+    /// Launch menu entries loaded from config.
+    launch_entries: Vec<LaunchEntry>,
+    /// Whether the launch menu overlay is currently visible.
+    launch_menu_open: bool,
+    /// Selected entry index in the launch menu overlay.
+    launch_menu_selection: usize,
 }
 
 impl App {
-    fn new(config: st_config::Config, shell: String) -> Self {
+    fn new(config: st_config::Config, shell: String, launch_entries: Vec<LaunchEntry>) -> Self {
+        // Initialise with one tab and a split layout for its root pane.
+        let tab_bar = TabBar::new();
+        let root_pane_id = tab_bar.tabs[0].panes[0].id;
+        let split_layouts = vec![SplitLayout::new(root_pane_id)];
+
         Self {
             window: None,
             renderer: None,
             pty: None,
             config,
             shell,
+            tab_bar,
+            split_layouts,
+            modifiers: Modifiers::default(),
+            launch_entries,
+            launch_menu_open: false,
+            launch_menu_selection: 0,
         }
+    }
+
+    // ── Tab helpers ───────────────────────────────────────────────────────────
+
+    /// Opens a new tab, creating a matching split layout for it.
+    fn open_tab(&mut self) {
+        let count = self.tab_bar.tabs.len() + 1;
+        let new_tab = self.tab_bar.open_tab(count.to_string());
+        let root_pane_id = new_tab.panes[0].id;
+        self.split_layouts.push(SplitLayout::new(root_pane_id));
+        info!("opened tab {}", count);
+    }
+
+    /// Closes the active tab, also removing its split layout.
+    fn close_active_tab(&mut self) {
+        let idx = self.tab_bar.active;
+        if self.tab_bar.tabs.len() <= 1 {
+            // Never close the last tab.
+            return;
+        }
+        self.tab_bar.close_tab(idx);
+        if idx < self.split_layouts.len() {
+            self.split_layouts.remove(idx);
+        }
+        info!("closed tab {}", idx);
+    }
+
+    /// Splits the active pane in the active tab.
+    fn split_active_pane(&mut self, dir: SplitDirection) {
+        // Collect the IDs we need while holding the tab borrow, then release it.
+        let ids = {
+            let Some(tab) = self.tab_bar.active_tab_mut() else {
+                return;
+            };
+            let Some(active_pane) = tab.active_pane() else {
+                return;
+            };
+            let existing_id = active_pane.id;
+            let new_idx = tab.push_pane();
+            let new_id = tab.panes[new_idx].id;
+            tab.active_pane = new_idx;
+            (existing_id, new_id)
+        }; // borrow of tab_bar ends here
+
+        let (existing_id, new_id) = ids;
+        let active_tab_idx = self.tab_bar.active;
+        if let Some(layout) = self.split_layouts.get_mut(active_tab_idx) {
+            if let Err(e) = layout.split(existing_id, dir, new_id) {
+                error!("split layout error: {}", e);
+            }
+        }
+        info!("split {:?}", dir);
+    }
+
+    /// Toggles zoom on the active pane of the active tab.
+    fn toggle_zoom(&mut self) {
+        if let Some(tab) = self.tab_bar.active_tab_mut() {
+            tab.toggle_zoom();
+        }
+    }
+
+    /// Opens or closes the launch menu overlay.
+    fn toggle_launch_menu(&mut self) {
+        self.launch_menu_open = !self.launch_menu_open;
+        self.launch_menu_selection = 0;
+        info!(
+            "launch menu {}",
+            if self.launch_menu_open {
+                "open"
+            } else {
+                "closed"
+            }
+        );
+    }
+
+    /// Activates the currently selected launch menu entry.
+    fn activate_launch_entry(&mut self) {
+        if !self.launch_menu_open {
+            return;
+        }
+        // Collect the command string before splitting (borrow ends after the block).
+        let cmd = self
+            .launch_entries
+            .get(self.launch_menu_selection)
+            .map(|e| e.command.clone());
+
+        if let Some(cmd) = cmd {
+            info!("launch: {}", cmd);
+            // Split the active pane horizontally to host the new command.
+            self.split_active_pane(SplitDirection::Horizontal);
+        }
+        self.launch_menu_open = false;
+    }
+
+    // ── Modifier helpers ──────────────────────────────────────────────────────
+
+    fn ctrl(&self) -> bool {
+        self.modifiers.state().control_key()
+    }
+
+    fn shift(&self) -> bool {
+        self.modifiers.state().shift_key()
     }
 }
 
@@ -137,6 +292,7 @@ impl ApplicationHandler for App {
         info!("smedja-term initialised");
     }
 
+    #[allow(clippy::too_many_lines)]
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -147,6 +303,10 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => {
                 info!("close requested");
                 event_loop.exit();
+            }
+
+            WindowEvent::ModifiersChanged(mods) => {
+                self.modifiers = mods;
             }
 
             WindowEvent::Resized(new_size) => {
@@ -209,6 +369,96 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
+                // ── Phase 6 multiplexer bindings ──────────────────────────────
+                //
+                // These are checked before passing input to the PTY so the
+                // terminal application never sees the control sequences.
+
+                if self.launch_menu_open {
+                    // When the launch menu is visible, intercept navigation keys.
+                    match &logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            self.launch_menu_open = false;
+                            return;
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            self.activate_launch_entry();
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            if !self.launch_entries.is_empty() {
+                                self.launch_menu_selection =
+                                    (self.launch_menu_selection + 1) % self.launch_entries.len();
+                            }
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            if !self.launch_entries.is_empty() {
+                                self.launch_menu_selection = self
+                                    .launch_menu_selection
+                                    .checked_sub(1)
+                                    .unwrap_or(self.launch_entries.len() - 1);
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Ctrl+T → open new tab
+                if self.ctrl() && !self.shift() {
+                    if let Key::Character(s) = &logical_key {
+                        if s.to_lowercase() == "t" {
+                            self.open_tab();
+                            return;
+                        }
+                        // Ctrl+W → close active tab
+                        if s.to_lowercase() == "w" {
+                            self.close_active_tab();
+                            return;
+                        }
+                    }
+                    // Ctrl+Tab → next tab
+                    if logical_key == Key::Named(NamedKey::Tab) {
+                        self.tab_bar.next_tab();
+                        return;
+                    }
+                }
+
+                // Ctrl+Shift+Tab → prev tab
+                if self.ctrl() && self.shift() {
+                    if logical_key == Key::Named(NamedKey::Tab) {
+                        self.tab_bar.prev_tab();
+                        return;
+                    }
+                    if let Key::Character(s) = &logical_key {
+                        match s.to_lowercase().as_str() {
+                            // Ctrl+Shift+H → horizontal split
+                            "h" => {
+                                self.split_active_pane(SplitDirection::Horizontal);
+                                return;
+                            }
+                            // Ctrl+Shift+V → vertical split
+                            "v" => {
+                                self.split_active_pane(SplitDirection::Vertical);
+                                return;
+                            }
+                            // Ctrl+Shift+Z → toggle zoom
+                            "z" => {
+                                self.toggle_zoom();
+                                return;
+                            }
+                            // Ctrl+Shift+L → launch menu
+                            "l" => {
+                                self.toggle_launch_menu();
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // ── Pass remaining input to the PTY ───────────────────────────
                 if let Some(pty) = &mut self.pty {
                     let bytes: Option<Vec<u8>> = match &logical_key {
                         Key::Character(s) => Some(s.as_str().as_bytes().to_vec()),
@@ -285,6 +535,61 @@ fn default_db_path() -> std::path::PathBuf {
     base.join("smedja-term").join("blocks.db")
 }
 
+// ── Launch menu config loading ─────────────────────────────────────────────────
+
+/// Loads `[[launch_menu]]` entries from the smedja-term config file.
+///
+/// The TOML format is:
+/// ```toml
+/// [[launch_menu]]
+/// label   = "htop"
+/// command = "htop"
+///
+/// [[launch_menu]]
+/// label   = "neovim"
+/// command = "nvim"
+/// ```
+///
+/// Returns an empty `Vec` when the file is absent or the section is missing.
+fn load_launch_entries() -> Vec<LaunchEntry> {
+    #[derive(serde::Deserialize)]
+    struct RawEntry {
+        label: String,
+        command: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RawLaunchConfig {
+        #[serde(default)]
+        launch_menu: Vec<RawEntry>,
+    }
+
+    let path = dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+        .join("smedja-term")
+        .join("config.toml");
+
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+
+    let raw: RawLaunchConfig = match toml::from_str(&text) {
+        Ok(r) => r,
+        Err(e) => {
+            debug!("launch_menu parse error: {}", e);
+            return Vec::new();
+        }
+    };
+
+    raw.launch_menu
+        .into_iter()
+        .map(|e| LaunchEntry {
+            label: e.label,
+            command: e.command,
+        })
+        .collect()
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> anyhow::Result<()> {
@@ -307,10 +612,13 @@ fn main() -> anyhow::Result<()> {
         .shell
         .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()));
 
+    let launch_entries = load_launch_entries();
+    info!("loaded {} launch menu entries", launch_entries.len());
+
     info!("starting smedja-term with shell={}", shell);
 
     let event_loop = EventLoop::new().context("creating event loop")?;
-    let mut app = App::new(config, shell);
+    let mut app = App::new(config, shell, launch_entries);
     event_loop.run_app(&mut app).context("running event loop")?;
 
     Ok(())
