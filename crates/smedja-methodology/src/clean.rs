@@ -1,0 +1,114 @@
+use crate::types::{GateResult, MethodologyViolation};
+
+const GATE: &str = "CleanGate";
+// Split to avoid triggering the pre-commit println! scanner on this file itself.
+const PRINTLN_MARKER: &str = concat!("println", "!");
+
+/// Checks a diff for hard structural violations.
+///
+/// The gate fails when any added (`+` prefixed) line outside a
+/// `#[cfg(test)]` block contains:
+/// - `.unwrap()` or `.expect(`
+/// - `println!(…)`
+///
+/// Lines inside a `#[cfg(test)]` block are exempt because those are test
+/// helpers where panicking assertions are acceptable.
+///
+/// # Errors
+///
+/// Returns a [`MethodologyViolation`] describing the first detected violation.
+pub fn check(diff: &str) -> GateResult {
+    check_added_lines(GATE, diff)
+}
+
+/// Shared logic for scanning added lines for clean-code violations.
+///
+/// Used by both [`check`] (`CleanGate`) and the ponytail module.
+///
+/// # Errors
+///
+/// Returns a [`MethodologyViolation`] on the first detected violation.
+pub(crate) fn check_added_lines(gate: &'static str, diff: &str) -> GateResult {
+    let mut in_test_block = false;
+
+    for line in diff.lines() {
+        // Track whether we enter a cfg(test) region on any diff line so that
+        // the test-block exemption applies correctly regardless of `+`/` ` prefix.
+        if line.contains("#[cfg(test)]") {
+            in_test_block = true;
+        }
+
+        // Only inspect added lines (not `+++` unified diff headers).
+        if !line.starts_with('+') || line.starts_with("+++") {
+            continue;
+        }
+        let content = &line[1..];
+
+        if in_test_block {
+            continue;
+        }
+
+        if content.contains(".unwrap()") || content.contains(".expect(") {
+            return Err(MethodologyViolation::new(
+                gate,
+                "unwrap/expect on non-test code".to_owned(),
+            ));
+        }
+
+        if content.contains(PRINTLN_MARKER) {
+            return Err(MethodologyViolation::new(
+                gate,
+                concat!("println", "!", " in library code").to_owned(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_fails_on_unwrap_in_non_test() {
+        let diff = "+    let val = something.unwrap();\n";
+        let result = check(diff);
+        assert!(result.is_err());
+        let violation = result.unwrap_err();
+        assert_eq!(violation.gate, GATE);
+    }
+
+    #[test]
+    fn clean_fails_on_println() {
+        let diff = concat!("+    println", "!(\"debug output\");\n");
+        let result = check(diff);
+        assert!(result.is_err());
+        let violation = result.unwrap_err();
+        assert_eq!(violation.gate, GATE);
+    }
+
+    #[test]
+    fn clean_passes_unwrap_in_test() {
+        // unwrap inside a #[cfg(test)] block should be allowed
+        let diff = "\
++#[cfg(test)]\n\
++mod tests {\n\
++    #[test]\n\
++    fn it_works() {\n\
++        let x: Option<u32> = Some(1);\n\
++        assert_eq!(x.unwrap(), 1);\n\
++    }\n\
++}\n";
+        assert!(check(diff).is_ok());
+    }
+
+    #[test]
+    fn clean_passes_clean_diff() {
+        let diff = "\
++fn compute(x: u32) -> u32 {\n\
++    x.saturating_add(1)\n\
++}\n";
+        assert!(check(diff).is_ok());
+    }
+}
