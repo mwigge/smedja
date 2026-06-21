@@ -87,4 +87,37 @@ mod tests {
     fn compound_rm_in_chain_is_write() {
         assert_eq!(classify_bash("ls /tmp && rm -rf /tmp/x"), BashArity::Write);
     }
+
+    // ── smoke-level tests matching task 58 spec ─────────────────────────────
+
+    #[test]
+    fn rm_is_write_class() {
+        assert_eq!(classify_bash("rm foo.rs"), BashArity::Write);
+    }
+
+    #[test]
+    fn git_log_is_read_class() {
+        assert_eq!(classify_bash("git log --oneline -10"), BashArity::Read);
+    }
+
+    #[test]
+    fn git_rm_is_write_class() {
+        assert_eq!(classify_bash("git rm foo.rs"), BashArity::Write);
+    }
+
+    #[test]
+    fn cargo_test_is_read_class() {
+        assert_eq!(classify_bash("cargo test --workspace"), BashArity::Read);
+    }
+
+    #[test]
+    fn compound_write_classifies_as_write() {
+        // Even if first command is read, a write command in the chain → Write.
+        assert_eq!(classify_bash("cat foo.rs && rm foo.rs"), BashArity::Write);
+    }
+
+    #[test]
+    fn echo_is_read_class() {
+        assert_eq!(classify_bash("echo hello"), BashArity::Read);
+    }
 }
