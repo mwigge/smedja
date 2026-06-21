@@ -15,6 +15,7 @@ anyhow            = { workspace = true }
 clap              = { workspace = true }
 dirs              = "5"
 pollster          = "0.3"
+russh             = "0.61"
 serde             = { workspace = true }
 st-agent          = { path = "../../crates/st-agent" }
 st-blocks         = { path = "../../crates/st-blocks" }
@@ -31,3 +32,7 @@ tracing-subscriber = { workspace = true }
 uuid              = { workspace = true }
 wgpu              = { workspace = true }
 winit             = { workspace = true }
+
+[dev-dependencies]
+portable-pty = { workspace = true }
+vte          = { workspace = true }

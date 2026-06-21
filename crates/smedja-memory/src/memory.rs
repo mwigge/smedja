@@ -272,7 +272,12 @@ pub fn inject_workspace_skills(
         return Ok(0);
     }
     let count = skills.len();
-    let combined = skills.join("\n\n---\n\n");
+    let combined = skills
+        .iter()
+        .enumerate()
+        .map(|(i, body)| smedja_plugins::wrap_skill_body(&format!("skill-{i}"), body))
+        .collect::<Vec<_>>()
+        .join("\n\n");
     memory.push(crate::types::Message::system(format!(
         "[workspace skills]\n\n{combined}"
     )));
