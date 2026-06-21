@@ -31,7 +31,7 @@ impl McpHttpClient {
         Ok(Self {
             url: url.to_owned(),
             token: token.to_owned(),
-            http: reqwest::Client::builder().build()?,
+            http: reqwest::Client::new(),
         })
     }
 
@@ -60,6 +60,10 @@ impl McpHttpClient {
             .json::<serde_json::Value>()
             .await
             .map_err(|e| e.to_string())?;
+
+        if let Some(err) = resp.get("error") {
+            tracing::warn!(error = %err, url = %self.url, "MCP server returned error response");
+        }
 
         let tools = resp
             .get("result")

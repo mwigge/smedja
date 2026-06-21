@@ -2,11 +2,12 @@ FROM alpine:3.20
 
 RUN apk add --no-cache \
     bash \
-    curl \
     git \
     jq \
     ripgrep \
-    fd \
-    && rm -rf /var/cache/apk/*
+    fd
+
+RUN adduser -D -H -h /workspace smedja
+USER smedja
 
 WORKDIR /workspace
