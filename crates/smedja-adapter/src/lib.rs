@@ -12,9 +12,11 @@
 //! |--------|-----|
 //! | [`OpenAiProvider`] | `OpenAI` chat completions (streaming) |
 //! | [`AnthropicProvider`] | Anthropic Messages API (streaming) |
+//! | [`LocalProvider`] | Local rs-llmctl instance (OpenAI-compatible) |
 
 pub mod anthropic;
 pub mod error;
+pub mod local;
 pub mod openai;
 pub mod provider;
 pub mod types;
@@ -23,6 +25,7 @@ pub(crate) mod sse;
 
 pub use anthropic::AnthropicProvider;
 pub use error::AdapterError;
+pub use local::{LocalCapability, LocalProvider};
 pub use openai::OpenAiProvider;
 pub use provider::{DeltaStream, Provider};
 pub use types::{CallOptions, Delta, Message, Role};
