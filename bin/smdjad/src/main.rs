@@ -149,6 +149,17 @@ async fn drain_stream(
     Ok((full_response, output_tokens))
 }
 
+/// Returns `true` when the session's mode permits write-arity bash commands.
+///
+/// The `"review"` mode is read-only by default; all other modes are unrestricted.
+/// This guard is consulted by any bash tool handler before executing write-arity
+/// commands (see `smedja_assayer::classify_bash` / `BashArity`).
+#[allow(dead_code)] // ToolGate integration point: called by bash tool dispatch when implemented
+fn role_allows_write_bash(session: &Session) -> bool {
+    // ponytail: review role is read-only by default; all others are unrestricted
+    session.mode.as_deref() != Some("review")
+}
+
 /// Executes a single turn: loads the task, calls the LLM, stores the response.
 #[allow(clippy::too_many_lines)] // all turn lifecycle steps live in one function per the spec
 async fn run_turn(
@@ -203,11 +214,36 @@ async fn run_turn(
     } else {
         "gpt-4o-mini"
     };
+
+    // Inject active task context if the session has a task_id.
+    let task_prefix = {
+        let ig = ingot.lock().await;
+        match ig.get_session(&session_id) {
+            Ok(Some(session)) => {
+                if let Some(ref task_id) = session.task_id {
+                    match ig.get_task(task_id) {
+                        Ok(Some(active_task)) => format!(
+                            "\n\nActive task: {}\n{}",
+                            active_task.title,
+                            active_task.description.as_str(),
+                        ),
+                        _ => String::new(),
+                    }
+                } else {
+                    String::new()
+                }
+            }
+            _ => String::new(),
+        }
+    };
+
+    let system_prompt = format!("You are smedja, an AI coding assistant.{task_prefix}");
+
     let opts = CallOptions {
         model: model.to_owned(),
         max_tokens: Some(2048),
         temperature: Some(0.7),
-        system: Some("You are smedja, an AI coding assistant.".to_owned()),
+        system: Some(system_prompt),
     };
     let messages = vec![AdapterMessage {
         role: AdapterRole::User,
@@ -920,6 +956,31 @@ async fn main() -> anyhow::Result<()> {
 
     let ingot = open_ingot()?;
     let ingot = Arc::new(Mutex::new(ingot));
+
+    // Detect sessions left in_flight by a prior crash.
+    {
+        let mut ig = ingot.lock().await;
+        // ponytail: linear scan; session counts are small
+        match ig.list_sessions() {
+            Ok(sessions) => {
+                let orphaned: Vec<_> = sessions
+                    .iter()
+                    .filter(|s| s.status == "in_flight")
+                    .collect();
+                if !orphaned.is_empty() {
+                    tracing::warn!(
+                        count = orphaned.len(),
+                        "orphaned in_flight sessions detected at startup; marking as orphaned"
+                    );
+                    for sess in orphaned {
+                        let _ = ig.update_session_status(&sess.id.to_string(), "orphaned");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not list sessions at startup"),
+        }
+    }
+
     let dispatcher = Arc::new(Dispatcher::new(32));
 
     let router = build_router(&ingot, Arc::clone(&dispatcher));
