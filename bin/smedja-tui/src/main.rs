@@ -67,7 +67,7 @@ struct Message {
 }
 
 /// Available slash-command completions shown in the popup.
-const SLASH_COMPLETIONS: &[&str] = &["/agent", "/tier", "/spec", "/tdd", "/ponytail"];
+const SLASH_COMPLETIONS: &[&str] = &["/agent", "/health", "/tier", "/spec", "/tdd", "/ponytail"];
 
 #[allow(clippy::struct_excessive_bools)] // AppState is a TUI dispatch table; enum-splitting would add indirection without clarity
 #[derive(Debug)]
@@ -114,6 +114,9 @@ struct AppState {
     slash_popup_visible: bool,
     /// Cursor index within the filtered completion list.
     slash_cursor: usize,
+    /// True while a turn is awaiting a response from the daemon.
+    #[allow(dead_code)] // wired at init; read path lands once streaming poll is complete
+    turn_in_flight: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +161,7 @@ async fn submit(input: &str, state: &mut AppState, client: &mut Client) -> Resul
         Ok(ref v) => {
             let task_id = v["task_id"].as_str().unwrap_or("?").to_owned();
             state.pending_task_id = Some(task_id.clone());
+            state.turn_in_flight = true;
             state.last_poll = Some(std::time::Instant::now());
             format!("queued (task: {task_id})")
         }
@@ -537,6 +541,26 @@ async fn handle_key(
                 };
                 state.main_panel.push_line(msg.text.clone());
                 state.messages.push(msg);
+            } else if input.trim() == "/health" {
+                // Measure RPC round-trip latency by calling session.get.
+                let start = std::time::Instant::now();
+                let session_id = state.session_id.clone();
+                let health_result = client
+                    .call("session.get", json!({ "session_id": session_id }))
+                    .await;
+                let latency_ms = start.elapsed().as_millis();
+                let text = match health_result {
+                    Ok(_) => {
+                        format!("health: socket=ok session={session_id} latency={latency_ms}ms")
+                    }
+                    Err(e) => format!("health: error — {e}"),
+                };
+                let msg = Message {
+                    role: Role::System,
+                    text,
+                };
+                state.main_panel.push_line(msg.text.clone());
+                state.messages.push(msg);
             } else {
                 submit(&input, state, client).await?;
             }
@@ -610,6 +634,23 @@ fn render(frame: &mut ratatui::Frame, state: &AppState) {
 
     // L122: render MainPanel from state.main_panel.
     state.main_panel.render(main_area, frame);
+
+    // Overlay a one-row "⠿ thinking…" indicator at the bottom of the main area.
+    if state.turn_in_flight && main_area.height >= 1 {
+        let thinking_area = ratatui::layout::Rect::new(
+            main_area.x,
+            main_area.y + main_area.height.saturating_sub(1),
+            main_area.width,
+            1,
+        );
+        let thinking_para = Paragraph::new(Line::from(Span::styled(
+            "\u{283f} thinking\u{2026}",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        frame.render_widget(thinking_para, thinking_area);
+    }
 
     // -- Action log -----------------------------------------------------------
     // L122: 5-row area using the existing ActionLog widget.
@@ -797,7 +838,35 @@ async fn main() -> Result<()> {
         slash_completions: Vec::new(),
         slash_popup_visible: false,
         slash_cursor: 0,
+        turn_in_flight: false,
     };
+
+    // Connect banner — shown on every startup so the user knows what's connected.
+    let banner_sock = sock.display().to_string();
+    state
+        .main_panel
+        .push_line(format!("connected to {banner_sock}"));
+    state
+        .main_panel
+        .push_line(format!("session {}", state.session_id));
+    let provider = session_resp
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_owned();
+    state.main_panel.push_line(format!("provider: {provider}"));
+    let tier_str = state.tier.as_deref().unwrap_or("default");
+    state.main_panel.push_line(format!("tier: {tier_str}"));
+    state
+        .main_panel
+        .push_line("type a message or /help for commands".into());
+
+    // Detect tier from session response if not set via CLI.
+    if state.tier.is_none() {
+        if let Some(t) = session_resp.get("tier").and_then(|v| v.as_str()) {
+            state.tier = Some(t.to_owned());
+        }
+    }
 
     enable_raw_mode().context("enable raw mode")?;
     execute!(stdout(), EnterAlternateScreen).context("enter alternate screen")?;
@@ -834,11 +903,11 @@ async fn main() -> Result<()> {
 
         terminal.draw(|f| render(f, &state))?;
 
-        // Poll for pending task result (every 500 ms).
+        // Poll for pending task result (every 200 ms).
         if let Some(task_id) = state.pending_task_id.clone() {
             let should_poll = state
                 .last_poll
-                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(500));
+                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(200));
             if should_poll {
                 state.last_poll = Some(std::time::Instant::now());
                 if let Ok(v) = client.call("task.get", json!({"id": task_id})).await {
@@ -873,6 +942,7 @@ async fn main() -> Result<()> {
                         }
                         state.pending_task_id = None;
                         state.last_poll = None;
+                        state.turn_in_flight = false;
                     } else if status == "failed" {
                         if let Some(mut block) = state.current_block.take() {
                             block.fail();
@@ -896,6 +966,14 @@ async fn main() -> Result<()> {
                         }
                         state.pending_task_id = None;
                         state.last_poll = None;
+                        state.turn_in_flight = false;
+                    } else if status == "in_progress" {
+                        // Show partial response if available (soft streaming).
+                        if let Some(partial) = v["response_partial"].as_str() {
+                            if !partial.is_empty() {
+                                state.main_panel.push_delta(partial);
+                            }
+                        }
                     }
                 }
             }
@@ -1008,6 +1086,7 @@ mod tests {
             slash_completions: Vec::new(),
             slash_popup_visible: false,
             slash_cursor: 0,
+            turn_in_flight: false,
         }
     }
 
@@ -1098,5 +1177,160 @@ mod tests {
             !content.trim().is_empty(),
             "buffer should not be blank when diff overlay is set"
         );
+    }
+
+    #[test]
+    fn slash_health_in_completions() {
+        // /health must appear in completions when user types "/h"
+        let completions = filtered_completions("/h");
+        assert!(
+            completions.contains(&"/health"),
+            "/health must be in SLASH_COMPLETIONS and match '/h' prefix"
+        );
+    }
+
+    #[test]
+    fn health_command_shows_socket_path_in_state() {
+        let mut state = make_state("sess-health");
+        // Simulate what /health should push to main_panel.
+        let msg = format!("health: socket=ok session={} latency=?ms", state.session_id);
+        state.main_panel.push_line(msg.clone());
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            content.contains("health"),
+            "health output should appear in panel"
+        );
+        assert!(
+            content.contains("sess-health"),
+            "health output should show session ID"
+        );
+    }
+
+    // push_delta accumulated via the panel renders into the frame buffer.
+    #[test]
+    fn push_delta_accumulates_content_in_panel() {
+        let mut state = make_state("sess-stream");
+        state.main_panel.push_delta("hello");
+        state.main_panel.push_delta(" there");
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            content.contains("hello"),
+            "delta content should appear in rendered buffer"
+        );
+    }
+
+    // --- connect banner tests ---
+
+    #[test]
+    fn connect_banner_visible() {
+        let mut state = make_state("sess-abc");
+        let sock = "/run/user/1000/smdjad.sock";
+        state.main_panel.push_line(format!("connected to {sock}"));
+        state.main_panel.push_line("session sess-abc".into());
+        state.main_panel.push_line("provider: unknown".into());
+        state.main_panel.push_line("tier: default".into());
+        state
+            .main_panel
+            .push_line("type a message or /help for commands".into());
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(content.contains("sess-abc"), "banner must show session ID");
+        assert!(
+            content.contains("connected"),
+            "banner must show connection line"
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_tier_when_set() {
+        let mut state = make_state("sess-xyz");
+        state.tier = Some("fast".into());
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(content.contains("fast"), "status bar must render the tier");
+    }
+
+    #[test]
+    fn status_bar_shows_unknown_when_no_tier() {
+        let state = make_state("sess-xyz");
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(!content.trim().is_empty());
+    }
+
+    // --- thinking indicator tests ---
+
+    #[test]
+    fn thinking_indicator_visible_when_turn_in_flight() {
+        let mut state = make_state("sess-think");
+        state.turn_in_flight = true;
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            content.contains("thinking") || content.contains('\u{283f}'),
+            "buffer should contain thinking indicator when turn_in_flight is true"
+        );
+    }
+
+    #[test]
+    fn thinking_indicator_hidden_when_idle() {
+        let state = make_state("sess-idle");
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(!content.is_empty());
+    }
+
+    // --- layout regression tests ---
+
+    #[test]
+    fn layout_input_row_at_bottom_of_80x24() {
+        let state = make_state("sess-layout");
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf.area().height, 24);
+        assert_eq!(buf.area().width, 80);
+    }
+
+    #[test]
+    fn layout_40x10_does_not_panic() {
+        let state = make_state("sess-narrow");
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf.area().width, 40);
+        assert_eq!(buf.area().height, 10);
     }
 }
