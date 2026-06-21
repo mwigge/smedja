@@ -11,4 +11,4 @@ pub mod similarity;
 pub mod vault;
 
 pub use error::VaultError;
-pub use vault::{QueryResult, Vault, VaultEntry};
+pub use vault::{DiaryEntry, EmbedderIdentity, QueryResult, Vault, VaultEntry};

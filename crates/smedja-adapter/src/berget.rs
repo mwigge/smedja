@@ -22,10 +22,16 @@ impl Provider for BergetProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    // ponytail: global lock — env vars are process-global, tests run in parallel
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn detect_returns_none_when_key_absent() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let saved = std::env::var("BERGET_API_KEY").ok();
         std::env::remove_var("BERGET_API_KEY");
         let provider = BergetProvider::detect();
@@ -37,6 +43,7 @@ mod tests {
 
     #[test]
     fn detect_returns_some_when_key_present() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BERGET_API_KEY", "test-key");
         let provider = BergetProvider::detect();
         std::env::remove_var("BERGET_API_KEY");

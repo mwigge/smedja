@@ -14,4 +14,8 @@ pub enum VaultError {
     /// The query embedding has a different dimension than the stored embeddings.
     #[error("embedding dimension mismatch: expected {expected}, got {got}")]
     DimensionMismatch { expected: usize, got: usize },
+
+    /// The embedder identity stored in the vault does not match the one being inserted.
+    #[error("embedder mismatch: vault has {stored:?}, inserting with {incoming:?}")]
+    EmbedderMismatch { stored: String, incoming: String },
 }
