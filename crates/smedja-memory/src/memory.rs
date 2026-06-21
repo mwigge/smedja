@@ -143,6 +143,33 @@ impl WorkingMemory {
     }
 }
 
+/// Loads workspace skill files from `<dir>/.smedja/skills/*.md`.
+///
+/// Returns an empty [`Vec`] when the directory is absent or no `.md` files
+/// are present — this is not an error.
+///
+/// # Errors
+///
+/// Returns an error only if the directory exists but cannot be read.
+pub fn load_workspace_skills(dir: &std::path::Path) -> Result<Vec<String>, std::io::Error> {
+    let skills_dir = dir.join(".smedja").join("skills");
+    if !skills_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut skills = Vec::new();
+    for entry in std::fs::read_dir(&skills_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            let content = std::fs::read_to_string(&path)?;
+            skills.push(content);
+        }
+    }
+    // Sort for deterministic ordering (alphabetical by filename).
+    skills.sort();
+    Ok(skills)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +275,35 @@ mod tests {
         // 50 messages; index 0 → 50-1-0 = 49 from end → beyond WARM(30) → Cold
         let m = make_mem(50);
         assert_eq!(m.stratum_for(0), Stratum::Cold);
+    }
+
+    #[test]
+    fn load_skills_empty_when_dir_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = super::load_workspace_skills(tmp.path()).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn load_skills_reads_md_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join(".smedja").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(skills_dir.join("alpha.md"), "skill alpha").unwrap();
+        std::fs::write(skills_dir.join("beta.md"), "skill beta").unwrap();
+        let mut result = super::load_workspace_skills(tmp.path()).unwrap();
+        result.sort();
+        assert_eq!(result, vec!["skill alpha", "skill beta"]);
+    }
+
+    #[test]
+    fn load_skills_ignores_non_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join(".smedja").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(skills_dir.join("skill.md"), "md content").unwrap();
+        std::fs::write(skills_dir.join("readme.txt"), "txt content").unwrap();
+        let result = super::load_workspace_skills(tmp.path()).unwrap();
+        assert_eq!(result, vec!["md content"]);
     }
 }

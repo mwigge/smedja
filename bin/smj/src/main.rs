@@ -92,6 +92,10 @@ enum SessionCmd {
         id: String,
         turn: u32,
     },
+    /// List stored blocks for a session
+    Blocks {
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -220,17 +224,26 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Session { action } => {
-            let mut client = Client::connect(&sock)
-                .await
-                .with_context(|| format!("smdjad not running ({})", sock.display()))?;
-            match action {
-                SessionCmd::List => cmd_session_list(&mut client).await?,
-                SessionCmd::Show { id } => cmd_session_show(&mut client, &id).await?,
-                SessionCmd::Rollback { id, turn } => {
-                    cmd_session_rollback(&mut client, &id, turn).await?;
-                }
-                SessionCmd::Fork { id, .. } => {
-                    println!("fork: not yet implemented for session {id}");
+            if let SessionCmd::Blocks { id } = action {
+                // ponytail: blocks are in-memory in the TUI; smj can only call the
+                // smdjad RPC if one is wired, so for now print a message.
+                println!(
+                    "smj session blocks {id}: requires smdjad 'session.blocks' RPC (not yet wired)"
+                );
+            } else {
+                let mut client = Client::connect(&sock)
+                    .await
+                    .with_context(|| format!("smdjad not running ({})", sock.display()))?;
+                match action {
+                    SessionCmd::List => cmd_session_list(&mut client).await?,
+                    SessionCmd::Show { id } => cmd_session_show(&mut client, &id).await?,
+                    SessionCmd::Rollback { id, turn } => {
+                        cmd_session_rollback(&mut client, &id, turn).await?;
+                    }
+                    SessionCmd::Fork { id, .. } => {
+                        println!("fork: not yet implemented for session {id}");
+                    }
+                    SessionCmd::Blocks { .. } => unreachable!(),
                 }
             }
         }
