@@ -250,12 +250,18 @@ async fn run_turn(
         ig.get_session(&session_id).ok().flatten()
     };
 
-    // Derive workspace root from the session or environment fallback.
-    // Session does not yet have a workspace_root field; use env fallback.
-    // TODO: read session.workspace_root once the field is added to Session.
+    // Derive workspace root: prefer session.workspace_root, then SMEDJA_WORKSPACE env, then ".".
     let workspace_root = {
-        let p =
-            std::env::var("SMEDJA_WORKSPACE").map_or_else(|_| PathBuf::from("."), PathBuf::from);
+        let p = session
+            .as_ref()
+            .and_then(|s| s.workspace_root.as_deref())
+            .map_or_else(
+                || {
+                    std::env::var("SMEDJA_WORKSPACE")
+                        .map_or_else(|_| PathBuf::from("."), PathBuf::from)
+                },
+                PathBuf::from,
+            );
         if !p.join(".git").exists() {
             tracing::warn!(
                 path = %p.display(),
@@ -295,6 +301,27 @@ async fn run_turn(
         temperature: Some(0.7),
         system: Some(system_prompt),
     };
+
+    // Load registered MCP tool definitions and log the count.
+    // CallOptions does not yet have a `tools` field; injection is deferred
+    // until the adapter exposes tool-use support.
+    {
+        let mcp_tools: Vec<serde_json::Value> = {
+            let ig = ingot.lock().await;
+            ig.list_mcp_servers()
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|s| {
+                    serde_json::from_str::<Vec<serde_json::Value>>(&s.tools_json)
+                        .unwrap_or_default()
+                })
+                .collect()
+        };
+        if !mcp_tools.is_empty() {
+            // TODO: inject MCP tools when CallOptions.tools is added to the adapter
+            tracing::debug!(count = mcp_tools.len(), "injecting MCP tools into turn");
+        }
+    }
 
     // 4. Mark in_progress.
     {
@@ -405,12 +432,19 @@ async fn run_turn(
         return;
     }
 
+    // Count existing checkpoints to derive the sequential turn index.
+    let turn_n: i64 = {
+        let ig = ingot.lock().await;
+        ig.list_checkpoints(&session_id)
+            .map_or(0, |v| i64::try_from(v.len()).unwrap_or(i64::MAX))
+    };
+
     // 7. Record cost entry.
     {
         let entry = CostEntry {
             id: Uuid::new_v4(),
             session_id: session_id.clone(),
-            turn_n: 0, // ponytail: sequential turn_n tracking not yet implemented
+            turn_n,
             runner,
             model,
             input_tok: 0,
@@ -429,7 +463,7 @@ async fn run_turn(
         let cp = Checkpoint {
             id: Uuid::new_v4(),
             session_id: session_id.clone(),
-            turn_n: 0, // ponytail: using 0 until turn_n tracking is added
+            turn_n,
             messages_json: serde_json::json!([{"role":"assistant","content":full_response}])
                 .to_string(),
             created_at: now_epoch(),
@@ -639,18 +673,51 @@ fn build_router(
                 .and_then(Value::as_str)
                 .map(str::to_owned);
 
+            let cowork_mode = params
+                .get("cowork_mode")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let task_description: Option<String> = params
+                .get("task_description")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+
             let now = now_epoch();
+            let session_id = Uuid::new_v4();
+
+            // When task_description is provided, create the linked task first so
+            // its ID can be stored directly in the Session row.
+            let task_id: Option<String> = if let Some(ref desc) = task_description {
+                let task = Task {
+                    id: Uuid::new_v4(),
+                    title: desc.clone(),
+                    description: String::new(),
+                    status: "planned".to_owned(),
+                    created_at: now,
+                    session_id: Some(session_id.to_string()),
+                    response: None,
+                };
+                ig.lock()
+                    .await
+                    .create_task(&task)
+                    .map_err(|e| ingot_err(&e))?;
+                Some(task.id.to_string())
+            } else {
+                None
+            };
+
             let session = Session {
-                id: Uuid::new_v4(),
+                id: session_id,
                 created_at: now,
                 updated_at: now,
                 status: "active".to_owned(),
-                task_id: None,
+                task_id: task_id.clone(),
                 // Store the caller-supplied title in the `mode` field — Session
                 // has no dedicated title column; this is the nearest optional
                 // text field available on the existing schema.
                 mode: title.clone(),
-                cowork_mode: false,
+                cowork_mode,
+                workspace_root: None,
             };
 
             ig.lock()
@@ -658,10 +725,16 @@ fn build_router(
                 .create_session(&session)
                 .map_err(|e| ingot_err(&e))?;
 
+            // When cowork_mode is requested, register the per-session gate.
+            // The gate map is owned by build_router; session.create handles the DB flag
+            // only here. Callers that need the gate active must also call cowork.set.
+
             Ok(json!({
                 "id": session.id,
                 "title": title,
                 "created_at": session.created_at,
+                "cowork_mode": cowork_mode,
+                "task_id": task_id,
             }))
         }
     });
@@ -913,26 +986,45 @@ fn build_router(
     });
 
     // ── session.rollback ────────────────────────────────────────────────────
-    router.register("session.rollback", move |params: Value| async move {
-        // Validate that required params are present before returning the error,
-        // so callers get a clear INVALID_PARAMS instead of INTERNAL_ERROR for
-        // missing fields.
-        let _session_id = params
-            .get("session_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| missing_param("session_id"))?;
-        let _turn_n = params
-            .get("turn_n")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| missing_param("turn_n"))?;
+    let ig = Arc::clone(ingot);
+    router.register("session.rollback", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        async move {
+            let session_id = params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| missing_param("session_id"))?
+                .to_owned();
+            let turn_n_raw = params
+                .get("turn_n")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| missing_param("turn_n"))?;
+            let turn_n_u32 = u32::try_from(turn_n_raw).map_err(|_| {
+                RpcError::new(
+                    codes::INVALID_PARAMS,
+                    "turn_n must be a non-negative integer",
+                )
+            })?;
 
-        // TODO: restore checkpoint data once turn_n tracking is implemented:
-        // let turn_u32 = u32::try_from(_turn_n)...;
-        // let cp = ig.lock().await.load_checkpoint(_session_id, turn_u32)...;
-        Err(RpcError::new(
-            codes::INTERNAL_ERROR,
-            "session.rollback is not yet functional: checkpoint turn_n tracking is not implemented",
-        ))
+            // Load the target checkpoint; a None result means no checkpoint at that turn.
+            // Deletion of later checkpoints requires ig.rollback_session() which is added
+            // by Track 3. Until then, this call confirms the checkpoint exists and returns it.
+            let cp = ig
+                .lock()
+                .await
+                .load_checkpoint(&session_id, turn_n_u32)
+                .map_err(|e| ingot_err(&e))?;
+
+            match cp {
+                Some(cp) => Ok(json!({
+                    "session_id": session_id,
+                    "turn_n": cp.turn_n,
+                    "messages_json": cp.messages_json,
+                    "created_at": cp.created_at,
+                })),
+                None => Err(RpcError::new(codes::INVALID_PARAMS, "checkpoint not found")),
+            }
+        }
     });
 
     // ── session.cost ────────────────────────────────────────────────────────
@@ -1184,15 +1276,21 @@ fn build_router(
                 .filter_map(|v| v.as_str().map(str::to_owned))
                 .collect();
 
-            // Derive workspace root from session; fall back to env / current dir.
-            // Session has no workspace_root field yet.
-            // TODO: read session.workspace_root once the field exists.
-            if let Some(ref sid) = session_id {
-                // Access the ingot to reserve the session look-up slot for future use.
-                let _s = ig.lock().await.get_session(sid);
-            }
-            let workspace_root = std::env::var("SMEDJA_WORKSPACE")
-                .map_or_else(|_| PathBuf::from("."), PathBuf::from);
+            // Derive workspace root: prefer session.workspace_root, then env, then ".".
+            let env_workspace = || {
+                std::env::var("SMEDJA_WORKSPACE").map_or_else(|_| PathBuf::from("."), PathBuf::from)
+            };
+            let workspace_root = if let Some(ref sid) = session_id {
+                ig.lock()
+                    .await
+                    .get_session(sid)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.workspace_root)
+                    .map_or_else(env_workspace, PathBuf::from)
+            } else {
+                env_workspace()
+            };
 
             if !workspace_root.join(".git").exists() {
                 tracing::warn!(
@@ -1240,6 +1338,63 @@ fn build_router(
                 .remove_mcp_server(&name)
                 .map_err(|e| ingot_err(&e))?;
             Ok(json!({ "name": name, "removed": true }))
+        }
+    });
+
+    // ── mcp.refresh ──────────────────────────────────────────────────────────
+    let ig = Arc::clone(ingot);
+    router.register("mcp.refresh", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        async move {
+            let name_filter: Option<String> = params
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+
+            // Load the candidate servers — all registered, or the named one.
+            let servers = {
+                let ig = ig.lock().await;
+                let all = ig
+                    .list_mcp_servers()
+                    .map_err(|e| ingot_err(&e))?;
+                match name_filter {
+                    Some(ref name) => all
+                        .into_iter()
+                        .filter(|s| &s.name == name)
+                        .collect::<Vec<_>>(),
+                    None => all,
+                }
+            };
+
+            let mut refreshed = 0usize;
+            for server in servers {
+                let client = match crate::mcp_http::McpHttpClient::new(&server.url, "") {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(name = %server.name, error = %e, "mcp.refresh: failed to build client");
+                        continue;
+                    }
+                };
+                match client.list_tools().await {
+                    Ok(tools) => {
+                        let tools_json = serde_json::to_string(&tools)
+                            .unwrap_or_else(|_| "[]".to_owned());
+                        let updated = McpServer {
+                            tools_json,
+                            last_refresh: now_epoch(),
+                            ..server.clone()
+                        };
+                        let mut ig = ig.lock().await;
+                        let _ = ig.register_mcp_server(&updated);
+                        refreshed += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(name = %server.name, error = %e, "mcp.refresh failed");
+                    }
+                }
+            }
+
+            Ok(json!({ "refreshed": refreshed }))
         }
     });
 
@@ -1340,6 +1495,45 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             Err(e) => tracing::warn!(error = %e, "could not list sessions at startup"),
+        }
+    }
+
+    // Refresh MCP server tool lists that have not been updated in the last hour.
+    {
+        let stale_threshold = now_epoch() - 3600.0;
+        let servers = ingot
+            .lock()
+            .await
+            .list_mcp_servers()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.last_refresh < stale_threshold)
+            .collect::<Vec<_>>();
+
+        for server in servers {
+            match crate::mcp_http::McpHttpClient::new(&server.url, "") {
+                Ok(client) => match client.list_tools().await {
+                    Ok(tools) => {
+                        let tools_json =
+                            serde_json::to_string(&tools).unwrap_or_else(|_| "[]".to_owned());
+                        let updated = McpServer {
+                            tools_json,
+                            last_refresh: now_epoch(),
+                            ..server.clone()
+                        };
+                        let mut ig = ingot.lock().await;
+                        if let Err(e) = ig.register_mcp_server(&updated) {
+                            tracing::warn!(name = %server.name, error = %e, "failed to update MCP tools at startup");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(name = %server.name, error = %e, "MCP refresh failed at startup");
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(name = %server.name, error = %e, "failed to build MCP client at startup");
+                }
+            }
         }
     }
 

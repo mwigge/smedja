@@ -268,6 +268,7 @@ mod tests {
             task_id: None,
             mode: None,
             cowork_mode: false,
+            workspace_root: None,
         };
         ingot.create_session(&session).unwrap();
 

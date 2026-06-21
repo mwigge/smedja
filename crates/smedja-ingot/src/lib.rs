@@ -93,13 +93,14 @@ impl Ingot {
             );
 
             CREATE TABLE IF NOT EXISTS sessions (
-                id          TEXT PRIMARY KEY,
-                created_at  REAL NOT NULL,
-                updated_at  REAL NOT NULL,
-                status      TEXT NOT NULL DEFAULT 'active',
-                task_id     TEXT,
-                mode        TEXT,
-                cowork_mode INTEGER NOT NULL DEFAULT 0
+                id             TEXT PRIMARY KEY,
+                created_at     REAL NOT NULL,
+                updated_at     REAL NOT NULL,
+                status         TEXT NOT NULL DEFAULT 'active',
+                task_id        TEXT,
+                mode           TEXT,
+                cowork_mode    INTEGER NOT NULL DEFAULT 0,
+                workspace_root TEXT
             );
 
             CREATE TABLE IF NOT EXISTS mcp_servers (
@@ -164,6 +165,11 @@ impl Ingot {
         let _ = self.conn.execute_batch(
             "ALTER TABLE sessions ADD COLUMN cowork_mode INTEGER NOT NULL DEFAULT 0;",
         );
+
+        // Add workspace_root column to existing sessions tables — suppressed if already present.
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE sessions ADD COLUMN workspace_root TEXT;");
 
         // Record (or ignore) the schema version marker.
         self.conn.execute(
@@ -267,6 +273,48 @@ impl Ingot {
         Ok(())
     }
 
+    /// Sets the `workspace_root` filesystem path for the session identified by `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the workspace root was updated"]
+    pub fn update_session_workspace_root(
+        &mut self,
+        session_id: &str,
+        workspace_root: &str,
+    ) -> Result<(), IngotError> {
+        session::update_workspace_root(&self.conn, session_id, workspace_root)
+    }
+
+    /// Links the session identified by `session_id` to a task by setting `task_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the task id was linked"]
+    pub fn update_session_task_id(
+        &mut self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<(), IngotError> {
+        session::update_task_id(&self.conn, session_id, task_id)
+    }
+
+    /// Enables or disables the cowork gate for the session identified by `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the cowork mode was updated"]
+    pub fn update_session_cowork_mode(
+        &mut self,
+        session_id: &str,
+        enabled: bool,
+    ) -> Result<(), IngotError> {
+        session::update_cowork_mode(&self.conn, session_id, enabled)
+    }
+
     // ── mcp_servers ──────────────────────────────────────────────────────────
 
     /// Registers (or replaces) an [`McpServer`] in the registry.
@@ -297,6 +345,50 @@ impl Ingot {
     #[must_use = "check the Result to confirm the MCP server was removed"]
     pub fn remove_mcp_server(&mut self, id: &str) -> Result<(), IngotError> {
         mcp::remove(&self.conn, id)
+    }
+
+    /// Updates the cached tool list and refresh timestamp for the server identified
+    /// by `name`. Sets `last_refresh` to the current Unix epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the tool list was updated"]
+    pub fn update_mcp_tools(&mut self, name: &str, tools_json: &str) -> Result<(), IngotError> {
+        mcp::update_tools(&self.conn, name, tools_json)
+    }
+
+    /// Returns all registered [`McpServer`]s whose `last_refresh` is older than
+    /// `older_than_secs` seconds ago, or that have never been refreshed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned servers"]
+    pub fn get_stale_servers(&self, older_than_secs: f64) -> Result<Vec<McpServer>, IngotError> {
+        mcp::stale(&self.conn, older_than_secs)
+    }
+
+    /// Returns all MCP servers that have a non-empty `tools_json`, as
+    /// `(server_name, tools_json)` pairs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned tool pairs"]
+    pub fn get_all_mcp_tools(&self) -> Result<Vec<(String, String)>, IngotError> {
+        mcp::all_tools(&self.conn)
+    }
+
+    /// Looks up a single [`McpServer`] by its registered name, returning `None`
+    /// when no server with that name exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned server"]
+    pub fn get_mcp_server_by_name(&self, name: &str) -> Result<Option<McpServer>, IngotError> {
+        mcp::by_name(&self.conn, name)
     }
 
     // ── tasks ─────────────────────────────────────────────────────────────────
