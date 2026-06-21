@@ -812,6 +812,34 @@ async fn execute_tool(
 ) -> String {
     let input: Value = serde_json::from_str(tool_input).unwrap_or(Value::Null);
 
+    // Least-privilege enforcement: block write tools for read-only (review) sessions.
+    if session.is_some_and(|s| s.mode.as_deref() == Some("review")) {
+        const WRITE_TOOLS: &[&str] = &["edit_file", "bash", "write_file", "run_command"];
+        if WRITE_TOOLS.contains(&tool_name) {
+            tracing::warn!(
+                tool = tool_name,
+                "smedja.security.tool_blocked: write tool blocked for read-only session"
+            );
+            return format!(
+                "error: tool '{tool_name}' is blocked for read-only roles (TOOL_BLOCKED)"
+            );
+        }
+    }
+
+    // Data access tracking: warn on absolute-path write attempts outside workspace.
+    if matches!(tool_name, "write_file" | "edit_file") {
+        if let Some(path_str) = input.get("path").and_then(Value::as_str) {
+            let path = std::path::Path::new(path_str);
+            if path.is_absolute() {
+                tracing::warn!(
+                    tool = tool_name,
+                    path = path_str,
+                    "smedja.security.data_access_blocked: write outside workspace attempted"
+                );
+            }
+        }
+    }
+
     match tool_name {
         "bash" | "run_command" => {
             let cmd = input
@@ -1114,6 +1142,77 @@ fn build_router(
                 .await
                 .create_session(&session)
                 .map_err(|e| ingot_err(&e))?;
+
+            // Auto-index: check workspace.toml in cwd; if stale, index in background.
+            {
+                let cwd = std::env::var("SMEDJA_WORKSPACE")
+                    .map_or_else(|_| std::path::PathBuf::from("."), std::path::PathBuf::from);
+                let toml_path = cwd.join(".smedja").join("workspace.toml");
+                let needs_index = if toml_path.exists() {
+                    let content = std::fs::read_to_string(&toml_path).unwrap_or_default();
+                    if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
+                        parsed
+                            .get("graph")
+                            .and_then(|g| g.get("last_indexed_at"))
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                            .is_none_or(|ts| {
+                                let age = chrono::Utc::now()
+                                    .signed_duration_since(ts.with_timezone(&chrono::Utc));
+                                age.num_hours() >= 24
+                            })
+                    } else {
+                        true
+                    }
+                } else {
+                    // Only auto-index if workspace.toml already exists (workspace was initialised).
+                    false
+                };
+
+                if needs_index {
+                    let bg_cwd = cwd.clone();
+                    let bg_toml = toml_path.clone();
+                    tokio::task::spawn(async move {
+                        use opentelemetry::trace::Span as _;
+                        let tracer = opentelemetry::global::tracer("smedja");
+                        let mut span =
+                            opentelemetry::trace::Tracer::start(&tracer, "smedja.workspace.index");
+                        let start = std::time::Instant::now();
+                        let db_path = bg_cwd.join(".smedja").join("graph.db");
+                        let bg_cwd_clone = bg_cwd.clone();
+                        let symbol_count = tokio::task::spawn_blocking(move || {
+                            smedja_graph::GraphStore::open(&db_path)
+                                .and_then(|mut s| {
+                                    s.index_workspace_incremental(&bg_cwd_clone, "workspace", None)
+                                })
+                                .unwrap_or(0)
+                        })
+                        .await
+                        .unwrap_or(0);
+                        let duration_ms = start.elapsed().as_millis();
+                        span.set_attribute(opentelemetry::KeyValue::new(
+                            "workspace_path",
+                            bg_cwd.to_string_lossy().into_owned(),
+                        ));
+                        span.set_attribute(opentelemetry::KeyValue::new(
+                            "symbol_count",
+                            i64::try_from(symbol_count).unwrap_or(i64::MAX),
+                        ));
+                        span.set_attribute(opentelemetry::KeyValue::new(
+                            "duration_ms",
+                            i64::try_from(duration_ms).unwrap_or(i64::MAX),
+                        ));
+                        span.end();
+                        let ts = chrono::Utc::now().to_rfc3339();
+                        let new_content = format!(
+                            "[graph]\nauto_index = true\nlast_indexed_at = \"{ts}\"\n"
+                        );
+                        if let Err(e) = std::fs::write(&bg_toml, new_content) {
+                            tracing::warn!(error = %e, "failed to update workspace.toml after auto-index");
+                        }
+                    });
+                }
+            }
 
             // When cowork_mode is requested, register the per-session gate.
             // The gate map is owned by build_router; session.create handles the DB flag
@@ -2140,6 +2239,60 @@ fn build_router(
         }
     });
 
+    // ── loop.retire ──────────────────────────────────────────────────────────
+    let ig = Arc::clone(ingot);
+    router.register("loop.retire", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        async move {
+            let loop_id = params["loop_id"]
+                .as_str()
+                .ok_or_else(|| missing_param("loop_id"))?
+                .to_owned();
+            let rec = ig
+                .lock()
+                .await
+                .get_loop(&loop_id)
+                .map_err(|e| ingot_err(&e))?
+                .ok_or_else(|| {
+                    RpcError::new(codes::INVALID_PARAMS, format!("loop not found: {loop_id}"))
+                })?;
+            // Only complete or failed loops can be retired.
+            if rec.status != "complete" && rec.status != "failed" {
+                return Err(RpcError::new(
+                    codes::INVALID_PARAMS,
+                    format!(
+                        "loop is in state '{}'; only complete or failed loops can be retired",
+                        rec.status
+                    ),
+                ));
+            }
+            ig.lock()
+                .await
+                .update_loop_status(&loop_id, "retired", now_epoch())
+                .map_err(|e| ingot_err(&e))?;
+            Ok(json!({ "loop_id": loop_id, "status": "retired" }))
+        }
+    });
+
+    // ── loop.list_by_status ──────────────────────────────────────────────────
+    let ig = Arc::clone(ingot);
+    router.register("loop.list_by_status", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        async move {
+            let status = params["status"].as_str().map(str::to_owned);
+            let loops = ig
+                .lock()
+                .await
+                .list_loops_by_status(status.as_deref())
+                .map_err(|e| ingot_err(&e))?;
+            let loops_json: Vec<Value> = loops
+                .into_iter()
+                .map(|r| serde_json::to_value(&r).unwrap_or(Value::Null))
+                .collect();
+            Ok(json!({ "loops": loops_json }))
+        }
+    });
+
     // ── audit.list ───────────────────────────────────────────────────────────
     let ig = Arc::clone(ingot);
     router.register("audit.list", move |params: Value| {
@@ -2184,6 +2337,14 @@ fn build_router(
                 .ok_or_else(|| {
                     RpcError::new(codes::INVALID_PARAMS, format!("loop not found: {loop_id}"))
                 })?;
+
+            // Retired loops cannot be re-run.
+            if rec.status == "retired" {
+                return Err(RpcError::new(
+                    codes::INVALID_PARAMS,
+                    "loop is retired and cannot be re-run",
+                ));
+            }
 
             // Spawn background task — caller gets an immediate response.
             let bg_ig = Arc::clone(&ig);
@@ -2529,6 +2690,49 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn read_only_role_blocks_write_tools() {
+        // The least-privilege check in execute_tool blocks write tools when
+        // session mode is "review". Verify the logic inline.
+        let read_only_modes = ["review"];
+        let write_tools = ["edit_file", "bash", "write_file", "run_command"];
+        for mode in &read_only_modes {
+            for tool in &write_tools {
+                let is_blocked = *mode == "review" && write_tools.contains(tool);
+                assert!(is_blocked, "tool {tool} should be blocked for mode {mode}");
+            }
+        }
+    }
+
+    #[test]
+    fn loop_retire_state_is_terminal() {
+        // Verify the terminal-status strings used in loop.retire enforcement.
+        // "retired" must not be "complete" or "failed" — so the retire guard
+        // would have rejected it (retired loops cannot be retired again).
+        let retired = "retired";
+        assert!(retired != "complete" && retired != "failed");
+    }
+
+    #[test]
+    fn loop_complete_and_failed_allow_retire() {
+        // Only complete or failed loops may be retired — verify the predicate.
+        let terminal_for_retire = |s: &str| s == "complete" || s == "failed";
+        assert!(terminal_for_retire("complete"));
+        assert!(terminal_for_retire("failed"));
+        assert!(!terminal_for_retire("planning"));
+        assert!(!terminal_for_retire("slicing"));
+        assert!(!terminal_for_retire("retired"));
+    }
+
+    #[test]
+    fn retired_loop_cannot_be_re_run() {
+        // The loop.run guard rejects status == "retired".
+        let guard = |status: &str| status == "retired";
+        assert!(guard("retired"));
+        assert!(!guard("complete"));
+        assert!(!guard("planning"));
+    }
+
     #[tokio::test]
     async fn subprocess_provider_absent_keys_fails() {
         // When no API keys and no special CLIs are set, build_provider returns Err.

@@ -13,6 +13,7 @@ pub mod guard;
 pub mod loop_state;
 pub mod mcp;
 pub mod openspec_store;
+pub mod prompt_hash;
 pub mod session;
 pub mod task;
 pub mod token_snapshot;
@@ -25,6 +26,7 @@ pub use guard::{classify as classify_command, is_safe as command_is_safe, Comman
 pub use loop_state::LoopRecord;
 pub use mcp::McpServer;
 pub use openspec_store::OpenSpecStore;
+pub use prompt_hash::PromptHashRecord;
 pub use session::Session;
 pub use task::Task;
 pub use token_snapshot::TokenSnapshot;
@@ -172,6 +174,14 @@ impl Ingot {
                 created_at       REAL NOT NULL,
                 UNIQUE(session_id, turn_n)
             );
+
+            CREATE TABLE IF NOT EXISTS prompt_hashes (
+                id          TEXT PRIMARY KEY,
+                change_name TEXT NOT NULL,
+                role        TEXT NOT NULL,
+                hash        TEXT NOT NULL,
+                ts          REAL NOT NULL
+            );
             ",
         )?;
 
@@ -195,6 +205,11 @@ impl Ingot {
         let _ = self
             .conn
             .execute_batch("ALTER TABLE sessions ADD COLUMN model_override TEXT;");
+
+        // Add role_id column to audit_events — suppressed if already present.
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE audit_events ADD COLUMN role_id TEXT;");
 
         // Record (or ignore) the schema version marker.
         self.conn.execute(
@@ -680,8 +695,8 @@ impl Ingot {
                     let result = self.conn.execute(
                         "INSERT OR IGNORE INTO audit_events \
                          (id, ts, session_id, turn_id, action_type, actor, tool_name, \
-                          input_tok, output_tok, latency_ms, traceparent, tier) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                          input_tok, output_tok, latency_ms, traceparent, tier, role_id) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                         rusqlite::params![
                             ev.id.to_string(),
                             ev.ts,
@@ -695,6 +710,7 @@ impl Ingot {
                             ev.latency_ms,
                             ev.traceparent,
                             ev.tier,
+                            ev.role_id,
                         ],
                     )?;
                     imported += result;
@@ -798,6 +814,73 @@ impl Ingot {
     ) -> Result<(), IngotError> {
         loop_state::update_slice(&self.conn, id, current_slice, updated_at)
     }
+
+    /// Returns all [`LoopRecord`]s, optionally filtered by `status`.
+    ///
+    /// Pass `None` to return all loops. Pass `Some("retired")` (or any other valid
+    /// status string) to restrict the result set. Results are ordered by
+    /// `created_at` descending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned loop records"]
+    pub fn list_loops_by_status(
+        &self,
+        status: Option<&str>,
+    ) -> Result<Vec<LoopRecord>, IngotError> {
+        loop_state::list_by_status(&self.conn, status)
+    }
+
+    // ── prompt_hashes ─────────────────────────────────────────────────────────
+
+    /// Records a prompt content hash for `(change, role)` at the current time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the INSERT fails.
+    #[must_use = "check the Result to confirm the hash was saved"]
+    pub fn save_prompt_hash(
+        &mut self,
+        change: &str,
+        role: &str,
+        hash: &str,
+    ) -> Result<(), IngotError> {
+        prompt_hash::save(&self.conn, change, role, hash, now_epoch())
+    }
+
+    /// Returns the most recent prompt hash for `(change, role)`, or `None` when
+    /// no record exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned hash"]
+    pub fn get_prompt_hash(&self, change: &str, role: &str) -> Result<Option<String>, IngotError> {
+        prompt_hash::get_latest(&self.conn, change, role)
+    }
+
+    /// Returns all prompt hash records for `change`, ordered by `ts` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned records"]
+    pub fn list_prompt_hashes(&self, change: &str) -> Result<Vec<PromptHashRecord>, IngotError> {
+        prompt_hash::list_by_change(&self.conn, change)
+    }
+
+    // ── audit_events (all) ────────────────────────────────────────────────────
+
+    /// Returns all [`AuditEvent`]s ordered by `ts` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned events"]
+    pub fn list_all_audit_events(&self) -> Result<Vec<AuditEvent>, IngotError> {
+        audit::list_all(&self.conn)
+    }
 }
 
 /// Returns the current time as a Unix epoch `f64`.
@@ -870,6 +953,7 @@ mod tests {
             latency_ms: 42,
             traceparent: None,
             tier: None,
+            role_id: None,
         }
     }
 

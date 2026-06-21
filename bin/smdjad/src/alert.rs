@@ -133,6 +133,7 @@ async fn webhook_alert(
             latency_ms: 0,
             traceparent: None,
             tier: None,
+            role_id: None,
         };
         normalised.push((alert, event));
     }
