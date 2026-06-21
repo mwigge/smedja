@@ -8,4 +8,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow    = { workspace = true }
+base64    = "0.22"
+png       = "0.17"
+tiny-skia = "0.12"
 tracing   = { workspace = true }
