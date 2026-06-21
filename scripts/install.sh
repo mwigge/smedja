@@ -1,9 +1,9 @@
 #!/bin/sh
-# Install smdjad, smj, and smedja from GitHub Releases.
+# Install smedja: smdjad, smj, smedja TUI, and smedja-term GPU terminal.
 # Usage:
 #   curl -fsSL https://github.com/mwigge/smedja/releases/latest/download/install.sh | sh
 #   SMEDJA_VERSION=v0.1.0 ... | sh   # pin a version
-#   SMEDJA_DIR=/usr/local/bin ... | sh  # override install dir
+#   SMEDJA_DIR=/usr/local/bin ... | sh  # override install dir (default: ~/.local/bin)
 set -e
 
 REPO="mwigge/smedja"
@@ -48,7 +48,7 @@ else
   echo "error: curl or wget required" >&2; exit 1
 fi
 
-for bin in smdjad smj smedja; do
+for bin in smdjad smj smedja smedja-term; do
   src="$TMP/smedja-$OS-$ARCH/$bin"
   if [ -f "$src" ]; then
     install -m755 "$src" "$INSTALL_DIR/$bin"
@@ -56,15 +56,48 @@ for bin in smdjad smj smedja; do
   fi
 done
 
-# PATH hint if needed
+# register smedja-term as a .desktop app (Linux only)
+if [ "$OS" = "linux" ] && [ -f "$INSTALL_DIR/smedja-term" ]; then
+  DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  mkdir -p "$DESKTOP_DIR"
+  cat > "$DESKTOP_DIR/smedja-term.desktop" <<EOF
+[Desktop Entry]
+Name=smedja-term
+Comment=smedja GPU terminal
+Exec=$INSTALL_DIR/smedja-term
+Icon=utilities-terminal
+Type=Application
+Categories=System;TerminalEmulator;
+StartupNotify=true
+EOF
+  # register as default terminal handler if update-alternatives is available
+  if command -v update-alternatives >/dev/null 2>&1; then
+    update-alternatives --install /usr/bin/x-terminal-emulator x-terminal-emulator "$INSTALL_DIR/smedja-term" 50 2>/dev/null || true
+  fi
+  echo "  smedja-term.desktop → $DESKTOP_DIR"
+fi
+
+# add to PATH if not already there
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *)
     echo ""
-    echo "note: add $INSTALL_DIR to your PATH:"
-    echo "  export PATH=\"\$PATH:$INSTALL_DIR\""
+    echo "note: $INSTALL_DIR is not in PATH. Add it:"
+    echo ""
+    # detect shell and suggest the right rc file
+    case "${SHELL:-}" in
+      */fish)  echo "  fish_add_path $INSTALL_DIR" ;;
+      */zsh)   echo "  echo 'export PATH=\"\$PATH:$INSTALL_DIR\"' >> ~/.zshrc && source ~/.zshrc" ;;
+      *)       echo "  echo 'export PATH=\"\$PATH:$INSTALL_DIR\"' >> ~/.bashrc && source ~/.bashrc" ;;
+    esac
     ;;
 esac
 
 echo ""
-echo "done. run 'smdjad --help' to get started."
+echo "installed:"
+echo "  smdjad      — AI orchestration daemon"
+echo "  smj         — control CLI (smj --help)"
+echo "  smedja      — TUI session interface"
+echo "  smedja-term — GPU terminal emulator"
+echo ""
+echo "quickstart: smdjad & && smedja-term"
