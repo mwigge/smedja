@@ -48,3 +48,21 @@ cargo test -p smedja-tui --test smoke
 4. Set the checkbox to `[x]` in the relevant `tasks.md`.
 
 Do not skip step 3. A passing unit test without a passing smoke run is not done.
+
+## Test Pyramid
+
+| Layer | What | How to Run | CI Default |
+|-------|------|-----------|-----------|
+| 1 — Unit (st-pty) | CellGrid resize, scroll, VTE sequences | `cargo test -p st-pty` | Yes |
+| 2 — VTE conformance | vttest battery sequences | `cargo test -p st-pty vte_` | Yes |
+| 3 — GPU smoke (st-render) | Glyph atlas, renderer state | `LIBGL_ALWAYS_SOFTWARE=1 cargo test -p st-render --features gpu-tests` | No (opt-in) |
+| 4 — TUI functional | TestBackend render + state checks | `cargo test -p smedja-tui` | Yes |
+| 5 — User journey | MockDaemon + client protocol | `cargo test -p smedja-tui --test smoke` | Yes |
+
+### Definition of Done
+
+A task is complete only when:
+1. Test written (red phase — test fails or is `#[ignore]` pending feature)
+2. Implementation makes it pass (green phase)
+3. `scripts/smoke-test.sh` passes
+4. Checkbox set to `[x]` in tasks.md

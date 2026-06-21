@@ -973,4 +973,130 @@ mod tests {
         let completions = filtered_completions("/zzz");
         assert!(completions.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // Layer 4 TUI functional tests — TestBackend (no network)
+    // -----------------------------------------------------------------------
+
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Constructs a minimal `AppState` for testing without a daemon connection.
+    fn make_state(session_id: &str) -> AppState {
+        AppState {
+            session_id: session_id.to_owned(),
+            mode: None,
+            tier: None,
+            messages: Vec::new(),
+            input: String::new(),
+            quit: false,
+            pending_task_id: None,
+            last_poll: None,
+            turn_n: 0,
+            turn_submitted_at: None,
+            current_block: None,
+            block_store: blocks::BlockStore::new(),
+            block_browser_open: false,
+            block_browser_cursor: 0,
+            clipboard: None,
+            diff_overlay: None,
+            diff_scroll: 0,
+            staging_queue: staging::StagingQueue::new(),
+            context_rail_visible: true,
+            main_panel: main_panel::MainPanel::new(),
+            action_log: action_log::ActionLog::new(50),
+            slash_completions: Vec::new(),
+            slash_popup_visible: false,
+            slash_cursor: 0,
+        }
+    }
+
+    /// Renders `state` to an 80×24 `TestBackend` and returns the buffer.
+    fn render_frame(state: &AppState) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, state)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn quit_flag_starts_false_and_can_be_set() {
+        let mut state = make_state("test-session");
+        assert!(!state.quit);
+        state.quit = true;
+        assert!(state.quit);
+    }
+
+    #[test]
+    fn input_accumulates_characters_in_state() {
+        let mut state = make_state("test-session");
+        state.input.push('h');
+        state.input.push('i');
+        assert_eq!(state.input, "hi");
+        // TODO: assert the input appears in the rendered buffer once
+        // handle_key can be called without a live Client.
+    }
+
+    #[test]
+    fn render_does_not_panic_with_empty_state() {
+        let state = make_state("test-session");
+        let _buf = render_frame(&state);
+        // Verify no panic — any output is acceptable.
+    }
+
+    #[test]
+    fn slash_popup_visible_flag_and_render() {
+        let mut state = make_state("test-session");
+        assert!(!state.slash_popup_visible);
+        state.slash_popup_visible = true;
+        state.slash_completions = filtered_completions("/");
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            !content.trim().is_empty(),
+            "buffer should not be entirely blank when slash popup is open"
+        );
+    }
+
+    #[test]
+    fn block_browser_renders_without_panic() {
+        let mut state = make_state("test-session");
+        let mut block = blocks::TurnBlock::new(1);
+        block.complete(42);
+        state.block_store.push(block);
+        state.block_browser_open = true;
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            !content.trim().is_empty(),
+            "buffer should not be blank when block browser is open"
+        );
+    }
+
+    #[test]
+    fn diff_overlay_renders_without_panic() {
+        let mut state = make_state("test-session");
+        state.diff_overlay = Some((
+            0,
+            vec!["+added line".to_owned(), "-removed line".to_owned()],
+        ));
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            !content.trim().is_empty(),
+            "buffer should not be blank when diff overlay is set"
+        );
+    }
 }
