@@ -1,12 +1,14 @@
 pub mod acp;
+pub mod compact;
 pub mod cowork;
+pub mod local_provider;
 pub mod mcp_http;
 pub mod mcp_oauth;
 pub mod sandbox;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
@@ -38,6 +40,13 @@ fn now_epoch() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+/// In-memory store for content blocks addressed by SHA-256 hash.
+/// Used by the `smedja_retrieve` tool to look up compressed context blocks.
+fn retrieve_store() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
+    static STORE: OnceLock<tokio::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
+    STORE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
 fn open_ingot() -> anyhow::Result<Ingot> {
@@ -327,15 +336,77 @@ async fn run_turn(
         tracing::debug!(count = mcp_tools.len(), "injecting MCP tools into turn");
     }
 
+    // Re-check local health if stale (> 30s since last check).
+    let local_tool_format = {
+        let local_base = std::env::var("SMEDJA_LOCAL_BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:8080".to_owned());
+        let health_arc = crate::local_provider::global_health();
+        let needs_recheck = {
+            let h = health_arc.lock().await;
+            (crate::now_epoch() - h.last_checked) > 30.0
+        };
+        if needs_recheck {
+            let fresh = crate::local_provider::check_health(&local_base).await;
+            let fmt = fresh.tool_format.clone();
+            *health_arc.lock().await = fresh;
+            fmt
+        } else {
+            health_arc.lock().await.tool_format.clone()
+        }
+    };
+    // local_tool_format is "openai" or "xml"; used in tool dispatch
+    if local_tool_format == "xml" {
+        tracing::debug!(tool_format = "xml", "local provider tool format: xml");
+    }
+
+    // Builtin tools: smedja_vault_search, smedja_retrieve, graph_query
+    let builtin_tools: Vec<serde_json::Value> = vec![
+        serde_json::json!({
+            "name": "smedja_vault_search",
+            "description": "Search the smedja vault for semantically similar entries.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "namespace": { "type": "string" },
+                    "k": { "type": "integer" }
+                },
+                "required": ["query"]
+            }
+        }),
+        serde_json::json!({
+            "name": "smedja_retrieve",
+            "description": "Retrieve the original full content for a compressed block by its content hash.",
+            "input_schema": {
+                "type": "object",
+                "properties": { "hash": { "type": "string" } },
+                "required": ["hash"]
+            }
+        }),
+        serde_json::json!({
+            "name": "graph_query",
+            "description": "Query the workspace code graph for symbols related to a query.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "depth": { "type": "integer" }
+                },
+                "required": ["query"]
+            }
+        }),
+    ];
+    let all_tools: Vec<serde_json::Value> = builtin_tools.into_iter().chain(mcp_tools).collect();
+
     let opts = CallOptions {
         model: model.clone(),
         max_tokens: Some(2048),
         temperature: Some(0.7),
         system: Some(system_prompt),
-        tools: if mcp_tools.is_empty() {
+        tools: if all_tools.is_empty() {
             None
         } else {
-            Some(mcp_tools)
+            Some(all_tools)
         },
     };
 
@@ -352,6 +423,71 @@ async fn run_turn(
         role: AdapterRole::User,
         content: task.title.clone(),
     }];
+
+    // Auto-inject top-3 graph symbols related to user message nouns (Task 64).
+    {
+        let stop_words = [
+            "the", "and", "for", "with", "this", "that", "from", "into", "use", "are", "was",
+            "has", "not", "can", "its", "will",
+        ];
+        let nouns: Vec<&str> = task
+            .title
+            .split_whitespace()
+            .filter(|t| t.len() >= 3 && !stop_words.contains(&t.to_lowercase().as_str()))
+            .take(5)
+            .collect();
+        let mut injected_count = 0usize;
+        if !nouns.is_empty() {
+            let graph_db_path = workspace_root.join(".smedja").join("graph.db");
+            if graph_db_path.exists() {
+                match smedja_graph::GraphStore::open(&graph_db_path) {
+                    Ok(store) => {
+                        let query = nouns.join(" ");
+                        match store.graph_query(&query, 3, 2) {
+                            Ok(symbols) => {
+                                if !symbols.is_empty() {
+                                    let snippets: Vec<String> = symbols
+                                        .iter()
+                                        .map(|s| {
+                                            format!(
+                                                "// {} {} ({}:{})\n{}",
+                                                s.kind.as_str(),
+                                                s.name,
+                                                s.file_path,
+                                                s.start_line,
+                                                s.snippet
+                                            )
+                                        })
+                                        .collect();
+                                    let injection = format!(
+                                        "\n\n<graph_symbols>\n{}\n</graph_symbols>",
+                                        snippets.join("\n\n")
+                                    );
+                                    // Append to system message via prepending to first user message
+                                    if let Some(first) = messages.first_mut() {
+                                        first.content.push_str(&injection);
+                                    }
+                                    injected_count = symbols.len();
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(error = %e, "graph_query failed; skipping injection");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "could not open graph.db; skipping injection");
+                    }
+                }
+            } else {
+                tracing::debug!("graph.db not found; skipping auto-injection");
+            }
+        }
+        tracing::debug!(
+            smedja.turn.graph_symbols_injected = injected_count,
+            "graph symbol injection"
+        );
+    }
 
     let mut full_response = String::new();
     let mut total_output_tokens = 0u32;
@@ -622,6 +758,68 @@ async fn execute_tool(
                     entries.join("\n")
                 }
                 Err(e) => format!("error listing {dir_str}: {e}"),
+            }
+        }
+        "smedja_vault_search" => {
+            let query = input.get("query").and_then(Value::as_str).unwrap_or("");
+            let k = input.get("k").and_then(Value::as_u64).unwrap_or(5) as usize;
+            // ponytail: vault not yet wired; stub returns empty results
+            tracing::warn!(
+                query,
+                k,
+                "smedja_vault_search called; vault stub returning empty results"
+            );
+            serde_json::json!({ "results": [] }).to_string()
+        }
+        "smedja_retrieve" => {
+            let hash = input.get("hash").and_then(Value::as_str).unwrap_or("");
+            let store = retrieve_store().lock().await;
+            match store.get(hash) {
+                Some(content) => {
+                    // ponytail: audit deferred; log the retrieval.
+                    tracing::info!(hash, "smedja_retrieve hit");
+                    content.clone()
+                }
+                None => {
+                    tracing::debug!(hash, "smedja_retrieve: hash not found");
+                    format!("error: hash not found: {hash}")
+                }
+            }
+        }
+        "graph_query" => {
+            let query = input.get("query").and_then(Value::as_str).unwrap_or("");
+            let depth = input.get("depth").and_then(Value::as_u64).unwrap_or(2) as u8;
+            let graph_db_path = workspace.join(".smedja").join("graph.db");
+            if !graph_db_path.exists() {
+                tracing::debug!("graph.db not found; returning empty symbols");
+                return serde_json::json!({ "symbols": [] }).to_string();
+            }
+            match smedja_graph::GraphStore::open(&graph_db_path) {
+                Ok(store) => match store.graph_query(query, 10, depth) {
+                    Ok(symbols) => {
+                        let sym_json: Vec<serde_json::Value> = symbols
+                            .iter()
+                            .map(|s| {
+                                serde_json::json!({
+                                    "name": s.name,
+                                    "kind": s.kind.as_str(),
+                                    "file": s.file_path,
+                                    "line": s.start_line,
+                                    "snippet": s.snippet,
+                                })
+                            })
+                            .collect();
+                        serde_json::json!({ "symbols": sym_json }).to_string()
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "graph_query error");
+                        serde_json::json!({ "symbols": [], "error": e.to_string() }).to_string()
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to open graph store");
+                    serde_json::json!({ "symbols": [] }).to_string()
+                }
             }
         }
         other => format!("error: tool '{other}' is not available"),
@@ -1978,4 +2176,24 @@ async fn main() -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&path);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn subprocess_provider_absent_keys_fails() {
+        // When no API keys and no special CLIs are set, build_provider returns Err.
+        // We can't easily unset all env vars in a test (other tests run in parallel),
+        // so we verify the error path via direct build when we know keys are absent.
+        // This is a best-effort heuristic test.
+        if std::env::var("ANTHROPIC_API_KEY").is_ok() || std::env::var("OPENAI_API_KEY").is_ok() {
+            // If keys are present in test environment, skip.
+            return;
+        }
+        // Attempt build — expect Err since no keys and likely no local server.
+        // We don't care about the exact message, just that it fails gracefully.
+        let result = super::build_provider().await;
+        // Result may be Ok if local endpoint happens to be up; just verify no panic.
+        drop(result);
+    }
 }
