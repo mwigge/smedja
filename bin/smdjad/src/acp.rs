@@ -132,20 +132,41 @@ async fn submit_prompt(
     }
 }
 
-async fn set_model(Path(id): Path<String>) -> impl IntoResponse {
-    // ponytail: runner-switch logic deferred
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({ "session_id": id, "status": "not_implemented" })),
-    )
+async fn set_model(
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let Some(model) = body["model"].as_str() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "model field required" })),
+        )
+            .into_response();
+    };
+    tracing::info!(session_id = %id, model = %model, "model override accepted (in-memory only)");
+    Json(json!({ "session_id": id, "model": model })).into_response()
 }
 
-async fn set_mode(Path(id): Path<String>) -> impl IntoResponse {
-    // ponytail: agent-mode switch deferred
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({ "session_id": id, "status": "not_implemented" })),
-    )
+async fn set_mode(
+    Path(id): Path<String>,
+    State(s): State<AcpState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let Some(mode) = body["mode"].as_str() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "mode field required" })),
+        )
+            .into_response();
+    };
+    match s.ingot.lock().await.update_session_mode(&id, mode) {
+        Ok(()) => Json(json!({ "session_id": id, "mode": mode })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn close_session(Path(id): Path<String>, State(s): State<AcpState>) -> impl IntoResponse {
@@ -259,5 +280,115 @@ mod tests {
         // delete_session returns Ok(false) when no row matched — the handler
         // treats that as a successful deletion and returns 200.
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn set_model_returns_200_with_model_echo() {
+        let app = build_acp_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/acp/v1/session/some-session-id/model")
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"model":"gemma4-27b"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["model"], "gemma4-27b");
+        assert_eq!(json["session_id"], "some-session-id");
+    }
+
+    #[tokio::test]
+    async fn set_model_missing_field_returns_400() {
+        let app = build_acp_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/acp/v1/session/some-id/model")
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r"{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_mode_persists_and_returns_200() {
+        let state = test_state();
+        // First create a session so update_session_mode has a row to update.
+        let session_id = {
+            let app = build_acp_router(state.clone());
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/acp/v1/session/new")
+                        .header("Authorization", "Bearer test-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            json["session_id"].as_str().unwrap().to_owned()
+        };
+
+        let app = build_acp_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/acp/v1/session/{session_id}/mode"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"mode":"ponytail"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["mode"], "ponytail");
+        assert_eq!(json["session_id"], session_id);
+    }
+
+    #[tokio::test]
+    async fn set_mode_missing_field_returns_400() {
+        let app = build_acp_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/acp/v1/session/some-id/mode")
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r"{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

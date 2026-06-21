@@ -200,6 +200,23 @@ pub(crate) fn update_cowork_mode(
     Ok(())
 }
 
+/// Sets the `mode` field for the session identified by `id`.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the UPDATE fails.
+pub(crate) fn update_mode(
+    conn: &rusqlite::Connection,
+    id: &str,
+    mode: &str,
+) -> Result<(), IngotError> {
+    conn.execute(
+        "UPDATE sessions SET mode = ?1 WHERE id = ?2",
+        rusqlite::params![mode, id],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +320,20 @@ mod tests {
             fetched.workspace_root.as_deref(),
             Some("/home/user/projects/myrepo")
         );
+    }
+
+    #[test]
+    fn update_mode_round_trip() {
+        let mut ingot = Ingot::open_in_memory().unwrap();
+        let s = sample_session();
+        ingot.create_session(&s).unwrap();
+
+        ingot
+            .update_session_mode(&s.id.to_string(), "ponytail")
+            .unwrap();
+
+        let fetched = ingot.get_session(&s.id.to_string()).unwrap().unwrap();
+        assert_eq!(fetched.mode.as_deref(), Some("ponytail"));
     }
 
     #[test]

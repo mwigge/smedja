@@ -287,6 +287,16 @@ impl Ingot {
         session::update_workspace_root(&self.conn, session_id, workspace_root)
     }
 
+    /// Sets the `mode` field for the session identified by `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the mode was updated"]
+    pub fn update_session_mode(&mut self, session_id: &str, mode: &str) -> Result<(), IngotError> {
+        session::update_mode(&self.conn, session_id, mode)
+    }
+
     /// Links the session identified by `session_id` to a task by setting `task_id`.
     ///
     /// # Errors
