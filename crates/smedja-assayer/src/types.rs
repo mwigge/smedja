@@ -55,4 +55,6 @@ pub struct Route {
     pub runner: Runner,
     /// The execution tier to request.
     pub tier: Tier,
+    /// Optional model override (e.g. `"claude-sonnet-4-6"`). `None` uses the runner default.
+    pub model: Option<String>,
 }

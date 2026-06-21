@@ -1,3 +1,5 @@
+pub mod cowork;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,7 +11,7 @@ use smedja_adapter::{
     AnthropicProvider, CallOptions, Delta, LocalProvider, OpenAiProvider, Provider,
 };
 use smedja_bellows::{Dispatcher, TurnEvent};
-use smedja_ingot::{Checkpoint, CostEntry, Ingot, Session, Task};
+use smedja_ingot::{Checkpoint, CostEntry, Ingot, McpServer, Session, Task};
 use smedja_rpc::{codes, router::Router, server::Server, RpcError};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -314,6 +316,7 @@ fn build_router(ingot: &Arc<Mutex<Ingot>>, dispatcher: Arc<Dispatcher>) -> Route
                     // has no dedicated title column; this is the nearest optional
                     // text field available on the existing schema.
                     mode: title.clone(),
+                    cowork_mode: false,
                 };
 
                 ig.lock()
@@ -638,6 +641,95 @@ fn build_router(ingot: &Arc<Mutex<Ingot>>, dispatcher: Arc<Dispatcher>) -> Route
                     .session_cost(session_id)
                     .map_err(|e| ingot_err(&e))?;
                 Ok(json!({ "session_id": session_id, "total_usd": total_usd }))
+            }
+        });
+    }
+
+    // ── cowork.set ──────────────────────────────────────────────────────────
+    {
+        let ig = Arc::clone(ingot);
+        router.register("cowork.set", move |params: Value| {
+            let ig = Arc::clone(&ig);
+            async move {
+                let session_id = params
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| missing_param("session_id"))?
+                    .to_owned();
+                let enabled = params
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| missing_param("enabled"))?;
+                ig.lock()
+                    .await
+                    .set_cowork_mode(&session_id, enabled)
+                    .map_err(|e| ingot_err(&e))?;
+                Ok(json!({ "session_id": session_id, "cowork_mode": enabled }))
+            }
+        });
+    }
+
+    // ── mcp.register ────────────────────────────────────────────────────────
+    {
+        let ig = Arc::clone(ingot);
+        router.register("mcp.register", move |params: Value| {
+            let ig = Arc::clone(&ig);
+            async move {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| missing_param("name"))?
+                    .to_owned();
+                let url = params
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let transport = params
+                    .get("transport")
+                    .and_then(Value::as_str)
+                    .unwrap_or("http")
+                    .to_owned();
+                let server = McpServer {
+                    id: Uuid::new_v4().to_string(),
+                    name,
+                    url,
+                    transport,
+                    tools_json: "[]".into(),
+                    last_refresh: 0.0,
+                };
+                ig.lock()
+                    .await
+                    .register_mcp_server(&server)
+                    .map_err(|e| ingot_err(&e))?;
+                Ok(json!({ "id": server.id }))
+            }
+        });
+    }
+
+    // ── mcp.list ────────────────────────────────────────────────────────────
+    {
+        let ig = Arc::clone(ingot);
+        router.register("mcp.list", move |_: Value| {
+            let ig = Arc::clone(&ig);
+            async move {
+                let servers = ig
+                    .lock()
+                    .await
+                    .list_mcp_servers()
+                    .map_err(|e| ingot_err(&e))?;
+                let out: Vec<Value> = servers
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "id": s.id,
+                            "name": s.name,
+                            "url": s.url,
+                            "transport": s.transport,
+                        })
+                    })
+                    .collect();
+                Ok(Value::Array(out))
             }
         });
     }

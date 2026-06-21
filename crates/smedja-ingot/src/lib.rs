@@ -9,6 +9,8 @@ pub mod audit;
 pub mod checkpoint;
 pub mod cost;
 pub mod error;
+pub mod loop_state;
+pub mod mcp;
 pub mod session;
 pub mod task;
 
@@ -16,6 +18,8 @@ pub use audit::AuditEvent;
 pub use checkpoint::Checkpoint;
 pub use cost::CostEntry;
 pub use error::IngotError;
+pub use loop_state::LoopRecord;
+pub use mcp::McpServer;
 pub use session::Session;
 pub use task::Task;
 
@@ -94,7 +98,17 @@ impl Ingot {
                 updated_at  REAL NOT NULL,
                 status      TEXT NOT NULL DEFAULT 'active',
                 task_id     TEXT,
-                mode        TEXT
+                mode        TEXT,
+                cowork_mode INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS mcp_servers (
+                id           TEXT PRIMARY KEY,
+                name         TEXT NOT NULL,
+                url          TEXT NOT NULL DEFAULT '',
+                transport    TEXT NOT NULL DEFAULT 'http',
+                tools_json   TEXT NOT NULL DEFAULT '[]',
+                last_refresh REAL NOT NULL DEFAULT 0.0
             );
 
             CREATE TABLE IF NOT EXISTS tasks (
@@ -127,6 +141,16 @@ impl Ingot {
                 cost_usd    REAL NOT NULL DEFAULT 0.0,
                 created_at  REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS loops (
+                id            TEXT PRIMARY KEY,
+                change_name   TEXT NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'planning',
+                current_slice INTEGER NOT NULL DEFAULT 0,
+                attempt       INTEGER NOT NULL DEFAULT 1,
+                created_at    REAL NOT NULL,
+                updated_at    REAL NOT NULL
+            );
             ",
         )?;
 
@@ -135,6 +159,11 @@ impl Ingot {
         let _ = self
             .conn
             .execute_batch("ALTER TABLE tasks ADD COLUMN response TEXT;");
+
+        // Add cowork_mode column to existing sessions tables — suppressed if already present.
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN cowork_mode INTEGER NOT NULL DEFAULT 0;",
+        );
 
         // Record (or ignore) the schema version marker.
         self.conn.execute(
@@ -222,6 +251,52 @@ impl Ingot {
     pub fn update_session_status(&mut self, id: &str, status: &str) -> Result<(), IngotError> {
         let now = now_epoch();
         session::update_status(&self.conn, id, status, now)
+    }
+
+    /// Sets the `cowork_mode` flag for the session identified by `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the cowork mode was updated"]
+    pub fn set_cowork_mode(&mut self, session_id: &str, enabled: bool) -> Result<(), IngotError> {
+        self.conn.execute(
+            "UPDATE sessions SET cowork_mode = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![i64::from(enabled), now_epoch(), session_id],
+        )?;
+        Ok(())
+    }
+
+    // ── mcp_servers ──────────────────────────────────────────────────────────
+
+    /// Registers (or replaces) an [`McpServer`] in the registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the INSERT OR REPLACE fails.
+    #[must_use = "check the Result to confirm the MCP server was registered"]
+    pub fn register_mcp_server(&mut self, server: &McpServer) -> Result<(), IngotError> {
+        mcp::insert(&self.conn, server)
+    }
+
+    /// Returns all registered [`McpServer`]s ordered by `name` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned servers"]
+    pub fn list_mcp_servers(&self) -> Result<Vec<McpServer>, IngotError> {
+        mcp::list(&self.conn)
+    }
+
+    /// Removes the [`McpServer`] with the given `id` from the registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the DELETE fails.
+    #[must_use = "check the Result to confirm the MCP server was removed"]
+    pub fn remove_mcp_server(&mut self, id: &str) -> Result<(), IngotError> {
+        mcp::remove(&self.conn, id)
     }
 
     // ── tasks ─────────────────────────────────────────────────────────────────
@@ -350,6 +425,53 @@ impl Ingot {
     #[must_use = "check the Result and inspect the returned sum"]
     pub fn session_cost(&self, session_id: &str) -> Result<f64, IngotError> {
         cost::session_total(&self.conn, session_id)
+    }
+
+    // ── loops ─────────────────────────────────────────────────────────────────
+
+    /// Inserts a new [`LoopRecord`] into the `loops` table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the INSERT fails (e.g. duplicate `id`).
+    #[must_use = "check the Result to confirm the loop record was created"]
+    pub fn create_loop(&mut self, rec: &LoopRecord) -> Result<(), IngotError> {
+        loop_state::insert(&self.conn, rec)
+    }
+
+    /// Retrieves a [`LoopRecord`] by `id`, returning `None` when not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned loop record"]
+    pub fn get_loop(&self, id: &str) -> Result<Option<LoopRecord>, IngotError> {
+        loop_state::get(&self.conn, id)
+    }
+
+    /// Updates the `status` and `updated_at` fields for the loop with `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the loop status was updated"]
+    pub fn update_loop_status(
+        &mut self,
+        id: &str,
+        status: &str,
+        updated_at: f64,
+    ) -> Result<(), IngotError> {
+        loop_state::update_status(&self.conn, id, status, updated_at)
+    }
+
+    /// Returns all [`LoopRecord`]s for `change_name`, ordered by `created_at` descending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned loop records"]
+    pub fn list_loops(&self, change_name: &str) -> Result<Vec<LoopRecord>, IngotError> {
+        loop_state::list_by_change(&self.conn, change_name)
     }
 }
 

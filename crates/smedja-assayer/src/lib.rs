@@ -17,7 +17,9 @@
 //! ```
 
 pub mod assayer;
+pub mod config;
 pub mod types;
 
 pub use assayer::{Assayer, RoutingRule};
+pub use config::load_rules;
 pub use types::{Complexity, Role, Route, Runner, Tier};
