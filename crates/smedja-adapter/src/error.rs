@@ -15,4 +15,9 @@ pub enum AdapterError {
     /// unexpected (e.g. missing required fields).
     #[error("invalid response: {0}")]
     InvalidResponse(String),
+
+    /// A request could not be dispatched (e.g. the subprocess binary was not
+    /// found or could not be spawned).
+    #[error("request error: {0}")]
+    Request(String),
 }

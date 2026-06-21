@@ -1,0 +1,120 @@
+//! Generic subprocess provider — spawns a binary, streams stdout as deltas.
+
+use tokio::io::AsyncWriteExt as _;
+use tokio::process::Command as TokioCommand;
+use tokio_stream::wrappers::ReceiverStream;
+
+use crate::{AdapterError, CallOptions, Delta, DeltaStream, Message, Provider};
+
+/// Runs a CLI binary with the prompt on stdin; streams stdout lines as [`Delta::Text`].
+pub struct SubprocessProvider {
+    binary: String,
+    extra_args: Vec<String>,
+}
+
+impl SubprocessProvider {
+    /// Creates a new [`SubprocessProvider`].
+    pub fn new(binary: impl Into<String>, extra_args: Vec<String>) -> Self {
+        Self {
+            binary: binary.into(),
+            extra_args,
+        }
+    }
+
+    /// Returns `true` if the binary is found on `$PATH`.
+    pub fn available(binary: &str) -> bool {
+        which::which(binary).is_ok()
+    }
+}
+
+impl Provider for SubprocessProvider {
+    fn stream_chat(&self, messages: &[Message], _opts: &CallOptions) -> DeltaStream {
+        // Flatten conversation to a single prompt string.
+        let prompt = messages
+            .iter()
+            .map(|m| format!("{}: {}", m.role.as_str(), m.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let binary = self.binary.clone();
+        let extra_args = self.extra_args.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+        tokio::spawn(async move {
+            let mut child = match TokioCommand::new(&binary)
+                .args(&extra_args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(Err(AdapterError::Request(e.to_string()))).await;
+                    return;
+                }
+            };
+
+            // Write prompt to stdin, then close it so the child sees EOF.
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(prompt.as_bytes()).await;
+                // stdin is dropped here, closing the pipe
+            }
+
+            // Stream stdout lines.
+            if let Some(stdout) = child.stdout.take() {
+                use tokio::io::AsyncBufReadExt as _;
+                let mut lines = tokio::io::BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if tx.send(Ok(Delta::Text(line + "\n"))).await.is_err() {
+                        break;
+                    }
+                }
+            }
+
+            let _ = child.wait().await;
+        });
+
+        Box::pin(ReceiverStream::new(rx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt as _;
+
+    #[tokio::test]
+    async fn subprocess_unavailable_binary_yields_error() {
+        let p = SubprocessProvider::new("__no_such_binary__", vec![]);
+        let messages = vec![crate::Message {
+            role: crate::Role::User,
+            content: "hi".into(),
+        }];
+        let opts = crate::CallOptions {
+            model: "x".into(),
+            max_tokens: None,
+            temperature: None,
+            system: None,
+        };
+        let mut stream = p.stream_chat(&messages, &opts);
+        let first = stream.next().await;
+        assert!(first.is_some());
+        assert!(first.unwrap().is_err());
+    }
+
+    #[test]
+    fn available_returns_false_for_missing_binary() {
+        assert!(!SubprocessProvider::available("__no_such_binary_xyz__"));
+    }
+
+    #[test]
+    fn available_returns_true_for_sh() {
+        // `/bin/sh` is universally available on Linux/macOS.
+        assert!(SubprocessProvider::available("sh"));
+    }
+}

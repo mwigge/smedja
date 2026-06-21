@@ -16,6 +16,18 @@ pub enum Role {
     Tool,
 }
 
+impl Role {
+    /// Returns a static string representation of the role.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+        }
+    }
+}
+
 /// A single message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
