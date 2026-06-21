@@ -22,6 +22,7 @@ members = [
     "term/crates/st-pty",
     "term/crates/st-render",
     "term/crates/st-statusbar",
+    "xtask",
 ]
 resolver = "2"
 
@@ -71,6 +72,9 @@ reqwest      = { version = "0.12", features = ["json", "stream"] }
 rusqlite     = { version = "0.32", features = ["bundled"] }
 rustyline    = "14"
 
+# xtask — JSON Schema → Rust type generation
+schemars     = "0.8"
+
 # serialisation
 serde        = { version = "1", features = ["derive"] }
 serde_json   = "1"
@@ -95,8 +99,11 @@ tower-http   = { version = "0.6", features = ["trace", "cors"] }
 # observability
 tracing                = "0.1"
 tracing-subscriber     = { version = "0.3", features = ["env-filter", "json"] }
-tree-sitter        = "0.24"
-tree-sitter-rust   = "0.23"
+tree-sitter            = "0.24"
+tree-sitter-go         = "0.23"
+tree-sitter-python     = "0.23"
+tree-sitter-rust       = "0.23"
+tree-sitter-typescript = "0.23"
 
 # ids / time
 uuid         = { version = "1", features = ["v4", "serde"] }
