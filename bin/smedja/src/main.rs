@@ -1,6 +1,10 @@
+mod blocks;
+
 use std::io::stdout;
 use std::path::PathBuf;
 use std::time::Duration;
+
+use blocks::TurnBlock;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -66,6 +70,10 @@ struct AppState {
     pending_task_id: Option<String>,
     /// Timestamp of the last poll attempt.
     last_poll: Option<std::time::Instant>,
+    /// Monotonically increasing turn counter.
+    turn_n: u32,
+    /// Timestamp when the current turn was submitted (used to compute `elapsed_ms`).
+    turn_submitted_at: Option<std::time::Instant>,
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +100,8 @@ async fn submit(input: &str, state: &mut AppState, client: &mut Client) -> Resul
         role: Role::User,
         text: text.clone(),
     });
+    state.turn_n += 1;
+    state.turn_submitted_at = Some(std::time::Instant::now());
     let resp = client
         .call(
             "turn.submit",
@@ -138,7 +148,27 @@ async fn handle_key(
         }
         KeyCode::Enter => {
             let input = std::mem::take(&mut state.input);
-            submit(&input, state, client).await?;
+            if let Some(rest) = input.trim().strip_prefix("/task create ") {
+                let title = rest.trim().to_owned();
+                if !title.is_empty() {
+                    if let Ok(v) = client.call("task.create", json!({"title": title})).await {
+                        state.messages.push(Message {
+                            role: Role::System,
+                            text: format!("task created: {}", v["id"].as_str().unwrap_or("?")),
+                        });
+                    }
+                }
+            } else if let Some(id) = input.trim().strip_prefix("/task done ") {
+                let id = id.trim().to_owned();
+                if client.call("task.close", json!({"id": id})).await.is_ok() {
+                    state.messages.push(Message {
+                        role: Role::System,
+                        text: format!("task {id} closed"),
+                    });
+                }
+            } else {
+                submit(&input, state, client).await?;
+            }
         }
         KeyCode::Char(c) => {
             state.input.push(c);
@@ -273,6 +303,8 @@ async fn main() -> Result<()> {
         quit: false,
         pending_task_id: None,
         last_poll: None,
+        turn_n: 0,
+        turn_submitted_at: None,
     };
 
     // Enter alternate screen and raw mode — guard restores on drop.
@@ -317,10 +349,22 @@ async fn main() -> Result<()> {
                     let status = v["status"].as_str().unwrap_or("");
                     if status == "complete" {
                         let response = v["response"].as_str().unwrap_or("(no response)").to_owned();
-                        state.messages.push(Message {
-                            role: Role::System,
-                            text: response,
+                        let elapsed_ms = state.turn_submitted_at.map_or(0, |t| {
+                            u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
                         });
+                        state.turn_submitted_at = None;
+                        let block = TurnBlock {
+                            turn_n: state.turn_n,
+                            content: response,
+                            elapsed_ms,
+                        };
+                        let area_width = 80usize; // ponytail: fixed width, real width comes later
+                        for line in block.render_lines(area_width) {
+                            state.messages.push(Message {
+                                role: Role::System,
+                                text: line,
+                            });
+                        }
                         state.pending_task_id = None;
                         state.last_poll = None;
                     } else if status == "failed" {
