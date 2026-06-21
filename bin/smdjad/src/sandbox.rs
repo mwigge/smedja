@@ -10,7 +10,7 @@ use std::path::Path;
 use which::which;
 
 /// Tools exempt from sandboxing (read-only; no side-effects).
-const EXEMPT_TOOLS: &[&str] = &["read_file", "list_files", "graph_query", "mcp_call"];
+const EXEMPT_TOOLS: &[&str] = &["read_file", "list_files", "graph_query"];
 
 /// Executes bash commands (and write-class tools) inside a Docker container.
 pub struct SandboxExecutor {
@@ -25,6 +25,13 @@ impl SandboxExecutor {
     ///
     /// Sets `available = false` if the `docker` binary is absent or
     /// `SMEDJA_TOOL_SANDBOX` is not set to `"docker"`.
+    ///
+    /// # Note
+    ///
+    /// The image-inspect step uses a blocking `std::process::Command`. This is
+    /// intentional: `new()` is called once at daemon startup before the Tokio
+    /// runtime is accepting work, so a brief blocking call here is acceptable
+    /// and avoids the complexity of an `async fn new()`.
     pub fn new() -> Self {
         let enabled = std::env::var("SMEDJA_TOOL_SANDBOX").is_ok_and(|v| v == "docker");
 
@@ -78,38 +85,100 @@ impl SandboxExecutor {
     /// Executes `cmd` inside the sandbox container.
     ///
     /// Mounts `workspace` at `/workspace` read-write; no network access.
+    /// Resource limits: 0.5 CPU, 256 MiB RAM, 64 PIDs, 30-second stop timeout.
+    /// Security: dropped capabilities, read-only root filesystem, `/tmp` tmpfs
+    /// (64 MiB), no-new-privileges, and the `.git` directory (if present)
+    /// bind-mounted read-only on top of the workspace mount to prevent git-hook
+    /// escape.
+    ///
     /// Returns the combined stdout of the container.
     ///
     /// # Errors
     ///
-    /// Returns `Err` if Docker is unavailable or the container exits non-zero.
-    pub fn exec(&self, cmd: &str, workspace: &Path) -> Result<String, String> {
+    /// Returns `Err` if the workspace path is invalid, Docker is unavailable,
+    /// the command times out after 30 seconds, or the container exits non-zero.
+    pub async fn exec(&self, cmd: &str, workspace: &Path) -> Result<String, String> {
         if !self.available {
             return Err("sandbox not available".into());
         }
-        let workspace_str = workspace.to_str().ok_or("workspace path invalid")?;
-        let out = std::process::Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "--network",
-                "none",
-                "-v",
-                &format!("{workspace_str}:/workspace:rw"),
-                "-w",
-                "/workspace",
-                &self.image,
-                "bash",
-                "-c",
-                cmd,
-            ])
-            .output()
-            .map_err(|e| e.to_string())?;
 
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-        } else {
-            Err(String::from_utf8_lossy(&out.stderr).into_owned())
+        // Canonicalise and optionally validate against an allowed root.
+        let workspace = workspace
+            .canonicalize()
+            .map_err(|e| format!("invalid workspace: {e}"))?;
+        let allowed_root = std::env::var("SMEDJA_WORKSPACE_ROOT").map_or_else(
+            |_| {
+                std::env::var("HOME")
+                    .map_or_else(|_| std::path::PathBuf::from("/"), std::path::PathBuf::from)
+            },
+            std::path::PathBuf::from,
+        );
+        if std::env::var("SMEDJA_WORKSPACE_ROOT").is_ok() && !workspace.starts_with(&allowed_root) {
+            return Err(format!(
+                "workspace {} is outside allowed root {}",
+                workspace.display(),
+                allowed_root.display()
+            ));
+        }
+
+        let workspace_str = workspace
+            .to_str()
+            .ok_or("workspace path contains non-UTF-8 bytes")?;
+        let workspace_str_rw = format!("{workspace_str}:/workspace:rw");
+
+        let git_dir = workspace.join(".git");
+
+        // Build the args vec dynamically so we can conditionally add the
+        // read-only .git override mount.
+        let mut args: Vec<&str> = vec![
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--cpus",
+            "0.5",
+            "--memory",
+            "256m",
+            "--pids-limit",
+            "64",
+            "--stop-timeout",
+            "30",
+            "--security-opt",
+            "no-new-privileges",
+            "--cap-drop",
+            "ALL",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:size=64m",
+            "-v",
+            &workspace_str_rw,
+            "-w",
+            "/workspace",
+        ];
+
+        // Shadow .git with a read-only mount if the directory exists.
+        // This prevents an agent writing hooks that execute on the host.
+        let git_vol;
+        if git_dir.exists() {
+            git_vol = format!("{}:/workspace/.git:ro", git_dir.display());
+            args.push("-v");
+            args.push(&git_vol);
+        }
+
+        args.extend_from_slice(&["--", &self.image, "sh", "-c", cmd]);
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::process::Command::new("docker").args(&args).output(),
+        )
+        .await
+        {
+            Err(_) => Err("sandbox: command timed out after 30 seconds".to_owned()),
+            Ok(Err(e)) => Err(e.to_string()),
+            Ok(Ok(out)) if out.status.success() => {
+                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            }
+            Ok(Ok(out)) => Err(String::from_utf8_lossy(&out.stderr).into_owned()),
         }
     }
 }
@@ -143,11 +212,36 @@ mod tests {
     }
 
     #[test]
-    fn exec_unavailable_returns_err() {
+    fn mcp_call_is_not_exempt() {
+        // mcp_call does not exist in the codebase; it must not be exempt.
+        assert!(!SandboxExecutor::is_exempt("mcp_call"));
+    }
+
+    #[tokio::test]
+    async fn exec_unavailable_returns_err() {
         let ex = SandboxExecutor {
             available: false,
             image: String::new(),
         };
-        assert!(ex.exec("ls", std::path::Path::new("/tmp")).is_err());
+        assert!(ex.exec("ls", std::path::Path::new("/tmp")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn exec_rejects_workspace_outside_allowed_root() {
+        // Set a tight allowed root so /tmp is outside it.
+        std::env::set_var("SMEDJA_WORKSPACE_ROOT", "/nonexistent-root-xyz");
+        let ex = SandboxExecutor {
+            available: true,
+            image: "smedja-sandbox:latest".to_owned(),
+        };
+        let result = ex.exec("ls", std::path::Path::new("/tmp")).await;
+        std::env::remove_var("SMEDJA_WORKSPACE_ROOT");
+        // /tmp canonicalises to /tmp; /nonexistent-root-xyz doesn't contain it.
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("outside allowed root") || msg.contains("invalid workspace"),
+            "unexpected error: {msg}"
+        );
     }
 }

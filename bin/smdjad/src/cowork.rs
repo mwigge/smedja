@@ -38,38 +38,20 @@ struct PendingApproval {
 ///
 /// One `CoworkGate` per session. External RPC calls (`cowork.approve`,
 /// `cowork.deny`, `cowork.modify`) send decisions through the channel.
+///
+/// Codex-backed sessions that manage their own approval loop skip `intercept`
+/// entirely at the call site rather than using a bypass flag on the gate.
 #[derive(Default)]
 pub struct CoworkGate {
     pending: Arc<Mutex<HashMap<ApprovalId, PendingApproval>>>,
-    /// When `true`, [`CoworkGate::intercept`] returns [`Decision::Approve`] immediately.
-    ///
-    /// Used for Codex-backed sessions that manage their own approval loop.
-    bypass: bool,
 }
 
 impl CoworkGate {
-    /// Creates a new gate with no pending approvals.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Disables the gate for this session — all `intercept` calls return `Decision::Approve` immediately.
-    ///
-    /// Use for Codex-backed sessions that manage their own approval loop.
-    pub fn set_bypass(&mut self, bypass: bool) {
-        self.bypass = bypass;
-    }
-
-    // ponytail: approval gate applies to all runners; Codex is excluded via set_bypass
-
     /// Submits a tool call for approval. Suspends until a decision arrives
     /// or the optional `timeout_secs` (0 = infinite) elapses.
     ///
-    /// Returns [`Decision::Approve`] on timeout (with a WARN log).
+    /// Returns [`Decision::Deny`] on timeout or channel close (fail-closed).
     pub async fn intercept(&self, prompt: ApprovalPrompt, timeout_secs: u64) -> Decision {
-        if self.bypass {
-            return Decision::Approve;
-        }
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         {
@@ -90,17 +72,25 @@ impl CoworkGate {
         );
 
         if timeout_secs == 0 {
-            rx.await.unwrap_or(Decision::Approve)
-        } else if let Ok(Ok(decision)) =
-            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await
-        {
-            decision
+            // Wait indefinitely; deny if the channel closes unexpectedly.
+            rx.await
+                .unwrap_or_else(|_| Decision::Deny("channel closed".to_owned()))
         } else {
-            tracing::warn!(
-                approval_id = %id,
-                "cowork gate: timeout, auto-approving",
-            );
-            Decision::Approve
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+                Ok(Ok(decision)) => decision,
+                Ok(Err(_)) => {
+                    // Sender dropped without sending — deny.
+                    Decision::Deny("channel closed".to_owned())
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        approval_id = %id,
+                        timeout_secs,
+                        "cowork gate: approval timed out; denying",
+                    );
+                    Decision::Deny("timeout".to_owned())
+                }
+            }
         }
     }
 
@@ -164,7 +154,7 @@ mod tests {
 
     #[tokio::test]
     async fn approve_resolves_pending() {
-        let gate = Arc::new(CoworkGate::new());
+        let gate = Arc::new(CoworkGate::default());
         let gate2 = Arc::clone(&gate);
 
         let handle = tokio::spawn(async move { gate2.intercept(prompt(), 0).await });
@@ -183,7 +173,7 @@ mod tests {
 
     #[tokio::test]
     async fn deny_resolves_with_reason() {
-        let gate = Arc::new(CoworkGate::new());
+        let gate = Arc::new(CoworkGate::default());
         let gate2 = Arc::clone(&gate);
 
         let handle = tokio::spawn(async move { gate2.intercept(prompt(), 0).await });
@@ -199,33 +189,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_auto_approves() {
-        let gate = CoworkGate::new();
+    async fn timeout_denies() {
+        let gate = CoworkGate::default();
         let decision = gate.intercept(prompt(), 1).await;
-        assert!(matches!(decision, Decision::Approve));
+        assert!(matches!(decision, Decision::Deny(r) if r == "timeout"));
     }
 
     #[tokio::test]
     async fn unknown_id_resolve_returns_false() {
-        let gate = CoworkGate::new();
+        let gate = CoworkGate::default();
         assert!(!gate.approve("nonexistent-id").await);
         assert!(!gate.deny("nonexistent-id", "reason".into()).await);
         assert!(!gate.modify("nonexistent-id", "instruction".into()).await);
     }
 
+    /// Session-skip path: when a Codex-backed session calls intercept but the
+    /// caller is responsible for skipping intercept entirely, the gate itself
+    /// still works correctly — approve resolves immediately.
     #[tokio::test]
-    async fn bypass_auto_approves() {
-        let mut gate = CoworkGate::new();
-        gate.set_bypass(true);
-        let decision = gate.intercept(prompt(), 0).await;
+    async fn session_skip_approve_resolves() {
+        // Callers that want to skip the gate simply don't call intercept.
+        // This test exercises that the gate resolves correctly when used directly,
+        // which is all we can assert from outside the call site.
+        let gate = Arc::new(CoworkGate::default());
+        let gate2 = Arc::clone(&gate);
+
+        let handle = tokio::spawn(async move { gate2.intercept(prompt(), 0).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let pending = gate.list_pending().await;
+        assert_eq!(pending.len(), 1, "one pending approval expected");
+        let id = pending[0].0.clone();
+        gate.approve(&id).await;
+
+        let decision = handle.await.unwrap();
         assert!(matches!(decision, Decision::Approve));
-        // No pending entry should have been created.
         assert!(gate.list_pending().await.is_empty());
     }
 
     #[tokio::test]
     async fn approval_round_trip_emits_pending_then_resolves() {
-        let gate = Arc::new(CoworkGate::new());
+        let gate = Arc::new(CoworkGate::default());
         let gate_ref = Arc::clone(&gate);
 
         // Spawn a task that intercepts a tool call.
@@ -253,7 +257,7 @@ mod tests {
 
     #[tokio::test]
     async fn intercept_emits_pending_for_any_runner() {
-        let gate = Arc::new(CoworkGate::new());
+        let gate = Arc::new(CoworkGate::default());
         let gate2 = Arc::clone(&gate);
 
         let handle = tokio::spawn(async move { gate2.intercept(prompt(), 0).await });

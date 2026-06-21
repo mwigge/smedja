@@ -98,27 +98,34 @@ impl TokenStore {
         let base = std::env::var("XDG_CONFIG_HOME").map_or_else(
             |_| {
                 std::env::var("HOME").map_or_else(
-                    |_| PathBuf::from(".config"),
-                    |h| PathBuf::from(h).join(".config"),
+                    |_| std::path::PathBuf::from(".config"),
+                    |h| std::path::PathBuf::from(h).join(".config"),
                 )
             },
-            PathBuf::from,
+            std::path::PathBuf::from,
         );
-        Self::new(base.join("smedja").join("mcp-tokens"))
+        Self::new(base.join("smedja"))
     }
 
     /// Returns the path where `server_url`'s token is stored.
+    ///
+    /// Uses [`DefaultHasher`] to produce a compact, filename-safe hex name.
+    /// Collision probability is negligible for the number of MCP servers a
+    /// user is likely to register.
     fn token_path(&self, server_url: &str) -> PathBuf {
-        // Simple hash: use the URL as a filename-safe hex digest stub.
-        // ponytail: use a proper SHA-256 digest when adding crypto deps.
-        let name = server_url
-            .chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '_' })
-            .collect::<String>();
-        self.dir.join(format!("{name}.json"))
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash as _, Hasher as _};
+        let mut h = DefaultHasher::new();
+        server_url.hash(&mut h);
+        self.dir.join(format!("{:016x}.json", h.finish()))
     }
 
     /// Saves a token for `server_url`.
+    ///
+    /// On UNIX the token file is created atomically at mode 0o600 (owner
+    /// read/write only) using [`OpenOptions::mode`], which avoids the TOCTOU
+    /// window that would exist if we wrote the file first and then called
+    /// `set_permissions`.
     ///
     /// # Errors
     ///
@@ -127,13 +134,22 @@ impl TokenStore {
         std::fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
         let path = self.token_path(server_url);
         let json = serde_json::to_string_pretty(token).map_err(|e| e.to_string())?;
-        std::fs::write(&path, &json).map_err(|e| e.to_string())?;
-        // Set file permissions to 0600 on UNIX.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
                 .map_err(|e| e.to_string())?;
+            f.write_all(json.as_bytes()).map_err(|e| e.to_string())?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&path, &json).map_err(|e| e.to_string())?;
         }
         Ok(())
     }
