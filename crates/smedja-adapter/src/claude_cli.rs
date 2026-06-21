@@ -43,10 +43,10 @@ mod tests {
     fn detect_returns_none_when_no_binary_and_no_key() {
         // Assumes `claude` is not on $PATH in CI. If it is, this picks Cli instead.
         let provider = ClaudeCliProvider::detect(None);
-        if !SubprocessProvider::available("claude") {
-            assert!(provider.is_none());
-        } else {
+        if SubprocessProvider::available("claude") {
             assert!(matches!(provider, Some(ClaudeCliProvider::Cli(_))));
+        } else {
+            assert!(provider.is_none());
         }
     }
 
