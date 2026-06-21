@@ -510,10 +510,32 @@ async fn main() -> Result<()> {
                     println!("Created {}", agents_toml.display());
                 }
             },
-            WorkspaceCmd::Index => println!("smj workspace index: not yet implemented"),
+            WorkspaceCmd::Index => {
+                let workspace =
+                    std::env::current_dir().context("cannot determine current directory")?;
+                let db_path = workspace.join(".smedja").join("graph.db");
+                std::fs::create_dir_all(workspace.join(".smedja"))?;
+                let mut store = smedja_graph::GraphStore::open(&db_path)
+                    .context("failed to open graph store")?;
+                let count = store
+                    .index_workspace(&workspace, "workspace")
+                    .context("indexing failed")?;
+                println!("Indexed {count} symbols in {}", workspace.display());
+            }
         },
-        Cmd::Audit { .. } => {
-            println!("smj audit: not yet implemented");
+        Cmd::Audit { session, .. } => {
+            let Some(session_id) = session else {
+                eprintln!("audit requires --session <id>");
+                return Ok(());
+            };
+            let mut client = Client::connect(&sock)
+                .await
+                .with_context(|| format!("smdjad not running ({})", sock.display()))?;
+            let resp = client
+                .call("audit.list", json!({ "session_id": session_id }))
+                .await
+                .context("audit.list failed")?;
+            println!("{}", serde_json::to_string_pretty(&resp)?);
         }
         Cmd::Loop { action } => {
             let mut client = Client::connect(&sock)
@@ -528,8 +550,15 @@ async fn main() -> Result<()> {
                         )
                         .await
                         .context("loop.create failed")?;
-                    let loop_id = resp["loop_id"].as_str().unwrap_or("?");
-                    println!("Loop created: {loop_id}");
+                    let loop_id = resp["loop_id"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("loop.create returned no loop_id"))?
+                        .to_owned();
+                    client
+                        .call("loop.run", json!({ "loop_id": loop_id }))
+                        .await
+                        .context("loop.run failed")?;
+                    println!("Loop {loop_id} running");
                 }
                 LoopCmd::Status { change } => {
                     let resp = client

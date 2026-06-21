@@ -100,7 +100,8 @@ impl Ingot {
                 task_id        TEXT,
                 mode           TEXT,
                 cowork_mode    INTEGER NOT NULL DEFAULT 0,
-                workspace_root TEXT
+                workspace_root TEXT,
+                model_override TEXT
             );
 
             CREATE TABLE IF NOT EXISTS mcp_servers (
@@ -170,6 +171,11 @@ impl Ingot {
         let _ = self
             .conn
             .execute_batch("ALTER TABLE sessions ADD COLUMN workspace_root TEXT;");
+
+        // Add model_override column to existing sessions tables — suppressed if already present.
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE sessions ADD COLUMN model_override TEXT;");
 
         // Record (or ignore) the schema version marker.
         self.conn.execute(
@@ -295,6 +301,23 @@ impl Ingot {
     #[must_use = "check the Result to confirm the mode was updated"]
     pub fn update_session_mode(&mut self, session_id: &str, mode: &str) -> Result<(), IngotError> {
         session::update_mode(&self.conn, session_id, mode)
+    }
+
+    /// Sets the `model_override` field for the session identified by `session_id`.
+    ///
+    /// When set, `run_turn` uses this model name instead of the `SMEDJA_MODEL`
+    /// environment variable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the model override was updated"]
+    pub fn update_session_model_override(
+        &mut self,
+        session_id: &str,
+        model: &str,
+    ) -> Result<(), IngotError> {
+        session::update_model_override(&self.conn, session_id, model).map_err(IngotError::Db)
     }
 
     /// Links the session identified by `session_id` to a task by setting `task_id`.
@@ -593,6 +616,21 @@ impl Ingot {
     #[must_use = "check the Result and inspect the returned loop records"]
     pub fn list_loops(&self, change_name: &str) -> Result<Vec<LoopRecord>, IngotError> {
         loop_state::list_by_change(&self.conn, change_name)
+    }
+
+    /// Updates `current_slice` and `updated_at` for the loop with `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the slice was updated"]
+    pub fn update_loop_slice(
+        &mut self,
+        id: &str,
+        current_slice: i64,
+        updated_at: f64,
+    ) -> Result<(), IngotError> {
+        loop_state::update_slice(&self.conn, id, current_slice, updated_at)
     }
 }
 

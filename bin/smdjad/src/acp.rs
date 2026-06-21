@@ -84,6 +84,7 @@ async fn create_session(State(s): State<AcpState>) -> impl IntoResponse {
         created_at: now,
         updated_at: now,
         workspace_root: None,
+        model_override: None,
     };
     match s.ingot.lock().await.create_session(&session) {
         Ok(()) => Json(json!({ "session_id": id })).into_response(),
@@ -134,6 +135,7 @@ async fn submit_prompt(
 
 async fn set_model(
     Path(id): Path<String>,
+    State(s): State<AcpState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let Some(model) = body["model"].as_str() else {
@@ -143,8 +145,19 @@ async fn set_model(
         )
             .into_response();
     };
-    tracing::info!(session_id = %id, model = %model, "model override accepted (in-memory only)");
-    Json(json!({ "session_id": id, "model": model })).into_response()
+    match s
+        .ingot
+        .lock()
+        .await
+        .update_session_model_override(&id, model)
+    {
+        Ok(()) => Json(json!({ "session_id": id, "model": model })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn set_mode(
@@ -390,5 +403,62 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_model_persists_override_in_db() {
+        let state = test_state();
+        // Create a session so the UPDATE has a row to modify.
+        let session_id = {
+            let app = build_acp_router(state.clone());
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/acp/v1/session/new")
+                        .header("Authorization", "Bearer test-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            json["session_id"].as_str().unwrap().to_owned()
+        };
+
+        let app = build_acp_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/acp/v1/session/{session_id}/model"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"model":"gemma4-27b"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["model"], "gemma4-27b");
+        assert_eq!(json["session_id"], session_id);
+
+        // Verify the override was persisted in the DB.
+        let fetched = state
+            .ingot
+            .lock()
+            .await
+            .get_session(&session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.model_override.as_deref(), Some("gemma4-27b"));
     }
 }
