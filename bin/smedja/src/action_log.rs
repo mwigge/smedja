@@ -22,6 +22,7 @@ pub struct AuditEntry {
 }
 
 /// Ring-buffer widget showing the last N audit events.
+#[derive(Debug)]
 pub struct ActionLog {
     events: VecDeque<AuditEntry>,
     max: usize,
