@@ -170,6 +170,42 @@ async fn handle_key(
                         text: format!("task {id} closed"),
                     });
                 }
+            } else if let Some(arg) = input.trim().strip_prefix("/cowork ") {
+                match arg.trim() {
+                    "on" | "off" => {
+                        let enabled = arg.trim() == "on";
+                        let session_id = state.session_id.clone();
+                        if client
+                            .call(
+                                "cowork.set",
+                                json!({ "session_id": session_id, "enabled": enabled }),
+                            )
+                            .await
+                            .is_ok()
+                        {
+                            state.messages.push(Message {
+                                role: Role::System,
+                                text: format!(
+                                    "cowork mode {}",
+                                    if enabled { "enabled" } else { "disabled" }
+                                ),
+                            });
+                        }
+                    }
+                    "status" => {
+                        let cowork_on = false; // ponytail: read from session state when wired
+                        state.messages.push(Message {
+                            role: Role::System,
+                            text: format!("cowork: {}", if cowork_on { "on" } else { "off" }),
+                        });
+                    }
+                    _ => {
+                        state.messages.push(Message {
+                            role: Role::System,
+                            text: "usage: /cowork on|off|status".into(),
+                        });
+                    }
+                }
             } else {
                 submit(&input, state, client).await?;
             }

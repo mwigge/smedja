@@ -17,11 +17,13 @@
 //! ```
 
 pub mod assayer;
+pub mod bash_arity;
 pub mod config;
 pub mod parallel;
 pub mod types;
 
 pub use assayer::{Assayer, RoutingRule};
+pub use bash_arity::{classify_bash, BashArity};
 pub use config::load_rules;
 pub use parallel::{Task, TaskStatus, WorktreePool};
 pub use types::{Complexity, Role, Route, Runner, Tier};
