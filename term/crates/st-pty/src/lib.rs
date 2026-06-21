@@ -288,6 +288,12 @@ pub struct CellGrid {
     osc133_seen: bool,
     /// Monotonic line count since start (for heuristic timing).
     lines_since_start: u32,
+    /// Window title set via OSC 0 or OSC 2.
+    pub title: Option<String>,
+    /// Saved cursor position (ESC 7 / ESC 8 DEC save/restore).
+    pub cursor_saved: Option<(u16, u16)>,
+    /// Whether the cursor is visible (`true` by default; `?25l` hides it).
+    pub cursor_visible: bool,
 }
 
 impl CellGrid {
@@ -312,6 +318,9 @@ impl CellGrid {
             palette: DEFAULT_PALETTE,
             osc133_seen: false,
             lines_since_start: 0,
+            title: None,
+            cursor_saved: None,
+            cursor_visible: true,
         }
     }
 
@@ -684,16 +693,16 @@ impl vte::Perform for VtHandler {
                 apply_sgr(&mut grid, &p);
             }
             // ── Private mode (DEC) ───────────────────────────────────────────
-            'h' if intermediates == [b'?'] => {
-                if p.first().copied().unwrap_or(0) == 1049 {
-                    grid.enter_alt_screen();
-                }
-            }
-            'l' if intermediates == [b'?'] => {
-                if p.first().copied().unwrap_or(0) == 1049 {
-                    grid.leave_alt_screen();
-                }
-            }
+            'h' if intermediates == [b'?'] => match p.first().copied().unwrap_or(0) {
+                1049 => grid.enter_alt_screen(),
+                25 => grid.cursor_visible = true,
+                _ => {}
+            },
+            'l' if intermediates == [b'?'] => match p.first().copied().unwrap_or(0) {
+                1049 => grid.leave_alt_screen(),
+                25 => grid.cursor_visible = false,
+                _ => {}
+            },
             // ── Line delete / insert ─────────────────────────────────────────
             'L' => {
                 // Insert lines above cursor.
@@ -735,6 +744,12 @@ impl vte::Perform for VtHandler {
         }
         let command = std::str::from_utf8(params[0]).unwrap_or("");
         match command {
+            // OSC 0/2 — set window title and/or icon name.
+            "0" | "2" => {
+                if let Some(title) = params.get(1).and_then(|b| std::str::from_utf8(b).ok()) {
+                    grid.title = Some(title.to_owned());
+                }
+            }
             "8" => {
                 // OSC 8 ; params ; uri ST — hyperlink.
                 let uri = params.get(2).and_then(|b| std::str::from_utf8(b).ok());
@@ -808,6 +823,16 @@ impl vte::Perform for VtHandler {
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
         let mut grid = self.grid.lock();
         match byte {
+            b'7' => {
+                // DEC cursor save.
+                grid.cursor_saved = Some(grid.cursor);
+            }
+            b'8' => {
+                // DEC cursor restore.
+                if let Some(saved) = grid.cursor_saved {
+                    grid.cursor = saved;
+                }
+            }
             b'D' => {
                 // Index: move cursor down one row, scroll if at last row.
                 let last_row = grid.rows.saturating_sub(1);
@@ -826,7 +851,7 @@ impl vte::Perform for VtHandler {
                 }
             }
             _ => {
-                debug!("unhandled esc_dispatch byte: 0x{:02x}", byte);
+                debug!("unhandled ESC: 0x{:02x}", byte);
             }
         }
     }
@@ -1609,5 +1634,163 @@ mod tests {
         handler.esc_dispatch(&[], false, b'M');
         let g = grid.lock();
         assert_eq!(g.cursor.1, 1, "cursor should move up one row");
+    }
+
+    // ── Section 4a: OSC 0 — window title ─────────────────────────────────
+
+    #[test]
+    fn vte_osc0_sets_window_title() {
+        let grid = Arc::new(Mutex::new(make_grid(80, 24)));
+        let mut handler = VtHandler {
+            grid: Arc::clone(&grid),
+        };
+        let mut parser = vte::Parser::new();
+        // OSC 0 ; title BEL
+        let seq = b"\x1b]0;my terminal title\x07";
+        for &byte in seq {
+            parser.advance(&mut handler, byte);
+        }
+        let g = grid.lock();
+        assert_eq!(
+            g.title.as_deref(),
+            Some("my terminal title"),
+            "OSC 0 should set the window title"
+        );
+    }
+
+    #[test]
+    fn vte_osc2_sets_window_title() {
+        let grid = Arc::new(Mutex::new(make_grid(80, 24)));
+        let mut handler = VtHandler {
+            grid: Arc::clone(&grid),
+        };
+        let mut parser = vte::Parser::new();
+        // OSC 2 ; title BEL
+        let seq = b"\x1b]2;icon title\x07";
+        for &byte in seq {
+            parser.advance(&mut handler, byte);
+        }
+        let g = grid.lock();
+        assert_eq!(
+            g.title.as_deref(),
+            Some("icon title"),
+            "OSC 2 should set the window title"
+        );
+    }
+
+    // ── Section 4b: ESC 7 / ESC 8 — cursor save/restore ─────────────────
+
+    #[test]
+    fn vte_esc7_saves_and_esc8_restores_cursor() {
+        let grid = Arc::new(Mutex::new(make_grid(80, 24)));
+        let mut handler = VtHandler {
+            grid: Arc::clone(&grid),
+        };
+        let mut parser = vte::Parser::new();
+        // Move cursor to (5, 3), save, move to (0, 0), restore.
+        let seq = b"\x1b[4;6H\x1b7\x1b[H\x1b8";
+        for &byte in seq {
+            parser.advance(&mut handler, byte);
+        }
+        let g = grid.lock();
+        // After restore, cursor should be at col 5, row 3 (0-indexed after 1-based CSI H).
+        assert_eq!(g.cursor.0, 5, "cursor col should be restored to 5");
+        assert_eq!(g.cursor.1, 3, "cursor row should be restored to 3");
+    }
+
+    // ── Section 4c: CSI ?25l / ?25h — cursor hide/show ───────────────────
+
+    #[test]
+    fn vte_cursor_hide_and_show() {
+        let grid = Arc::new(Mutex::new(make_grid(80, 24)));
+        let mut handler = VtHandler {
+            grid: Arc::clone(&grid),
+        };
+        let mut parser = vte::Parser::new();
+        // Hide cursor.
+        let seq = b"\x1b[?25l";
+        for &byte in seq {
+            parser.advance(&mut handler, byte);
+        }
+        {
+            let g = grid.lock();
+            assert!(!g.cursor_visible, "?25l should hide cursor");
+        }
+        // Show cursor.
+        let seq2 = b"\x1b[?25h";
+        for &byte in seq2 {
+            parser.advance(&mut handler, byte);
+        }
+        {
+            let g = grid.lock();
+            assert!(g.cursor_visible, "?25h should show cursor");
+        }
+    }
+
+    // ── Section 4d: regression tests for already-implemented sequences ────
+
+    #[test]
+    fn vte_24bit_fg_colour() {
+        let grid = Arc::new(Mutex::new(make_grid(80, 24)));
+        let mut handler = VtHandler {
+            grid: Arc::clone(&grid),
+        };
+        let mut parser = vte::Parser::new();
+        let seq = b"\x1b[38;2;255;128;0m";
+        for &byte in seq {
+            parser.advance(&mut handler, byte);
+        }
+        let g = grid.lock();
+        assert_eq!(
+            g.sgr.fg,
+            Color::Rgb(255, 128, 0),
+            "SGR 38;2 should set 24-bit fg colour"
+        );
+    }
+
+    #[test]
+    fn vte_256_bg_colour() {
+        let grid = Arc::new(Mutex::new(make_grid(80, 24)));
+        let mut handler = VtHandler {
+            grid: Arc::clone(&grid),
+        };
+        let mut parser = vte::Parser::new();
+        let seq = b"\x1b[48;5;196m";
+        for &byte in seq {
+            parser.advance(&mut handler, byte);
+        }
+        let g = grid.lock();
+        assert_eq!(
+            g.sgr.bg,
+            Color::Ansi256(196),
+            "SGR 48;5 should set 256-colour bg"
+        );
+    }
+
+    #[test]
+    fn vte_alternate_screen_enter_exit() {
+        let grid = Arc::new(Mutex::new(make_grid(80, 24)));
+        let mut handler = VtHandler {
+            grid: Arc::clone(&grid),
+        };
+        let mut parser = vte::Parser::new();
+        // Enter alt screen.
+        let enter = b"\x1b[?1049h";
+        for &byte in enter {
+            parser.advance(&mut handler, byte);
+        }
+        {
+            let g = grid.lock();
+            assert!(g.alt_screen, "?1049h should enter alt screen");
+        }
+        // Exit alt screen.
+        let exit = b"\x1b[?1049l";
+        for &byte in exit {
+            parser.advance(&mut handler, byte);
+        }
+        {
+            let g = grid.lock();
+            assert!(!g.alt_screen, "?1049l should exit alt screen");
+        }
     }
 }
