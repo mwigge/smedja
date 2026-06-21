@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
+use smedja_ingot::Ingot;
 use smedja_plugins::SkillRegistry;
 use smedja_rpc::client::Client;
 
@@ -154,7 +155,17 @@ enum WorkspaceCmd {
         #[command(subcommand)]
         action: AgentsCmd,
     },
-    Index,
+    /// Index the current workspace into the code graph
+    Index {
+        /// Optional git commit SHA for incremental re-indexing
+        #[arg(long)]
+        commit_sha: Option<String>,
+    },
+    /// Register a directory path with the workspace
+    Add {
+        /// Directory path to add to the workspace
+        path: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -238,6 +249,14 @@ enum TaskCmd {
         /// Parallel task ID to cancel
         id: String,
     },
+    /// Export tasks (and their audit events) as JSONL to stdout
+    Export {
+        /// Filter to tasks whose title contains this change name
+        #[arg(long)]
+        change: Option<String>,
+    },
+    /// Import tasks and audit events from JSONL on stdin
+    Import,
 }
 
 #[derive(Subcommand)]
@@ -289,6 +308,26 @@ enum McpCmd {
 enum SandboxCmd {
     /// Build the smedja-sandbox Docker image
     Build,
+}
+
+/// Returns the default path to the smedja ingot database.
+///
+/// The database lives under the XDG data directory so that it is isolated
+/// from per-workspace `.smedja/` directories.
+fn default_ingot_path() -> PathBuf {
+    let data_home = std::env::var("XDG_DATA_HOME").map_or_else(
+        |_| {
+            std::env::var("HOME").map_or_else(
+                |_| PathBuf::from(".local/share"),
+                |h| PathBuf::from(h).join(".local/share"),
+            )
+        },
+        PathBuf::from,
+    );
+    let dir = data_home.join("smedja");
+    // Best-effort directory creation — open() will surface the error if it fails.
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("ingot.db")
 }
 
 fn default_socket_path() -> PathBuf {
@@ -362,6 +401,49 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Task { action } => {
+            // Export and Import operate on the local Ingot DB directly without
+            // needing a running smdjad daemon.
+            match action {
+                TaskCmd::Export { change } => {
+                    let db_path = default_ingot_path();
+                    let ingot = Ingot::open(&db_path).with_context(|| {
+                        format!("failed to open ingot at {}", db_path.display())
+                    })?;
+                    let records = ingot
+                        .export_jsonl(change.as_deref())
+                        .context("export_jsonl failed")?;
+                    for rec in &records {
+                        println!("{}", serde_json::to_string(rec)?);
+                    }
+                    return Ok(());
+                }
+                TaskCmd::Import => {
+                    use std::io::BufRead as _;
+                    let db_path = default_ingot_path();
+                    let mut ingot = Ingot::open(&db_path).with_context(|| {
+                        format!("failed to open ingot at {}", db_path.display())
+                    })?;
+                    let stdin = std::io::stdin();
+                    let mut records: Vec<serde_json::Value> = Vec::new();
+                    for line in stdin.lock().lines() {
+                        let line = line.context("failed to read stdin")?;
+                        let line = line.trim().to_owned();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let val: serde_json::Value =
+                            serde_json::from_str(&line).context("invalid JSON line")?;
+                        records.push(val);
+                    }
+                    let n = ingot
+                        .import_jsonl(&records)
+                        .context("import_jsonl failed")?;
+                    println!("Imported {n} record(s)");
+                    return Ok(());
+                }
+                _ => {}
+            }
+
             let mut client = Client::connect(&sock)
                 .await
                 .with_context(|| format!("smdjad not running ({})", sock.display()))?;
@@ -404,6 +486,8 @@ async fn main() -> Result<()> {
                         .context("task.cancel failed")?;
                     println!("cancelled: {id}");
                 }
+                // Already handled above; unreachable but required for exhaustiveness.
+                TaskCmd::Export { .. } | TaskCmd::Import => unreachable!(),
             }
         }
         Cmd::Session { action } => {
@@ -510,7 +594,7 @@ async fn main() -> Result<()> {
                     println!("Created {}", agents_toml.display());
                 }
             },
-            WorkspaceCmd::Index => {
+            WorkspaceCmd::Index { commit_sha } => {
                 let workspace =
                     std::env::current_dir().context("cannot determine current directory")?;
                 let db_path = workspace.join(".smedja").join("graph.db");
@@ -518,9 +602,33 @@ async fn main() -> Result<()> {
                 let mut store = smedja_graph::GraphStore::open(&db_path)
                     .context("failed to open graph store")?;
                 let count = store
-                    .index_workspace(&workspace, "workspace")
+                    .index_workspace_incremental(&workspace, "workspace", commit_sha.as_deref())
                     .context("indexing failed")?;
                 println!("Indexed {count} symbols in {}", workspace.display());
+            }
+            WorkspaceCmd::Add { path } => {
+                let workspace =
+                    std::env::current_dir().context("cannot determine current directory")?;
+                let smedja_dir = workspace.join(".smedja");
+                std::fs::create_dir_all(&smedja_dir)?;
+                let toml_path = smedja_dir.join("workspace.toml");
+
+                // Read existing content or start fresh.
+                let mut content = if toml_path.exists() {
+                    std::fs::read_to_string(&toml_path).context("failed to read workspace.toml")?
+                } else {
+                    String::new()
+                };
+
+                // Append the new path entry.
+                if !content.is_empty() && !content.ends_with('\n') {
+                    content.push('\n');
+                }
+                content.push_str("\n[[workspace.paths]]\npath = \"");
+                content.push_str(&path);
+                content.push_str("\"\n");
+                std::fs::write(&toml_path, &content).context("failed to write workspace.toml")?;
+                println!("Added path '{}' to {}", path, toml_path.display());
             }
         },
         Cmd::Audit { session, .. } => {

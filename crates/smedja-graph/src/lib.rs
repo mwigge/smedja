@@ -172,4 +172,86 @@ mod tests {
             "expected WorkingMemory symbol in smedja-memory, got none"
         );
     }
+
+    // ── 10. incremental re-index — same sha skips unchanged files ─────────────
+
+    #[test]
+    fn incremental_reindex_same_sha_returns_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.rs"), "fn hello() {}\n").expect("write");
+
+        let mut store = GraphStore::open_in_memory().unwrap();
+
+        // First index run with a sha — should insert symbols.
+        let first = store
+            .index_workspace_incremental(dir.path(), "ws-incr", Some("abc123"))
+            .unwrap();
+        assert!(
+            first >= 1,
+            "expected at least 1 symbol on first index, got {first}"
+        );
+
+        // Second run with the same sha — file is unchanged, should return 0.
+        let second = store
+            .index_workspace_incremental(dir.path(), "ws-incr", Some("abc123"))
+            .unwrap();
+        assert_eq!(
+            second, 0,
+            "same sha + unchanged file must return 0 new symbols"
+        );
+    }
+
+    // ── 11. incremental re-index — new sha re-indexes all files ──────────────
+
+    #[test]
+    fn incremental_reindex_new_sha_returns_symbols() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("b.rs"), "fn world() {}\n").expect("write");
+
+        let mut store = GraphStore::open_in_memory().unwrap();
+
+        store
+            .index_workspace_incremental(dir.path(), "ws-newsha", Some("sha-v1"))
+            .unwrap();
+
+        // New sha — all files are treated as changed.
+        let second = store
+            .index_workspace_incremental(dir.path(), "ws-newsha", Some("sha-v2"))
+            .unwrap();
+        assert!(
+            second >= 1,
+            "new sha must re-index all files; expected ≥ 1 symbol, got {second}"
+        );
+    }
+
+    // ── 12. incremental re-index — None sha performs full re-index ────────────
+
+    #[test]
+    fn incremental_reindex_none_sha_is_full_reindex() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("c.rs"), "fn full() {}\n").expect("write");
+
+        let mut store = GraphStore::open_in_memory().unwrap();
+        let n = store
+            .index_workspace_incremental(dir.path(), "ws-full", None)
+            .unwrap();
+        assert!(n >= 1, "full re-index should return symbols; got {n}");
+    }
+
+    // ── 13. integration: index smedja repo; query WorkingMemory ─────────────
+
+    #[test]
+    #[ignore = "requires the full smedja repository at /data/src/smedja"]
+    fn integration_index_smedja_and_query_working_memory() {
+        let root = std::path::Path::new("/data/src/smedja");
+
+        let mut store = GraphStore::open_in_memory().unwrap();
+        store.index_workspace(root, "smedja-self").unwrap();
+
+        let results = store.graph_query("WorkingMemory", 2, 0).unwrap();
+        assert!(
+            !results.is_empty(),
+            "graph_query(WorkingMemory) must return at least one symbol"
+        );
+    }
 }
