@@ -294,4 +294,63 @@ mod tests {
         assert!(lines.iter().any(|l| l.starts_with('-')));
         assert!(lines.iter().any(|l| l.starts_with('+')));
     }
+
+    // --- smoke test equivalents (L64-L65) ---
+
+    #[test]
+    fn smoke_l64_turn_block_full_cycle_header_footer() {
+        // Smoke L64: 5-turn session; each turn produces a TurnBlock with header/footer.
+        // Drives turn_start → tool_call → tool_result → turn_end and checks header/footer.
+        let mut store = BlockStore::new();
+        for n in 1..=5 {
+            let mut b = TurnBlock::new(n);
+            b.push_tool_call("read_file".into(), "main.rs".into());
+            b.set_tool_outcome("fn main() {}".into());
+            b.push_text("Done.");
+            b.complete(u64::from(n) * 10);
+            let lines = b.render_lines(60);
+            assert!(
+                lines[0].starts_with("┌─ turn"),
+                "turn {n}: header must start with '┌─ turn', got: {:?}",
+                lines[0]
+            );
+            let footer = lines.last().expect("footer line must exist");
+            assert!(
+                footer.contains("ms"),
+                "turn {n}: footer must contain token/latency info, got: {footer:?}"
+            );
+            store.push(b);
+        }
+        assert_eq!(store.len(), 5);
+    }
+
+    #[test]
+    fn smoke_l65_edit_file_diff_renders_plus_minus_at_20_line_limit() {
+        use std::fmt::Write as _;
+        // Smoke L65: edit_file turn; d key → inline diff shows +/- lines; truncated at 20.
+        let mut b = TurnBlock::new(1);
+        b.push_tool_call("edit_file".into(), "foo.rs".into());
+        // Build a diff with 30 +/- lines so truncation at 20 is exercised.
+        let mut diff_body = "@@ -1,30 +1,30 @@\n".to_owned();
+        for i in 0..30 {
+            let _ = write!(diff_body, "-old line {i}\n+new line {i}\n");
+        }
+        b.set_tool_outcome(diff_body);
+        // diff must have been extracted
+        assert!(
+            b.tool_calls[0].diff.is_some(),
+            "diff must be extracted from edit_file outcome"
+        );
+        // inline render must truncate to exactly 20 lines
+        let lines = b.inline_diff(0, 20).unwrap();
+        assert_eq!(lines.len(), 20, "inline diff must truncate at 20 lines");
+        assert!(
+            lines.iter().any(|l| l.starts_with('+')),
+            "at least one '+' line required"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with('-')),
+            "at least one '-' line required"
+        );
+    }
 }

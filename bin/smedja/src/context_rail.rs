@@ -187,4 +187,36 @@ mod tests {
         assert_eq!(SlotStyle::from_pct(70.0).color(), Color::Yellow);
         assert_eq!(SlotStyle::from_pct(90.0).color(), Color::Red);
     }
+
+    // --- smoke test equivalent (L68) ---
+
+    #[test]
+    fn smoke_l68_context_pct_shows_50_percent_at_half_window() {
+        // Smoke L68: status bar shows correct context% after a turn that fills 50% of window.
+        // context_used=50_000, context_window=100_000 → pct() == 50.0.
+        let slot = ContextSlot {
+            name: "context".into(),
+            used: 50_000,
+            total: 100_000,
+        };
+        let pct = slot.pct();
+        // Exact equality is safe: 50000/100000 * 100 = 50.0 is exactly representable in f64.
+        assert!(
+            (pct - 50.0).abs() < f64::EPSILON,
+            "expected 50.0%, got {pct}"
+        );
+        // fill_bar of 10 must show exactly 5 filled characters.
+        let bar = slot.fill_bar(10);
+        let filled_count = bar.chars().filter(|&c| c == '\u{2588}').count();
+        assert_eq!(
+            filled_count, 5,
+            "50% fill bar of width 10 must have 5 filled chars, got {filled_count}"
+        );
+        // SlotStyle must be Low (< 60%).
+        assert_eq!(
+            SlotStyle::from_pct(pct),
+            SlotStyle::Low,
+            "50% context usage must be Low (green)"
+        );
+    }
 }
