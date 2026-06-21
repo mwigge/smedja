@@ -1,0 +1,19 @@
+# Model pricing in USD per 1M tokens.
+# Source: public pricing pages as of 2026-06.
+# update with: smj prices update --file <path>
+
+[input]
+"claude-haiku-4-5-20251001" = 0.80
+"claude-sonnet-4-6"         = 3.00
+"claude-opus-4-8"           = 15.00
+"gpt-4o-mini"               = 0.15
+"gpt-4o"                    = 2.50
+"o3-mini"                   = 1.10
+
+[output]
+"claude-haiku-4-5-20251001" = 4.00
+"claude-sonnet-4-6"         = 15.00
+"claude-opus-4-8"           = 75.00
+"gpt-4o-mini"               = 0.60
+"gpt-4o"                    = 10.00
+"o3-mini"                   = 4.40

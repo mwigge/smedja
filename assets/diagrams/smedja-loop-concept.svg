@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="532" viewBox="0 0 940 532">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0d0f"/>
+      <stop offset="48%" stop-color="#17110d"/>
+      <stop offset="100%" stop-color="#2a160d"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="78%" cy="5%" r="80%">
+      <stop offset="0%" stop-color="#ff9f2e" stop-opacity="0.35"/>
+      <stop offset="48%" stop-color="#8a3d16" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#000000" flood-opacity="0.48"/>
+    </filter>
+  </defs>
+  <rect width="940" height="532" fill="url(#bg)"/>
+  <rect width="940" height="532" fill="url(#glow)"/>
+  <rect x="22" y="22" width="896" height="488" rx="8" fill="#111316" stroke="#a9652f" stroke-width="2" filter="url(#shadow)"/>
+  <rect x="24" y="24" width="892" height="50" rx="6" fill="#211811" stroke="#3b2a1f" stroke-width="1"/>
+  <circle cx="52" cy="49" r="7" fill="#d65f2e"/>
+  <circle cx="78" cy="49" r="7" fill="#d99b55"/>
+  <circle cx="104" cy="49" r="7" fill="#5d946b"/>
+  <text x="132" y="56" fill="#f7c77e" font-size="21" font-family="Inter, DejaVu Sans, sans-serif" font-weight="700">smedja-loop concept</text>
+  <g opacity="0.92">
+    <text x="54" y="102" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">┌─────────────────────────────────────────────────────────────────┐</text><text x="54" y="124" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│  smedja-loop (new concept)                                      │</text><text x="54" y="146" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│  .smedja/loop.json  ←→  OpenSpec change tasks.md               │</text><text x="54" y="168" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">├─────────────────────────────────────────────────────────────────┤</text><text x="54" y="190" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│  orchestrator (claude/deep)  plans slices                       │</text><text x="54" y="212" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│       │                                                         │</text><text x="54" y="234" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│       ├── tester (local/rs-llmctl)  red phase                   │</text><text x="54" y="256" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│       ├── implementer (local/rs-llmctl)  green phase            │</text><text x="54" y="278" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│       ├── verifier  (cargo test, no model)                      │</text><text x="54" y="300" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│       ├── reviewer (minimax/fast)  read-only                    │</text><text x="54" y="322" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│       └── fix (local/rs-llmctl)  retry ≤ 3                      │</text><text x="54" y="344" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│                                                                 │</text><text x="54" y="366" fill="#ffb24a" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│  failure mining ─▶ .smedja/guides/&lt;role&gt;.md ─▶ stable_prefix    │</text><text x="54" y="388" fill="#ffb24a" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│  SmartCrusher ─▶ strips tool result nulls before LLM call       │</text><text x="54" y="410" fill="#ffb24a" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│  LocalProvider ─▶ rs-llmctl capability pre-flight               │</text><text x="54" y="432" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│  Evaluator ≠ Generator (enforced by agents.toml runner field)   │</text><text x="54" y="454" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">└─────────────────────────────────────────────────────────────────┘</text>
+  </g>
+  <rect x="22" y="482" width="896" height="28" fill="#0d0f11" opacity="0.8"/>
+  <text x="690" y="501" fill="#8f765b" font-size="13" font-family="DejaVu Sans Mono, monospace">smedja forged-terminal</text>
+</svg>

@@ -1,9 +1,10 @@
 //! Parallel task pool for multi-role worktree execution.
 //!
 //! [`WorktreePool`] tracks [`Task`] records keyed by UUID. Each task
-//! represents one agent role running against its own git worktree. No I/O
-//! is performed here — worktree creation and process spawning are the
-//! caller's responsibility.
+//! represents one agent role running against its own git worktree. Worktree
+//! lifecycle (creation and removal) is handled by [`WorktreePool::start_worktrees`]
+//! and [`WorktreePool::remove_worktree`]; process spawning remains the caller's
+//! responsibility.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -116,6 +117,93 @@ impl WorktreePool {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Creates git worktrees on disk for all [`TaskStatus::Pending`] tasks.
+    ///
+    /// Calls `git worktree add <path> HEAD` for each pending task using
+    /// [`tokio::process::Command`]. On success the task transitions to
+    /// `Running { pid: 0 }` — the caller is expected to replace `pid` once
+    /// the session process is actually started. On non-zero exit or I/O error
+    /// the task transitions to `Failed { reason }`.
+    ///
+    /// Returns the list of task IDs that were successfully set to `Running`.
+    pub async fn start_worktrees(&mut self, workspace_root: &Path) -> Vec<String> {
+        let mut started = Vec::new();
+        let pending_ids: Vec<String> = self
+            .tasks
+            .values()
+            .filter(|t| t.status == TaskStatus::Pending)
+            .map(|t| t.id.clone())
+            .collect();
+
+        for id in pending_ids {
+            let path = workspace_root.join(".smedja").join("worktrees").join(&id);
+
+            let path_str = path.to_str().unwrap_or(".smedja/worktrees/x").to_owned();
+
+            let output = tokio::process::Command::new("git")
+                .args(["worktree", "add", &path_str, "HEAD"])
+                .current_dir(workspace_root)
+                .output()
+                .await;
+
+            match output {
+                Ok(out) if out.status.success() => {
+                    tracing::info!(task_id = %id, path = ?path, "worktree created");
+                    self.set_status(&id, TaskStatus::Running { pid: 0 });
+                    started.push(id);
+                }
+                Ok(out) => {
+                    let reason = String::from_utf8_lossy(&out.stderr).to_string();
+                    tracing::warn!(task_id = %id, %reason, "git worktree add failed");
+                    self.set_status(&id, TaskStatus::Failed { reason });
+                }
+                Err(e) => {
+                    let reason = e.to_string();
+                    tracing::warn!(task_id = %id, %reason, "git worktree add error");
+                    self.set_status(&id, TaskStatus::Failed { reason });
+                }
+            }
+        }
+        started
+    }
+
+    /// Removes the git worktree for any task, regardless of its current status.
+    ///
+    /// Calls `git worktree remove --force <path>`. The operation is
+    /// best-effort: failures are logged as warnings but no error is returned.
+    /// The task record is not removed from the pool — status updates remain
+    /// the caller's responsibility.
+    pub async fn remove_worktree(&self, task_id: &str, workspace_root: &Path) {
+        let Some(task) = self.tasks.get(task_id) else {
+            tracing::warn!(task_id, "remove_worktree: task not found");
+            return;
+        };
+
+        let path_str = task.worktree_path.to_str().unwrap_or(".").to_owned();
+
+        let output = tokio::process::Command::new("git")
+            .args(["worktree", "remove", "--force", &path_str])
+            .current_dir(workspace_root)
+            .output()
+            .await;
+
+        match output {
+            Ok(out) if out.status.success() => {
+                tracing::info!(task_id, "worktree removed");
+            }
+            Ok(out) => {
+                tracing::warn!(
+                    task_id,
+                    stderr = %String::from_utf8_lossy(&out.stderr),
+                    "git worktree remove failed (ignored)",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(task_id, error = %e, "git worktree remove error (ignored)");
+            }
         }
     }
 }

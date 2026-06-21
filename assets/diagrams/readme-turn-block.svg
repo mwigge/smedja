@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1012" height="378" viewBox="0 0 1012 378">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0d0f"/>
+      <stop offset="48%" stop-color="#17110d"/>
+      <stop offset="100%" stop-color="#2a160d"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="78%" cy="5%" r="80%">
+      <stop offset="0%" stop-color="#ff9f2e" stop-opacity="0.35"/>
+      <stop offset="48%" stop-color="#8a3d16" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#000000" flood-opacity="0.48"/>
+    </filter>
+  </defs>
+  <rect width="1012" height="378" fill="url(#bg)"/>
+  <rect width="1012" height="378" fill="url(#glow)"/>
+  <rect x="22" y="22" width="968" height="334" rx="8" fill="#111316" stroke="#a9652f" stroke-width="2" filter="url(#shadow)"/>
+  <rect x="24" y="24" width="964" height="50" rx="6" fill="#211811" stroke="#3b2a1f" stroke-width="1"/>
+  <circle cx="52" cy="49" r="7" fill="#d65f2e"/>
+  <circle cx="78" cy="49" r="7" fill="#d99b55"/>
+  <circle cx="104" cy="49" r="7" fill="#5d946b"/>
+  <text x="132" y="56" fill="#f7c77e" font-size="21" font-family="Inter, DejaVu Sans, sans-serif" font-weight="700">README - Turn Block</text>
+  <g opacity="0.92">
+    <text x="54" y="102" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">┌─ turn 14 ── local · Qwen3-14B ── 1,240 → 312 tok ── 2.1s ───────────────┐</text><text x="54" y="124" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│                                                                            │</text><text x="54" y="146" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│  The softcap needs to drop from 50.0 to 30.0 per the Gemma 4 spec.       │</text><text x="54" y="168" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│                                                                            │</text><text x="54" y="190" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│  ▸ read_file  crates/native/src/lib.rs       → 412 lines                 │</text><text x="54" y="212" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│  ▸ edit_file  crates/native/src/lib.rs       → +1/-1  (L432)             │</text><text x="54" y="234" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│    - softcap: f32 = 50.0,                                                 │</text><text x="54" y="256" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│    + softcap: f32 = 30.0,                                                 │</text><text x="54" y="278" fill="#d99b55" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">│                                                                            │</text><text x="54" y="300" fill="#ffb24a" font-size="18" xml:space="preserve" font-family="DejaVu Sans Mono, JetBrains Mono, Menlo, monospace">└────────────────────────────────── ✓ complete - trace: 4bf92f3a ───────────┘</text>
+  </g>
+  <rect x="22" y="328" width="968" height="28" fill="#0d0f11" opacity="0.8"/>
+  <text x="762" y="347" fill="#8f765b" font-size="13" font-family="DejaVu Sans Mono, monospace">smedja forged-terminal</text>
+</svg>
