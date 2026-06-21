@@ -77,6 +77,11 @@ fn build_body(messages: &[Message], opts: &CallOptions) -> serde_json::Value {
     if let Some(sys) = system_content {
         body["system"] = json!(sys);
     }
+    if let Some(tools) = &opts.tools {
+        if !tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(tools.clone());
+        }
+    }
     if let Some(temp) = opts.temperature {
         body["temperature"] = json!(temp);
     }
@@ -180,5 +185,73 @@ impl Provider for AnthropicProvider {
         });
 
         Box::pin(ReceiverStream::new(rx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_opts() -> CallOptions {
+        CallOptions {
+            model: "claude-opus-4-5".into(),
+            max_tokens: Some(512),
+            temperature: None,
+            system: None,
+            tools: None,
+        }
+    }
+
+    #[test]
+    fn build_body_omits_tools_key_when_tools_is_none() {
+        let opts = base_opts();
+        let body = build_body(&[], &opts);
+        assert!(
+            body.get("tools").is_none(),
+            "tools key must be absent when CallOptions::tools is None"
+        );
+    }
+
+    #[test]
+    fn build_body_omits_tools_key_when_tools_vec_is_empty() {
+        let mut opts = base_opts();
+        opts.tools = Some(vec![]);
+        let body = build_body(&[], &opts);
+        assert!(
+            body.get("tools").is_none(),
+            "tools key must be absent when the tools Vec is empty"
+        );
+    }
+
+    #[test]
+    fn build_body_injects_tools_when_non_empty() {
+        let tool = serde_json::json!({
+            "name": "bash",
+            "description": "Run a bash command",
+            "input_schema": { "type": "object" }
+        });
+        let mut opts = base_opts();
+        opts.tools = Some(vec![tool.clone()]);
+
+        let body = build_body(&[], &opts);
+        let injected = body
+            .get("tools")
+            .expect("tools key must be present when tools Vec is non-empty");
+        let arr = injected.as_array().expect("tools value must be an array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0], tool);
+    }
+
+    #[test]
+    fn build_body_preserves_tool_order() {
+        let tool_a = serde_json::json!({ "name": "a" });
+        let tool_b = serde_json::json!({ "name": "b" });
+        let mut opts = base_opts();
+        opts.tools = Some(vec![tool_a.clone(), tool_b.clone()]);
+
+        let body = build_body(&[], &opts);
+        let arr = body["tools"].as_array().unwrap();
+        assert_eq!(arr[0], tool_a);
+        assert_eq!(arr[1], tool_b);
     }
 }

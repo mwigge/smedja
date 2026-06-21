@@ -135,4 +135,113 @@ mod tests {
         assert_eq!(tools[0].name, "read_file");
         assert_eq!(tools[0].description, "Read a file from the workspace");
     }
+
+    /// Integration test: registers a local mock MCP HTTP server, discovers its
+    /// tool list, and verifies the tools appear in the smedja-ingot registry.
+    ///
+    /// Flow:
+    ///   1. Spawn a minimal axum server that returns a valid MCP tool list.
+    ///   2. Create an in-memory `Ingot` and register the server entry.
+    ///   3. Call `McpHttpClient::list_tools()` against the local server.
+    ///   4. Serialise the returned tools and persist via `update_mcp_tools`.
+    ///   5. Call `get_all_mcp_tools` and verify the tool appears in routing.
+    #[tokio::test]
+    async fn tool_discovery_persists_into_ingot_registry() {
+        // --- Step 1: spawn a minimal local MCP HTTP server on an ephemeral port ---
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_url = format!("http://{addr}");
+
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::post(|| async {
+                    axum::Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": "echo",
+                                    "description": "Echo input",
+                                    "input_schema": { "type": "object" }
+                                }
+                            ]
+                        }
+                    }))
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Give the server a moment to start listening.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // --- Step 2: create an in-memory Ingot and register the server entry ---
+        let server_name = "test-echo-server";
+        let mut ig = smedja_ingot::Ingot::open_in_memory().expect("in-memory Ingot must open");
+
+        let mcp_entry = smedja_ingot::McpServer {
+            id: "test-echo-server-id".into(),
+            name: server_name.into(),
+            url: server_url.clone(),
+            transport: "http".into(),
+            tools_json: "[]".into(),
+            last_refresh: 0.0,
+        };
+        ig.register_mcp_server(&mcp_entry)
+            .expect("register_mcp_server must succeed");
+
+        // Confirm the registry now contains the server (with an empty tool list).
+        let servers_before = ig.list_mcp_servers().unwrap();
+        assert_eq!(servers_before.len(), 1);
+        assert_eq!(servers_before[0].name, server_name);
+        assert_eq!(servers_before[0].tools_json, "[]");
+
+        // --- Step 3: call list_tools against the local MCP server ---
+        let client = McpHttpClient::new(&server_url, "").expect("McpHttpClient::new must succeed");
+        let tools = client
+            .list_tools()
+            .await
+            .expect("list_tools must succeed against local server");
+
+        assert_eq!(tools.len(), 1, "server must return exactly one tool");
+        assert_eq!(tools[0].name, "echo");
+        assert_eq!(tools[0].description, "Echo input");
+
+        // --- Step 4: serialise and persist via update_mcp_tools ---
+        let tools_json = serde_json::to_string(&tools).expect("tools must serialise to JSON");
+
+        ig.update_mcp_tools(server_name, &tools_json)
+            .expect("update_mcp_tools must succeed");
+
+        // --- Step 5: verify tools appear in the routing surface ---
+        let all_tools = ig
+            .get_all_mcp_tools()
+            .expect("get_all_mcp_tools must succeed");
+
+        assert_eq!(
+            all_tools.len(),
+            1,
+            "exactly one server must have non-empty tools_json"
+        );
+        assert_eq!(
+            all_tools[0].0, server_name,
+            "tool entry must be keyed by server name"
+        );
+
+        // Confirm the persisted JSON round-trips to the original tool list.
+        let persisted: Vec<McpTool> =
+            serde_json::from_str(&all_tools[0].1).expect("persisted tools_json must deserialise");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].name, "echo");
+        assert_eq!(persisted[0].description, "Echo input");
+
+        // Confirm last_refresh was updated (non-zero after update_mcp_tools).
+        let servers_after = ig.list_mcp_servers().unwrap();
+        assert!(
+            servers_after[0].last_refresh > 0.0,
+            "last_refresh must be non-zero after update_mcp_tools"
+        );
+    }
 }
