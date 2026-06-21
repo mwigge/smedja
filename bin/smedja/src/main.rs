@@ -1,10 +1,11 @@
 mod blocks;
+mod statusbar;
 
 use std::io::stdout;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use blocks::TurnBlock;
+use statusbar::{render_status_bar, ModuleCtx};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -74,6 +75,8 @@ struct AppState {
     turn_n: u32,
     /// Timestamp when the current turn was submitted (used to compute `elapsed_ms`).
     turn_submitted_at: Option<std::time::Instant>,
+    /// The turn block being assembled for the current in-flight turn.
+    current_block: Option<blocks::TurnBlock>,
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +105,7 @@ async fn submit(input: &str, state: &mut AppState, client: &mut Client) -> Resul
     });
     state.turn_n += 1;
     state.turn_submitted_at = Some(std::time::Instant::now());
+    state.current_block = Some(blocks::TurnBlock::new(state.turn_n));
     let resp = client
         .call(
             "turn.submit",
@@ -192,17 +196,16 @@ fn render(frame: &mut ratatui::Frame, state: &AppState) {
     ])
     .split(area);
 
-    // -- Title bar ----------------------------------------------------------
-    let mode_str = state.mode.as_deref().unwrap_or("impl");
-    let tier_str = state.tier.as_deref().unwrap_or("fast");
-    let title_text = format!(
-        " smedja  [session: {}]  [mode: {}]  [tier: {}]",
-        truncate(&state.session_id, 8),
-        mode_str,
-        tier_str,
-    );
-    let title = Paragraph::new(title_text).style(Style::default().add_modifier(Modifier::BOLD));
-    frame.render_widget(title, chunks[0]);
+    // -- Status bar (replaces old title bar) --------------------------------
+    let ctx = ModuleCtx {
+        session_id: &state.session_id,
+        mode: state.mode.as_deref(),
+        tier: state.tier.as_deref(),
+        pending: state.pending_task_id.is_some(),
+    };
+    let status_text = render_status_bar(&ctx);
+    let status = Paragraph::new(status_text).style(Style::default().add_modifier(Modifier::BOLD));
+    frame.render_widget(status, chunks[0]);
 
     // -- Messages area ------------------------------------------------------
     let inner_height = chunks[1].height.saturating_sub(2) as usize; // subtract borders
@@ -238,18 +241,6 @@ fn render(frame: &mut ratatui::Frame, state: &AppState) {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Returns the first `max_chars` characters of `s`, or `s` itself if shorter.
-fn truncate(s: &str, max_chars: usize) -> &str {
-    match s.char_indices().nth(max_chars) {
-        Some((idx, _)) => &s[..idx],
-        None => s,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Cleanup guard — always restores terminal even on panic
 // ---------------------------------------------------------------------------
 
@@ -268,6 +259,7 @@ impl Drop for TerminalGuard {
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)] // event loop + render + poll in a single binary entry point
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
@@ -305,6 +297,7 @@ async fn main() -> Result<()> {
         last_poll: None,
         turn_n: 0,
         turn_submitted_at: None,
+        current_block: None,
     };
 
     // Enter alternate screen and raw mode — guard restores on drop.
@@ -353,25 +346,39 @@ async fn main() -> Result<()> {
                             u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
                         });
                         state.turn_submitted_at = None;
-                        let block = TurnBlock {
-                            turn_n: state.turn_n,
-                            content: response,
-                            elapsed_ms,
-                        };
-                        let area_width = 80usize; // ponytail: fixed width, real width comes later
-                        for line in block.render_lines(area_width) {
+                        if let Some(mut block) = state.current_block.take() {
+                            block.push_text(&response);
+                            block.complete(elapsed_ms);
+                            let width = 80usize;
+                            for line in block.render_lines(width) {
+                                state.messages.push(Message {
+                                    role: Role::System,
+                                    text: line,
+                                });
+                            }
+                        } else {
                             state.messages.push(Message {
                                 role: Role::System,
-                                text: line,
+                                text: response,
                             });
                         }
                         state.pending_task_id = None;
                         state.last_poll = None;
                     } else if status == "failed" {
-                        state.messages.push(Message {
-                            role: Role::System,
-                            text: "turn failed".to_owned(),
-                        });
+                        if let Some(mut block) = state.current_block.take() {
+                            block.fail();
+                            for line in block.render_lines(80) {
+                                state.messages.push(Message {
+                                    role: Role::System,
+                                    text: line,
+                                });
+                            }
+                        } else {
+                            state.messages.push(Message {
+                                role: Role::System,
+                                text: "turn failed".to_owned(),
+                            });
+                        }
                         state.pending_task_id = None;
                         state.last_poll = None;
                     }
