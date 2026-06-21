@@ -11,18 +11,19 @@ name = "smedja-term"
 path = "src/main.rs"
 
 [dependencies]
-anyhow       = { workspace = true }
-smedja-ingot = { path = "../../../crates/smedja-ingot" }
-smedja-rpc   = { path = "../../../crates/smedja-rpc" }
-st-agent     = { path = "../../crates/st-agent" }
-st-blocks    = { path = "../../crates/st-blocks" }
-st-config    = { path = "../../crates/st-config" }
-st-glyph     = { path = "../../crates/st-glyph" }
-st-pty       = { path = "../../crates/st-pty" }
-st-render    = { path = "../../crates/st-render" }
-st-statusbar = { path = "../../crates/st-statusbar" }
-tokio        = { workspace = true }
-tracing      = { workspace = true }
+anyhow            = { workspace = true }
+clap              = { workspace = true }
+pollster          = "0.3"
+st-agent          = { path = "../../crates/st-agent" }
+st-blocks         = { path = "../../crates/st-blocks" }
+st-config         = { path = "../../crates/st-config" }
+st-glyph          = { path = "../../crates/st-glyph" }
+st-pty            = { path = "../../crates/st-pty" }
+st-render         = { path = "../../crates/st-render" }
+st-statusbar      = { path = "../../crates/st-statusbar" }
+tokio             = { workspace = true }
+tracing           = { workspace = true }
 tracing-subscriber = { workspace = true }
-wgpu         = { workspace = true }
-winit        = { workspace = true }
+uuid              = { workspace = true }
+wgpu              = { workspace = true }
+winit             = { workspace = true }
