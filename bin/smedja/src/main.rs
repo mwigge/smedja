@@ -768,10 +768,7 @@ async fn main() -> Result<()> {
         .call("session.create", json!({ "title": "smedja" }))
         .await
         .map_err(|e| anyhow::anyhow!("session.create failed: {e}"))?;
-    let session_id = session_resp["session_id"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_owned();
+    let session_id = session_resp["id"].as_str().unwrap_or("unknown").to_owned();
 
     tracing::debug!(session_id = %session_id, "session created");
 

@@ -31,9 +31,9 @@ use uuid::Uuid;
 #[must_use]
 pub fn smdjad_socket_path() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(xdg).join("smedja").join("smdjad.sock")
+        PathBuf::from(xdg).join("smdjad.sock")
     } else {
-        PathBuf::from("/tmp/smedja/smdjad.sock")
+        PathBuf::from("/tmp/smdjad.sock")
     }
 }
 
@@ -626,14 +626,14 @@ mod tests {
         // Temporarily set XDG_RUNTIME_DIR; restore afterward.
         let _guard = EnvGuard::set("XDG_RUNTIME_DIR", "/run/user/1000");
         let path = smdjad_socket_path();
-        assert_eq!(path, PathBuf::from("/run/user/1000/smedja/smdjad.sock"));
+        assert_eq!(path, PathBuf::from("/run/user/1000/smdjad.sock"));
     }
 
     #[test]
     fn smdjad_socket_path_falls_back_to_tmp() {
         let _guard = EnvGuard::remove("XDG_RUNTIME_DIR");
         let path = smdjad_socket_path();
-        assert_eq!(path, PathBuf::from("/tmp/smedja/smdjad.sock"));
+        assert_eq!(path, PathBuf::from("/tmp/smdjad.sock"));
     }
 
     #[test]
