@@ -2334,6 +2334,43 @@ fn build_router(
         }
     });
 
+    // ── session.set_model ────────────────────────────────────────────────────
+    let ig = Arc::clone(ingot);
+    router.register("session.set_model", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        async move {
+            let session_id = params["session_id"]
+                .as_str()
+                .ok_or_else(|| missing_param("session_id"))?
+                .to_owned();
+            let model = params["model"]
+                .as_str()
+                .ok_or_else(|| missing_param("model"))?
+                .to_owned();
+            ig.lock()
+                .await
+                .update_session_model_override(&session_id, &model)
+                .map_err(|e| ingot_err(&e))?;
+            Ok(json!({ "session_id": session_id, "model": model }))
+        }
+    });
+
+    // ── runner.list ──────────────────────────────────────────────────────────
+    let rl_pool = Arc::clone(&provider_pool);
+    router.register("runner.list", move |_params: Value| {
+        let pool = Arc::clone(&rl_pool);
+        async move {
+            let runners: Vec<Value> = pool
+                .list_all_entries()
+                .into_iter()
+                .map(|(runner, tier, model)| {
+                    json!({ "runner": runner, "tier": tier, "model": model })
+                })
+                .collect();
+            Ok(json!({ "runners": runners }))
+        }
+    });
+
     // ── session.context ─────────────────────────────────────────────────────
     let ig = Arc::clone(ingot);
     let pt = Arc::clone(&price_table);
