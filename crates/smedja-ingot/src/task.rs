@@ -270,6 +270,7 @@ mod tests {
             cowork_mode: false,
             workspace_root: None,
             model_override: None,
+            runner_override: None,
         };
         ingot.create_session(&session).unwrap();
 

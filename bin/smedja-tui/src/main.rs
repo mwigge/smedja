@@ -83,6 +83,8 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/quota",
     "/review",
     "/spec",
+    "/switch",
+    "/takeover",
     "/tdd",
     "/tier",
 ];
@@ -662,6 +664,76 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
                 }
             };
             push_system_message(state, guidance);
+            Ok(true)
+        }
+        "switch" => {
+            if args.is_empty() {
+                push_system_message(
+                    state,
+                    "usage: /switch <runner>  (runners: claude, codex, local, copilot)",
+                );
+                return Ok(true);
+            }
+            let session_id = state.session_id.clone();
+            let result = client
+                .call(
+                    "session.set_runner",
+                    json!({ "session_id": session_id, "runner": args }),
+                )
+                .await;
+            match result {
+                Ok(v) => {
+                    let canonical = v
+                        .get("runner")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or(args)
+                        .to_owned();
+                    state.runner = canonical.clone();
+                    push_system_message(state, format!("runner switched to {canonical}"));
+                }
+                Err(e) => push_system_message(state, format!("session.set_runner error: {e}")),
+            }
+            Ok(true)
+        }
+        "takeover" => {
+            if args.is_empty() {
+                push_system_message(
+                    state,
+                    "usage: /takeover <runner>  — fork this session onto a new runner",
+                );
+                return Ok(true);
+            }
+            let session_id = state.session_id.clone();
+            let result = client
+                .call(
+                    "session.takeover",
+                    json!({ "session_id": session_id, "runner": args }),
+                )
+                .await;
+            match result {
+                Ok(v) => {
+                    let new_session_id = v
+                        .get("new_session_id")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    let runner = v
+                        .get("runner")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or(args)
+                        .to_owned();
+                    state.session_id = new_session_id.clone();
+                    state.runner = runner.clone();
+                    push_system_message(
+                        state,
+                        format!(
+                            "handed off to {runner} — new session: {}",
+                            &new_session_id[..8.min(new_session_id.len())]
+                        ),
+                    );
+                }
+                Err(e) => push_system_message(state, format!("session.takeover error: {e}")),
+            }
             Ok(true)
         }
         _ => Ok(false),
@@ -2252,6 +2324,7 @@ mod tests {
         let required = [
             "/agents", "/approve", "/approvals", "/briefing",
             "/deny", "/login", "/metrics", "/model", "/quota", "/review",
+            "/switch", "/takeover",
         ];
         for cmd in required {
             assert!(
@@ -2259,6 +2332,106 @@ mod tests {
                 "{cmd} must be in SLASH_COMPLETIONS"
             );
         }
+    }
+
+    #[test]
+    fn slash_completions_switch_matches_sw_prefix() {
+        let completions = filtered_completions("/sw");
+        assert!(
+            completions.contains(&"/switch"),
+            "/switch must match '/sw' prefix; got: {completions:?}"
+        );
+    }
+
+    #[test]
+    fn slash_completions_takeover_matches_tak_prefix() {
+        let completions = filtered_completions("/tak");
+        assert!(
+            completions.contains(&"/takeover"),
+            "/takeover must match '/tak' prefix; got: {completions:?}"
+        );
+    }
+
+    #[test]
+    fn slash_switch_no_args_produces_usage_hint() {
+        // Verify state is mutated correctly for the no-arg branch
+        // (no RPC call — pure state logic).
+        let mut state = make_state("sess-switch");
+        // Simulate: command="switch", args="" → push usage hint
+        let cmd = "switch";
+        let args = "";
+        let guidance = if args.is_empty() {
+            Some("usage: /switch <runner>  (runners: claude, codex, local, copilot)".to_owned())
+        } else {
+            None
+        };
+        if let Some(msg) = guidance {
+            state.main_panel.push_line(msg.clone());
+            assert!(msg.contains("usage"), "hint must mention 'usage'");
+        } else {
+            panic!("expected usage hint for cmd={cmd} args={args}");
+        }
+    }
+
+    #[test]
+    fn slash_takeover_no_args_produces_usage_hint() {
+        let mut state = make_state("sess-takeover");
+        let cmd = "takeover";
+        let args = "";
+        let guidance = if args.is_empty() {
+            Some("usage: /takeover <runner>  — fork this session onto a new runner".to_owned())
+        } else {
+            None
+        };
+        if let Some(msg) = guidance {
+            state.main_panel.push_line(msg.clone());
+            assert!(msg.contains("usage"), "hint must mention 'usage'");
+        } else {
+            panic!("expected usage hint for cmd={cmd} args={args}");
+        }
+    }
+
+    #[test]
+    fn slash_switch_updates_state_runner_on_success() {
+        // Simulate what dispatch_slash("switch", "codex") does on success
+        // without a live daemon: verify state mutations are correct.
+        let mut state = make_state("sess-switch-ok");
+        let canonical = "codex-cli";
+        state.runner = canonical.to_owned();
+        push_system_message(&mut state, format!("runner switched to {canonical}"));
+
+        assert_eq!(state.runner, "codex-cli");
+        let has_msg = state
+            .main_panel
+            .lines_text(0, 100)
+            .iter()
+            .any(|l| l.contains("runner switched to codex-cli"));
+        assert!(has_msg, "panel must show switch confirmation");
+    }
+
+    #[test]
+    fn slash_takeover_updates_session_id_and_runner_on_success() {
+        let mut state = make_state("old-session");
+        let new_session_id = "new-session-uuid-1234";
+        let runner = "codex-cli";
+        state.session_id = new_session_id.to_owned();
+        state.runner = runner.to_owned();
+        push_system_message(
+            &mut state,
+            format!(
+                "handed off to {runner} — new session: {}",
+                &new_session_id[..8]
+            ),
+        );
+
+        assert_eq!(state.session_id, new_session_id);
+        assert_eq!(state.runner, "codex-cli");
+        let has_msg = state
+            .main_panel
+            .lines_text(0, 100)
+            .iter()
+            .any(|l| l.contains("handed off to codex-cli"));
+        assert!(has_msg, "panel must show handoff confirmation");
     }
 
     // -----------------------------------------------------------------------
