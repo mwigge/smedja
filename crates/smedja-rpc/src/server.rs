@@ -18,6 +18,7 @@ pub struct Server {
 }
 
 impl Server {
+    #[must_use]
     pub fn new(router: Router) -> Self {
         Self {
             router: Arc::new(router),

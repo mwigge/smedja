@@ -58,12 +58,14 @@ impl Request {
         }
     }
 
+    #[must_use]
     pub fn is_notification(&self) -> bool {
         self.id.is_none()
     }
 }
 
 impl Response {
+    #[must_use]
     pub fn ok(id: Option<Value>, result: Value) -> Self {
         Self {
             jsonrpc: crate::JSONRPC.into(),
@@ -73,6 +75,7 @@ impl Response {
         }
     }
 
+    #[must_use]
     pub fn err(id: Option<Value>, error: Error) -> Self {
         Self {
             jsonrpc: crate::JSONRPC.into(),
