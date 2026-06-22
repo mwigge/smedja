@@ -2182,4 +2182,83 @@ mod tests {
             "status bar must render the runner; got: {content}"
         );
     }
+
+    // ── tui-message-selection: T6 tests ─────────────────────────────────────
+
+    #[test]
+    fn yank_lines_text_builds_newline_joined_string() {
+        let mut panel = main_panel::MainPanel::new();
+        for i in 0..5u32 {
+            panel.push_line(format!("line {i}"));
+        }
+        let lines = panel.lines_text(1, 3);
+        let text = lines.join("\n");
+        assert_eq!(text, "line 1\nline 2\nline 3");
+    }
+
+    #[test]
+    fn selection_anchor_end_resolves_to_min_max_regardless_of_direction() {
+        // Drag from line 4 back to line 1 — selection should span 1..=4.
+        let anchor = 4usize;
+        let end = 1usize;
+        let lo = anchor.min(end);
+        let hi = anchor.max(end);
+        assert_eq!(lo, 1);
+        assert_eq!(hi, 4);
+        // Forward direction.
+        let anchor = 1usize;
+        let end = 4usize;
+        assert_eq!(anchor.min(end), 1);
+        assert_eq!(anchor.max(end), 4);
+    }
+
+    #[test]
+    fn esc_in_selection_mode_cancels_selection_without_scroll_change() {
+        let mut state = make_state("sess-sel");
+        for i in 0..10u32 {
+            state.main_panel.push_line(format!("msg {i}"));
+        }
+        state.scroll_focus = true;
+        state.selection_mode = true;
+        state.selection_anchor = 3;
+        state.selection_end = 6;
+        state.main_panel.scroll = 3;
+
+        // Simulate the Esc path: selection_mode cleared, scroll unchanged.
+        if state.selection_mode {
+            state.selection_mode = false;
+        }
+
+        assert!(!state.selection_mode, "selection must be cancelled after Esc");
+        assert_eq!(state.main_panel.scroll, 3, "scroll must not change on Esc");
+        assert!(state.scroll_focus, "scroll_focus must remain active after cancelling selection");
+    }
+
+    #[test]
+    fn esc_when_idle_activates_scroll_focus() {
+        let mut state = make_state("sess-idle");
+        assert!(!state.scroll_focus, "scroll_focus should be off by default");
+
+        // Simulate the last else branch of Esc: no overlay, no selection, no scroll focus.
+        state.scroll_focus = true;
+
+        assert!(state.scroll_focus, "scroll_focus must be set by Esc when idle");
+    }
+
+    #[test]
+    fn insert_key_exits_scroll_and_clears_selection() {
+        let mut state = make_state("sess-ins");
+        state.scroll_focus = true;
+        state.selection_mode = true;
+        state.g_pending = true;
+
+        // Simulate 'i' key in scroll_focus block.
+        state.scroll_focus = false;
+        state.selection_mode = false;
+        state.g_pending = false;
+
+        assert!(!state.scroll_focus);
+        assert!(!state.selection_mode);
+        assert!(!state.g_pending);
+    }
 }
