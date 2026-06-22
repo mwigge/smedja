@@ -53,6 +53,7 @@ mod tests {
 
         dispatcher.publish(TurnEvent::AssistantDelta {
             content: "hello".to_owned(),
+            turn_id: None,
             conversation_id: None,
             trace_id: None,
             span_id: None,
@@ -67,6 +68,7 @@ mod tests {
             event,
             TurnEvent::AssistantDelta {
                 content: "hello".to_owned(),
+                turn_id: None,
                 conversation_id: None,
                 trace_id: None,
                 span_id: None,
@@ -86,6 +88,7 @@ mod tests {
 
         let count = dispatcher.publish(TurnEvent::AssistantDelta {
             content: "broadcast".to_owned(),
+            turn_id: None,
             conversation_id: None,
             trace_id: None,
             span_id: None,
@@ -101,6 +104,7 @@ mod tests {
 
         let expected = TurnEvent::AssistantDelta {
             content: "broadcast".to_owned(),
+            turn_id: None,
             conversation_id: None,
             trace_id: None,
             span_id: None,
@@ -121,6 +125,7 @@ mod tests {
 
         let count = dispatcher.publish(TurnEvent::AssistantDelta {
             content: "dropped".to_owned(),
+            turn_id: None,
             conversation_id: None,
             trace_id: None,
             span_id: None,
@@ -231,6 +236,7 @@ mod tests {
             TurnEvent::ToolCalled {
                 tool_name: "bash".to_owned(),
                 input_summary: "ls -la /tmp".to_owned(),
+                turn_id: Some("turn-4".to_owned()),
                 conversation_id: None,
                 trace_id: None,
                 span_id: None,
@@ -258,6 +264,7 @@ mod tests {
             event,
             TurnEvent::AssistantDelta {
                 content: "hello".to_owned(),
+                turn_id: Some("turn-5".to_owned()),
                 conversation_id: None,
                 trace_id: None,
                 span_id: None,
@@ -286,6 +293,7 @@ mod tests {
 
         dispatcher.publish(TurnEvent::AssistantDelta {
             content: "a".to_owned(),
+            turn_id: None,
             conversation_id: None,
             trace_id: None,
             span_id: None,
@@ -296,6 +304,7 @@ mod tests {
         });
         dispatcher.publish(TurnEvent::AssistantDelta {
             content: "b".to_owned(),
+            turn_id: None,
             conversation_id: None,
             trace_id: None,
             span_id: None,
@@ -306,6 +315,7 @@ mod tests {
         });
         dispatcher.publish(TurnEvent::AssistantDelta {
             content: "c".to_owned(),
+            turn_id: None,
             conversation_id: None,
             trace_id: None,
             span_id: None,
