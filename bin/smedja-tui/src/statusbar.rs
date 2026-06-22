@@ -7,6 +7,7 @@ pub struct ModuleCtx<'a> {
     pub session_id: &'a str,
     pub mode: Option<&'a str>,
     pub tier: Option<&'a str>,
+    pub runner: Option<&'a str>,
     pub pending: bool,
 }
 
@@ -52,6 +53,11 @@ fn segment_session(ctx: &ModuleCtx<'_>) -> String {
     format!("[{sess}]")
 }
 
+fn segment_runner(ctx: &ModuleCtx<'_>) -> String {
+    let runner = ctx.runner.unwrap_or("unknown");
+    format!("[{runner}]")
+}
+
 // ---------------------------------------------------------------------------
 // Public render functions
 // ---------------------------------------------------------------------------
@@ -90,10 +96,11 @@ pub fn render_status_bar_configured(
     let session_id = ctx.session_id.to_owned();
     let mode = ctx.mode.map(str::to_owned);
     let tier = ctx.tier.map(str::to_owned);
+    let runner = ctx.runner.map(str::to_owned);
     let pending = ctx.pending;
 
     // Determine which modules to render and in what order.
-    let all_keys: &[&str] = &["tier", "mode", "session"];
+    let all_keys: &[&str] = &["runner", "tier", "mode", "session"];
     let ordered_keys: Vec<&str> = if let Some(cfg) = config {
         if let Some(fmt) = &cfg.format {
             // Extract `{key}` tokens from the format string.
@@ -123,6 +130,7 @@ pub fn render_status_bar_configured(
             let s_id = session_id.clone();
             let md = mode.clone();
             let tr = tier.clone();
+            let rn = runner.clone();
 
             let (tx, rx) = mpsc::channel::<String>();
             let key_owned = key.to_owned();
@@ -131,9 +139,11 @@ pub fn render_status_bar_configured(
                     session_id: &s_id,
                     mode: md.as_deref(),
                     tier: tr.as_deref(),
+                    runner: rn.as_deref(),
                     pending,
                 };
                 let text = match key_owned.as_str() {
+                    "runner" => segment_runner(&snapshot),
                     "tier" => segment_tier(&snapshot),
                     "mode" => segment_mode(&snapshot),
                     "session" => segment_session(&snapshot),
@@ -162,6 +172,7 @@ mod tests {
             session_id: "abc123",
             mode: Some("review"),
             tier: Some("deep"),
+            runner: None,
             pending: false,
         };
         let bar = render_status_bar(&ctx);
@@ -175,6 +186,7 @@ mod tests {
             session_id: "x",
             mode: None,
             tier: None,
+            runner: None,
             pending: true,
         };
         assert!(render_status_bar(&ctx).contains('\u{27f3}'));
@@ -186,6 +198,7 @@ mod tests {
             session_id: "x",
             mode: None,
             tier: None,
+            runner: None,
             pending: false,
         };
         assert!(!render_status_bar(&ctx).contains('\u{27f3}'));
@@ -199,6 +212,7 @@ mod tests {
             session_id: "sess",
             mode: Some("impl"),
             tier: Some("fast"),
+            runner: None,
             pending: false,
         };
         let result = render_status_bar_with_timeout(&ctx, 0);
@@ -213,6 +227,7 @@ mod tests {
             session_id: "mysession",
             mode: Some("impl"),
             tier: Some("fast"),
+            runner: None,
             pending: false,
         };
         let config = StatusBarConfig {
@@ -228,11 +243,44 @@ mod tests {
     }
 
     #[test]
+    fn segment_runner_renders_known_value() {
+        let ctx = ModuleCtx {
+            session_id: "x",
+            mode: None,
+            tier: None,
+            runner: Some("claude-sonnet"),
+            pending: false,
+        };
+        let bar = render_status_bar(&ctx);
+        assert!(
+            bar.contains("[claude-sonnet]"),
+            "runner expected, got: {bar}"
+        );
+    }
+
+    #[test]
+    fn segment_runner_defaults_to_unknown_when_none() {
+        let ctx = ModuleCtx {
+            session_id: "x",
+            mode: None,
+            tier: None,
+            runner: None,
+            pending: false,
+        };
+        let bar = render_status_bar(&ctx);
+        assert!(
+            bar.contains("[unknown]"),
+            "default runner expected, got: {bar}"
+        );
+    }
+
+    #[test]
     fn format_string_reorders_segments() {
         let ctx = ModuleCtx {
             session_id: "ssid",
             mode: Some("review"),
             tier: Some("deep"),
+            runner: None,
             pending: false,
         };
         // Request session before tier.
