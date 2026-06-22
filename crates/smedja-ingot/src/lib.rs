@@ -20,7 +20,7 @@ pub mod token_snapshot;
 
 pub use audit::AuditEvent;
 pub use checkpoint::Checkpoint;
-pub use cost::CostEntry;
+pub use cost::{CostEntry, CostRow};
 pub use error::IngotError;
 pub use guard::{classify as classify_command, is_safe as command_is_safe, CommandRisk};
 pub use loop_state::LoopRecord;
@@ -798,6 +798,18 @@ impl Ingot {
     #[must_use = "check the Result and inspect the returned sum"]
     pub fn session_cost(&self, session_id: &str) -> Result<f64, IngotError> {
         cost::session_total(&self.conn, session_id)
+    }
+
+    /// Returns per-model/runner aggregate rows for `session_id`, sorted by descending cost.
+    ///
+    /// Returns an empty vec when no entries exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned rows"]
+    pub fn session_cost_entries(&self, session_id: &str) -> Result<Vec<CostRow>, IngotError> {
+        cost::session_cost_entries(&self.conn, session_id)
     }
 
     // JSONL export / import --------------------------------------------------
