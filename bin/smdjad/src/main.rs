@@ -326,7 +326,17 @@ async fn exec_bash(cmd: &str, workspace: &std::path::Path) -> String {
 }
 
 /// Maximum number of tool-dispatch iterations in a single turn.
+/// Override with `SMEDJA_MAX_TOOL_TURNS` (e.g. `SMEDJA_MAX_TOOL_TURNS=5`).
+/// Values above 50 are clamped to 50 to prevent runaway LLM loops.
 const MAX_TOOL_TURNS: usize = 10;
+
+fn effective_max_tool_turns() -> usize {
+    std::env::var("SMEDJA_MAX_TOOL_TURNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.min(50))
+        .unwrap_or(MAX_TOOL_TURNS)
+}
 
 /// Executes a single turn: loads the task, calls the LLM, handles tool calls,
 /// stores the final response.
@@ -756,7 +766,7 @@ async fn run_turn(
     let mut total_input_tokens = 0u32;
     let mut total_output_tokens = 0u32;
 
-    'tool_loop: for _iteration in 0..MAX_TOOL_TURNS {
+    'tool_loop: for _iteration in 0..effective_max_tool_turns() {
         // 5a. Stream LLM response with rate-limit retry (up to MAX_RATE_LIMIT_RETRIES).
         let (response_text, input_tokens, output_tokens, native_session_id) = {
             let mut backoff_secs = RATE_LIMIT_BACKOFF_BASE_SECS;
@@ -901,15 +911,24 @@ async fn run_turn(
                 denial
             } else {
                 // Classify tool type per the design contract.
-                let tool_type_val = if tool_name.starts_with("mcp_") || tool_name.contains("mcp") {
-                    "extension"
-                } else if matches!(
-                    tool_name.as_str(),
-                    "vault_search" | "graph_query" | "retrieve"
-                ) {
-                    "datastore"
+                // Local tools are an explicit allowlist; anything not on the list
+                // is an MCP extension. Using a substring match on "mcp" would
+                // allow a tool named "bash_mcp_wrapper" to intercept bash calls.
+                const LOCAL_TOOLS: &[&str] = &[
+                    "bash", "run_command",
+                    "read_file", "write_file", "edit_file", "list_files",
+                    "smedja_vault_search", "smedja_vault_store",
+                    "graph_query",
+                    "otel_query", "metric_query", "log_tail",
+                ];
+                let tool_type_val = if LOCAL_TOOLS.contains(&tool_name.as_str()) {
+                    if matches!(tool_name.as_str(), "smedja_vault_search" | "smedja_vault_store" | "graph_query") {
+                        "datastore"
+                    } else {
+                        "function"
+                    }
                 } else {
-                    "function"
+                    "extension"
                 };
                 let mut tool_span = tracer.start(tel::SPAN_TOOL_EXECUTE);
                 tool_span.set_attribute(KeyValue::new(

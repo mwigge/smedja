@@ -10,7 +10,6 @@ members = [
     "crates/smedja-ingot",
     "crates/smedja-loop",
     "crates/smedja-memory",
-    "crates/smedja-methodology",
     "crates/smedja-plugins",
     "crates/smedja-rpc",
     "crates/smedja-sre",

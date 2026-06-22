@@ -4,6 +4,10 @@ use tokio::net::UnixStream;
 
 use crate::{Request, Response};
 
+/// Maximum inbound frame size: 4 MiB. Prevents unbounded allocation from a
+/// malicious or runaway local process sending a giant JSON payload.
+const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
 /// Newline-delimited JSON framing over a Unix socket.
 pub struct Codec {
     stream: BufReader<UnixStream>,
@@ -71,6 +75,13 @@ impl Codec {
         if n == 0 {
             return Ok(None);
         }
+        if line.len() > MAX_FRAME_BYTES {
+            anyhow::bail!(
+                "incoming JSON-RPC frame too large: {} bytes (max {})",
+                line.len(),
+                MAX_FRAME_BYTES
+            );
+        }
         Ok(Some(serde_json::from_str(line.trim_end())?))
     }
 }
@@ -135,6 +146,25 @@ mod tests {
         let req = Request::new(1_i64, "ping", json!({}));
         let resp = client.call(&req).await.unwrap();
         assert_eq!(resp.result, Some(json!("pong")));
+    }
+
+    #[tokio::test]
+    async fn recv_rejects_frame_exceeding_max_size() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut server = Codec::new(a);
+        let mut client = Codec::new(b);
+
+        // Send a line larger than MAX_FRAME_BYTES.
+        let giant = "x".repeat(MAX_FRAME_BYTES + 1) + "\n";
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            client.stream.get_mut().write_all(giant.as_bytes()).await.unwrap();
+        });
+
+        let result = server.recv_request().await;
+        assert!(result.is_err(), "oversized frame must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("too large"), "error must mention 'too large': {msg}");
     }
 
     #[tokio::test]

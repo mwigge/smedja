@@ -51,8 +51,15 @@ impl SandboxExecutor {
             };
         }
 
-        // Verify the image exists.
-        let image = "smedja-sandbox:latest".to_owned();
+        // Verify the image exists. Allow operator to pin to a digest via env var.
+        let image = std::env::var("SMEDJA_SANDBOX_IMAGE")
+            .unwrap_or_else(|_| "smedja-sandbox:latest".to_owned());
+        if image.ends_with(":latest") {
+            tracing::warn!(
+                %image,
+                "sandbox image uses :latest tag — pin to a digest with SMEDJA_SANDBOX_IMAGE=smedja-sandbox@sha256:<digest> for supply-chain safety"
+            );
+        }
         let out = std::process::Command::new("docker")
             .args(["image", "inspect", "--format", "{{.Id}}", &image])
             .output();
