@@ -5,6 +5,7 @@ pub mod cowork;
 pub mod local_provider;
 pub mod mcp_http;
 pub mod mcp_oauth;
+pub mod provider_pool;
 pub mod sandbox;
 
 use std::collections::HashMap;
@@ -20,12 +21,10 @@ use opentelemetry::{
 };
 use serde_json::{json, Value};
 use smedja_adapter::types::{Message as AdapterMessage, Role as AdapterRole};
-use smedja_adapter::{
-    AnthropicProvider, BergetProvider, CallOptions, ClaudeCliProvider, CodexCliProvider,
-    CopilotProvider, Delta, LocalProvider, MinimaxProvider, OpenAiProvider, PoolsideProvider,
-    Provider,
-};
-use smedja_assayer::{BashArity, WorktreePool};
+use smedja_adapter::{CallOptions, Delta};
+use smedja_assayer::{Assayer, BashArity, Complexity, Role as AgentRole, Runner, Tier, WorktreePool};
+
+use crate::provider_pool::{build_provider_pool, ProviderPool};
 use smedja_bellows::{Dispatcher, TurnEvent};
 use smedja_ingot::{Checkpoint, CostEntry, Ingot, McpServer, Session, Task, TokenSnapshot};
 use smedja_rpc::{codes, router::Router, server::Server, RpcError};
@@ -110,85 +109,26 @@ fn missing_param(name: &str) -> RpcError {
     )
 }
 
-/// Selects the LLM provider from environment variables and installed CLIs.
-///
-/// Priority order (stops at the first that resolves):
-/// 1. `claude` binary on `$PATH` → [`ClaudeCliProvider`] (subscription, no API key)
-/// 2. `codex` binary on `$PATH` → [`CodexCliProvider`] (subscription, no API key)
-/// 3. `gh` binary + copilot extension (or `GITHUB_TOKEN`) → [`CopilotProvider`]
-/// 4. `poolside` binary → [`PoolsideProvider`]
-/// 5. `ANTHROPIC_API_KEY` → [`AnthropicProvider`] (API key fallback)
-/// 6. `OPENAI_API_KEY` → [`OpenAiProvider`] (API key fallback)
-/// 7. `MINIMAX_API_KEY` → [`MinimaxProvider`]
-/// 8. `BERGET_API_KEY` → [`BergetProvider`]
-/// 9. Local rs-llmctl endpoint health check → [`LocalProvider`]
-///
-/// Returns `Err(reason)` only when all options are unavailable.
-/// Returns `(provider, runner_name, default_model)` for the first available
-/// provider, in priority order.  The `runner_name` and `default_model` values
-/// are derived from the concrete provider type, not re-checked from the
-/// environment after selection.
-async fn build_provider() -> Result<(Box<dyn Provider>, &'static str, &'static str), String> {
-    // CLI subscription providers take priority over API key providers.
-    if let Some(p) = ClaudeCliProvider::detect(None) {
-        info!(
-            provider = "claude-cli",
-            "provider selected via claude CLI subscription"
-        );
-        return Ok((Box::new(p), "claude-cli", "claude-haiku-4-5-20251001"));
+/// Maps a session mode string to an [`AgentRole`] for routing purposes.
+fn parse_session_mode_to_role(mode: &str) -> Option<AgentRole> {
+    match mode {
+        "impl" => Some(AgentRole::Impl),
+        "test" => Some(AgentRole::Test),
+        "review" => Some(AgentRole::Review),
+        "sre" => Some(AgentRole::Sre),
+        "orchestrator" => Some(AgentRole::Orchestrator),
+        _ => None,
     }
-    if let Some(p) = CodexCliProvider::detect(None) {
-        info!(
-            provider = "codex-cli",
-            "provider selected via codex CLI subscription"
-        );
-        return Ok((Box::new(p), "codex-cli", "gpt-4o-mini"));
+}
+
+/// Maps a [`Runner`] enum value to the short string used in the session-resume store.
+fn runner_session_key(runner: Runner) -> &'static str {
+    match runner {
+        Runner::Claude => "claude-cli",
+        Runner::Codex => "codex-cli",
+        Runner::Local => "local",
+        Runner::Copilot => "copilot",
     }
-    if let Some(p) = CopilotProvider::detect() {
-        info!(provider = "copilot", "provider selected");
-        return Ok((Box::new(p), "copilot", "gpt-4o-mini"));
-    }
-    if let Some(p) = PoolsideProvider::detect() {
-        info!(provider = "poolside", "provider selected");
-        return Ok((Box::new(p), "poolside", "poolside-muse"));
-    }
-    // API key providers as fallback from CLI subscription providers.
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        info!(provider = "anthropic", "provider selected");
-        return Ok((
-            Box::new(AnthropicProvider::new(key)),
-            "anthropic",
-            "claude-haiku-4-5-20251001",
-        ));
-    }
-    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        info!(provider = "openai", "provider selected");
-        return Ok((
-            Box::new(OpenAiProvider::new("https://api.openai.com", key)),
-            "openai",
-            "gpt-4o-mini",
-        ));
-    }
-    if let Some(p) = MinimaxProvider::detect() {
-        info!(provider = "minimax", "provider selected");
-        return Ok((Box::new(p), "minimax", "abab6.5s-chat"));
-    }
-    if let Some(p) = BergetProvider::detect() {
-        info!(provider = "berget", "provider selected");
-        return Ok((Box::new(p), "berget", "gpt-4o-mini"));
-    }
-    // Fall back to the local rs-llmctl endpoint.
-    let local = LocalProvider::connect().await;
-    if local.capability.healthy {
-        info!(
-            provider = "local",
-            model_id = %local.capability.model_id,
-            "provider selected",
-        );
-        return Ok((Box::new(local), "local", "local"));
-    }
-    warn!("no provider available — all options exhausted");
-    Err("no LLM API key and local endpoint unreachable".to_owned())
 }
 
 /// Drains `stream`, accumulating text deltas into a single string.
@@ -348,6 +288,8 @@ async fn run_turn(
     session_id: String,
     turn_id: String,
     gates: Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
+    pool: Arc<ProviderPool>,
+    assayer: Arc<Assayer>,
 ) {
     let tracer = global::tracer("smedja");
     let mut turn_span = tracer.start(tel::SPAN_AGENT_INVOKE);
@@ -397,11 +339,33 @@ async fn run_turn(
         }
     };
 
-    // 2. Select provider from environment.
-    let (provider, provider_runner, provider_default_model) = match build_provider().await {
-        Ok(triple) => triple,
-        Err(reason) => {
-            warn!(session_id = %session_id, turn_id = %turn_id, "no LLM provider available; turn cannot execute");
+    // 2. Route this turn to a provider via the assayer.
+    //    Role comes from session.mode; complexity is conservatively Coding for now.
+    let route = {
+        // Load session early to get mode for routing (full load happens in step 3).
+        let session_mode = {
+            let ig = ingot.lock().await;
+            ig.get_session(&session_id).ok().flatten().and_then(|s| s.mode)
+        };
+        let role = session_mode
+            .as_deref()
+            .and_then(parse_session_mode_to_role)
+            .unwrap_or(AgentRole::Orchestrator);
+        let complexity = Complexity::Coding;
+        tracing::debug!(
+            turn_id = %turn_id,
+            role = ?role,
+            complexity = ?complexity,
+            "routing turn"
+        );
+        assayer.route(role, complexity)
+    };
+
+    let pool_entry = match pool.get(route.runner, route.tier) {
+        Some(e) => e,
+        None => {
+            let reason = "no LLM provider available; turn cannot execute".to_owned();
+            warn!(session_id = %session_id, turn_id = %turn_id, "{reason}");
             let _ = ingot.lock().await.update_task_status(&turn_id, "failed");
             dispatcher.publish(TurnEvent::Failed {
                 session_id,
@@ -421,10 +385,16 @@ async fn run_turn(
         }
     };
 
-    // Derive model and runner from the concrete provider type selected above.
+    let provider = &pool_entry.provider;
+    let runner = pool_entry.runner_name.to_owned();
+    let runner_enum = route.runner;
+
     // SMEDJA_MODEL can override the default model name but never changes the runner.
-    let runner = provider_runner.to_owned();
-    let model = std::env::var("SMEDJA_MODEL").unwrap_or_else(|_| provider_default_model.to_owned());
+    let model = route
+        .model
+        .clone()
+        .or_else(|| std::env::var("SMEDJA_MODEL").ok())
+        .unwrap_or_else(|| pool_entry.default_model.to_owned());
 
     // 3. Load session for workspace root, cowork mode, and task context.
     let session = {
@@ -620,11 +590,13 @@ async fn run_turn(
 
     let all_tools: Vec<serde_json::Value> = builtin_tools.into_iter().chain(mcp_tools).collect();
 
-    let provider_session_id = if runner == "claude-cli" || runner == "codex-cli" {
+    // Providers that support CLI-level session resume carry a stored session ID.
+    let session_store_key = runner_session_key(runner_enum);
+    let provider_session_id = if matches!(runner_enum, Runner::Claude | Runner::Codex) {
         provider_session_store()
             .lock()
             .await
-            .get(&session_id)
+            .get(session_store_key)
             .cloned()
     } else {
         None
@@ -820,12 +792,12 @@ async fn run_turn(
                 }
             }
         };
-        if runner == "claude-cli" || runner == "codex-cli" {
+        if matches!(runner_enum, Runner::Claude | Runner::Codex) {
             if let Some(native_session_id) = native_session_id {
                 provider_session_store()
                     .lock()
                     .await
-                    .insert(session_id.clone(), native_session_id);
+                    .insert(session_store_key.to_owned(), native_session_id);
             }
         }
         total_input_tokens = total_input_tokens.saturating_add(input_tokens);
@@ -1513,6 +1485,8 @@ fn spawn_worker(
     ingot: Arc<Mutex<Ingot>>,
     dispatcher: Arc<Dispatcher>,
     gates: Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
+    pool: Arc<ProviderPool>,
+    assayer: Arc<Assayer>,
 ) -> Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> {
     let handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
     let handles_inner = Arc::clone(&handles);
@@ -1544,7 +1518,10 @@ fn spawn_worker(
                     let ig = Arc::clone(&ingot);
                     let dp = Arc::clone(&dispatcher);
                     let g = Arc::clone(&gates);
-                    let handle = tokio::spawn(run_turn(ig, dp, session_id, turn_id, g));
+                    let pl = Arc::clone(&pool);
+                    let as_ = Arc::clone(&assayer);
+                    let handle =
+                        tokio::spawn(run_turn(ig, dp, session_id, turn_id, g, pl, as_));
                     handles_inner.lock().await.push(handle);
                 }
                 // ignore non-Started events
@@ -1559,6 +1536,7 @@ fn build_router(
     ingot: &Arc<Mutex<Ingot>>,
     dispatcher: Arc<Dispatcher>,
     gates: &Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
+    pool: Arc<ProviderPool>,
     startup_runner: &'static str,
     startup_model: &'static str,
 ) -> Router {
@@ -1567,7 +1545,10 @@ fn build_router(
     // Clone gates so the closures below can each hold an independent Arc.
     let gates = Arc::clone(gates);
 
-    // Create two Arcs for the pool so task.parallel and task.cancel each hold one.
+    // Stash provider pool Arc before the name is shadowed by the WorktreePool below.
+    let provider_pool = pool;
+
+    // Create two Arcs for the worktree pool so task.parallel and task.cancel each hold one.
     let pool = Arc::new(Mutex::new(WorktreePool::default()));
     let pool_cancel = Arc::clone(&pool);
 
@@ -2186,8 +2167,10 @@ fn build_router(
 
     // ── session.compact ──────────────────────────────────────────────────────
     let ig = Arc::clone(ingot);
+    let compact_pool = Arc::clone(&provider_pool);
     router.register("session.compact", move |params: Value| {
         let ig = Arc::clone(&ig);
+        let pool = Arc::clone(&compact_pool);
         async move {
             let session_id = params
                 .get("session_id")
@@ -2209,9 +2192,14 @@ fn build_router(
                 "Summarise this conversation in 3–5 bullet points, then state the current goal. \
                  Be concise.\n\nConversation history:\n{messages_json}"
             );
-            let (provider, _, _) = build_provider()
-                .await
-                .map_err(|e| RpcError::new(codes::INTERNAL_ERROR, format!("no provider: {e}")))?;
+            let pool_entry = pool
+                .get(Runner::Claude, Tier::Fast)
+                .or_else(|| pool.get(Runner::Codex, Tier::Fast))
+                .or_else(|| pool.get_default())
+                .ok_or_else(|| {
+                    RpcError::new(codes::INTERNAL_ERROR, "no provider available for compaction")
+                })?;
+            let provider = &pool_entry.provider;
             let opts = CallOptions {
                 model: std::env::var("SMEDJA_MODEL")
                     .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_owned()),
@@ -3279,13 +3267,34 @@ async fn main() -> anyhow::Result<()> {
     let dispatcher = Arc::new(Dispatcher::new(256));
     let gates: Arc<Mutex<HashMap<String, Arc<CoworkGate>>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    let (startup_runner, startup_model) = build_provider()
-        .await
-        .map_or(("unknown", ""), |(_, r, m)| (r, m));
+    // Build the provider pool and assayer once at startup; thread through Arc.
+    let pool = build_provider_pool().await;
+    let startup_runner: &'static str = Box::leak(pool.default_runner_name().to_owned().into_boxed_str());
+    let startup_model: &'static str = Box::leak(pool.default_model().to_owned().into_boxed_str());
+    let pool = Arc::new(pool);
+
+    // Load workspace-local routing overrides if .smedja/agents.toml exists.
+    let workspace_root = std::env::var("SMEDJA_WORKSPACE")
+        .map_or_else(|_| std::path::PathBuf::from("."), std::path::PathBuf::from);
+    let mut assayer = Assayer::default_rules();
+    match smedja_assayer::load_rules(&workspace_root) {
+        Ok(rules) if !rules.is_empty() => {
+            let n = rules.len();
+            assayer.prepend_rules(rules);
+            info!(count = n, path = ?workspace_root.join(".smedja/agents.toml"), "loaded agents.toml overrides");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(error = %e, "failed to load .smedja/agents.toml; using default routing");
+        }
+    }
+    let assayer = Arc::new(assayer);
+
     let router = build_router(
         &ingot,
         Arc::clone(&dispatcher),
         &gates,
+        Arc::clone(&pool),
         startup_runner,
         startup_model,
     );
@@ -3294,6 +3303,8 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&ingot),
         Arc::clone(&dispatcher),
         Arc::clone(&gates),
+        Arc::clone(&pool),
+        Arc::clone(&assayer),
     );
 
     // ACP HTTP server — activated by SMEDJA_ACP_PORT.
@@ -3413,20 +3424,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subprocess_provider_absent_keys_fails() {
-        // When no API keys and no special CLIs are set, build_provider returns Err.
-        // We can't easily unset all env vars in a test (other tests run in parallel),
-        // so we verify the error path via direct build when we know keys are absent.
-        // This is a best-effort heuristic test.
-        if std::env::var("ANTHROPIC_API_KEY").is_ok() || std::env::var("OPENAI_API_KEY").is_ok() {
-            // If keys are present in test environment, skip.
-            return;
-        }
-        // Attempt build — expect Err since no keys and likely no local server.
-        // We don't care about the exact message, just that it fails gracefully.
-        let result = super::build_provider().await;
-        // Result may be Ok if local endpoint happens to be up; just verify no panic.
-        drop(result);
+    async fn provider_pool_builds_without_panic() {
+        // build_provider_pool is infallible — just verify no panic regardless
+        // of what environment variables are set in the test runner.
+        let pool = crate::provider_pool::build_provider_pool().await;
+        // Pool may be empty or non-empty depending on the environment; either is valid.
+        drop(pool);
     }
 
     /// Returns the provider name that `build_provider` would select given the
