@@ -929,7 +929,8 @@ async fn run_turn(
                     }
                 }
                 let result =
-                    execute_tool(&tool_name, &tool_input, &workspace_root, session.as_ref()).await;
+                    execute_tool(&tool_name, &tool_input, &workspace_root, session.as_ref(), &ingot)
+                        .await;
                 tool_span.set_attribute(KeyValue::new(
                     tel::TOOL_RESULT_HASH,
                     tel::content_hash(&result),
@@ -1277,6 +1278,7 @@ async fn execute_tool(
     tool_input: &str,
     workspace: &std::path::Path,
     session: Option<&Session>,
+    ingot: &Arc<Mutex<Ingot>>,
 ) -> String {
     let input: Value = serde_json::from_str(tool_input).unwrap_or(Value::Null);
 
@@ -1485,7 +1487,51 @@ async fn execute_tool(
                 "SRE config not available (set SMEDJA_LOKI_ENDPOINT)".into()
             }
         }
-        other => format!("error: tool '{other}' is not available"),
+        other => dispatch_mcp_tool(other, &input, ingot).await,
+    }
+}
+
+/// Dispatches a tool call to the MCP server that owns `tool_name`.
+///
+/// Queries the ingot registry for a registered MCP server whose `tools_json`
+/// contains an entry named `tool_name`, then forwards the call to that server
+/// via `McpHttpClient::call_tool`.  Returns an error string if no server owns
+/// the tool or if the HTTP call fails.
+async fn dispatch_mcp_tool(
+    tool_name: &str,
+    input: &serde_json::Value,
+    ingot: &Arc<Mutex<Ingot>>,
+) -> String {
+    let server = {
+        let ig = ingot.lock().await;
+        match ig.find_mcp_server_for_tool(tool_name) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                tracing::debug!(tool = tool_name, "no MCP server registered for tool");
+                return format!("error: tool '{tool_name}' is not available");
+            }
+            Err(e) => {
+                tracing::warn!(tool = tool_name, error = %e, "ingot error looking up MCP tool");
+                return format!("error: tool '{tool_name}' is not available");
+            }
+        }
+    };
+
+    let client = match crate::mcp_http::McpHttpClient::new(&server.url, "") {
+        Ok(c) => c,
+        Err(e) => return format!("error: could not connect to MCP server '{}': {e}", server.name),
+    };
+
+    tracing::debug!(
+        tool = tool_name,
+        server = %server.name,
+        url = %server.url,
+        "dispatching MCP tool call"
+    );
+
+    match client.call_tool(tool_name, input).await {
+        Ok(result) => result,
+        Err(e) => format!("error: MCP tool call failed: {e}"),
     }
 }
 
@@ -3523,6 +3569,10 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::Mutex;
+
     #[test]
     fn read_only_role_blocks_write_tools() {
         // The least-privilege check in execute_tool blocks write tools when
@@ -3564,6 +3614,77 @@ mod tests {
         assert!(guard("retired"));
         assert!(!guard("complete"));
         assert!(!guard("planning"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_mcp_tool_returns_error_when_no_server_registered() {
+        let ig = Arc::new(Mutex::new(
+            smedja_ingot::Ingot::open_in_memory().expect("in-memory Ingot must open"),
+        ));
+        let result =
+            super::dispatch_mcp_tool("unknown_tool", &serde_json::json!({}), &ig).await;
+        assert!(
+            result.starts_with("error:"),
+            "unregistered tool must return an error; got: {result}"
+        );
+        assert!(
+            result.contains("unknown_tool"),
+            "error must include the tool name; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_mcp_tool_routes_to_registered_server() {
+        use tokio::net::TcpListener;
+
+        // Spawn a minimal mock MCP server that responds to tools/call.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_url = format!("http://{addr}");
+
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::post(|| async {
+                    axum::Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "content": [{ "type": "text", "text": "dispatched-ok" }],
+                            "isError": false
+                        }
+                    }))
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Register the mock server in an in-memory Ingot.
+        let ig = Arc::new(Mutex::new(
+            smedja_ingot::Ingot::open_in_memory().expect("in-memory Ingot must open"),
+        ));
+        {
+            let mut guard = ig.lock().await;
+            guard
+                .register_mcp_server(&smedja_ingot::McpServer {
+                    id: "mock-1".into(),
+                    name: "mock-server".into(),
+                    url: server_url,
+                    transport: "http".into(),
+                    tools_json: r#"[{"name":"greet","description":"Greet"}]"#.into(),
+                    last_refresh: 1.0,
+                })
+                .expect("register_mcp_server must succeed");
+        }
+
+        let result =
+            super::dispatch_mcp_tool("greet", &serde_json::json!({"name": "world"}), &ig).await;
+        assert!(
+            result.contains("dispatched-ok"),
+            "must return the mock server's response; got: {result}"
+        );
     }
 
     #[tokio::test]

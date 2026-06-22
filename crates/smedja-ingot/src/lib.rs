@@ -653,6 +653,33 @@ impl Ingot {
         mcp::by_name(&self.conn, name)
     }
 
+    /// Finds the MCP server that exposes a tool with the given `tool_name`.
+    ///
+    /// Searches the `tools_json` of every server that has a non-empty tool
+    /// list.  Returns the first server whose list contains a tool entry with
+    /// `"name": tool_name`, or `None` when no match is found.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the tool-list query fails.
+    #[must_use = "check the Result; None means no registered MCP server owns this tool"]
+    pub fn find_mcp_server_for_tool(
+        &self,
+        tool_name: &str,
+    ) -> Result<Option<McpServer>, IngotError> {
+        for (server_name, tools_json) in mcp::all_tools(&self.conn)? {
+            let tools: Vec<serde_json::Value> =
+                serde_json::from_str(&tools_json).unwrap_or_default();
+            let owns_tool = tools
+                .iter()
+                .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(tool_name));
+            if owns_tool {
+                return mcp::by_name(&self.conn, &server_name);
+            }
+        }
+        Ok(None)
+    }
+
     // tasks ------------------------------------------------------------------
 
     /// Inserts a new [`Task`].
