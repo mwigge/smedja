@@ -111,14 +111,21 @@ pub fn spawn_delta_buffer(dispatcher: Arc<Dispatcher>) -> DeltaStore {
                 TurnEvent::Completed {
                     ref turn_id,
                     output_tokens,
+                    input_tokens,
+                    ref traceparent,
                     ..
                 } => {
                     if let Some(buf) = store.get_mut(turn_id) {
-                        let line = json!({
-                            "type": "done",
-                            "output_tok": output_tokens,
-                        })
-                        .to_string();
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("type".into(), json!("done"));
+                        obj.insert("output_tok".into(), json!(output_tokens));
+                        if let Some(n) = input_tokens {
+                            obj.insert("input_tok".into(), json!(n));
+                        }
+                        if let Some(tp) = traceparent {
+                            obj.insert("traceparent".into(), json!(tp));
+                        }
+                        let line = serde_json::Value::Object(obj).to_string();
                         buf.push_back(line);
                     }
                 }
@@ -300,12 +307,23 @@ fn turn_event_to_ndjson(
         TurnEvent::Completed {
             turn_id,
             output_tokens,
+            input_tokens,
+            traceparent,
             ..
         } => {
             if turn_id != expected_turn_id {
                 return (Some(turn_id.clone()), String::new(), false);
             }
-            let line = json!({"type": "done", "output_tok": output_tokens}).to_string();
+            let mut obj = serde_json::Map::new();
+            obj.insert("type".into(), json!("done"));
+            obj.insert("output_tok".into(), json!(output_tokens));
+            if let Some(n) = input_tokens {
+                obj.insert("input_tok".into(), json!(n));
+            }
+            if let Some(tp) = traceparent {
+                obj.insert("traceparent".into(), json!(tp));
+            }
+            let line = serde_json::Value::Object(obj).to_string();
             (Some(turn_id.clone()), line, true)
         }
         TurnEvent::Failed {
@@ -441,6 +459,8 @@ mod tests {
             session_id: "s".into(),
             turn_id: "t4".into(),
             output_tokens: 42,
+            input_tokens: None,
+            traceparent: None,
             conversation_id: None,
             trace_id: None,
             span_id: None,
@@ -453,5 +473,34 @@ mod tests {
         assert_eq!(tid.as_deref(), Some("t4"));
         assert!(line.contains(r#""type":"done""#));
         assert!(terminal);
+    }
+
+    #[test]
+    fn turn_event_to_ndjson_completed_includes_traceparent_and_input_tok() {
+        let event = TurnEvent::Completed {
+            session_id: "s".into(),
+            turn_id: "t5".into(),
+            output_tokens: 88,
+            input_tokens: Some(412),
+            traceparent: Some("00-abc123-def456-01".into()),
+            conversation_id: None,
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            operation_name: None,
+            agent_name: None,
+            status: None,
+        };
+        let (tid, line, terminal) = turn_event_to_ndjson(&event, "t5");
+        assert_eq!(tid.as_deref(), Some("t5"));
+        assert!(terminal);
+        assert!(
+            line.contains(r#""input_tok":412"#),
+            "expected input_tok in done line; got: {line}"
+        );
+        assert!(
+            line.contains("abc123"),
+            "expected traceparent in done line; got: {line}"
+        );
     }
 }

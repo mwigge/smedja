@@ -135,6 +135,8 @@ impl TurnHandle {
             session_id: self.session_id,
             turn_id: self.turn_id,
             output_tokens,
+            input_tokens: None,
+            traceparent: None,
             conversation_id: None,
             trace_id: self.trace_id,
             span_id: self.span_id,
