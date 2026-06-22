@@ -25,6 +25,9 @@ pub struct Session {
     /// Optional model name override; when set, `run_turn` uses this instead of
     /// the `SMEDJA_MODEL` environment variable.
     pub model_override: Option<String>,
+    /// Optional runner override; when set, `run_turn` bypasses the assayer and
+    /// routes to this runner (e.g. `"claude-cli"`, `"codex-cli"`, `"local"`).
+    pub runner_override: Option<String>,
 }
 
 /// Inserts a new [`Session`] row.
@@ -35,8 +38,8 @@ pub struct Session {
 pub(crate) fn create(conn: &rusqlite::Connection, session: &Session) -> Result<(), IngotError> {
     conn.execute(
         "INSERT INTO sessions \
-         (id, created_at, updated_at, status, task_id, mode, cowork_mode, workspace_root, model_override) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         (id, created_at, updated_at, status, task_id, mode, cowork_mode, workspace_root, model_override, runner_override) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             session.id.to_string(),
             session.created_at,
@@ -47,6 +50,7 @@ pub(crate) fn create(conn: &rusqlite::Connection, session: &Session) -> Result<(
             i64::from(session.cowork_mode),
             session.workspace_root,
             session.model_override,
+            session.runner_override,
         ],
     )?;
     Ok(())
@@ -59,7 +63,7 @@ pub(crate) fn create(conn: &rusqlite::Connection, session: &Session) -> Result<(
 /// Returns [`IngotError::Db`] if the query fails.
 pub(crate) fn get(conn: &rusqlite::Connection, id: &str) -> Result<Option<Session>, IngotError> {
     let result = conn.query_row(
-        "SELECT id, created_at, updated_at, status, task_id, mode, cowork_mode, workspace_root, model_override \
+        "SELECT id, created_at, updated_at, status, task_id, mode, cowork_mode, workspace_root, model_override, runner_override \
          FROM sessions WHERE id = ?1",
         rusqlite::params![id],
         |row| {
@@ -82,6 +86,7 @@ pub(crate) fn get(conn: &rusqlite::Connection, id: &str) -> Result<Option<Sessio
                 cowork_mode: cowork_raw != 0,
                 workspace_root: row.get(7)?,
                 model_override: row.get(8)?,
+                runner_override: row.get(9)?,
             })
         },
     );
@@ -100,7 +105,7 @@ pub(crate) fn get(conn: &rusqlite::Connection, id: &str) -> Result<Option<Sessio
 /// Returns [`IngotError::Db`] if the query fails.
 pub(crate) fn list(conn: &rusqlite::Connection) -> Result<Vec<Session>, IngotError> {
     let mut stmt = conn.prepare(
-        "SELECT id, created_at, updated_at, status, task_id, mode, cowork_mode, workspace_root, model_override \
+        "SELECT id, created_at, updated_at, status, task_id, mode, cowork_mode, workspace_root, model_override, runner_override \
          FROM sessions ORDER BY created_at ASC",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -119,6 +124,7 @@ pub(crate) fn list(conn: &rusqlite::Connection) -> Result<Vec<Session>, IngotErr
             cowork_mode: cowork_raw != 0,
             workspace_root: row.get(7)?,
             model_override: row.get(8)?,
+            runner_override: row.get(9)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(IngotError::Db)
@@ -240,6 +246,25 @@ pub(crate) fn update_model_override(
     Ok(())
 }
 
+/// Sets the `runner_override` field and updates `updated_at` for the session identified by `id`.
+///
+/// When set, `run_turn` bypasses the assayer and routes directly to this runner.
+///
+/// # Errors
+///
+/// Returns [`rusqlite::Error`] if the UPDATE fails.
+pub(crate) fn update_runner_override(
+    conn: &rusqlite::Connection,
+    id: &str,
+    runner: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE sessions SET runner_override = ?1, updated_at = ?2 WHERE id = ?3",
+        rusqlite::params![runner, crate::now_epoch(), id],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +281,7 @@ mod tests {
             cowork_mode: false,
             workspace_root: None,
             model_override: None,
+            runner_override: None,
         }
     }
 
@@ -322,6 +348,7 @@ mod tests {
             cowork_mode: false,
             workspace_root: None,
             model_override: None,
+            runner_override: None,
         };
         ingot.create_session(&s).unwrap();
 
@@ -413,5 +440,29 @@ mod tests {
             fetched.task_id.as_deref(),
             Some(task_id.to_string().as_str())
         );
+    }
+
+    #[test]
+    fn runner_override_round_trip() {
+        let mut ingot = Ingot::open_in_memory().unwrap();
+        let s = sample_session();
+        ingot.create_session(&s).unwrap();
+
+        ingot
+            .update_session_runner_override(&s.id.to_string(), "codex-cli")
+            .unwrap();
+
+        let fetched = ingot.get_session(&s.id.to_string()).unwrap().unwrap();
+        assert_eq!(fetched.runner_override.as_deref(), Some("codex-cli"));
+    }
+
+    #[test]
+    fn runner_override_defaults_to_none() {
+        let mut ingot = Ingot::open_in_memory().unwrap();
+        let s = sample_session();
+        ingot.create_session(&s).unwrap();
+
+        let fetched = ingot.get_session(&s.id.to_string()).unwrap().unwrap();
+        assert!(fetched.runner_override.is_none());
     }
 }

@@ -245,6 +245,11 @@ impl Ingot {
             .conn
             .execute_batch("ALTER TABLE sessions ADD COLUMN model_override TEXT;");
 
+        // Add runner_override column to existing sessions tables -- suppressed if already present.
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE sessions ADD COLUMN runner_override TEXT;");
+
         // Add role_id column to audit_events -- suppressed if already present.
         let _ = self
             .conn
@@ -547,6 +552,23 @@ impl Ingot {
         model: &str,
     ) -> Result<(), IngotError> {
         session::update_model_override(&self.conn, session_id, model).map_err(IngotError::Db)
+    }
+
+    /// Sets the `runner_override` field for the session identified by `session_id`.
+    ///
+    /// When set, `run_turn` bypasses the assayer and routes directly to this runner
+    /// (e.g. `"claude-cli"`, `"codex-cli"`, `"local"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the runner override was updated"]
+    pub fn update_session_runner_override(
+        &mut self,
+        session_id: &str,
+        runner: &str,
+    ) -> Result<(), IngotError> {
+        session::update_runner_override(&self.conn, session_id, runner).map_err(IngotError::Db)
     }
 
     /// Links the session identified by `session_id` to a task by setting `task_id`.
@@ -1277,6 +1299,7 @@ mod tests {
             cowork_mode: false,
             workspace_root: None,
             model_override: None,
+            runner_override: None,
         };
         ingot.create_session(&session).unwrap();
 

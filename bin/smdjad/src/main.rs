@@ -24,7 +24,7 @@ use opentelemetry::{
 use serde_json::{json, Value};
 use smedja_adapter::types::{Message as AdapterMessage, Role as AdapterRole};
 use smedja_adapter::{CallOptions, Delta};
-use smedja_assayer::{Assayer, BashArity, Complexity, Role as AgentRole, Runner, Tier, WorktreePool};
+use smedja_assayer::{Assayer, BashArity, Complexity, Role as AgentRole, Route, Runner, Tier, WorktreePool};
 
 use crate::price_table::PriceTable;
 use crate::provider_pool::{build_provider_pool, ProviderPool};
@@ -131,6 +131,19 @@ fn runner_session_key(runner: Runner) -> &'static str {
         Runner::Codex => "codex-cli",
         Runner::Local => "local",
         Runner::Copilot => "copilot",
+    }
+}
+
+/// Parses a user-supplied or stored runner string to a [`Runner`] enum value.
+///
+/// Accepts both canonical keys (`"claude-cli"`) and short aliases (`"claude"`).
+fn parse_runner_str(s: &str) -> Option<Runner> {
+    match s {
+        "claude" | "claude-cli" => Some(Runner::Claude),
+        "codex" | "codex-cli" => Some(Runner::Codex),
+        "local" => Some(Runner::Local),
+        "copilot" => Some(Runner::Copilot),
+        _ => None,
     }
 }
 
@@ -368,6 +381,24 @@ async fn run_turn(
             "routing turn"
         );
         assayer.route(role, complexity)
+    };
+
+    // Apply session runner override: if stored, replace the assayer's routing choice
+    // before the pool lookup so the correct provider is selected.
+    let route = {
+        let override_runner = {
+            let ig = ingot.lock().await;
+            ig.get_session(&session_id)
+                .ok()
+                .flatten()
+                .and_then(|s| s.runner_override)
+                .and_then(|r| parse_runner_str(&r))
+        };
+        if let Some(overridden) = override_runner {
+            Route { runner: overridden, ..route }
+        } else {
+            route
+        }
     };
 
     let pool_entry = match pool.get(route.runner, route.tier) {
@@ -1672,6 +1703,7 @@ fn build_router(
                 cowork_mode,
                 workspace_root: None,
                 model_override: None,
+                runner_override: None,
             };
 
             ig.lock()
@@ -1889,6 +1921,7 @@ fn build_router(
                         cowork_mode: parent.cowork_mode,
                         workspace_root: parent.workspace_root.clone(),
                         model_override: parent.model_override.clone(),
+                        runner_override: None,
                     })
                     .map_err(|e| ingot_err(&e))?;
             }
@@ -2398,6 +2431,128 @@ fn build_router(
                 .update_session_model_override(&session_id, &model)
                 .map_err(|e| ingot_err(&e))?;
             Ok(json!({ "session_id": session_id, "model": model }))
+        }
+    });
+
+    // ── session.set_runner ───────────────────────────────────────────────────
+    let ig = Arc::clone(ingot);
+    router.register("session.set_runner", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        async move {
+            let session_id = params["session_id"]
+                .as_str()
+                .ok_or_else(|| missing_param("session_id"))?
+                .to_owned();
+            let runner_str = params["runner"]
+                .as_str()
+                .ok_or_else(|| missing_param("runner"))?
+                .to_owned();
+            // Validate and normalise to the canonical key stored in the DB.
+            let canonical = parse_runner_str(&runner_str)
+                .map(runner_session_key)
+                .ok_or_else(|| {
+                    RpcError::new(
+                        codes::INVALID_PARAMS,
+                        format!("unknown runner: {runner_str}; valid: claude, codex, local, copilot"),
+                    )
+                })?;
+            ig.lock()
+                .await
+                .update_session_runner_override(&session_id, canonical)
+                .map_err(|e| ingot_err(&e))?;
+            Ok(json!({ "session_id": session_id, "runner": canonical }))
+        }
+    });
+
+    // ── session.takeover ─────────────────────────────────────────────────────
+    // Forks the current session onto a new runner in one atomic operation:
+    // creates a new session, copies the latest checkpoint, and sets the
+    // runner_override so the next turn routes to the requested runner.
+    let ig = Arc::clone(ingot);
+    router.register("session.takeover", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        async move {
+            let session_id = params["session_id"]
+                .as_str()
+                .ok_or_else(|| missing_param("session_id"))?
+                .to_owned();
+            let runner_str = params["runner"]
+                .as_str()
+                .ok_or_else(|| missing_param("runner"))?
+                .to_owned();
+
+            let canonical = parse_runner_str(&runner_str)
+                .map(runner_session_key)
+                .ok_or_else(|| {
+                    RpcError::new(
+                        codes::INVALID_PARAMS,
+                        format!("unknown runner: {runner_str}; valid: claude, codex, local, copilot"),
+                    )
+                })?;
+
+            let parent = {
+                let guard = ig.lock().await;
+                guard
+                    .get_session(&session_id)
+                    .map_err(|e| ingot_err(&e))?
+                    .ok_or_else(|| {
+                        RpcError::new(
+                            codes::INTERNAL_ERROR,
+                            format!("session not found: {session_id}"),
+                        )
+                    })?
+            };
+
+            let latest_cp = {
+                let guard = ig.lock().await;
+                guard
+                    .latest_checkpoint(&session_id)
+                    .map_err(|e| ingot_err(&e))?
+            };
+
+            let now = now_epoch();
+            let new_id = Uuid::new_v4().to_string();
+
+            {
+                let mut guard = ig.lock().await;
+                guard
+                    .create_session(&Session {
+                        id: Uuid::parse_str(&new_id).map_err(|e| {
+                            RpcError::new(codes::INTERNAL_ERROR, format!("uuid error: {e}"))
+                        })?,
+                        created_at: now,
+                        updated_at: now,
+                        status: "active".into(),
+                        task_id: None,
+                        mode: parent.mode.clone(),
+                        cowork_mode: parent.cowork_mode,
+                        workspace_root: parent.workspace_root.clone(),
+                        model_override: parent.model_override.clone(),
+                        runner_override: Some(canonical.to_owned()),
+                    })
+                    .map_err(|e| ingot_err(&e))?;
+            }
+
+            let has_checkpoint = latest_cp.is_some();
+            if let Some(cp) = latest_cp {
+                let mut guard = ig.lock().await;
+                guard
+                    .save_checkpoint(&Checkpoint {
+                        id: Uuid::new_v4(),
+                        session_id: new_id.clone(),
+                        turn_n: cp.turn_n,
+                        messages_json: cp.messages_json,
+                        created_at: now,
+                    })
+                    .map_err(|e| ingot_err(&e))?;
+            }
+
+            Ok(json!({
+                "new_session_id": new_id,
+                "forked_from": session_id,
+                "runner": canonical,
+                "has_checkpoint": has_checkpoint,
+            }))
         }
     });
 
@@ -3151,6 +3306,7 @@ fn build_router(
                     cowork_mode: false,
                     workspace_root: Some(workspace),
                     model_override: None,
+                    runner_override: None,
                 };
                 {
                     let mut guard = bg_ig.lock().await;
@@ -3842,5 +3998,118 @@ mod tests {
         assert_eq!(resp["runner"].as_str().unwrap(), runner);
         assert_eq!(resp["model"].as_str().unwrap(), model);
         assert_eq!(resp["tier"].as_str().unwrap(), "fast");
+    }
+
+    // ── parse_runner_str ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_runner_str_accepts_short_aliases() {
+        use super::{Runner, parse_runner_str};
+        assert!(matches!(parse_runner_str("claude"), Some(Runner::Claude)));
+        assert!(matches!(parse_runner_str("codex"), Some(Runner::Codex)));
+        assert!(matches!(parse_runner_str("local"), Some(Runner::Local)));
+        assert!(matches!(parse_runner_str("copilot"), Some(Runner::Copilot)));
+    }
+
+    #[test]
+    fn parse_runner_str_accepts_canonical_keys() {
+        use super::{Runner, parse_runner_str};
+        assert!(matches!(parse_runner_str("claude-cli"), Some(Runner::Claude)));
+        assert!(matches!(parse_runner_str("codex-cli"), Some(Runner::Codex)));
+    }
+
+    #[test]
+    fn parse_runner_str_rejects_unknown_values() {
+        use super::parse_runner_str;
+        assert!(parse_runner_str("openai").is_none());
+        assert!(parse_runner_str("").is_none());
+        assert!(parse_runner_str("anthropic").is_none());
+    }
+
+    // ── session.set_runner / session.takeover ─────────────────────────────
+
+    #[tokio::test]
+    async fn session_set_runner_stores_canonical_key() {
+        use smedja_ingot::{Ingot, Session};
+        use uuid::Uuid;
+
+        let ig = Arc::new(Mutex::new(Ingot::open_in_memory().unwrap()));
+        let session_id = Uuid::new_v4().to_string();
+        let now = 1_700_000_000.0_f64;
+        {
+            let mut guard = ig.lock().await;
+            guard
+                .create_session(&Session {
+                    id: Uuid::parse_str(&session_id).unwrap(),
+                    created_at: now,
+                    updated_at: now,
+                    status: "active".into(),
+                    task_id: None,
+                    mode: None,
+                    cowork_mode: false,
+                    workspace_root: None,
+                    model_override: None,
+                    runner_override: None,
+                })
+                .unwrap();
+        }
+        ig.lock()
+            .await
+            .update_session_runner_override(&session_id, "codex-cli")
+            .unwrap();
+        let fetched = ig.lock().await.get_session(&session_id).unwrap().unwrap();
+        assert_eq!(fetched.runner_override.as_deref(), Some("codex-cli"));
+    }
+
+    #[tokio::test]
+    async fn session_takeover_forks_with_runner_override() {
+        use smedja_ingot::{Ingot, Session};
+        use uuid::Uuid;
+
+        let ig = Arc::new(Mutex::new(Ingot::open_in_memory().unwrap()));
+        let parent_id = Uuid::new_v4().to_string();
+        let now = 1_700_000_000.0_f64;
+        {
+            let mut guard = ig.lock().await;
+            guard
+                .create_session(&Session {
+                    id: Uuid::parse_str(&parent_id).unwrap(),
+                    created_at: now,
+                    updated_at: now,
+                    status: "active".into(),
+                    task_id: None,
+                    mode: Some("impl".into()),
+                    cowork_mode: false,
+                    workspace_root: None,
+                    model_override: None,
+                    runner_override: None,
+                })
+                .unwrap();
+        }
+
+        // Simulate takeover: fork then set runner_override.
+        let new_id = Uuid::new_v4().to_string();
+        let parent = ig.lock().await.get_session(&parent_id).unwrap().unwrap();
+        {
+            let mut guard = ig.lock().await;
+            guard
+                .create_session(&Session {
+                    id: Uuid::parse_str(&new_id).unwrap(),
+                    created_at: now + 1.0,
+                    updated_at: now + 1.0,
+                    status: "active".into(),
+                    task_id: None,
+                    mode: parent.mode.clone(),
+                    cowork_mode: parent.cowork_mode,
+                    workspace_root: parent.workspace_root.clone(),
+                    model_override: parent.model_override.clone(),
+                    runner_override: Some("codex-cli".into()),
+                })
+                .unwrap();
+        }
+
+        let new_sess = ig.lock().await.get_session(&new_id).unwrap().unwrap();
+        assert_eq!(new_sess.runner_override.as_deref(), Some("codex-cli"));
+        assert_eq!(new_sess.mode.as_deref(), Some("impl"));
     }
 }
