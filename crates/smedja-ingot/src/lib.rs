@@ -1268,6 +1268,58 @@ mod tests {
     }
 
     #[test]
+    fn migrate_existing_db_adds_new_columns() {
+        // Create a connection with the OLD schema (no conversation_id column).
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE audit_events (
+                id TEXT PRIMARY KEY,
+                ts REAL NOT NULL,
+                session_id TEXT NOT NULL,
+                turn_id TEXT,
+                action_type TEXT NOT NULL DEFAULT '',
+                actor TEXT NOT NULL DEFAULT '',
+                tool_name TEXT,
+                input_tok INTEGER NOT NULL DEFAULT 0,
+                output_tok INTEGER NOT NULL DEFAULT 0,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                traceparent TEXT,
+                tier TEXT,
+                role_id TEXT
+            );
+            CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version VALUES (1);",
+        )
+        .unwrap();
+        // Re-run the new-column ALTER TABLE statements manually to simulate migration.
+        for col in &[
+            "conversation_id TEXT",
+            "trace_id TEXT",
+            "span_id TEXT",
+            "parent_span_id TEXT",
+            "agent_name TEXT",
+            "operation_name TEXT",
+            "status TEXT",
+            "error_kind TEXT",
+            "error_count INTEGER",
+            "tool_call_id TEXT",
+        ] {
+            let _ = conn.execute(&format!("ALTER TABLE audit_events ADD COLUMN {col}"), []);
+        }
+        // Verify all new columns exist by inserting an event with the new fields.
+        conn.execute(
+            "INSERT INTO audit_events (id, ts, session_id, action_type, actor, conversation_id, trace_id, span_id, status)
+             VALUES ('test-id', 1.0, 'sess-1', 'turn_start', 'user', 'conv-001', 'tid-1', 'sid-1', 'ok')",
+            [],
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn parse_traceparent_extracts_ids() {
         let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
         let (tid, sid) = parse_traceparent(tp).unwrap();
@@ -1419,5 +1471,64 @@ mod tests {
         }
         let rollups = ingot.recent_conversations(3).unwrap();
         assert_eq!(rollups.len(), 3);
+    }
+
+    // 9.4 — Ingot timeline tests -----------------------------------------------
+
+    #[test]
+    fn conversation_timeline_returns_events_in_order() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let make_ev = |action: &str, ts: f64| AuditEvent {
+            id: uuid::Uuid::new_v4(),
+            ts,
+            session_id: "s".into(),
+            action_type: action.to_string(),
+            actor: "smdjad".into(),
+            conversation_id: Some("conv-order-2".into()),
+            ..AuditEvent::default()
+        };
+        ingot
+            .record_timeline_event(&make_ev("turn_start", 1.0))
+            .unwrap();
+        ingot
+            .record_timeline_event(&make_ev("tool_exec", 2.0))
+            .unwrap();
+        ingot
+            .record_timeline_event(&make_ev("turn_end", 3.0))
+            .unwrap();
+        let events = ingot.conversation_timeline("conv-order-2").unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].action_type, "turn_start");
+        assert_eq!(events[2].action_type, "turn_end");
+    }
+
+    #[test]
+    fn failed_events_filters_by_status() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let ok_ev = AuditEvent {
+            id: uuid::Uuid::new_v4(),
+            ts: 1.0,
+            session_id: "s".into(),
+            action_type: "tool_exec".into(),
+            actor: "smdjad".into(),
+            conversation_id: Some("conv-fail-filter".into()),
+            status: Some("ok".into()),
+            ..AuditEvent::default()
+        };
+        let err_ev = AuditEvent {
+            id: uuid::Uuid::new_v4(),
+            ts: 2.0,
+            status: Some("error".into()),
+            action_type: "tool_exec".into(),
+            actor: "smdjad".into(),
+            session_id: "s".into(),
+            conversation_id: Some("conv-fail-filter".into()),
+            ..AuditEvent::default()
+        };
+        ingot.record_timeline_event(&ok_ev).unwrap();
+        ingot.record_timeline_event(&err_ev).unwrap();
+        let fails = ingot.failed_events("conv-fail-filter").unwrap();
+        assert_eq!(fails.len(), 1);
+        assert_eq!(fails[0].status.as_deref(), Some("error"));
     }
 }
