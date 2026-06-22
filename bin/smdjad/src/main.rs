@@ -7,6 +7,7 @@ pub mod executor;
 pub mod local_provider;
 pub mod mcp_http;
 pub mod mcp_oauth;
+pub mod orchestrator;
 pub mod price_table;
 pub mod provider_pool;
 pub mod sandbox;
@@ -18,20 +19,15 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
-use opentelemetry::{
-    global,
-    trace::{Span as _, Status as SpanStatus, Tracer as _},
-    KeyValue,
-};
 use serde_json::{json, Value};
 use smedja_adapter::types::{Message as AdapterMessage, Role as AdapterRole};
 use smedja_adapter::{CallOptions, Delta};
-use smedja_assayer::{Assayer, Complexity, Role as AgentRole, Route, Runner, Tier, WorktreePool};
+use smedja_assayer::{Assayer, Role as AgentRole, Runner, Tier, WorktreePool};
 
 use crate::price_table::PriceTable;
 use crate::provider_pool::{build_provider_pool, ProviderPool};
 use smedja_bellows::{Dispatcher, TurnEvent};
-use smedja_ingot::{Checkpoint, CostEntry, CostRow, Ingot, McpServer, Session, Task, TokenSnapshot};
+use smedja_ingot::{Checkpoint, CostRow, Ingot, IngotHandle, McpServer, Session, Task};
 use smedja_vault::{Vault, VaultEntry};
 use smedja_rpc::{codes, router::Router, server::Server, RpcError};
 use tokio::net::UnixListener;
@@ -41,8 +37,7 @@ use uuid::Uuid;
 
 use smedja_telemetry as tel;
 
-use crate::cowork::{ApprovalPrompt, CoworkGate, Decision};
-use crate::executor::{execute_tool, parse_tool_call};
+use crate::cowork::CoworkGate;
 
 fn socket_path() -> PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
@@ -330,9 +325,9 @@ fn effective_max_tool_turns() -> usize {
 
 /// Executes a single turn: loads the task, calls the LLM, handles tool calls,
 /// stores the final response.
-#[allow(clippy::too_many_lines, clippy::items_after_statements, clippy::too_many_arguments)] // TurnOrchestrator extraction is the long-term fix
+#[allow(clippy::too_many_arguments)] // forwarded directly to TurnOrchestrator
 async fn run_turn(
-    ingot: Arc<Mutex<Ingot>>,
+    ingot: IngotHandle,
     dispatcher: Arc<Dispatcher>,
     session_id: String,
     turn_id: String,
@@ -342,871 +337,11 @@ async fn run_turn(
     price_table: Arc<PriceTable>,
     vault: Arc<Mutex<Vault>>,
 ) {
-    let tracer = global::tracer("smedja");
-    let mut turn_span = tracer.start(tel::SPAN_AGENT_INVOKE);
-
-    // 1. Load the task to retrieve user content.
-    let task = {
-        let ig = ingot.lock().await;
-        match ig.get_task(&turn_id) {
-            Ok(Some(t)) => t,
-            Ok(None) => {
-                warn!(turn_id = %turn_id, "task not found; dropping turn");
-                dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, "task not found"));
-                turn_span.set_status(SpanStatus::error("task not found"));
-                turn_span.end();
-                return;
-            }
-            Err(e) => {
-                warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to load task");
-                let reason = e.to_string();
-                dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
-                turn_span.set_status(SpanStatus::error(reason));
-                turn_span.end();
-                return;
-            }
-        }
-    };
-
-    // 2. Route this turn to a provider via the assayer.
-    //    Role comes from session.mode; complexity is conservatively Coding for now.
-    let route = {
-        // Load session early to get mode for routing (full load happens in step 3).
-        let session_mode = {
-            let ig = ingot.lock().await;
-            ig.get_session(&session_id).ok().flatten().and_then(|s| s.mode)
-        };
-        let role = session_mode
-            .as_deref()
-            .and_then(parse_session_mode_to_role)
-            .unwrap_or(AgentRole::Orchestrator);
-        let complexity = Complexity::Coding;
-        tracing::debug!(
-            turn_id = %turn_id,
-            role = ?role,
-            complexity = ?complexity,
-            "routing turn"
-        );
-        assayer.route(role, complexity)
-    };
-
-    // Apply session runner override: if stored, replace the assayer's routing choice
-    // before the pool lookup so the correct provider is selected.
-    let route = {
-        let override_runner = {
-            let ig = ingot.lock().await;
-            ig.get_session(&session_id)
-                .ok()
-                .flatten()
-                .and_then(|s| s.runner_override)
-                .and_then(|r| parse_runner_str(&r))
-        };
-        if let Some(overridden) = override_runner {
-            Route { runner: overridden, ..route }
-        } else {
-            route
-        }
-    };
-
-    let pool_entry = match pool.get(route.runner, route.tier) {
-        Some(e) => e,
-        None => {
-            let reason = "no LLM provider available; turn cannot execute".to_owned();
-            warn!(session_id = %session_id, turn_id = %turn_id, "{reason}");
-            let _ = ingot.lock().await.update_task_status(&turn_id, "failed");
-            dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
-            turn_span.set_status(SpanStatus::error(reason));
-            turn_span.end();
-            return;
-        }
-    };
-
-    let provider = &pool_entry.provider;
-    let runner = pool_entry.runner_name.to_owned();
-    let runner_enum = route.runner;
-
-    // SMEDJA_MODEL can override the default model name but never changes the runner.
-    let model = route
-        .model
-        .clone()
-        .or_else(|| std::env::var("SMEDJA_MODEL").ok())
-        .unwrap_or_else(|| pool_entry.default_model.to_owned());
-
-    // 3. Load session for workspace root, cowork mode, and task context.
-    let session = {
-        let ig = ingot.lock().await;
-        ig.get_session(&session_id).ok().flatten()
-    };
-
-    // Apply session model override: if the session has a stored model name, use it
-    // instead of the environment-derived default chosen above.
-    let model = session
-        .as_ref()
-        .and_then(|s| s.model_override.clone())
-        .unwrap_or(model);
-
-    // Attach mandatory GenAI semantic-convention attributes to the turn span now
-    // that model and runner are resolved.
-    turn_span.set_attribute(KeyValue::new(tel::GEN_AI_SYSTEM, runner.clone()));
-    turn_span.set_attribute(KeyValue::new(tel::REQUEST_MODEL, model.clone()));
-    turn_span.set_attribute(KeyValue::new(tel::CONV_ID, session_id.clone()));
-    turn_span.set_attribute(KeyValue::new(
-        tel::OPERATION_NAME,
-        tel::OPERATION_INVOKE_AGENT,
-    ));
-    turn_span.set_attribute(KeyValue::new(tel::SESSION_ID, session_id.clone()));
-    turn_span.set_attribute(KeyValue::new(tel::TURN_ID, turn_id.clone()));
-    // agent_name: use session mode or "interactive" for user-facing sessions
-    turn_span.set_attribute(KeyValue::new(
-        tel::AGENT_NAME,
-        session
-            .as_ref()
-            .and_then(|s| s.mode.as_deref())
-            .unwrap_or("interactive")
-            .to_owned(),
-    ));
-
-    // Derive workspace root: prefer session.workspace_root, then SMEDJA_WORKSPACE env, then ".".
-    let workspace_root = {
-        let p = session
-            .as_ref()
-            .and_then(|s| s.workspace_root.as_deref())
-            .map_or_else(
-                || {
-                    std::env::var("SMEDJA_WORKSPACE")
-                        .map_or_else(|_| PathBuf::from("."), PathBuf::from)
-                },
-                PathBuf::from,
-            );
-        if !p.join(".git").exists() {
-            tracing::warn!(
-                path = %p.display(),
-                "workspace does not contain .git; tool execution may be in wrong directory",
-            );
-        }
-        p
-    };
-
-    // Inject active task context wrapped in XML delimiters (prevents prompt injection).
-    let task_prefix = {
-        let ig = ingot.lock().await;
-        match ig.get_session(&session_id) {
-            Ok(Some(s)) => {
-                if let Some(ref task_id) = s.task_id {
-                    match ig.get_task(task_id) {
-                        Ok(Some(active_task)) => format!(
-                            "\n\n<active_task>\n<title>{}</title>\n<description>{}</description>\n</active_task>",
-                            xml_escape(&active_task.title),
-                            xml_escape(active_task.description.as_str()),
-                        ),
-                        _ => String::new(),
-                    }
-                } else {
-                    String::new()
-                }
-            }
-            _ => String::new(),
-        }
-    };
-
-    let system_prompt = format!("You are smedja, an AI coding assistant.{task_prefix}");
-
-    // Load registered MCP tool definitions and flatten into a single Vec.
-    let mcp_tools: Vec<serde_json::Value> = {
-        let ig = ingot.lock().await;
-        ig.list_mcp_servers()
-            .unwrap_or_default()
-            .into_iter()
-            .flat_map(
-                |s| match serde_json::from_str::<Vec<serde_json::Value>>(&s.tools_json) {
-                    Ok(tools) => tools,
-                    Err(e) => {
-                        tracing::warn!(
-                            server = %s.name,
-                            error = %e,
-                            "failed to deserialize MCP tools_json; skipping server"
-                        );
-                        vec![]
-                    }
-                },
-            )
-            .collect()
-    };
-    if !mcp_tools.is_empty() {
-        tracing::debug!(count = mcp_tools.len(), "injecting MCP tools into turn");
-    }
-
-    // Re-check local health if stale (> 30s since last check).
-    let local_tool_format = {
-        let local_base = std::env::var("SMEDJA_LOCAL_BASE_URL")
-            .unwrap_or_else(|_| "http://localhost:8080".to_owned());
-        let health_arc = crate::local_provider::global_health();
-        let needs_recheck = {
-            let h = health_arc.lock().await;
-            (crate::now_epoch() - h.last_checked) > 30.0
-        };
-        if needs_recheck {
-            let fresh = crate::local_provider::check_health(&local_base).await;
-            let fmt = fresh.tool_format.clone();
-            *health_arc.lock().await = fresh;
-            fmt
-        } else {
-            health_arc.lock().await.tool_format.clone()
-        }
-    };
-    // local_tool_format is "openai" or "xml"; used in tool dispatch
-    if local_tool_format == "xml" {
-        tracing::debug!(tool_format = "xml", "local provider tool format: xml");
-    }
-
-    // Builtin tools: smedja_vault_search, smedja_vault_store, smedja_retrieve, graph_query
-    let mut builtin_tools: Vec<serde_json::Value> = vec![
-        serde_json::json!({
-            "name": "smedja_vault_search",
-            "description": "Search the smedja vault for semantically similar entries.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" },
-                    "namespace": { "type": "string" },
-                    "k": { "type": "integer" }
-                },
-                "required": ["query"]
-            }
-        }),
-        serde_json::json!({
-            "name": "smedja_vault_store",
-            "description": "Store an entry in the smedja vault for future retrieval.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "content": { "type": "string" },
-                    "namespace": { "type": "string" },
-                    "id": { "type": "string" },
-                    "payload": { "type": "object" },
-                    "source_file": { "type": "string" },
-                    "added_by": { "type": "string" }
-                },
-                "required": ["content"]
-            }
-        }),
-        serde_json::json!({
-            "name": "smedja_retrieve",
-            "description": "Retrieve the original full content for a compressed block by its content hash.",
-            "input_schema": {
-                "type": "object",
-                "properties": { "hash": { "type": "string" } },
-                "required": ["hash"]
-            }
-        }),
-        serde_json::json!({
-            "name": "graph_query",
-            "description": "Query the workspace code graph for symbols related to a query.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" },
-                    "depth": { "type": "integer" }
-                },
-                "required": ["query"]
-            }
-        }),
-    ];
-    // When session is in SRE mode, inject monitoring tools.
-    let is_sre_mode = session
-        .as_ref()
-        .and_then(|s| s.mode.as_deref())
-        .is_some_and(|m| m == "sre");
-    if is_sre_mode {
-        builtin_tools.push(serde_json::json!({
-            "name": "alert_list",
-            "description": "Drain up to 50 pending alerts from the alert queue.",
-            "input_schema": { "type": "object", "properties": {} }
-        }));
-        builtin_tools.push(serde_json::json!({
-            "name": "otel_query",
-            "description": "Query SigNoz traces API.",
-            "input_schema": { "type": "object", "properties": { "service": { "type": "string" }, "filter": { "type": "string" }, "range_minutes": { "type": "integer" } }, "required": ["service"] }
-        }));
-        builtin_tools.push(serde_json::json!({
-            "name": "metric_query",
-            "description": "Query Prometheus with PromQL.",
-            "input_schema": { "type": "object", "properties": { "promql": { "type": "string" }, "range_minutes": { "type": "integer" } }, "required": ["promql"] }
-        }));
-        builtin_tools.push(serde_json::json!({
-            "name": "log_tail",
-            "description": "Tail logs from Loki.",
-            "input_schema": { "type": "object", "properties": { "service": { "type": "string" }, "filter": { "type": "string" }, "lines": { "type": "integer" } }, "required": ["service"] }
-        }));
-    }
-
-    let all_tools: Vec<serde_json::Value> = builtin_tools.into_iter().chain(mcp_tools).collect();
-
-    // Providers that support CLI-level session resume carry a stored session ID.
-    let session_store_key = runner_session_key(runner_enum);
-    let provider_session_id = if matches!(runner_enum, Runner::Claude | Runner::Codex) {
-        provider_session_store()
-            .lock()
-            .await
-            .get(session_store_key)
-            .cloned()
-    } else {
-        None
-    };
-
-    let opts = CallOptions {
-        model: model.clone(),
-        max_tokens: Some(2048),
-        temperature: Some(0.7),
-        system: Some(system_prompt),
-        tools: if all_tools.is_empty() {
-            None
-        } else {
-            Some(all_tools)
-        },
-        provider_session_id,
-        stable_prefix_len: if runner == "anthropic" { Some(0) } else { None },
-    };
-
-    // 4. Mark in_progress.
-    {
-        let mut ig = ingot.lock().await;
-        if let Err(e) = ig.update_task_status(&turn_id, "in_progress") {
-            warn!(turn_id = %turn_id, error = %e, "failed to mark task in_progress");
-        }
-    }
-
-    // 5. Tool-dispatch loop — up to MAX_TOOL_TURNS iterations.
-    let mut messages: Vec<AdapterMessage> = vec![AdapterMessage {
-        role: AdapterRole::User,
-        content: task.title.clone(),
-    }];
-
-    // Auto-inject top-3 graph symbols related to user message nouns (Task 64).
-    {
-        let stop_words = [
-            "the", "and", "for", "with", "this", "that", "from", "into", "use", "are", "was",
-            "has", "not", "can", "its", "will",
-        ];
-        let nouns: Vec<&str> = task
-            .title
-            .split_whitespace()
-            .filter(|t| t.len() >= 3 && !stop_words.contains(&t.to_lowercase().as_str()))
-            .take(5)
-            .collect();
-        let mut injected_count = 0usize;
-        if !nouns.is_empty() {
-            let graph_db_path = workspace_root.join(".smedja").join("graph.db");
-            if graph_db_path.exists() {
-                match smedja_graph::GraphStore::open(&graph_db_path) {
-                    Ok(store) => {
-                        let query = nouns.join(" ");
-                        match store.graph_query(&query, 3, 2) {
-                            Ok(symbols) => {
-                                if !symbols.is_empty() {
-                                    let snippets: Vec<String> = symbols
-                                        .iter()
-                                        .map(|s| {
-                                            format!(
-                                                "// {} {} ({}:{})\n{}",
-                                                s.kind.as_str(),
-                                                s.name,
-                                                s.file_path,
-                                                s.start_line,
-                                                s.snippet
-                                            )
-                                        })
-                                        .collect();
-                                    let injection = format!(
-                                        "\n\n<graph_symbols>\n{}\n</graph_symbols>",
-                                        snippets.join("\n\n")
-                                    );
-                                    // Append to system message via prepending to first user message
-                                    if let Some(first) = messages.first_mut() {
-                                        first.content.push_str(&injection);
-                                    }
-                                    injected_count = symbols.len();
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!(error = %e, "graph_query failed; skipping injection");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(error = %e, "could not open graph.db; skipping injection");
-                    }
-                }
-            } else {
-                tracing::debug!("graph.db not found; skipping auto-injection");
-            }
-        }
-        tracing::debug!(
-            smedja.turn.graph_symbols_injected = injected_count,
-            "graph symbol injection"
-        );
-    }
-
-    // Maximum number of rate-limit retries per turn before giving up.
-    const MAX_RATE_LIMIT_RETRIES: u32 = 4;
-    // Initial back-off when no Retry-After header is present.
-    const RATE_LIMIT_BACKOFF_BASE_SECS: u64 = 1;
-
-    let mut full_response = String::new();
-    let mut total_input_tokens = 0u32;
-    let mut total_output_tokens = 0u32;
-
-    'tool_loop: for _iteration in 0..effective_max_tool_turns() {
-        // 5a. Stream LLM response with rate-limit retry (up to MAX_RATE_LIMIT_RETRIES).
-        let (response_text, input_tokens, output_tokens, native_session_id) = {
-            let mut backoff_secs = RATE_LIMIT_BACKOFF_BASE_SECS;
-            let mut attempt = 0u32;
-            loop {
-                let stream = provider.stream_chat(&messages, &opts);
-                let drain_result = tokio::time::timeout(
-                    std::time::Duration::from_mins(5),
-                    drain_stream(stream, &dispatcher, Some(turn_id.as_str())),
-                )
-                .await;
-                match drain_result {
-                    Ok(Ok(triple)) => break triple,
-                    Ok(Err(DrainError::RateLimited { retry_after })) => {
-                        attempt += 1;
-                        if attempt > MAX_RATE_LIMIT_RETRIES {
-                            let reason =
-                                "rate limited by provider; retry limit exceeded".to_owned();
-                            warn!(turn_id = %turn_id, "rate limit retry limit exceeded");
-                            let _ = ingot.lock().await.update_task_status(&turn_id, "failed");
-                            dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
-                            turn_span.set_status(SpanStatus::error(reason));
-                            turn_span.end();
-                            return;
-                        }
-                        let sleep_secs = retry_after.map_or(backoff_secs, |d| d.as_secs().max(1));
-                        warn!(
-                            turn_id = %turn_id,
-                            attempt,
-                            sleep_secs,
-                            "rate limited by provider; backing off"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
-                        backoff_secs = (backoff_secs * 2).min(60);
-                    }
-                    Ok(Err(DrainError::Other(reason))) => {
-                        warn!(turn_id = %turn_id, error = %reason, "stream error during turn");
-                        let _ = ingot.lock().await.update_task_status(&turn_id, "failed");
-                        dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
-                        turn_span.set_status(SpanStatus::error(reason));
-                        turn_span.end();
-                        return;
-                    }
-                    Err(_elapsed) => {
-                        let reason = "stream timed out after 300s".to_owned();
-                        warn!(turn_id = %turn_id, "provider stream timed out");
-                        let _ = ingot.lock().await.update_task_status(&turn_id, "failed");
-                        dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
-                        turn_span.set_status(SpanStatus::error(reason));
-                        turn_span.end();
-                        return;
-                    }
-                }
-            }
-        };
-        if matches!(runner_enum, Runner::Claude | Runner::Codex) {
-            if let Some(native_session_id) = native_session_id {
-                provider_session_store()
-                    .lock()
-                    .await
-                    .insert(session_store_key.to_owned(), native_session_id);
-            }
-        }
-        total_input_tokens = total_input_tokens.saturating_add(input_tokens);
-        total_output_tokens = total_output_tokens.saturating_add(output_tokens);
-
-        // 5b. Parse tool calls from the response text.
-        // The adapter streams plain text; detect tool calls via JSON heuristics.
-        // A tool call appears as a JSON object with a "tool" key in the response.
-        let tool_call = parse_tool_call(&response_text);
-
-        if let Some((tool_name, mut tool_input)) = tool_call {
-            // Generate a per-invocation correlation ID so the ToolCalled event
-            // and the corresponding AuditEvent can be joined in the audit log.
-            let tool_call_id = Uuid::new_v4().to_string();
-
-            // Append assistant response to message history.
-            messages.push(AdapterMessage {
-                role: AdapterRole::Assistant,
-                content: response_text.clone(),
-            });
-
-            // Extract current span IDs to correlate event with the tool span.
-            let (ev_trace_id, ev_span_id) = {
-                use opentelemetry::trace::TraceContextExt as _;
-                let cx = opentelemetry::Context::current();
-                let sc = cx.span().span_context().clone();
-                if sc.is_valid() {
-                    (
-                        Some(format!("{}", sc.trace_id())),
-                        Some(format!("{}", sc.span_id())),
-                    )
-                } else {
-                    (None, None)
-                }
-            };
-            // Emit the ToolCalled event with the correlation ID.
-            dispatcher.publish(TurnEvent::ToolCalled {
-                tool_name: tool_name.clone(),
-                input_summary: tool_input.chars().take(120).collect(),
-                turn_id: Some(turn_id.clone()),
-                conversation_id: Some(session_id.clone()),
-                trace_id: ev_trace_id,
-                span_id: ev_span_id,
-                parent_span_id: None,
-                operation_name: Some(tel::OPERATION_EXECUTE_TOOL.to_owned()),
-                agent_name: session
-                    .as_ref()
-                    .and_then(|s| s.mode.as_deref())
-                    .map(str::to_owned),
-                status: None,
-                tool_call_id: Some(tool_call_id.clone()),
-            });
-
-            // 5c. Cowork gate intercept (when session has cowork mode enabled).
-            let cowork_denied = if session.as_ref().is_some_and(|s| s.cowork_mode) {
-                if let Some(gate) = gates.lock().await.get(&session_id).cloned() {
-                    let ap = ApprovalPrompt {
-                        step_n: 0,
-                        tool: tool_name.clone(),
-                        args_scrubbed: serde_json::from_str(&tool_input).unwrap_or(Value::Null),
-                        reasoning: String::new(),
-                        plan_summary: String::new(),
-                    };
-                    match gate.intercept(ap, 300).await {
-                        Decision::Approve => None,
-                        Decision::Deny(reason) => Some(format!("denied: {reason}")),
-                        Decision::Modify(new_input) => {
-                            tool_input = new_input;
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            // 5d. Execute the tool (or return the denial).
-            let tool_result = if let Some(denial) = cowork_denied {
-                denial
-            } else {
-                // Classify tool type per the design contract.
-                // Local tools are an explicit allowlist; anything not on the list
-                // is an MCP extension. Using a substring match on "mcp" would
-                // allow a tool named "bash_mcp_wrapper" to intercept bash calls.
-                let tool_type_val = if crate::executor::LOCAL_TOOLS.contains(&tool_name.as_str()) {
-                    if matches!(tool_name.as_str(), "smedja_vault_search" | "smedja_vault_store" | "graph_query") {
-                        "datastore"
-                    } else {
-                        "function"
-                    }
-                } else {
-                    "extension"
-                };
-                let mut tool_span = tracer.start(tel::SPAN_TOOL_EXECUTE);
-                tool_span.set_attribute(KeyValue::new(
-                    tel::OPERATION_NAME,
-                    tel::OPERATION_EXECUTE_TOOL,
-                ));
-                tool_span.set_attribute(KeyValue::new(tel::TOOL_NAME, tool_name.clone()));
-                tool_span.set_attribute(KeyValue::new(tel::TOOL_TYPE, tool_type_val));
-                tool_span.set_attribute(KeyValue::new(tel::TOOL_CALL_ID, tool_call_id.clone()));
-                // Capture policy for tool args (section 7.1).
-                match tel::tool_args_capture_mode() {
-                    tel::CaptureMode::Hash => {
-                        tool_span.set_attribute(KeyValue::new(
-                            tel::TOOL_ARGS_HASH,
-                            tel::content_hash(&tool_input),
-                        ));
-                    }
-                    tel::CaptureMode::Scrubbed | tel::CaptureMode::Full => {
-                        tool_span.set_attribute(KeyValue::new(
-                            tel::TOOL_ARGS_HASH,
-                            tel::content_hash(&tool_input),
-                        ));
-                        tool_span.set_attribute(KeyValue::new(
-                            "gen_ai.tool.args",
-                            tel::scrub_and_summarise(&tool_input),
-                        ));
-                    }
-                }
-                let result =
-                    execute_tool(&tool_name, &tool_input, &workspace_root, session.as_ref(), &ingot, &vault)
-                        .await;
-                tool_span.set_attribute(KeyValue::new(
-                    tel::TOOL_RESULT_HASH,
-                    tel::content_hash(&result),
-                ));
-                tool_span.set_attribute(KeyValue::new(
-                    tel::TOOL_RESULT_TOKENS,
-                    i64::try_from(result.split_whitespace().count()).unwrap_or(0),
-                ));
-                // rough word-count approximation; good enough for telemetry
-                if result.starts_with("error:") || result.starts_with("permission denied") {
-                    use opentelemetry::trace::Span as _;
-                    tool_span.set_status(opentelemetry::trace::Status::error(
-                        result.chars().take(120).collect::<String>(),
-                    ));
-                } else {
-                    use opentelemetry::trace::Span as _;
-                    tool_span.set_status(opentelemetry::trace::Status::Ok);
-                }
-                tool_span.end();
-                result
-            };
-
-            // Persist tool execution as a timeline event (section 5.7).
-            {
-                // Get current span IDs for correlation.
-                let tool_sc = {
-                    use opentelemetry::trace::TraceContextExt as _;
-                    let cx = opentelemetry::Context::current();
-                    cx.span().span_context().clone()
-                };
-                let (t_trace_id, t_span_id) = if tool_sc.is_valid() {
-                    (
-                        Some(format!("{}", tool_sc.trace_id())),
-                        Some(format!("{}", tool_sc.span_id())),
-                    )
-                } else {
-                    (None, None)
-                };
-                let tool_audit = smedja_ingot::AuditEvent {
-                    id: Uuid::new_v4(),
-                    ts: now_epoch(),
-                    session_id: session_id.clone(),
-                    turn_id: Some(turn_id.clone()),
-                    action_type: "tool_exec".into(),
-                    actor: "smdjad".into(),
-                    tool_name: Some(tool_name.clone()),
-                    traceparent: None,
-                    trace_id: t_trace_id,
-                    span_id: t_span_id,
-                    conversation_id: Some(session_id.clone()),
-                    tool_call_id: Some(tool_call_id.clone()),
-                    operation_name: Some(tel::OPERATION_EXECUTE_TOOL.to_owned()),
-                    status: if tool_result.starts_with("error:")
-                        || tool_result.starts_with("permission denied")
-                    {
-                        Some("error".to_owned())
-                    } else {
-                        Some("ok".to_owned())
-                    },
-                    ..smedja_ingot::AuditEvent::default()
-                };
-                let ig = ingot.lock().await;
-                if let Err(e) = ig.record_timeline_event(&tool_audit) {
-                    warn!(turn_id = %turn_id, error = %e, "failed to record tool audit event");
-                }
-            }
-
-            // 5e. Append tool result as a user message and continue the loop.
-            // Escape XML angle brackets in the raw tool output so that a
-            // malicious or unexpected response cannot break out of the
-            // <tool_result> wrapper and inject new XML structure into the
-            // prompt (prompt-injection mitigation).
-            let escaped_result = tool_result.replace('<', "&lt;").replace('>', "&gt;");
-            messages.push(AdapterMessage {
-                role: AdapterRole::User,
-                content: format!(
-                    "<tool_result tool=\"{tool_name}\">{escaped_result}</tool_result>"
-                ),
-            });
-
-            full_response = response_text;
-            continue 'tool_loop;
-        }
-
-        // 5f. No tool call — this is the final response.
-        full_response = response_text;
-        break 'tool_loop;
-    }
-
-    // 6. Persist response and mark complete.
-    if let Err(e) = ingot
-        .lock()
-        .await
-        .set_task_response(&turn_id, &full_response)
-    {
-        let reason = e.to_string();
-        warn!(turn_id = %turn_id, error = %reason, "failed to store task response");
-        dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
-        turn_span.set_status(SpanStatus::error(reason));
-        turn_span.end();
-        return;
-    }
-
-    // Count existing checkpoints to derive the sequential turn index.
-    let turn_n: i64 = {
-        let ig = ingot.lock().await;
-        ig.list_checkpoints(&session_id)
-            .map_or(0, |v| i64::try_from(v.len()).unwrap_or(i64::MAX))
-    };
-
-    // 7. Record cost entry.
-    {
-        let cost_usd = price_table.compute_cost(&model, total_input_tokens, total_output_tokens);
-        let entry = CostEntry {
-            id: Uuid::new_v4(),
-            session_id: session_id.clone(),
-            turn_n,
-            runner: runner.clone(),
-            model,
-            input_tok: i64::from(total_input_tokens),
-            output_tok: i64::from(total_output_tokens),
-            cost_usd,
-            created_at: now_epoch(),
-        };
-        let mut ig = ingot.lock().await;
-        if let Err(e) = ig.insert_cost(&entry) {
-            warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to record cost entry");
-        }
-    }
-
-    // 8. Save checkpoint — persist the full accumulated message history so that
-    //    tool-call/tool-result pairs from the loop are not lost.
-    {
-        let messages_json_value: Vec<serde_json::Value> = messages
-            .iter()
-            .map(|m| {
-                serde_json::json!({
-                    "role": match m.role {
-                        AdapterRole::User => "user",
-                        AdapterRole::Assistant => "assistant",
-                        AdapterRole::System => "system",
-                        AdapterRole::Tool => "tool",
-                    },
-                    "content": m.content,
-                })
-            })
-            .collect();
-        let cp = Checkpoint {
-            id: Uuid::new_v4(),
-            session_id: session_id.clone(),
-            turn_n,
-            messages_json: serde_json::to_string(&messages_json_value)
-                .unwrap_or_else(|_| "[]".to_owned()),
-            created_at: now_epoch(),
-        };
-        let mut ig = ingot.lock().await;
-        if let Err(e) = ig.save_checkpoint(&cp) {
-            warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to save checkpoint");
-        }
-    }
-
-    // 9. Save per-turn token snapshot with running cumulative totals.
-    {
-        let input_tok = i64::from(total_input_tokens);
-        let output_tok = i64::from(total_output_tokens);
-        let mut ig = ingot.lock().await;
-        // Compute cumulative totals by summing all prior snapshots.
-        let (prior_in, prior_out) =
-            ig.session_token_snapshots(&session_id)
-                .map_or((0, 0), |snaps| {
-                    snaps
-                        .last()
-                        .map_or((0i64, 0i64), |s| (s.cumulative_input, s.cumulative_output))
-                });
-        let snap = TokenSnapshot {
-            id: Uuid::new_v4(),
-            session_id: session_id.clone(),
-            turn_n,
-            input_tok,
-            output_tok,
-            cumulative_input: prior_in + input_tok,
-            cumulative_output: prior_out + output_tok,
-            created_at: now_epoch(),
-        };
-        if let Err(e) = ig.save_token_snapshot(&snap) {
-            warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to save token snapshot");
-        }
-    }
-
-    turn_span.set_attribute(KeyValue::new(
-        tel::INPUT_TOKENS,
-        i64::from(total_input_tokens),
-    ));
-    turn_span.set_attribute(KeyValue::new(
-        tel::OUTPUT_TOKENS,
-        i64::from(total_output_tokens),
-    ));
-    turn_span.set_attribute(KeyValue::new(tel::TIER, runner.clone()));
-    turn_span.set_attribute(KeyValue::new(
-        "smedja.agent.kind",
-        session
-            .as_ref()
-            .and_then(|s| s.mode.as_deref())
-            .unwrap_or("impl")
-            .to_owned(),
-    ));
-
-    // Extract trace context before ending the span so the traceparent field
-    // is populated in the audit event.
-    let sc = turn_span.span_context().clone();
-    let span_trace_id = format!("{}", sc.trace_id());
-    let span_span_id = format!("{}", sc.span_id());
-    let traceparent = format!("00-{span_trace_id}-{span_span_id}-01");
-
-    turn_span.end();
-
-    // 10. Record audit event for this turn with the OTel span context.
-    {
-        let agent_name_val = session
-            .as_ref()
-            .and_then(|s| s.mode.as_deref())
-            .unwrap_or("interactive")
-            .to_owned();
-        let audit_ev = smedja_ingot::AuditEvent {
-            id: Uuid::new_v4(),
-            ts: now_epoch(),
-            session_id: session_id.clone(),
-            turn_id: Some(turn_id.clone()),
-            action_type: "turn_end".into(),
-            actor: "smdjad".into(),
-            input_tok: i64::from(total_input_tokens),
-            output_tok: i64::from(total_output_tokens),
-            traceparent: Some(traceparent.clone()),
-            trace_id: Some(span_trace_id),
-            span_id: Some(span_span_id),
-            conversation_id: Some(session_id.clone()),
-            agent_name: Some(agent_name_val),
-            operation_name: Some(tel::OPERATION_INVOKE_AGENT.to_owned()),
-            status: Some("ok".to_owned()),
-            ..smedja_ingot::AuditEvent::default()
-        };
-        let ig = ingot.lock().await;
-        if let Err(e) = ig.record_timeline_event(&audit_ev) {
-            warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to record turn audit event");
-        }
-    }
-
-    dispatcher.publish(TurnEvent::Completed {
-        session_id: session_id.clone(),
-        turn_id: turn_id.clone(),
-        output_tokens: total_output_tokens,
-        input_tokens: Some(total_input_tokens),
-        traceparent: Some(traceparent),
-        conversation_id: Some(session_id.clone()),
-        trace_id: None, // span already ended before this
-        span_id: None,
-        parent_span_id: None,
-        operation_name: Some(tel::OPERATION_INVOKE_AGENT.to_owned()),
-        agent_name: session
-            .as_ref()
-            .and_then(|s| s.mode.as_deref())
-            .map(str::to_owned),
-        status: Some("ok".to_owned()),
-    });
+    orchestrator::TurnOrchestrator::new(
+        ingot, dispatcher, gates, pool, assayer, price_table, vault,
+    )
+    .run(session_id, turn_id)
+    .await;
 }
 
 /// Subscribes to [`TurnEvent::Started`] and spawns a [`run_turn`] task for each.
@@ -1214,7 +349,7 @@ async fn run_turn(
 /// Returns a shared handle store so that the caller can drain in-flight tasks
 /// before exiting (graceful shutdown).
 fn spawn_worker(
-    ingot: Arc<Mutex<Ingot>>,
+    ingot: IngotHandle,
     dispatcher: Arc<Dispatcher>,
     gates: Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
     pool: Arc<ProviderPool>,
@@ -1249,7 +384,7 @@ fn spawn_worker(
                     ..
                 } = event
                 {
-                    let ig = Arc::clone(&ingot);
+                    let ig = ingot.clone();
                     let dp = Arc::clone(&dispatcher);
                     let g = Arc::clone(&gates);
                     let pl = Arc::clone(&pool);
@@ -1300,7 +435,7 @@ fn is_safe_mcp_url(url: &str) -> bool {
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)] // all RPC methods live in one function per the spec
 fn build_router(
-    ingot: &Arc<Mutex<Ingot>>,
+    ingot: &IngotHandle,
     dispatcher: Arc<Dispatcher>,
     gates: &Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
     pool: Arc<ProviderPool>,
@@ -1328,9 +463,9 @@ fn build_router(
     router.register("ping", |_| async { Ok(json!("pong")) });
 
     // ── session.create ──────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("session.create", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let title = params
                 .get("title")
@@ -1366,9 +501,8 @@ fn build_router(
                     session_id: Some(session_id.to_string()),
                     response: None,
                 };
-                ig.lock()
+                ig.create_task(task.clone())
                     .await
-                    .create_task(&task)
                     .map_err(|e| ingot_err(&e))?;
                 Some(task.id.to_string())
             } else {
@@ -1389,9 +523,8 @@ fn build_router(
                 runner_override: None,
             };
 
-            ig.lock()
+            ig.create_session(session.clone())
                 .await
-                .create_session(&session)
                 .map_err(|e| ingot_err(&e))?;
 
             // Auto-index: check workspace.toml in cwd; if stale, index in background.
@@ -1484,11 +617,11 @@ fn build_router(
     });
 
     // ── session.list ────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("session.list", move |_| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
-            let sessions = ig.lock().await.list_sessions().map_err(|e| ingot_err(&e))?;
+            let sessions = ig.list_sessions().await.map_err(|e| ingot_err(&e))?;
             let out: Vec<Value> = sessions
                 .into_iter()
                 .map(|s| {
@@ -1506,9 +639,9 @@ fn build_router(
     });
 
     // ── session.get ─────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("session.get", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let id = params
                 .get("id")
@@ -1516,9 +649,8 @@ fn build_router(
                 .ok_or_else(|| missing_param("id"))?;
 
             let session = ig
-                .lock()
-                .await
                 .get_session(id)
+                .await
                 .map_err(|e| ingot_err(&e))?
                 .ok_or_else(|| {
                     RpcError::new(codes::INTERNAL_ERROR, format!("session not found: {id}"))
@@ -1537,27 +669,26 @@ fn build_router(
     });
 
     // ── session.delete ──────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("session.delete", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let id = params
                 .get("id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| missing_param("id"))?;
 
-            ig.lock()
+            ig.delete_session(id)
                 .await
-                .delete_session(id)
                 .map_err(|e| ingot_err(&e))?;
             Ok(Value::Bool(true))
         }
     });
 
     // ── session.fork ────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("session.fork", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let session_id = params
                 .get("session_id")
@@ -1569,9 +700,8 @@ fn build_router(
             // concurrent RPC handlers (including turn.subscribe's polling loop)
             // are not serialised behind the entire fork sequence.
             let parent = {
-                let guard = ig.lock().await;
-                guard
-                    .get_session(&session_id)
+                ig.get_session(&session_id)
+                    .await
                     .map_err(|e| ingot_err(&e))?
                     .ok_or_else(|| {
                         RpcError::new(
@@ -1582,9 +712,8 @@ fn build_router(
             };
 
             let latest_cp = {
-                let guard = ig.lock().await;
-                guard
-                    .latest_checkpoint(&session_id)
+                ig.latest_checkpoint(&session_id)
+                    .await
                     .map_err(|e| ingot_err(&e))?
             };
 
@@ -1592,9 +721,7 @@ fn build_router(
             let new_id = Uuid::new_v4().to_string();
 
             {
-                let mut guard = ig.lock().await;
-                guard
-                    .create_session(&Session {
+                ig.create_session(Session {
                         id: Uuid::parse_str(&new_id).map_err(|e| {
                             RpcError::new(codes::INTERNAL_ERROR, format!("uuid error: {e}"))
                         })?,
@@ -1609,20 +736,20 @@ fn build_router(
                         model_override: parent.model_override.clone(),
                         runner_override: None,
                     })
+                    .await
                     .map_err(|e| ingot_err(&e))?;
             }
 
             let has_checkpoint = latest_cp.is_some();
             if let Some(cp) = latest_cp {
-                let mut guard = ig.lock().await;
-                guard
-                    .save_checkpoint(&Checkpoint {
+                ig.save_checkpoint(Checkpoint {
                         id: Uuid::new_v4(),
                         session_id: new_id.clone(),
                         turn_n: cp.turn_n,
                         messages_json: cp.messages_json,
                         created_at: now,
                     })
+                    .await
                     .map_err(|e| ingot_err(&e))?;
             }
 
@@ -1638,9 +765,9 @@ fn build_router(
     // Blocks until the named task reaches a terminal status (complete / failed)
     // or a 60-second deadline expires.  Returns a single response envelope so
     // callers do not need to poll task.get in a loop.
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("turn.subscribe", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let task_id = params
                 .get("task_id")
@@ -1651,8 +778,7 @@ fn build_router(
             let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
             loop {
                 let task = {
-                    let guard = ig.lock().await;
-                    guard.get_task(&task_id).map_err(|e| ingot_err(&e))?
+                    ig.get_task(&task_id).await.map_err(|e| ingot_err(&e))?
                 };
                 match task {
                     None => {
@@ -1665,7 +791,7 @@ fn build_router(
                         // Best-effort: look up the latest token snapshot for
                         // this task's session so the TUI can display counts.
                         let (input_tok, output_tok) = if let Some(ref sid) = t.session_id {
-                            ig.lock().await.session_token_snapshots(sid).map_or(
+                            ig.session_token_snapshots(sid).await.map_or(
                                 (0i64, 0i64),
                                 |snaps| {
                                     snaps
@@ -1706,9 +832,9 @@ fn build_router(
     });
 
     // ── task.get ────────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("task.get", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let id = params
                 .get("id")
@@ -1716,9 +842,8 @@ fn build_router(
                 .ok_or_else(|| missing_param("id"))?;
 
             let task = ig
-                .lock()
-                .await
                 .get_task(id)
+                .await
                 .map_err(|e| ingot_err(&e))?
                 .ok_or_else(|| {
                     RpcError::new(codes::INTERNAL_ERROR, format!("task not found: {id}"))
@@ -1734,15 +859,14 @@ fn build_router(
     });
 
     // ── task.list ───────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("task.list", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
-            let status = params.get("status").and_then(Value::as_str);
+            let status = params.get("status").and_then(Value::as_str).map(str::to_owned);
             let tasks = ig
-                .lock()
-                .await
                 .list_tasks(status)
+                .await
                 .map_err(|e| ingot_err(&e))?;
             let out: Vec<Value> = tasks
                 .iter()
@@ -1761,9 +885,9 @@ fn build_router(
     });
 
     // ── task.create ─────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("task.create", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let title = params
                 .get("title")
@@ -1788,26 +912,24 @@ fn build_router(
                 session_id,
                 response: None,
             };
-            ig.lock()
+            ig.create_task(task.clone())
                 .await
-                .create_task(&task)
                 .map_err(|e| ingot_err(&e))?;
             Ok(json!({ "id": task.id, "status": task.status }))
         }
     });
 
     // ── task.close ──────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("task.close", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let id = params
                 .get("id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| missing_param("id"))?;
-            ig.lock()
+            ig.update_task_status(id, "complete")
                 .await
-                .update_task_status(id, "complete")
                 .map_err(|e| ingot_err(&e))?;
             Ok(json!({ "id": id, "status": "complete" }))
         }
@@ -1817,9 +939,9 @@ fn build_router(
     // Clone dispatcher before turn.submit moves it, so loop.run can hold its
     // own Arc without requiring a second clone point after the move.
     let dispatcher_loop_run = Arc::clone(&dispatcher);
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("turn.submit", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         let dispatcher = Arc::clone(&dispatcher);
         async move {
             let session_id = params
@@ -1844,9 +966,8 @@ fn build_router(
                 response: None,
             };
 
-            ig.lock()
+            ig.create_task(task.clone())
                 .await
-                .create_task(&task)
                 .map_err(|e| ingot_err(&e))?;
 
             // Extract current span IDs for turn start event correlation.
@@ -1880,18 +1001,17 @@ fn build_router(
     });
 
     // ── session.checkpoint.list ─────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("session.checkpoint.list", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let session_id = params
                 .get("session_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| missing_param("session_id"))?;
             let cps = ig
-                .lock()
-                .await
                 .list_checkpoints(session_id)
+                .await
                 .map_err(|e| ingot_err(&e))?;
             let out: Vec<Value> = cps
                 .iter()
@@ -1907,9 +1027,9 @@ fn build_router(
     });
 
     // ── session.rollback ────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("session.rollback", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let session_id = params
                 .get("session_id")
@@ -1930,9 +1050,8 @@ fn build_router(
             // Atomically load the target checkpoint and prune all later checkpoints
             // for this session in a single SQLite transaction.
             let cp = ig
-                .lock()
-                .await
                 .rollback_session(&session_id, turn_n_u32)
+                .await
                 .map_err(|e| ingot_err(&e))?;
 
             match cp {
@@ -1948,11 +1067,11 @@ fn build_router(
     });
 
     // ── session.compact ──────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     let compact_pool = Arc::clone(&provider_pool);
     let vault_compact = Arc::clone(&vault);
     router.register("session.compact", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         let pool = Arc::clone(&compact_pool);
         let vt = Arc::clone(&vault_compact);
         async move {
@@ -1964,9 +1083,8 @@ fn build_router(
 
             // Load latest checkpoint for conversation history.
             let messages_json = {
-                let guard = ig.lock().await;
-                guard
-                    .latest_checkpoint(&session_id)
+                ig.latest_checkpoint(&session_id)
+                    .await
                     .map_err(|e| ingot_err(&e))?
                     .map_or_else(|| "[]".to_owned(), |cp| cp.messages_json)
             };
@@ -2008,9 +1126,8 @@ fn build_router(
 
             // Save pre-compaction checkpoint tagged with turn_n = -1.
             let turn_count = {
-                let guard = ig.lock().await;
-                guard
-                    .list_checkpoints(&session_id)
+                ig.list_checkpoints(&session_id)
+                    .await
                     .map_or(0i64, |v| i64::try_from(v.len()).unwrap_or(i64::MAX))
             };
             let cp = Checkpoint {
@@ -2021,8 +1138,7 @@ fn build_router(
                 created_at: now_epoch(),
             };
             {
-                let mut guard = ig.lock().await;
-                if let Err(e) = guard.save_checkpoint(&cp) {
+                if let Err(e) = ig.save_checkpoint(cp).await {
                     warn!(error = %e, "failed to save pre-compaction checkpoint");
                 }
             }
@@ -2062,18 +1178,17 @@ fn build_router(
     });
 
     // ── session.token_usage ──────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("session.token_usage", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let session_id = params
                 .get("session_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| missing_param("session_id"))?;
             let snaps = ig
-                .lock()
-                .await
                 .session_token_snapshots(session_id)
+                .await
                 .map_err(|e| ingot_err(&e))?;
             let rows: Vec<Value> = snaps
                 .iter()
@@ -2092,20 +1207,21 @@ fn build_router(
     });
 
     // ── session.cost ────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("session.cost", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let session_id = params
                 .get("session_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| missing_param("session_id"))?;
-            let ig_guard = ig.lock().await;
-            let total_usd = ig_guard
+            let total_usd = ig
                 .session_cost(session_id)
+                .await
                 .map_err(|e| ingot_err(&e))?;
-            let rows: Vec<CostRow> = ig_guard
+            let rows: Vec<CostRow> = ig
                 .session_cost_entries(session_id)
+                .await
                 .map_err(|e| ingot_err(&e))?;
             let breakdown: Vec<Value> = rows
                 .into_iter()
@@ -2129,9 +1245,9 @@ fn build_router(
     });
 
     // ── session.set_model ────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("session.set_model", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let session_id = params["session_id"]
                 .as_str()
@@ -2141,18 +1257,17 @@ fn build_router(
                 .as_str()
                 .ok_or_else(|| missing_param("model"))?
                 .to_owned();
-            ig.lock()
+            ig.update_session_model_override(&session_id, &model)
                 .await
-                .update_session_model_override(&session_id, &model)
                 .map_err(|e| ingot_err(&e))?;
             Ok(json!({ "session_id": session_id, "model": model }))
         }
     });
 
     // ── session.set_runner ───────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("session.set_runner", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let session_id = params["session_id"]
                 .as_str()
@@ -2171,9 +1286,8 @@ fn build_router(
                         format!("unknown runner: {runner_str}; valid: claude, codex, local, copilot"),
                     )
                 })?;
-            ig.lock()
+            ig.update_session_runner_override(&session_id, canonical)
                 .await
-                .update_session_runner_override(&session_id, canonical)
                 .map_err(|e| ingot_err(&e))?;
             Ok(json!({ "session_id": session_id, "runner": canonical }))
         }
@@ -2183,10 +1297,10 @@ fn build_router(
     // Forks the current session onto a new runner in one atomic operation:
     // creates a new session, copies the latest checkpoint, and sets the
     // runner_override so the next turn routes to the requested runner.
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     let vault_takeover = Arc::clone(&vault);
     router.register("session.takeover", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         let vt = Arc::clone(&vault_takeover);
         async move {
             let session_id = params["session_id"]
@@ -2208,9 +1322,8 @@ fn build_router(
                 })?;
 
             let parent = {
-                let guard = ig.lock().await;
-                guard
-                    .get_session(&session_id)
+                ig.get_session(&session_id)
+                    .await
                     .map_err(|e| ingot_err(&e))?
                     .ok_or_else(|| {
                         RpcError::new(
@@ -2221,9 +1334,8 @@ fn build_router(
             };
 
             let latest_cp = {
-                let guard = ig.lock().await;
-                guard
-                    .latest_checkpoint(&session_id)
+                ig.latest_checkpoint(&session_id)
+                    .await
                     .map_err(|e| ingot_err(&e))?
             };
 
@@ -2231,9 +1343,7 @@ fn build_router(
             let new_id = Uuid::new_v4().to_string();
 
             {
-                let mut guard = ig.lock().await;
-                guard
-                    .create_session(&Session {
+                ig.create_session(Session {
                         id: Uuid::parse_str(&new_id).map_err(|e| {
                             RpcError::new(codes::INTERNAL_ERROR, format!("uuid error: {e}"))
                         })?,
@@ -2248,21 +1358,21 @@ fn build_router(
                         model_override: parent.model_override.clone(),
                         runner_override: Some(canonical.to_owned()),
                     })
+                    .await
                     .map_err(|e| ingot_err(&e))?;
             }
 
             let has_checkpoint = latest_cp.is_some();
             let handoff_context_id = format!("handoff:{session_id}:{new_id}");
             if let Some(cp) = latest_cp {
-                let mut guard = ig.lock().await;
-                guard
-                    .save_checkpoint(&Checkpoint {
+                ig.save_checkpoint(Checkpoint {
                         id: Uuid::new_v4(),
                         session_id: new_id.clone(),
                         turn_n: cp.turn_n,
                         messages_json: cp.messages_json.clone(),
                         created_at: now,
                     })
+                    .await
                     .map_err(|e| ingot_err(&e))?;
 
                 // Fire-and-forget vault write so the receiving session can retrieve
@@ -2322,11 +1432,11 @@ fn build_router(
     });
 
     // ── session.context ─────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     let pt = Arc::clone(&price_table);
     let vault_ctx = Arc::clone(&vault);
     router.register("session.context", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         let pt = Arc::clone(&pt);
         let vt = Arc::clone(&vault_ctx);
         async move {
@@ -2334,16 +1444,17 @@ fn build_router(
                 .get("session_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| missing_param("session_id"))?;
-            let ig_guard = ig.lock().await;
-            let snaps = ig_guard
+            let snaps = ig
                 .session_token_snapshots(session_id)
+                .await
                 .map_err(|e| ingot_err(&e))?;
             let (cumulative_input, cumulative_output) = snaps
                 .last()
                 .map_or((0i64, 0i64), |s| (s.cumulative_input, s.cumulative_output));
             let used_tok = cumulative_input.saturating_add(cumulative_output);
-            let model = ig_guard
+            let model = ig
                 .session_last_model(session_id)
+                .await
                 .map_err(|e| ingot_err(&e))?
                 .unwrap_or_default();
             let window_tok = u64::from(pt.context_window(&model));
@@ -2368,10 +1479,10 @@ fn build_router(
     });
 
     // ── cowork.set ──────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     let gates_set = Arc::clone(&gates);
     router.register("cowork.set", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         let gates = Arc::clone(&gates_set);
         async move {
             let session_id = params
@@ -2383,9 +1494,8 @@ fn build_router(
                 .get("enabled")
                 .and_then(Value::as_bool)
                 .ok_or_else(|| missing_param("enabled"))?;
-            ig.lock()
+            ig.set_cowork_mode(&session_id, enabled)
                 .await
-                .set_cowork_mode(&session_id, enabled)
                 .map_err(|e| ingot_err(&e))?;
 
             // Manage the per-session gate.
@@ -2402,9 +1512,9 @@ fn build_router(
     });
 
     // ── session.set_mode ────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("session.set_mode", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let session_id = params
                 .get("session_id")
@@ -2418,9 +1528,8 @@ fn build_router(
                 .to_owned();
             // Prevent escalation out of read-only review sessions.
             let existing_session = ig
-                .lock()
-                .await
                 .get_session(&session_id)
+                .await
                 .map_err(|e| ingot_err(&e))?;
             if let Some(existing_session) = existing_session {
                 if existing_session.mode.as_deref() == Some("review") {
@@ -2430,18 +1539,17 @@ fn build_router(
                     ));
                 }
             }
-            ig.lock()
+            ig.update_session_mode(&session_id, &mode)
                 .await
-                .update_session_mode(&session_id, &mode)
                 .map_err(|e| ingot_err(&e))?;
             Ok(json!({ "session_id": session_id, "mode": mode }))
         }
     });
 
     // ── mcp.register ────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("mcp.register", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let name = params
                 .get("name")
@@ -2469,23 +1577,21 @@ fn build_router(
                 tools_json: "[]".into(),
                 last_refresh: 0.0,
             };
-            ig.lock()
+            ig.register_mcp_server(server.clone())
                 .await
-                .register_mcp_server(&server)
                 .map_err(|e| ingot_err(&e))?;
             Ok(json!({ "id": server.id }))
         }
     });
 
     // ── mcp.list ────────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("mcp.list", move |_: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let servers = ig
-                .lock()
-                .await
                 .list_mcp_servers()
+                .await
                 .map_err(|e| ingot_err(&e))?;
             let out: Vec<Value> = servers
                 .iter()
@@ -2629,11 +1735,11 @@ fn build_router(
     });
 
     // ── task.parallel ────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     let vault_parallel = Arc::clone(&vault);
     router.register("task.parallel", move |params: Value| {
         let pool = Arc::clone(&pool);
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         let vt = Arc::clone(&vault_parallel);
         async move {
             let session_id = params["session_id"].as_str().map(str::to_owned);
@@ -2670,10 +1776,9 @@ fn build_router(
 
             // Enforce MAX_ROLE_DEPTH: reject any role that tries to resume a session at depth ≥ 4.
             {
-                let guard = ig.lock().await;
                 for role in &loop_roles {
                     if let Some(ref resume_sid) = role.resume_session_id {
-                        let cps = guard.list_checkpoints(resume_sid).unwrap_or_default();
+                        let cps = ig.list_checkpoints(resume_sid).await.unwrap_or_default();
                         let depth = cps.iter().filter(|cp| cp.turn_n == -1).count();
                         #[allow(clippy::cast_possible_truncation)]
                         if depth as u8 >= smedja_assayer::MAX_ROLE_DEPTH {
@@ -2696,9 +1801,8 @@ fn build_router(
                 std::env::var("SMEDJA_WORKSPACE").map_or_else(|_| PathBuf::from("."), PathBuf::from)
             };
             let workspace_root = if let Some(ref sid) = session_id {
-                ig.lock()
+                ig.get_session(sid)
                     .await
-                    .get_session(sid)
                     .ok()
                     .flatten()
                     .and_then(|s| s.workspace_root)
@@ -2732,7 +1836,7 @@ fn build_router(
             // agents can retrieve shared context via smedja_vault_search.
             let fan_out_id = Uuid::new_v4().to_string();
             if let Some(ref sid) = session_id {
-                let checkpoints = ig.lock().await.list_checkpoints(sid).unwrap_or_default();
+                let checkpoints = ig.list_checkpoints(sid).await.unwrap_or_default();
                 const WARM_WINDOW: usize = 5;
                 let recent: Vec<_> = checkpoints
                     .into_iter()
@@ -2808,26 +1912,25 @@ fn build_router(
     });
 
     // ── mcp.remove ───────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("mcp.remove", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let name = params["name"]
                 .as_str()
                 .ok_or_else(|| missing_param("name"))?
                 .to_owned();
-            ig.lock()
+            ig.remove_mcp_server(&name)
                 .await
-                .remove_mcp_server(&name)
                 .map_err(|e| ingot_err(&e))?;
             Ok(json!({ "name": name, "removed": true }))
         }
     });
 
     // ── mcp.refresh ──────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("mcp.refresh", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let name_filter: Option<String> = params
                 .get("name")
@@ -2836,9 +1939,9 @@ fn build_router(
 
             // Load the candidate servers — all registered, or the named one.
             let servers = {
-                let ig = ig.lock().await;
                 let all = ig
                     .list_mcp_servers()
+                    .await
                     .map_err(|e| ingot_err(&e))?;
                 match name_filter {
                     Some(ref name) => all
@@ -2867,8 +1970,7 @@ fn build_router(
                             last_refresh: now_epoch(),
                             ..server.clone()
                         };
-                        let mut ig = ig.lock().await;
-                        let _ = ig.register_mcp_server(&updated);
+                        let _ = ig.register_mcp_server(updated).await;
                         refreshed += 1;
                     }
                     Err(e) => {
@@ -2882,9 +1984,9 @@ fn build_router(
     });
 
     // ── loop.create ──────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("loop.create", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let change_name = params["change_name"]
                 .as_str()
@@ -2901,27 +2003,25 @@ fn build_router(
                 updated_at: now,
             };
             let loop_id = rec.id.clone();
-            ig.lock()
+            ig.create_loop(rec)
                 .await
-                .create_loop(&rec)
                 .map_err(|e| ingot_err(&e))?;
             Ok(json!({ "loop_id": loop_id }))
         }
     });
 
     // ── loop.status ──────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("loop.status", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let loop_id = params["loop_id"]
                 .as_str()
                 .ok_or_else(|| missing_param("loop_id"))?
                 .to_owned();
             let rec = ig
-                .lock()
-                .await
                 .get_loop(&loop_id)
+                .await
                 .map_err(|e| ingot_err(&e))?
                 .ok_or_else(|| {
                     RpcError::new(codes::INVALID_PARAMS, format!("loop not found: {loop_id}"))
@@ -2931,35 +2031,33 @@ fn build_router(
     });
 
     // ── loop.cancel ──────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("loop.cancel", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let loop_id = params["loop_id"]
                 .as_str()
                 .ok_or_else(|| missing_param("loop_id"))?
                 .to_owned();
-            ig.lock()
+            ig.update_loop_status(&loop_id, "cancelled", now_epoch())
                 .await
-                .update_loop_status(&loop_id, "cancelled", now_epoch())
                 .map_err(|e| ingot_err(&e))?;
             Ok(json!({ "loop_id": loop_id, "status": "cancelled" }))
         }
     });
 
     // ── loop.list ────────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("loop.list", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let change_name = params["change_name"]
                 .as_str()
                 .ok_or_else(|| missing_param("change_name"))?
                 .to_owned();
             let loops = ig
-                .lock()
-                .await
                 .list_loops(&change_name)
+                .await
                 .map_err(|e| ingot_err(&e))?;
             let loops_json: Vec<Value> = loops
                 .into_iter()
@@ -2970,18 +2068,17 @@ fn build_router(
     });
 
     // ── loop.retire ──────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("loop.retire", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let loop_id = params["loop_id"]
                 .as_str()
                 .ok_or_else(|| missing_param("loop_id"))?
                 .to_owned();
             let rec = ig
-                .lock()
-                .await
                 .get_loop(&loop_id)
+                .await
                 .map_err(|e| ingot_err(&e))?
                 .ok_or_else(|| {
                     RpcError::new(codes::INVALID_PARAMS, format!("loop not found: {loop_id}"))
@@ -2996,24 +2093,22 @@ fn build_router(
                     ),
                 ));
             }
-            ig.lock()
+            ig.update_loop_status(&loop_id, "retired", now_epoch())
                 .await
-                .update_loop_status(&loop_id, "retired", now_epoch())
                 .map_err(|e| ingot_err(&e))?;
             Ok(json!({ "loop_id": loop_id, "status": "retired" }))
         }
     });
 
     // ── loop.list_by_status ──────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("loop.list_by_status", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let status = params["status"].as_str().map(str::to_owned);
             let loops = ig
-                .lock()
+                .list_loops_by_status(status)
                 .await
-                .list_loops_by_status(status.as_deref())
                 .map_err(|e| ingot_err(&e))?;
             let loops_json: Vec<Value> = loops
                 .into_iter()
@@ -3024,18 +2119,17 @@ fn build_router(
     });
 
     // ── audit.list ───────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     router.register("audit.list", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         async move {
             let session_id = params["session_id"]
                 .as_str()
                 .ok_or_else(|| missing_param("session_id"))?
                 .to_owned();
             let events = ig
-                .lock()
-                .await
                 .list_audit_events(&session_id)
+                .await
                 .map_err(|e| ingot_err(&e))?;
             let events_json: Vec<Value> = events
                 .into_iter()
@@ -3046,10 +2140,10 @@ fn build_router(
     });
 
     // ── loop.run ────────────────────────────────────────────────────────────
-    let ig = Arc::clone(ingot);
+    let ig = ingot.clone();
     let gates_run = Arc::clone(&gates);
     router.register("loop.run", move |params: Value| {
-        let ig = Arc::clone(&ig);
+        let ig = ig.clone();
         let dispatcher = Arc::clone(&dispatcher_loop_run);
         let _gates = Arc::clone(&gates_run);
         async move {
@@ -3060,9 +2154,8 @@ fn build_router(
 
             // Verify the loop record exists before spawning background work.
             let rec = ig
-                .lock()
-                .await
                 .get_loop(&loop_id)
+                .await
                 .map_err(|e| ingot_err(&e))?
                 .ok_or_else(|| {
                     RpcError::new(codes::INVALID_PARAMS, format!("loop not found: {loop_id}"))
@@ -3082,7 +2175,7 @@ fn build_router(
             }
 
             // Spawn background task — caller gets an immediate response.
-            let bg_ig = Arc::clone(&ig);
+            let bg_ig = ig.clone();
             let bg_dispatcher = Arc::clone(&dispatcher);
             let bg_loop_id = loop_id.clone();
             let change_name = rec.change_name.clone();
@@ -3097,9 +2190,8 @@ fn build_router(
                 let Ok(tasks_content) = tokio::fs::read_to_string(&tasks_path).await else {
                     let _ =
                         bg_ig
-                            .lock()
-                            .await
-                            .update_loop_status(&bg_loop_id, "failed", now_epoch());
+                            .update_loop_status(&bg_loop_id, "failed", now_epoch())
+                            .await;
                     return;
                 };
 
@@ -3113,16 +2205,14 @@ fn build_router(
                 if pending.is_empty() {
                     let _ =
                         bg_ig
-                            .lock()
-                            .await
-                            .update_loop_status(&bg_loop_id, "complete", now_epoch());
+                            .update_loop_status(&bg_loop_id, "complete", now_epoch())
+                            .await;
                     return;
                 }
 
                 // Mark loop as slicing.
                 {
-                    let mut guard = bg_ig.lock().await;
-                    let _ = guard.update_loop_status(&bg_loop_id, "slicing", now_epoch());
+                    let _ = bg_ig.update_loop_status(&bg_loop_id, "slicing", now_epoch()).await;
                 }
 
                 // Create one session for this loop run.
@@ -3142,8 +2232,7 @@ fn build_router(
                     runner_override: None,
                 };
                 {
-                    let mut guard = bg_ig.lock().await;
-                    let _ = guard.create_session(&session);
+                    let _ = bg_ig.create_session(session).await;
                 }
 
                 // Submit one turn per pending task, poll until done, then mark checkbox.
@@ -3161,8 +2250,7 @@ fn build_router(
                     };
 
                     {
-                        let mut guard = bg_ig.lock().await;
-                        let _ = guard.create_task(&task);
+                        let _ = bg_ig.create_task(task.clone()).await;
                     }
 
                     // Extract current span IDs for loop turn start event correlation.
@@ -3195,9 +2283,8 @@ fn build_router(
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                         let status = bg_ig
-                            .lock()
-                            .await
                             .get_task(&task_id.to_string())
+                            .await
                             .ok()
                             .flatten()
                             .map_or_else(|| "unknown".to_owned(), |t| t.status);
@@ -3217,9 +2304,8 @@ fn build_router(
                     let slice_count = (slice_idx + 1) as i64;
                     let _ =
                         bg_ig
-                            .lock()
-                            .await
-                            .update_loop_slice(&bg_loop_id, slice_count, now_epoch());
+                            .update_loop_slice(&bg_loop_id, slice_count, now_epoch())
+                            .await;
                 }
 
                 // Write updated tasks.md back to disk.
@@ -3227,9 +2313,8 @@ fn build_router(
 
                 // Mark loop complete.
                 let _ = bg_ig
-                    .lock()
-                    .await
-                    .update_loop_status(&bg_loop_id, "complete", now_epoch());
+                    .update_loop_status(&bg_loop_id, "complete", now_epoch())
+                    .await;
             });
 
             Ok(json!({ "loop_id": loop_id, "status": "slicing" }))
@@ -3328,13 +2413,12 @@ async fn main() -> anyhow::Result<()> {
     info!(path = %path.display(), "smdjad listening");
 
     let ingot = open_ingot()?;
-    let ingot = Arc::new(Mutex::new(ingot));
+    let ingot = IngotHandle::new(ingot);
 
     // Detect sessions left in_flight by a prior crash.
     {
-        let mut ig = ingot.lock().await;
         // ponytail: linear scan; session counts are small
-        match ig.list_sessions() {
+        match ingot.list_sessions().await {
             Ok(sessions) => {
                 let orphaned: Vec<_> = sessions
                     .into_iter()
@@ -3347,15 +2431,16 @@ async fn main() -> anyhow::Result<()> {
                     );
                     for sess in &orphaned {
                         let sid = sess.id.to_string();
-                        let _ = ig.update_session_status(&sid, "orphaned");
+                        let _ = ingot.update_session_status(&sid, "orphaned").await;
 
                         // Also fail any in_progress tasks owned by this session.
-                        match ig.list_tasks(Some("in_progress")) {
+                        match ingot.list_tasks(Some("in_progress".to_owned())).await {
                             Ok(tasks) => {
                                 for task in tasks {
                                     if task.session_id.as_deref() == Some(sid.as_str()) {
-                                        let _ =
-                                            ig.update_task_status(&task.id.to_string(), "failed");
+                                        let _ = ingot
+                                            .update_task_status(&task.id.to_string(), "failed")
+                                            .await;
                                     }
                                 }
                             }
@@ -3374,9 +2459,8 @@ async fn main() -> anyhow::Result<()> {
     {
         let stale_threshold = now_epoch() - 3600.0;
         let servers = ingot
-            .lock()
-            .await
             .list_mcp_servers()
+            .await
             .unwrap_or_default()
             .into_iter()
             .filter(|s| s.last_refresh < stale_threshold)
@@ -3393,8 +2477,7 @@ async fn main() -> anyhow::Result<()> {
                             last_refresh: now_epoch(),
                             ..server.clone()
                         };
-                        let mut ig = ingot.lock().await;
-                        if let Err(e) = ig.register_mcp_server(&updated) {
+                        if let Err(e) = ingot.register_mcp_server(updated).await {
                             tracing::warn!(name = %server.name, error = %e, "failed to update MCP tools at startup");
                         }
                     }
@@ -3453,7 +2536,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let turn_handles = spawn_worker(
-        Arc::clone(&ingot),
+        ingot.clone(),
         Arc::clone(&dispatcher),
         Arc::clone(&gates),
         Arc::clone(&pool),
@@ -3469,7 +2552,7 @@ async fn main() -> anyhow::Result<()> {
             let acp_token = uuid::Uuid::new_v4().to_string();
             write_acp_secret(&acp_token);
             let acp_state = acp::AcpState {
-                ingot: Arc::clone(&ingot),
+                ingot: ingot.clone(),
                 dispatcher: Arc::clone(&dispatcher),
                 auth_token: acp_token,
             };
@@ -3796,88 +2879,78 @@ mod tests {
 
     #[tokio::test]
     async fn session_set_runner_stores_canonical_key() {
-        use smedja_ingot::{Ingot, Session};
+        use smedja_ingot::{Ingot, IngotHandle, Session};
         use uuid::Uuid;
 
-        let ig = Arc::new(Mutex::new(Ingot::open_in_memory().unwrap()));
+        let ig = IngotHandle::new(Ingot::open_in_memory().unwrap());
         let session_id = Uuid::new_v4().to_string();
         let now = 1_700_000_000.0_f64;
-        {
-            let mut guard = ig.lock().await;
-            guard
-                .create_session(&Session {
-                    id: Uuid::parse_str(&session_id).unwrap(),
-                    created_at: now,
-                    updated_at: now,
-                    status: "active".into(),
-                    task_id: None,
-                    mode: None,
-                    title: String::new(),
-                    cowork_mode: false,
-                    workspace_root: None,
-                    model_override: None,
-                    runner_override: None,
-                })
-                .unwrap();
-        }
-        ig.lock()
+        ig.create_session(Session {
+            id: Uuid::parse_str(&session_id).unwrap(),
+            created_at: now,
+            updated_at: now,
+            status: "active".into(),
+            task_id: None,
+            mode: None,
+            title: String::new(),
+            cowork_mode: false,
+            workspace_root: None,
+            model_override: None,
+            runner_override: None,
+        })
+        .await
+        .unwrap();
+        ig.update_session_runner_override(&session_id, "codex-cli")
             .await
-            .update_session_runner_override(&session_id, "codex-cli")
             .unwrap();
-        let fetched = ig.lock().await.get_session(&session_id).unwrap().unwrap();
+        let fetched = ig.get_session(&session_id).await.unwrap().unwrap();
         assert_eq!(fetched.runner_override.as_deref(), Some("codex-cli"));
     }
 
     #[tokio::test]
     async fn session_takeover_forks_with_runner_override() {
-        use smedja_ingot::{Ingot, Session};
+        use smedja_ingot::{Ingot, IngotHandle, Session};
         use uuid::Uuid;
 
-        let ig = Arc::new(Mutex::new(Ingot::open_in_memory().unwrap()));
+        let ig = IngotHandle::new(Ingot::open_in_memory().unwrap());
         let parent_id = Uuid::new_v4().to_string();
         let now = 1_700_000_000.0_f64;
-        {
-            let mut guard = ig.lock().await;
-            guard
-                .create_session(&Session {
-                    id: Uuid::parse_str(&parent_id).unwrap(),
-                    created_at: now,
-                    updated_at: now,
-                    status: "active".into(),
-                    task_id: None,
-                    mode: Some("impl".into()),
-                    title: String::new(),
-                    cowork_mode: false,
-                    workspace_root: None,
-                    model_override: None,
-                    runner_override: None,
-                })
-                .unwrap();
-        }
+        ig.create_session(Session {
+            id: Uuid::parse_str(&parent_id).unwrap(),
+            created_at: now,
+            updated_at: now,
+            status: "active".into(),
+            task_id: None,
+            mode: Some("impl".into()),
+            title: String::new(),
+            cowork_mode: false,
+            workspace_root: None,
+            model_override: None,
+            runner_override: None,
+        })
+        .await
+        .unwrap();
 
         // Simulate takeover: fork then set runner_override.
         let new_id = Uuid::new_v4().to_string();
-        let parent = ig.lock().await.get_session(&parent_id).unwrap().unwrap();
-        {
-            let mut guard = ig.lock().await;
-            guard
-                .create_session(&Session {
-                    id: Uuid::parse_str(&new_id).unwrap(),
-                    created_at: now + 1.0,
-                    updated_at: now + 1.0,
-                    status: "active".into(),
-                    task_id: None,
-                    mode: parent.mode.clone(),
-                    title: parent.title.clone(),
-                    cowork_mode: parent.cowork_mode,
-                    workspace_root: parent.workspace_root.clone(),
-                    model_override: parent.model_override.clone(),
-                    runner_override: Some("codex-cli".into()),
-                })
-                .unwrap();
-        }
+        let parent = ig.get_session(&parent_id).await.unwrap().unwrap();
+        ig.create_session(Session {
+            id: Uuid::parse_str(&new_id).unwrap(),
+            created_at: now + 1.0,
+            updated_at: now + 1.0,
+            status: "active".into(),
+            task_id: None,
+            mode: parent.mode.clone(),
+            title: parent.title.clone(),
+            cowork_mode: parent.cowork_mode,
+            workspace_root: parent.workspace_root.clone(),
+            model_override: parent.model_override.clone(),
+            runner_override: Some("codex-cli".into()),
+        })
+        .await
+        .unwrap();
 
-        let new_sess = ig.lock().await.get_session(&new_id).unwrap().unwrap();
+        let new_sess = ig.get_session(&new_id).await.unwrap().unwrap();
         assert_eq!(new_sess.runner_override.as_deref(), Some("codex-cli"));
         assert_eq!(new_sess.mode.as_deref(), Some("impl"));
     }
