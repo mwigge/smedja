@@ -812,6 +812,18 @@ impl Ingot {
         cost::session_cost_entries(&self.conn, session_id)
     }
 
+    /// Returns the model name from the most recent cost entry for `session_id`.
+    ///
+    /// Returns `None` when no cost entries exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result to determine the active model"]
+    pub fn session_last_model(&self, session_id: &str) -> Result<Option<String>, IngotError> {
+        cost::last_model(&self.conn, session_id)
+    }
+
     // JSONL export / import --------------------------------------------------
 
     /// Exports tasks and their associated audit events as a JSONL stream.

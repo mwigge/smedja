@@ -17,3 +17,12 @@
 "gpt-4o-mini"               = 0.60
 "gpt-4o"                    = 10.00
 "o3-mini"                   = 4.40
+
+# Context window sizes in tokens. Used by the TUI context rail.
+[windows]
+"claude-haiku-4-5-20251001" = 200000
+"claude-sonnet-4-6"         = 200000
+"claude-opus-4-8"           = 200000
+"gpt-4o-mini"               = 128000
+"gpt-4o"                    = 128000
+"o3-mini"                   = 200000

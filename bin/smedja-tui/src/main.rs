@@ -106,6 +106,10 @@ struct AppState {
     staging_queue: staging::StagingQueue,
     /// Whether the context rail sidebar is visible.
     context_rail_visible: bool,
+    /// Cumulative tokens used so far in this session (input + output).
+    context_used: u64,
+    /// Context window size in tokens for the active model.
+    context_window: u64,
     /// Main message display panel.
     main_panel: main_panel::MainPanel,
     /// Audit action log widget.
@@ -994,11 +998,12 @@ fn render(frame: &mut ratatui::Frame, state: &AppState) {
 
     // -- Context rail ---------------------------------------------------------
     if let Some(rail_rect) = rail_area {
-        // Build placeholder slots (real data wired when WorkingMemory is exposed).
+        // Clamp to usize::MAX — context windows are well within usize range on
+        // any 64-bit target, but the explicit clamp satisfies pedantic lints.
         let slots = vec![context_rail::ContextSlot {
             name: "context".into(),
-            used: 0,
-            total: 200_000,
+            used: usize::try_from(state.context_used).unwrap_or(usize::MAX),
+            total: usize::try_from(state.context_window).unwrap_or(usize::MAX),
         }];
         let rail = context_rail::ContextRail::new(slots);
         frame.render_widget(rail, rail_rect);
@@ -1174,6 +1179,8 @@ async fn main() -> Result<()> {
         diff_scroll: 0,
         staging_queue: staging::StagingQueue::new(),
         context_rail_visible: true,
+        context_used: 0,
+        context_window: 200_000,
         main_panel: main_panel::MainPanel::new(),
         action_log: action_log::ActionLog::new(50),
         slash_completions: Vec::new(),
@@ -1311,6 +1318,22 @@ async fn main() -> Result<()> {
                         state.last_poll = None;
                         state.turn_in_flight = false;
                         state.poll_retry_count = 0;
+
+                        // Refresh context rail from daemon after the turn completes.
+                        if let Ok(ctx) = client
+                            .call("session.context", json!({ "session_id": state.session_id }))
+                            .await
+                        {
+                            if let Some(used) = ctx["used_tok"].as_i64() {
+                                state.context_used =
+                                    u64::try_from(used.max(0)).unwrap_or(0);
+                            }
+                            if let Some(window) = ctx["window_tok"].as_u64() {
+                                if window > 0 {
+                                    state.context_window = window;
+                                }
+                            }
+                        }
                     }
                     Ok(_) => {
                         // turn.subscribe returned Ok but the response was not
@@ -1516,6 +1539,8 @@ mod tests {
             diff_scroll: 0,
             staging_queue: staging::StagingQueue::new(),
             context_rail_visible: true,
+            context_used: 0,
+            context_window: 200_000,
             main_panel: main_panel::MainPanel::new(),
             action_log: action_log::ActionLog::new(50),
             slash_completions: Vec::new(),
