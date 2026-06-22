@@ -292,4 +292,60 @@ mod tests {
         let found = ig.get_mcp_server_by_name("does-not-exist").unwrap();
         assert!(found.is_none());
     }
+
+    #[test]
+    fn find_mcp_server_for_tool_returns_owning_server() {
+        let mut ig = Ingot::open_in_memory().unwrap();
+        let s = McpServer {
+            tools_json: r#"[{"name":"echo","description":"Echo input","input_schema":{}}]"#
+                .into(),
+            ..server("echo-server")
+        };
+        ig.register_mcp_server(&s).unwrap();
+
+        let found = ig.find_mcp_server_for_tool("echo").unwrap();
+        assert!(found.is_some(), "must find the server that owns 'echo'");
+        assert_eq!(found.unwrap().name, "echo-server");
+    }
+
+    #[test]
+    fn find_mcp_server_for_tool_returns_none_when_tool_not_registered() {
+        let mut ig = Ingot::open_in_memory().unwrap();
+        let s = McpServer {
+            tools_json: r#"[{"name":"echo","description":"Echo"}]"#.into(),
+            ..server("echo-server")
+        };
+        ig.register_mcp_server(&s).unwrap();
+
+        let found = ig.find_mcp_server_for_tool("read_file").unwrap();
+        assert!(found.is_none(), "unregistered tool must return None");
+    }
+
+    #[test]
+    fn find_mcp_server_for_tool_returns_none_on_empty_registry() {
+        let ig = Ingot::open_in_memory().unwrap();
+        let found = ig.find_mcp_server_for_tool("any_tool").unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn find_mcp_server_for_tool_matches_across_multiple_servers() {
+        let mut ig = Ingot::open_in_memory().unwrap();
+        ig.register_mcp_server(&McpServer {
+            tools_json: r#"[{"name":"tool_a"}]"#.into(),
+            ..server("server-a")
+        })
+        .unwrap();
+        ig.register_mcp_server(&McpServer {
+            tools_json: r#"[{"name":"tool_b"}]"#.into(),
+            ..server("server-b")
+        })
+        .unwrap();
+
+        let found_a = ig.find_mcp_server_for_tool("tool_a").unwrap();
+        let found_b = ig.find_mcp_server_for_tool("tool_b").unwrap();
+
+        assert_eq!(found_a.unwrap().name, "server-a");
+        assert_eq!(found_b.unwrap().name, "server-b");
+    }
 }
