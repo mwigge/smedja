@@ -593,4 +593,25 @@ mod tests {
     fn fallback_text_maps_tier_local() {
         assert_eq!(fallback_text("smedja.tier.local"), "[local]");
     }
+
+    // pixel_size_to_grid boundary tests
+
+    #[test]
+    fn pixel_size_to_grid_zero_width_returns_minimum_one() {
+        let (cols, _rows) = pixel_size_to_grid(0, 600, 14.0);
+        assert_eq!(cols, 1, "zero width should clamp to minimum 1 col");
+    }
+
+    #[test]
+    fn pixel_size_to_grid_zero_height_returns_minimum_one() {
+        let (_cols, rows) = pixel_size_to_grid(800, 0, 14.0);
+        assert_eq!(rows, 1, "zero height should clamp to minimum 1 row");
+    }
+
+    #[test]
+    fn pixel_size_to_grid_zero_both_returns_one_one() {
+        let (cols, rows) = pixel_size_to_grid(0, 0, 14.0);
+        assert_eq!(cols, 1);
+        assert_eq!(rows, 1);
+    }
 }

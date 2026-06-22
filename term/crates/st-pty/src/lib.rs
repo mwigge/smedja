@@ -288,6 +288,12 @@ pub struct CellGrid {
     osc133_seen: bool,
     /// Monotonic line count since start (for heuristic timing).
     lines_since_start: u32,
+    /// Window title set via OSC 0 or OSC 2.
+    pub title: Option<String>,
+    /// Saved cursor position (ESC 7 / ESC 8 DEC save/restore).
+    pub cursor_saved: Option<(u16, u16)>,
+    /// Whether the cursor is visible (`true` by default; `?25l` hides it).
+    pub cursor_visible: bool,
 }
 
 impl CellGrid {
@@ -312,6 +318,9 @@ impl CellGrid {
             palette: DEFAULT_PALETTE,
             osc133_seen: false,
             lines_since_start: 0,
+            title: None,
+            cursor_saved: None,
+            cursor_visible: true,
         }
     }
 
@@ -684,16 +693,16 @@ impl vte::Perform for VtHandler {
                 apply_sgr(&mut grid, &p);
             }
             // ── Private mode (DEC) ───────────────────────────────────────────
-            'h' if intermediates == [b'?'] => {
-                if p.first().copied().unwrap_or(0) == 1049 {
-                    grid.enter_alt_screen();
-                }
-            }
-            'l' if intermediates == [b'?'] => {
-                if p.first().copied().unwrap_or(0) == 1049 {
-                    grid.leave_alt_screen();
-                }
-            }
+            'h' if intermediates == [b'?'] => match p.first().copied().unwrap_or(0) {
+                1049 => grid.enter_alt_screen(),
+                25 => grid.cursor_visible = true,
+                _ => {}
+            },
+            'l' if intermediates == [b'?'] => match p.first().copied().unwrap_or(0) {
+                1049 => grid.leave_alt_screen(),
+                25 => grid.cursor_visible = false,
+                _ => {}
+            },
             // ── Line delete / insert ─────────────────────────────────────────
             'L' => {
                 // Insert lines above cursor.
@@ -735,6 +744,12 @@ impl vte::Perform for VtHandler {
         }
         let command = std::str::from_utf8(params[0]).unwrap_or("");
         match command {
+            // OSC 0/2 — set window title and/or icon name.
+            "0" | "2" => {
+                if let Some(title) = params.get(1).and_then(|b| std::str::from_utf8(b).ok()) {
+                    grid.title = Some(title.to_owned());
+                }
+            }
             "8" => {
                 // OSC 8 ; params ; uri ST — hyperlink.
                 let uri = params.get(2).and_then(|b| std::str::from_utf8(b).ok());
@@ -804,7 +819,42 @@ impl vte::Perform for VtHandler {
     fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _c: char) {}
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
-    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
+
+    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+        let mut grid = self.grid.lock();
+        match byte {
+            b'7' => {
+                // DEC cursor save.
+                grid.cursor_saved = Some(grid.cursor);
+            }
+            b'8' => {
+                // DEC cursor restore.
+                if let Some(saved) = grid.cursor_saved {
+                    grid.cursor = saved;
+                }
+            }
+            b'D' => {
+                // Index: move cursor down one row, scroll if at last row.
+                let last_row = grid.rows.saturating_sub(1);
+                if grid.cursor.1 >= last_row {
+                    grid.scroll_up(1);
+                } else {
+                    grid.cursor.1 += 1;
+                }
+            }
+            b'M' => {
+                // Reverse Index: move cursor up one row, scroll down if at first row.
+                if grid.cursor.1 == 0 {
+                    grid.scroll_down(1);
+                } else {
+                    grid.cursor.1 -= 1;
+                }
+            }
+            _ => {
+                debug!("unhandled ESC: 0x{:02x}", byte);
+            }
+        }
+    }
 }
 
 /// Applies SGR parameters to the grid's current SGR state.
@@ -1457,5 +1507,290 @@ mod tests {
         assert!(parse_osc777("toast;oops").is_none());
         assert!(parse_osc777("").is_none());
         assert!(parse_osc777("notify;only-title").is_none());
+    }
+
+    // ── CellGrid::resize ──────────────────────────────────────────────────────
+
+    #[test]
+    fn resize_growing_preserves_content() {
+        let mut grid = make_grid(4, 4);
+        grid.cells[0][0].ch = 'X';
+        grid.resize(8, 8);
+        assert_eq!(grid.cols, 8);
+        assert_eq!(grid.rows, 8);
+        assert_eq!(grid.cells[0][0].ch, 'X');
+        assert_eq!(grid.cells.len(), 8);
+        assert_eq!(grid.cells[0].len(), 8);
+    }
+
+    #[test]
+    fn resize_shrinking_clips_content() {
+        let mut grid = make_grid(8, 8);
+        grid.cells[0][0].ch = 'A';
+        grid.resize(4, 4);
+        assert_eq!(grid.cols, 4);
+        assert_eq!(grid.rows, 4);
+        assert_eq!(grid.cells[0][0].ch, 'A');
+        assert_eq!(grid.cells.len(), 4);
+        assert_eq!(grid.cells[0].len(), 4);
+    }
+
+    #[test]
+    fn resize_clamps_cursor_to_new_bounds() {
+        let mut grid = make_grid(10, 10);
+        grid.cursor = (9, 9);
+        grid.resize(4, 4);
+        assert!(grid.cursor.0 < 4);
+        assert!(grid.cursor.1 < 4);
+    }
+
+    // ── scroll on last row ────────────────────────────────────────────────────
+
+    #[test]
+    fn newline_at_last_row_scrolls_without_panic() {
+        let grid = Arc::new(Mutex::new(make_grid(4, 3)));
+        let mut handler = VtHandler { grid: grid.clone() };
+        handler.execute(b'\n');
+        handler.execute(b'\n');
+        handler.execute(b'\n'); // cursor now at last row
+        handler.execute(b'\n'); // should scroll, not panic
+        let g = grid.lock();
+        assert!(g.cursor.1 < g.rows, "cursor.1 must be within grid bounds");
+    }
+
+    // ── VTE sequence dispatch ─────────────────────────────────────────────────
+
+    #[test]
+    fn vte_cursor_home_csi_h() {
+        let grid = Arc::new(Mutex::new(make_grid(20, 10)));
+        {
+            let mut g = grid.lock();
+            g.cursor = (10, 5);
+        }
+        let mut handler = VtHandler { grid: grid.clone() };
+        // \x1b[H — cursor home, no params → row=0, col=0
+        let params = vte::Params::default();
+        handler.csi_dispatch(&params, &[], false, 'H');
+        let g = grid.lock();
+        assert_eq!(g.cursor, (0, 0));
+    }
+
+    #[test]
+    fn vte_cursor_home_no_args() {
+        let grid = Arc::new(Mutex::new(make_grid(20, 10)));
+        {
+            let mut g = grid.lock();
+            g.cursor = (5, 3);
+        }
+        let mut handler = VtHandler { grid: grid.clone() };
+        let params = vte::Params::default();
+        handler.csi_dispatch(&params, &[], false, 'H');
+        let g = grid.lock();
+        assert_eq!(g.cursor, (0, 0));
+    }
+
+    #[test]
+    fn vte_delete_line_csi_m() {
+        let grid = Arc::new(Mutex::new(make_grid(10, 5)));
+        {
+            let mut g = grid.lock();
+            g.cells[2][0].ch = 'Z';
+            g.cursor = (0, 2);
+        }
+        let mut handler = VtHandler { grid: grid.clone() };
+        // \x1b[M — delete current line
+        let params = vte::Params::default();
+        handler.csi_dispatch(&params, &[], false, 'M');
+        let g = grid.lock();
+        // Grid still has the same number of rows.
+        assert_eq!(g.cells.len(), 5);
+        // Row 2 (the cursor row) should now be blank — the original 'Z' row was removed.
+        assert_eq!(g.cells[2][0].ch, ' ');
+    }
+
+    #[test]
+    fn vte_index_esc_d_moves_cursor_down() {
+        let grid = Arc::new(Mutex::new(make_grid(10, 5)));
+        {
+            let mut g = grid.lock();
+            g.cursor = (3, 2);
+        }
+        let mut handler = VtHandler { grid: grid.clone() };
+        // ESC D — Index: move cursor down one row (or scroll if at bottom).
+        handler.esc_dispatch(&[], false, b'D');
+        let g = grid.lock();
+        assert_eq!(g.cursor.1, 3, "cursor should move down one row");
+    }
+
+    #[test]
+    fn vte_reverse_index_esc_m_moves_cursor_up() {
+        let grid = Arc::new(Mutex::new(make_grid(10, 5)));
+        {
+            let mut g = grid.lock();
+            g.cursor = (3, 2);
+        }
+        let mut handler = VtHandler { grid: grid.clone() };
+        // ESC M — Reverse Index: move cursor up one row (or scroll down if at top).
+        handler.esc_dispatch(&[], false, b'M');
+        let g = grid.lock();
+        assert_eq!(g.cursor.1, 1, "cursor should move up one row");
+    }
+
+    // ── Section 4a: OSC 0 — window title ─────────────────────────────────
+
+    #[test]
+    fn vte_osc0_sets_window_title() {
+        let grid = Arc::new(Mutex::new(make_grid(80, 24)));
+        let mut handler = VtHandler {
+            grid: Arc::clone(&grid),
+        };
+        let mut parser = vte::Parser::new();
+        // OSC 0 ; title BEL
+        let seq = b"\x1b]0;my terminal title\x07";
+        for &byte in seq {
+            parser.advance(&mut handler, byte);
+        }
+        let g = grid.lock();
+        assert_eq!(
+            g.title.as_deref(),
+            Some("my terminal title"),
+            "OSC 0 should set the window title"
+        );
+    }
+
+    #[test]
+    fn vte_osc2_sets_window_title() {
+        let grid = Arc::new(Mutex::new(make_grid(80, 24)));
+        let mut handler = VtHandler {
+            grid: Arc::clone(&grid),
+        };
+        let mut parser = vte::Parser::new();
+        // OSC 2 ; title BEL
+        let seq = b"\x1b]2;icon title\x07";
+        for &byte in seq {
+            parser.advance(&mut handler, byte);
+        }
+        let g = grid.lock();
+        assert_eq!(
+            g.title.as_deref(),
+            Some("icon title"),
+            "OSC 2 should set the window title"
+        );
+    }
+
+    // ── Section 4b: ESC 7 / ESC 8 — cursor save/restore ─────────────────
+
+    #[test]
+    fn vte_esc7_saves_and_esc8_restores_cursor() {
+        let grid = Arc::new(Mutex::new(make_grid(80, 24)));
+        let mut handler = VtHandler {
+            grid: Arc::clone(&grid),
+        };
+        let mut parser = vte::Parser::new();
+        // Move cursor to (5, 3), save, move to (0, 0), restore.
+        let seq = b"\x1b[4;6H\x1b7\x1b[H\x1b8";
+        for &byte in seq {
+            parser.advance(&mut handler, byte);
+        }
+        let g = grid.lock();
+        // After restore, cursor should be at col 5, row 3 (0-indexed after 1-based CSI H).
+        assert_eq!(g.cursor.0, 5, "cursor col should be restored to 5");
+        assert_eq!(g.cursor.1, 3, "cursor row should be restored to 3");
+    }
+
+    // ── Section 4c: CSI ?25l / ?25h — cursor hide/show ───────────────────
+
+    #[test]
+    fn vte_cursor_hide_and_show() {
+        let grid = Arc::new(Mutex::new(make_grid(80, 24)));
+        let mut handler = VtHandler {
+            grid: Arc::clone(&grid),
+        };
+        let mut parser = vte::Parser::new();
+        // Hide cursor.
+        let seq = b"\x1b[?25l";
+        for &byte in seq {
+            parser.advance(&mut handler, byte);
+        }
+        {
+            let g = grid.lock();
+            assert!(!g.cursor_visible, "?25l should hide cursor");
+        }
+        // Show cursor.
+        let seq2 = b"\x1b[?25h";
+        for &byte in seq2 {
+            parser.advance(&mut handler, byte);
+        }
+        {
+            let g = grid.lock();
+            assert!(g.cursor_visible, "?25h should show cursor");
+        }
+    }
+
+    // ── Section 4d: regression tests for already-implemented sequences ────
+
+    #[test]
+    fn vte_24bit_fg_colour() {
+        let grid = Arc::new(Mutex::new(make_grid(80, 24)));
+        let mut handler = VtHandler {
+            grid: Arc::clone(&grid),
+        };
+        let mut parser = vte::Parser::new();
+        let seq = b"\x1b[38;2;255;128;0m";
+        for &byte in seq {
+            parser.advance(&mut handler, byte);
+        }
+        let g = grid.lock();
+        assert_eq!(
+            g.sgr.fg,
+            Color::Rgb(255, 128, 0),
+            "SGR 38;2 should set 24-bit fg colour"
+        );
+    }
+
+    #[test]
+    fn vte_256_bg_colour() {
+        let grid = Arc::new(Mutex::new(make_grid(80, 24)));
+        let mut handler = VtHandler {
+            grid: Arc::clone(&grid),
+        };
+        let mut parser = vte::Parser::new();
+        let seq = b"\x1b[48;5;196m";
+        for &byte in seq {
+            parser.advance(&mut handler, byte);
+        }
+        let g = grid.lock();
+        assert_eq!(
+            g.sgr.bg,
+            Color::Ansi256(196),
+            "SGR 48;5 should set 256-colour bg"
+        );
+    }
+
+    #[test]
+    fn vte_alternate_screen_enter_exit() {
+        let grid = Arc::new(Mutex::new(make_grid(80, 24)));
+        let mut handler = VtHandler {
+            grid: Arc::clone(&grid),
+        };
+        let mut parser = vte::Parser::new();
+        // Enter alt screen.
+        let enter = b"\x1b[?1049h";
+        for &byte in enter {
+            parser.advance(&mut handler, byte);
+        }
+        {
+            let g = grid.lock();
+            assert!(g.alt_screen, "?1049h should enter alt screen");
+        }
+        // Exit alt screen.
+        let exit = b"\x1b[?1049l";
+        for &byte in exit {
+            parser.advance(&mut handler, byte);
+        }
+        {
+            let g = grid.lock();
+            assert!(!g.alt_screen, "?1049l should exit alt screen");
+        }
     }
 }

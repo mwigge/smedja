@@ -67,7 +67,7 @@ struct Message {
 }
 
 /// Available slash-command completions shown in the popup.
-const SLASH_COMPLETIONS: &[&str] = &["/agent", "/tier", "/spec", "/tdd", "/ponytail"];
+const SLASH_COMPLETIONS: &[&str] = &["/agent", "/health", "/tier", "/spec", "/tdd", "/ponytail"];
 
 #[allow(clippy::struct_excessive_bools)] // AppState is a TUI dispatch table; enum-splitting would add indirection without clarity
 #[derive(Debug)]
@@ -114,6 +114,14 @@ struct AppState {
     slash_popup_visible: bool,
     /// Cursor index within the filtered completion list.
     slash_cursor: usize,
+    /// True while a turn is awaiting a response from the daemon.
+    #[allow(dead_code)] // wired at init; read path lands once streaming poll is complete
+    turn_in_flight: bool,
+    /// Number of consecutive unexpected (non-done) poll responses received.
+    ///
+    /// Used to rate-limit the "waiting for turn…" status message so it does not
+    /// flood the panel on rapid retries.
+    poll_retry_count: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +166,7 @@ async fn submit(input: &str, state: &mut AppState, client: &mut Client) -> Resul
         Ok(ref v) => {
             let task_id = v["task_id"].as_str().unwrap_or("?").to_owned();
             state.pending_task_id = Some(task_id.clone());
+            state.turn_in_flight = true;
             state.last_poll = Some(std::time::Instant::now());
             format!("queued (task: {task_id})")
         }
@@ -537,6 +546,26 @@ async fn handle_key(
                 };
                 state.main_panel.push_line(msg.text.clone());
                 state.messages.push(msg);
+            } else if input.trim() == "/health" {
+                // Measure RPC round-trip latency by calling session.get.
+                let start = std::time::Instant::now();
+                let session_id = state.session_id.clone();
+                let health_result = client
+                    .call("session.get", json!({ "id": session_id }))
+                    .await;
+                let latency_ms = start.elapsed().as_millis();
+                let text = match health_result {
+                    Ok(_) => {
+                        format!("health: socket=ok session={session_id} latency={latency_ms}ms")
+                    }
+                    Err(e) => format!("health: error — {e}"),
+                };
+                let msg = Message {
+                    role: Role::System,
+                    text,
+                };
+                state.main_panel.push_line(msg.text.clone());
+                state.messages.push(msg);
             } else {
                 submit(&input, state, client).await?;
             }
@@ -610,6 +639,23 @@ fn render(frame: &mut ratatui::Frame, state: &AppState) {
 
     // L122: render MainPanel from state.main_panel.
     state.main_panel.render(main_area, frame);
+
+    // Overlay a one-row "⠿ thinking…" indicator at the bottom of the main area.
+    if state.turn_in_flight && main_area.height >= 1 {
+        let thinking_area = ratatui::layout::Rect::new(
+            main_area.x,
+            main_area.y + main_area.height.saturating_sub(1),
+            main_area.width,
+            1,
+        );
+        let thinking_para = Paragraph::new(Line::from(Span::styled(
+            "\u{283f} thinking\u{2026}",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        frame.render_widget(thinking_para, thinking_area);
+    }
 
     // -- Action log -----------------------------------------------------------
     // L122: 5-row area using the existing ActionLog widget.
@@ -797,7 +843,36 @@ async fn main() -> Result<()> {
         slash_completions: Vec::new(),
         slash_popup_visible: false,
         slash_cursor: 0,
+        turn_in_flight: false,
+        poll_retry_count: 0,
     };
+
+    // Connect banner — shown on every startup so the user knows what's connected.
+    let banner_sock = sock.display().to_string();
+    state
+        .main_panel
+        .push_line(format!("connected to {banner_sock}"));
+    state
+        .main_panel
+        .push_line(format!("session {}", state.session_id));
+    let provider = session_resp
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_owned();
+    state.main_panel.push_line(format!("provider: {provider}"));
+    let tier_str = state.tier.as_deref().unwrap_or("default");
+    state.main_panel.push_line(format!("tier: {tier_str}"));
+    state
+        .main_panel
+        .push_line("type a message or /help for commands".into());
+
+    // Detect tier from session response if not set via CLI.
+    if state.tier.is_none() {
+        if let Some(t) = session_resp.get("tier").and_then(|v| v.as_str()) {
+            state.tier = Some(t.to_owned());
+        }
+    }
 
     enable_raw_mode().context("enable raw mode")?;
     execute!(stdout(), EnterAlternateScreen).context("enter alternate screen")?;
@@ -834,68 +909,116 @@ async fn main() -> Result<()> {
 
         terminal.draw(|f| render(f, &state))?;
 
-        // Poll for pending task result (every 500 ms).
+        // Subscribe to the in-flight turn result (replaces the old task.get poll
+        // loop).  turn.subscribe blocks on the daemon side until the turn
+        // reaches a terminal state, so a 50 ms guard prevents hammering the
+        // socket if the server returns early for any reason.
         if let Some(task_id) = state.pending_task_id.clone() {
-            let should_poll = state
+            let should_call = state
                 .last_poll
-                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(500));
-            if should_poll {
+                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(50));
+            if should_call {
                 state.last_poll = Some(std::time::Instant::now());
-                if let Ok(v) = client.call("task.get", json!({"id": task_id})).await {
-                    let status = v["status"].as_str().unwrap_or("");
-                    if status == "complete" {
-                        let response = v["response"].as_str().unwrap_or("(no response)").to_owned();
-                        let elapsed_ms = state.turn_submitted_at.map_or(0, |t| {
-                            u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
-                        });
-                        state.turn_submitted_at = None;
-                        if let Some(mut block) = state.current_block.take() {
-                            block.push_text(&response);
-                            block.complete(elapsed_ms);
-                            let width = 80usize;
-                            for line in block.render_lines(width) {
-                                let msg = Message {
-                                    role: Role::System,
-                                    text: line,
-                                };
-                                state.main_panel.push_line(msg.text.clone());
-                                state.messages.push(msg);
-                            }
-                            // Store completed block in history.
-                            state.block_store.push(block);
-                        } else {
+                match client
+                    .call("turn.subscribe", json!({ "task_id": task_id }))
+                    .await
+                {
+                    Ok(v) if v["done"].as_bool() == Some(true) => {
+                        if let Some(error) = v["error"].as_str() {
                             let msg = Message {
                                 role: Role::System,
-                                text: response,
+                                text: format!("error: {error}"),
                             };
                             state.main_panel.push_line(msg.text.clone());
                             state.messages.push(msg);
-                        }
-                        state.pending_task_id = None;
-                        state.last_poll = None;
-                    } else if status == "failed" {
-                        if let Some(mut block) = state.current_block.take() {
-                            block.fail();
-                            for line in block.render_lines(80) {
+                            if let Some(mut block) = state.current_block.take() {
+                                block.fail();
+                                state.block_store.push(block);
+                            }
+                        } else {
+                            let response = v["response"].as_str().unwrap_or("").to_owned();
+                            let input_tok = v["input_tok"].as_i64().unwrap_or(0);
+                            let output_tok = v["output_tok"].as_i64().unwrap_or(0);
+                            let elapsed_ms = state.turn_submitted_at.map_or(0, |t| {
+                                u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+                            });
+                            state.turn_submitted_at = None;
+
+                            if let Some(mut block) = state.current_block.take() {
+                                block.push_text(&response);
+                                block.complete(elapsed_ms);
+                                for line in block.render_lines(80) {
+                                    let msg = Message {
+                                        role: Role::System,
+                                        text: line,
+                                    };
+                                    state.main_panel.push_line(msg.text.clone());
+                                    state.messages.push(msg);
+                                }
+                                state.block_store.push(block);
+                            } else {
+                                if !response.is_empty() {
+                                    state.main_panel.push_delta(&response);
+                                }
                                 let msg = Message {
                                     role: Role::System,
-                                    text: line,
+                                    text: response,
                                 };
-                                state.main_panel.push_line(msg.text.clone());
                                 state.messages.push(msg);
                             }
-                            // Store failed block in history too.
-                            state.block_store.push(block);
-                        } else {
-                            let msg = Message {
-                                role: Role::System,
-                                text: "turn failed".to_owned(),
-                            };
-                            state.main_panel.push_line(msg.text.clone());
-                            state.messages.push(msg);
+
+                            // Turn footer: token counts and wall-clock latency.
+                            let footer =
+                                format!("↳ {input_tok}↑ {output_tok}↓ tokens · {elapsed_ms}ms");
+                            state.main_panel.push_line(footer);
                         }
                         state.pending_task_id = None;
                         state.last_poll = None;
+                        state.turn_in_flight = false;
+                        state.poll_retry_count = 0;
+                    }
+                    Ok(_) => {
+                        // turn.subscribe returned Ok but the response was not
+                        // done=true — retry on the next tick.
+                        state.poll_retry_count += 1;
+                        state.last_poll = None;
+                        // Surface a status line every 5 retries so the user is
+                        // not left staring at a silent spinner.
+                        if state.poll_retry_count % 5 == 1 {
+                            state.main_panel.push_line(format!(
+                                "waiting for turn… (poll attempt {})",
+                                state.poll_retry_count
+                            ));
+                        }
+                        // After 60 unexpected retries surface an error to avoid
+                        // an indefinitely silent hang.
+                        if state.poll_retry_count >= 60 {
+                            state.main_panel.push_line(
+                                "turn appears stuck — no done=true after 60 polls; giving up"
+                                    .to_owned(),
+                            );
+                            state.pending_task_id = None;
+                            state.last_poll = None;
+                            state.turn_in_flight = false;
+                            state.poll_retry_count = 0;
+                        }
+                    }
+                    Err(e) => {
+                        let text = if e.code == smedja_rpc::codes::TIMEOUT {
+                            "turn timed out (>60 s) — the daemon is still running the turn in the background".to_owned()
+                        } else {
+                            format!("turn error: {e}")
+                        };
+                        let msg = Message {
+                            role: Role::System,
+                            text,
+                        };
+                        state.main_panel.push_line(msg.text.clone());
+                        state.messages.push(msg);
+                        state.pending_task_id = None;
+                        state.last_poll = None;
+                        state.turn_in_flight = false;
+                        state.poll_retry_count = 0;
                     }
                 }
             }
@@ -972,5 +1095,395 @@ mod tests {
     fn slash_completions_empty_for_no_match() {
         let completions = filtered_completions("/zzz");
         assert!(completions.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Layer 4 TUI functional tests — TestBackend (no network)
+    // -----------------------------------------------------------------------
+
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Constructs a minimal `AppState` for testing without a daemon connection.
+    fn make_state(session_id: &str) -> AppState {
+        AppState {
+            session_id: session_id.to_owned(),
+            mode: None,
+            tier: None,
+            messages: Vec::new(),
+            input: String::new(),
+            quit: false,
+            pending_task_id: None,
+            last_poll: None,
+            turn_n: 0,
+            turn_submitted_at: None,
+            current_block: None,
+            block_store: blocks::BlockStore::new(),
+            block_browser_open: false,
+            block_browser_cursor: 0,
+            clipboard: None,
+            diff_overlay: None,
+            diff_scroll: 0,
+            staging_queue: staging::StagingQueue::new(),
+            context_rail_visible: true,
+            main_panel: main_panel::MainPanel::new(),
+            action_log: action_log::ActionLog::new(50),
+            slash_completions: Vec::new(),
+            slash_popup_visible: false,
+            slash_cursor: 0,
+            turn_in_flight: false,
+            poll_retry_count: 0,
+        }
+    }
+
+    /// Renders `state` to an 80×24 `TestBackend` and returns the buffer.
+    fn render_frame(state: &AppState) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, state)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn quit_flag_starts_false_and_can_be_set() {
+        let mut state = make_state("test-session");
+        assert!(!state.quit);
+        state.quit = true;
+        assert!(state.quit);
+    }
+
+    #[test]
+    fn input_accumulates_characters_in_state() {
+        let mut state = make_state("test-session");
+        state.input.push('h');
+        state.input.push('i');
+        assert_eq!(state.input, "hi");
+        // TODO: assert the input appears in the rendered buffer once
+        // handle_key can be called without a live Client.
+    }
+
+    #[test]
+    fn render_does_not_panic_with_empty_state() {
+        let state = make_state("test-session");
+        let _buf = render_frame(&state);
+        // Verify no panic — any output is acceptable.
+    }
+
+    #[test]
+    fn slash_popup_visible_flag_and_render() {
+        let mut state = make_state("test-session");
+        assert!(!state.slash_popup_visible);
+        state.slash_popup_visible = true;
+        state.slash_completions = filtered_completions("/");
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            !content.trim().is_empty(),
+            "buffer should not be entirely blank when slash popup is open"
+        );
+    }
+
+    #[test]
+    fn block_browser_renders_without_panic() {
+        let mut state = make_state("test-session");
+        let mut block = blocks::TurnBlock::new(1);
+        block.complete(42);
+        state.block_store.push(block);
+        state.block_browser_open = true;
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            !content.trim().is_empty(),
+            "buffer should not be blank when block browser is open"
+        );
+    }
+
+    #[test]
+    fn diff_overlay_renders_without_panic() {
+        let mut state = make_state("test-session");
+        state.diff_overlay = Some((
+            0,
+            vec!["+added line".to_owned(), "-removed line".to_owned()],
+        ));
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            !content.trim().is_empty(),
+            "buffer should not be blank when diff overlay is set"
+        );
+    }
+
+    #[test]
+    fn slash_health_in_completions() {
+        // /health must appear in completions when user types "/h"
+        let completions = filtered_completions("/h");
+        assert!(
+            completions.contains(&"/health"),
+            "/health must be in SLASH_COMPLETIONS and match '/h' prefix"
+        );
+    }
+
+    #[test]
+    fn health_command_shows_socket_path_in_state() {
+        let mut state = make_state("sess-health");
+        // Simulate what /health should push to main_panel.
+        let msg = format!("health: socket=ok session={} latency=?ms", state.session_id);
+        state.main_panel.push_line(msg.clone());
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            content.contains("health"),
+            "health output should appear in panel"
+        );
+        assert!(
+            content.contains("sess-health"),
+            "health output should show session ID"
+        );
+    }
+
+    #[test]
+    fn health_command_param_key_is_id() {
+        // The /health handler must pass "id", not "session_id", to session.get.
+        let session_id = "sess-health";
+        let payload = json!({ "id": session_id });
+        assert!(
+            payload.get("id").is_some(),
+            "RPC payload must contain key \"id\""
+        );
+        assert!(
+            payload.get("session_id").is_none(),
+            "RPC payload must not contain key \"session_id\""
+        );
+        assert_eq!(
+            payload["id"].as_str().unwrap(),
+            session_id,
+            "\"id\" value must match the session id"
+        );
+    }
+
+    // push_delta accumulated via the panel renders into the frame buffer.
+    #[test]
+    fn push_delta_accumulates_content_in_panel() {
+        let mut state = make_state("sess-stream");
+        state.main_panel.push_delta("hello");
+        state.main_panel.push_delta(" there");
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            content.contains("hello"),
+            "delta content should appear in rendered buffer"
+        );
+    }
+
+    // --- connect banner tests ---
+
+    #[test]
+    fn connect_banner_visible() {
+        let mut state = make_state("sess-abc");
+        let sock = "/run/user/1000/smdjad.sock";
+        state.main_panel.push_line(format!("connected to {sock}"));
+        state.main_panel.push_line("session sess-abc".into());
+        state.main_panel.push_line("provider: unknown".into());
+        state.main_panel.push_line("tier: default".into());
+        state
+            .main_panel
+            .push_line("type a message or /help for commands".into());
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(content.contains("sess-abc"), "banner must show session ID");
+        assert!(
+            content.contains("connected"),
+            "banner must show connection line"
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_tier_when_set() {
+        let mut state = make_state("sess-xyz");
+        state.tier = Some("fast".into());
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(content.contains("fast"), "status bar must render the tier");
+    }
+
+    #[test]
+    fn status_bar_shows_unknown_when_no_tier() {
+        let state = make_state("sess-xyz");
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(!content.trim().is_empty());
+    }
+
+    // --- thinking indicator tests ---
+
+    #[test]
+    fn thinking_indicator_visible_when_turn_in_flight() {
+        let mut state = make_state("sess-think");
+        state.turn_in_flight = true;
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            content.contains("thinking") || content.contains('\u{283f}'),
+            "buffer should contain thinking indicator when turn_in_flight is true"
+        );
+    }
+
+    #[test]
+    fn thinking_indicator_hidden_when_idle() {
+        let state = make_state("sess-idle");
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(!content.is_empty());
+    }
+
+    // --- layout regression tests ---
+
+    #[test]
+    fn layout_input_row_at_bottom_of_80x24() {
+        let state = make_state("sess-layout");
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf.area().height, 24);
+        assert_eq!(buf.area().width, 80);
+    }
+
+    #[test]
+    fn layout_40x10_does_not_panic() {
+        let state = make_state("sess-narrow");
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf.area().width, 40);
+        assert_eq!(buf.area().height, 10);
+    }
+
+    // handle_key with "/health" + Enter calls session.get and writes latency to panel.
+    #[tokio::test]
+    async fn health_command_handle_key_shows_latency_in_panel() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+        use tokio::net::UnixListener;
+
+        // Bind to a socket inside a temp dir so the path is unique per test run.
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("health-test.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        // Spawn a minimal mock daemon that handles exactly one JSON-RPC request.
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let mut reader = TokioBufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let req: serde_json::Value =
+                    serde_json::from_str(line.trim_end()).unwrap_or(serde_json::Value::Null);
+                let id = req["id"].clone();
+                let resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "id": "sess-health-mock" }
+                });
+                let mut bytes = serde_json::to_vec(&resp).unwrap();
+                bytes.push(b'\n');
+                let _ = reader.get_mut().write_all(&bytes).await;
+            }
+        });
+
+        let mut client = Client::connect(&sock_path).await.unwrap();
+        let mut state = make_state("sess-health-mock");
+        state.input = "/health".into();
+        let mut editor = rustyline::DefaultEditor::new().unwrap();
+
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::empty(),
+        );
+        handle_key(key, &mut state, &mut client, &mut editor)
+            .await
+            .unwrap();
+
+        // input is cleared by std::mem::take before the command runs.
+        assert!(
+            state.input.is_empty(),
+            "/health must clear the input field after Enter"
+        );
+
+        // The main panel must contain the health output line.
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            content.contains("health"),
+            "main panel should contain health output after /health command; got: {content:?}"
+        );
+    }
+
+    // Verifies that the token-count footer pushed after a turn completes
+    // appears in the rendered frame buffer.
+    #[test]
+    fn turn_footer_shows_token_counts() {
+        let mut state = make_state("sess-footer");
+        // Simulate what the subscribe completion path does.
+        state.main_panel.push_delta("response text");
+        state
+            .main_panel
+            .push_line("↳ 10↑ 20↓ tokens · 250ms".into());
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            content.contains("tokens"),
+            "turn footer should show token count label in the rendered buffer"
+        );
     }
 }

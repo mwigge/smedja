@@ -134,6 +134,16 @@ async fn webhook_alert(
             traceparent: None,
             tier: None,
             role_id: None,
+            conversation_id: None,
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            agent_name: None,
+            operation_name: None,
+            status: None,
+            error_kind: None,
+            error_count: None,
+            tool_call_id: None,
         };
         normalised.push((alert, event));
     }
@@ -153,7 +163,7 @@ async fn webhook_alert(
 
     // Phase 3 — write audit events; ingot lock is independent of queue lock.
     {
-        let mut ig = state.ingot.lock().await;
+        let ig = state.ingot.lock().await;
         for (alert, event) in &normalised {
             if let Err(e) = ig.insert_audit_event(event) {
                 tracing::warn!(

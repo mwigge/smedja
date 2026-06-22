@@ -53,6 +53,13 @@ mod tests {
 
         dispatcher.publish(TurnEvent::AssistantDelta {
             content: "hello".to_owned(),
+            conversation_id: None,
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            operation_name: None,
+            agent_name: None,
+            status: None,
         });
 
         let event = rx.recv().await.expect("expected an event");
@@ -60,6 +67,13 @@ mod tests {
             event,
             TurnEvent::AssistantDelta {
                 content: "hello".to_owned(),
+                conversation_id: None,
+                trace_id: None,
+                span_id: None,
+                parent_span_id: None,
+                operation_name: None,
+                agent_name: None,
+                status: None,
             }
         );
     }
@@ -72,6 +86,13 @@ mod tests {
 
         let count = dispatcher.publish(TurnEvent::AssistantDelta {
             content: "broadcast".to_owned(),
+            conversation_id: None,
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            operation_name: None,
+            agent_name: None,
+            status: None,
         });
         assert_eq!(count, 2);
 
@@ -80,6 +101,13 @@ mod tests {
 
         let expected = TurnEvent::AssistantDelta {
             content: "broadcast".to_owned(),
+            conversation_id: None,
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            operation_name: None,
+            agent_name: None,
+            status: None,
         };
         assert_eq!(e1, expected);
         assert_eq!(e2, expected);
@@ -93,6 +121,13 @@ mod tests {
 
         let count = dispatcher.publish(TurnEvent::AssistantDelta {
             content: "dropped".to_owned(),
+            conversation_id: None,
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            operation_name: None,
+            agent_name: None,
+            status: None,
         });
         assert_eq!(count, 0);
     }
@@ -112,6 +147,13 @@ mod tests {
             TurnEvent::Started {
                 session_id: "sess-1".to_owned(),
                 turn_id: "turn-1".to_owned(),
+                conversation_id: None,
+                trace_id: None,
+                span_id: None,
+                parent_span_id: None,
+                operation_name: None,
+                agent_name: None,
+                status: None,
             }
         );
     }
@@ -134,6 +176,13 @@ mod tests {
                 session_id: "sess-2".to_owned(),
                 turn_id: "turn-2".to_owned(),
                 output_tokens: 42,
+                conversation_id: None,
+                trace_id: None,
+                span_id: None,
+                parent_span_id: None,
+                operation_name: None,
+                agent_name: None,
+                status: None,
             }
         );
     }
@@ -155,6 +204,13 @@ mod tests {
                 session_id: "sess-3".to_owned(),
                 turn_id: "turn-3".to_owned(),
                 reason: "timeout".to_owned(),
+                conversation_id: None,
+                trace_id: None,
+                span_id: None,
+                parent_span_id: None,
+                operation_name: None,
+                agent_name: None,
+                status: None,
             }
         );
     }
@@ -167,7 +223,7 @@ mod tests {
         let handle = TurnHandle::start("sess-4", "turn-4", Arc::clone(&dispatcher));
         rx.recv().await.expect("expected Started event");
 
-        handle.tool_called("bash", "ls -la /tmp");
+        handle.tool_called("bash", "ls -la /tmp", None);
 
         let event = rx.recv().await.expect("expected ToolCalled event");
         assert_eq!(
@@ -175,6 +231,14 @@ mod tests {
             TurnEvent::ToolCalled {
                 tool_name: "bash".to_owned(),
                 input_summary: "ls -la /tmp".to_owned(),
+                conversation_id: None,
+                trace_id: None,
+                span_id: None,
+                parent_span_id: None,
+                operation_name: None,
+                agent_name: None,
+                status: None,
+                tool_call_id: None,
             }
         );
     }
@@ -194,6 +258,13 @@ mod tests {
             event,
             TurnEvent::AssistantDelta {
                 content: "hello".to_owned(),
+                conversation_id: None,
+                trace_id: None,
+                span_id: None,
+                parent_span_id: None,
+                operation_name: None,
+                agent_name: None,
+                status: None,
             }
         );
     }
@@ -215,12 +286,33 @@ mod tests {
 
         dispatcher.publish(TurnEvent::AssistantDelta {
             content: "a".to_owned(),
+            conversation_id: None,
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            operation_name: None,
+            agent_name: None,
+            status: None,
         });
         dispatcher.publish(TurnEvent::AssistantDelta {
             content: "b".to_owned(),
+            conversation_id: None,
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            operation_name: None,
+            agent_name: None,
+            status: None,
         });
         dispatcher.publish(TurnEvent::AssistantDelta {
             content: "c".to_owned(),
+            conversation_id: None,
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            operation_name: None,
+            agent_name: None,
+            status: None,
         });
 
         let batch = super::drain_ready(&mut rx);

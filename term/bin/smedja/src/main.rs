@@ -36,7 +36,7 @@ use winit::{
 use crate::split::{SplitDirection, SplitLayout};
 use crate::tab::TabBar;
 
-use st_agent::SharedPaneState;
+use st_agent::{AgentChunk, SharedAgentManager, SharedPaneState};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -134,6 +134,8 @@ struct App {
     launch_menu_selection: usize,
     /// Live agent state fed from the st-agent UDS listener.
     pane_state: SharedPaneState,
+    /// Accumulated agent session text, fed by the bridge and read each frame.
+    agent_manager: SharedAgentManager,
 }
 
 impl App {
@@ -156,6 +158,7 @@ impl App {
             launch_menu_open: false,
             launch_menu_selection: 0,
             pane_state: SharedPaneState::new(),
+            agent_manager: SharedAgentManager::new(),
         }
     }
 
@@ -350,7 +353,11 @@ impl ApplicationHandler<UserEvent> for App {
         };
         pty.start_reader_detached();
 
-        spawn_agent_bridge(self.pane_state.clone(), pane_id_str);
+        spawn_agent_bridge(
+            self.pane_state.clone(),
+            self.agent_manager.clone(),
+            pane_id_str,
+        );
 
         self.windows.insert(window.id(), window);
         self.renderer = Some(renderer);
@@ -469,6 +476,22 @@ impl ApplicationHandler<UserEvent> for App {
                     let segments =
                         st_statusbar::render_status_bar_parallel(&sb_modules, &sb_ctx, 8);
                     renderer.set_status_bar_segments(&segments);
+
+                    // Snapshot agent session content and push to renderer.
+                    if let Ok(mgr) = self.agent_manager.0.try_lock() {
+                        let blocks: Vec<st_render::AgentBlockView> = mgr
+                            .sessions()
+                            .enumerate()
+                            .map(|(i, session)| st_render::AgentBlockView {
+                                start_row: u16::try_from(i * 4).unwrap_or(u16::MAX),
+                                model: session.model.clone(),
+                                content_lines: session.content_lines(),
+                                approval_pending: session.approval
+                                    == st_agent::ApprovalState::Pending,
+                            })
+                            .collect();
+                        renderer.set_agent_blocks(&blocks);
+                    }
 
                     if let Err(e) = renderer.render() {
                         debug!("render error: {}", e);
@@ -762,7 +785,8 @@ fn load_launch_entries() -> Vec<LaunchEntry> {
 ///
 /// The thread is fire-and-forget: if smdjad is absent or the connection drops,
 /// it exits silently and the status bar simply shows no agent context.
-fn spawn_agent_bridge(state: SharedPaneState, pane_id: String) {
+#[allow(clippy::too_many_lines)]
+fn spawn_agent_bridge(state: SharedPaneState, agent_manager: SharedAgentManager, pane_id: String) {
     std::thread::Builder::new()
         .name("st-agent".into())
         .spawn(move || {
@@ -783,21 +807,107 @@ fn spawn_agent_bridge(state: SharedPaneState, pane_id: String) {
                 if client.subscribe_pane(&pane_id).await.is_err() {
                     return;
                 }
+                // Current turn identifier, used as the AgentSession block_id.
+                let mut current_turn_id = String::new();
+                let mut current_model = String::new();
                 while let Ok(Some(ev)) = client.next_event().await {
                     let mut s = state.0.write().await;
                     match ev {
-                        st_agent::PaneEvent::TurnStart { tier, model, .. } => {
+                        st_agent::PaneEvent::TurnStart {
+                            tier,
+                            model,
+                            turn_id,
+                            ..
+                        } => {
                             s.tier = Some(tier);
-                            s.model = Some(model);
+                            s.model = Some(model.clone());
                             s.is_agent_turn = true;
+                            current_turn_id = turn_id;
+                            current_model = model;
                         }
                         st_agent::PaneEvent::TurnEnd { .. } => {
                             s.is_agent_turn = false;
+                            // Mark the session done.
+                            if !current_turn_id.is_empty() {
+                                let mut mgr = agent_manager
+                                    .0
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                let session = mgr.session_mut(&current_turn_id, &current_model);
+                                session.push_chunk(&AgentChunk {
+                                    block_id: current_turn_id.clone(),
+                                    text: String::new(),
+                                    done: true,
+                                    approval_required: false,
+                                });
+                            }
                         }
                         st_agent::PaneEvent::ToolCall { tool_name, .. } => {
-                            s.active_task = Some(tool_name);
+                            s.active_task = Some(tool_name.clone());
+                            // Record tool call as a content line.
+                            if !current_turn_id.is_empty() {
+                                let mut mgr = agent_manager
+                                    .0
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                mgr.session_mut(&current_turn_id, &current_model)
+                                    .push_chunk(&AgentChunk {
+                                        block_id: current_turn_id.clone(),
+                                        text: format!("[tool: {tool_name}]"),
+                                        done: false,
+                                        approval_required: false,
+                                    });
+                            }
                         }
-                        _ => {}
+                        st_agent::PaneEvent::StreamDelta { text } => {
+                            if !current_turn_id.is_empty() {
+                                let mut mgr = agent_manager
+                                    .0
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                mgr.session_mut(&current_turn_id, &current_model)
+                                    .push_chunk(&AgentChunk {
+                                        block_id: current_turn_id.clone(),
+                                        text,
+                                        done: false,
+                                        approval_required: false,
+                                    });
+                            }
+                        }
+                        st_agent::PaneEvent::ToolResult { tool_name, outcome } => {
+                            if !current_turn_id.is_empty() {
+                                let mut mgr = agent_manager
+                                    .0
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                mgr.session_mut(&current_turn_id, &current_model)
+                                    .push_chunk(&AgentChunk {
+                                        block_id: current_turn_id.clone(),
+                                        text: format!("[{tool_name}: {outcome}]"),
+                                        done: false,
+                                        approval_required: false,
+                                    });
+                            }
+                        }
+                        st_agent::PaneEvent::ApprovalPrompt {
+                            tool_name, prompt, ..
+                        } => {
+                            if !current_turn_id.is_empty() {
+                                let mut mgr = agent_manager
+                                    .0
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                mgr.session_mut(&current_turn_id, &current_model)
+                                    .push_chunk(&AgentChunk {
+                                        block_id: current_turn_id.clone(),
+                                        text: format!(
+                                            "[approval required: {tool_name} — {prompt}]"
+                                        ),
+                                        done: false,
+                                        approval_required: true,
+                                    });
+                            }
+                        }
                     }
                 }
             });
@@ -824,9 +934,14 @@ fn main() -> anyhow::Result<()> {
 
     let config = st_config::Config::load().unwrap_or_default();
 
-    let shell = args
-        .shell
-        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()));
+    // Default to smedja-tui so opening smedja goes straight into the agent
+    // dashboard. Fall back to $SHELL for raw terminal access (smedja --shell fish).
+    let shell = args.shell.unwrap_or_else(|| {
+        which::which("smedja-tui").map_or_else(
+            |_| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+            |p| p.to_string_lossy().into_owned(),
+        )
+    });
 
     let launch_entries = load_launch_entries();
     info!("loaded {} launch menu entries", launch_entries.len());
