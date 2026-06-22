@@ -67,19 +67,30 @@ struct Message {
     text: String,
 }
 
+/// Structured output type requested by a generator slash command.
+#[derive(Debug, Clone, PartialEq)]
+enum OutputType {
+    /// `/drawio` — draw.io mxGraph XML
+    DrawIo { slug: String },
+    /// `/pptx` — python-pptx presentation script
+    Pptx { slug: String },
+}
+
 /// Available slash-command completions shown in the popup.
 const SLASH_COMPLETIONS: &[&str] = &[
     "/agent",
     "/agents",
-    "/approve",
     "/approvals",
+    "/approve",
     "/briefing",
     "/deny",
+    "/drawio",
     "/health",
     "/login",
     "/metrics",
     "/model",
     "/ponytail",
+    "/pptx",
     "/quota",
     "/review",
     "/spec",
@@ -175,6 +186,8 @@ struct AppState {
     stream_sock_path: PathBuf,
     /// W3C traceparent from the most recently completed turn.
     last_traceparent: Option<String>,
+    /// Pending structured output type for generator commands (/drawio, /pptx).
+    pending_output_type: Option<OutputType>,
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +333,88 @@ fn push_system_message(state: &mut AppState, text: impl Into<String>) {
     };
     state.main_panel.push_line(msg.text.clone());
     state.messages.push(msg);
+}
+
+/// Slugify `topic` for use in output filenames.
+fn slugify(topic: &str) -> String {
+    topic
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Extract the first fenced code block of the given `lang` from `text`.
+///
+/// Returns the content inside the delimiters (without the fence lines).
+fn extract_code_block<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
+    let fence_open = format!("```{lang}");
+    let start = text.find(fence_open.as_str())?;
+    let after_open = start + fence_open.len();
+    let newline = text[after_open..].find('\n')?;
+    let content_start = after_open + newline + 1;
+    let end = text[content_start..].find("```")?;
+    Some(text[content_start..content_start + end].trim())
+}
+
+/// Save the output of a generator command (`/drawio`, `/pptx`) to a file.
+///
+/// Extracts the appropriate code block from `content` and writes it to cwd.
+fn save_generator_output(output_type: &OutputType, content: &str, state: &mut AppState) {
+    match output_type {
+        OutputType::DrawIo { slug } => {
+            let xml = match extract_code_block(content, "xml") {
+                Some(x) => x,
+                None => {
+                    push_system_message(state, "no ```xml block found in response");
+                    return;
+                }
+            };
+            let path = format!("{slug}.drawio");
+            match std::fs::write(&path, xml) {
+                Ok(()) => push_system_message(state, format!("diagram saved: ./{path}")),
+                Err(e) => push_system_message(state, format!("failed to save {path}: {e}")),
+            }
+        }
+        OutputType::Pptx { slug } => {
+            let script = match extract_code_block(content, "python") {
+                Some(s) => s,
+                None => {
+                    push_system_message(state, "no ```python block found in response");
+                    return;
+                }
+            };
+            let script_path = format!("{slug}-gen.py");
+            if let Err(e) = std::fs::write(&script_path, script) {
+                push_system_message(state, format!("failed to write script {script_path}: {e}"));
+                return;
+            }
+            match std::process::Command::new("python3")
+                .arg(&script_path)
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    let pptx_path = format!("{slug}.pptx");
+                    let _ = std::fs::remove_file(&script_path);
+                    push_system_message(state, format!("presentation saved: ./{pptx_path}"));
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    push_system_message(
+                        state,
+                        format!("python3 {script_path} failed: {}", stderr.trim()),
+                    );
+                }
+                Err(e) => {
+                    push_system_message(state, format!("failed to run python3: {e}"));
+                }
+            }
+        }
+    }
 }
 
 fn render_input_with_cursor(input: &str, cursor: usize) -> String {
@@ -619,6 +714,37 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
                 return Ok(true);
             }
             let message = format!("Review the following git diff:{focus}\n\n```diff\n{diff}```");
+            submit(&message, state, client).await?;
+            Ok(true)
+        }
+        "drawio" => {
+            if args.is_empty() {
+                push_system_message(state, "usage: /drawio <topic>");
+                return Ok(true);
+            }
+            let slug = slugify(args);
+            state.pending_output_type = Some(OutputType::DrawIo { slug });
+            let message = format!(
+                "Generate a draw.io diagram (mxGraph XML format) for: {args}\n\n\
+                 Output ONLY the complete XML, enclosed in a ```xml code block. \
+                 Use valid mxGraph XML that draw.io can open directly."
+            );
+            submit(&message, state, client).await?;
+            Ok(true)
+        }
+        "pptx" => {
+            if args.is_empty() {
+                push_system_message(state, "usage: /pptx <topic>");
+                return Ok(true);
+            }
+            let slug = slugify(args);
+            state.pending_output_type = Some(OutputType::Pptx { slug });
+            let message = format!(
+                "Generate a python-pptx script to create a presentation about: {args}\n\n\
+                 Output ONLY the complete Python script, enclosed in a ```python code block. \
+                 The script must save the file as '{args_slug}.pptx' in the current directory.",
+                args_slug = slugify(args)
+            );
             submit(&message, state, client).await?;
             Ok(true)
         }
@@ -1755,6 +1881,7 @@ async fn main() -> Result<()> {
         stream_rx: None,
         stream_sock_path,
         last_traceparent: None,
+        pending_output_type: None,
     };
 
     // Connect banner — shown on every startup so the user knows what's connected.
@@ -1816,6 +1943,7 @@ async fn main() -> Result<()> {
         // When streaming is active (stream_rx is Some), render deltas in real
         // time and finalise the turn on the terminal event.  When streaming is
         // not available, fall back to the turn.subscribe blocking poll.
+        let mut pending_output_save: Option<(OutputType, String)> = None;
         if let Some(ref mut rx) = state.stream_rx {
             let mut turn_done = false;
             while let Ok(event) = rx.try_recv() {
@@ -1871,10 +1999,14 @@ async fn main() -> Result<()> {
                         state.turn_submitted_at = None;
                         state.last_traceparent = tp.clone();
 
-                        if let Some(mut block) = state.current_block.take() {
+                        let block_content = if let Some(mut block) = state.current_block.take() {
                             block.complete(elapsed_ms);
+                            let content = block.content.clone();
                             state.block_store.push(block);
-                        }
+                            content
+                        } else {
+                            String::new()
+                        };
 
                         let footer = if let Some(ref tp_str) = tp {
                             format!("↳ {input_tok}↑ {output_tok}↓ · trace: {tp_str}")
@@ -1882,6 +2014,10 @@ async fn main() -> Result<()> {
                             format!("↳ {input_tok}↑ {output_tok}↓ tokens · {elapsed_ms}ms")
                         };
                         state.main_panel.push_line(footer);
+
+                        if let Some(output_type) = state.pending_output_type.take() {
+                            pending_output_save = Some((output_type, block_content));
+                        }
 
                         turn_done = true;
                     }
@@ -2021,6 +2157,12 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+        }
+
+        // Process any deferred generator output (drawio/pptx) now that the
+        // stream_rx borrow has ended.
+        if let Some((output_type, content)) = pending_output_save {
+            save_generator_output(&output_type, &content, &mut state);
         }
 
         // Poll cowork.pending every 200 ms when a turn is in flight to surface
@@ -2506,6 +2648,7 @@ mod tests {
             stream_rx: None,
             stream_sock_path: PathBuf::from("/tmp/smdjad.sock.stream"),
             last_traceparent: None,
+            pending_output_type: None,
         }
     }
 
@@ -3068,5 +3211,48 @@ mod tests {
         assert!(!state.scroll_focus);
         assert!(!state.selection_mode);
         assert!(!state.g_pending);
+    }
+
+    #[test]
+    fn slugify_converts_spaces_and_upper() {
+        assert_eq!(slugify("Smedja Architecture"), "smedja-architecture");
+        assert_eq!(slugify("Q3 Agent Metrics!"), "q3-agent-metrics");
+        assert_eq!(slugify("multi--word"), "multi-word");
+    }
+
+    #[test]
+    fn extract_code_block_finds_xml_content() {
+        let text = "Some preamble\n```xml\n<mxGraph>hello</mxGraph>\n```\nsome epilogue";
+        let extracted = extract_code_block(text, "xml");
+        assert_eq!(extracted, Some("<mxGraph>hello</mxGraph>"));
+    }
+
+    #[test]
+    fn extract_code_block_returns_none_when_lang_absent() {
+        let text = "```python\nprint('hi')\n```";
+        assert!(extract_code_block(text, "xml").is_none());
+    }
+
+    #[test]
+    fn slash_completions_includes_drawio_and_pptx() {
+        assert!(
+            SLASH_COMPLETIONS.contains(&"/drawio"),
+            "/drawio must be in SLASH_COMPLETIONS"
+        );
+        assert!(
+            SLASH_COMPLETIONS.contains(&"/pptx"),
+            "/pptx must be in SLASH_COMPLETIONS"
+        );
+    }
+
+    #[test]
+    fn slash_completions_sorted_alphabetically() {
+        let mut sorted = SLASH_COMPLETIONS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            SLASH_COMPLETIONS.to_vec(),
+            sorted,
+            "SLASH_COMPLETIONS must be in alphabetical order"
+        );
     }
 }
