@@ -18,6 +18,7 @@ pub struct Router {
 
 impl Router {
     /// Creates a new empty router with no registered handlers.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
