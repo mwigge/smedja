@@ -35,6 +35,63 @@ impl McpHttpClient {
         })
     }
 
+    /// Calls `tools/call` on the MCP server and returns the result as a JSON
+    /// string suitable for use as a tool response.
+    ///
+    /// Follows the MCP HTTP transport specification (2024-11 draft):
+    /// - POST to the server URL
+    /// - Body: `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":input}}`
+    /// - Response: `{"result":{"content":[...],"isError":bool}}`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string on network failure, non-OK HTTP status, or
+    /// JSON-RPC error from the server.
+    pub async fn call_tool(&self, name: &str, input: &serde_json::Value) -> Result<String, String> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": input }
+        });
+
+        let mut req = self.http.post(&self.url).json(&body);
+        if !self.token.is_empty() {
+            req = req.bearer_auth(&self.token);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("MCP HTTP request failed: {e}"))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| format!("MCP response parse failed: {e}"))?;
+
+        if let Some(err) = resp.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("MCP server error: {msg}"));
+        }
+
+        let result = resp.get("result").cloned().unwrap_or(serde_json::Value::Null);
+
+        if result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let msg = result
+                .get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|entry| entry.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("tool returned an error");
+            return Err(format!("MCP tool error: {msg}"));
+        }
+
+        Ok(serde_json::to_string(&result).unwrap_or_default())
+    }
+
     /// Calls `tools/list` on the MCP server and returns the tool list.
     ///
     /// # Errors
@@ -80,6 +137,81 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    #[tokio::test]
+    async fn call_tool_against_mock_server_returns_result() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::post(|| async {
+                    axum::Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "content": [{ "type": "text", "text": "hello from tool" }],
+                            "isError": false
+                        }
+                    }))
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let client = McpHttpClient::new(&format!("http://{addr}"), "").unwrap();
+        let result = client
+            .call_tool("echo", &serde_json::json!({"text": "hi"}))
+            .await
+            .expect("call_tool must succeed");
+
+        assert!(
+            result.contains("hello from tool"),
+            "result must contain tool output; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_propagates_mcp_is_error_flag() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::post(|| async {
+                    axum::Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "content": [{ "type": "text", "text": "permission denied" }],
+                            "isError": true
+                        }
+                    }))
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let client = McpHttpClient::new(&format!("http://{addr}"), "").unwrap();
+        let result = client
+            .call_tool("restricted", &serde_json::json!({}))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "isError: true must produce an Err result"
+        );
+        assert!(
+            result.unwrap_err().contains("permission denied"),
+            "error message must include tool's error text"
+        );
+    }
 
     #[test]
     fn client_new_succeeds() {
