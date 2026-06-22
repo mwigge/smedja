@@ -87,7 +87,7 @@ pub struct ContextRail {
 }
 
 impl ContextRail {
-    pub const WIDTH: u16 = 25;
+    pub const WIDTH: u16 = 27;
 
     #[must_use]
     pub fn new(slots: Vec<ContextSlot>) -> Self {
@@ -105,7 +105,7 @@ impl ContextRail {
 
 impl Widget for ContextRail {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let bar_width = (area.width as usize).saturating_sub(9).max(1);
+        let bar_width = (area.width as usize).saturating_sub(12).max(1);
         let lines: Vec<Line<'_>> = self
             .slots
             .iter()
@@ -113,8 +113,8 @@ impl Widget for ContextRail {
                 let pct = slot.pct();
                 let color = SlotStyle::from_pct(pct).color();
                 let bar = slot.fill_bar(bar_width);
-                let name_trunc = &slot.name[..slot.name.len().min(6)];
-                let label = format!(" {name_trunc:<6}{pct:>3.0}%");
+                let name_trunc = &slot.name[..slot.name.len().min(7)];
+                let label = format!(" {name_trunc:<7}{pct:>3.0}%");
                 Line::from(vec![
                     Span::styled(bar, Style::default().fg(color)),
                     Span::raw(label),
