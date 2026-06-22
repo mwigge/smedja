@@ -5,6 +5,7 @@ pub mod cowork;
 pub mod local_provider;
 pub mod mcp_http;
 pub mod mcp_oauth;
+pub mod price_table;
 pub mod provider_pool;
 pub mod sandbox;
 
@@ -24,9 +25,10 @@ use smedja_adapter::types::{Message as AdapterMessage, Role as AdapterRole};
 use smedja_adapter::{CallOptions, Delta};
 use smedja_assayer::{Assayer, BashArity, Complexity, Role as AgentRole, Runner, Tier, WorktreePool};
 
+use crate::price_table::PriceTable;
 use crate::provider_pool::{build_provider_pool, ProviderPool};
 use smedja_bellows::{Dispatcher, TurnEvent};
-use smedja_ingot::{Checkpoint, CostEntry, Ingot, McpServer, Session, Task, TokenSnapshot};
+use smedja_ingot::{Checkpoint, CostEntry, CostRow, Ingot, McpServer, Session, Task, TokenSnapshot};
 use smedja_rpc::{codes, router::Router, server::Server, RpcError};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -290,6 +292,7 @@ async fn run_turn(
     gates: Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
     pool: Arc<ProviderPool>,
     assayer: Arc<Assayer>,
+    price_table: Arc<PriceTable>,
 ) {
     let tracer = global::tracer("smedja");
     let mut turn_span = tracer.start(tel::SPAN_AGENT_INVOKE);
@@ -1042,6 +1045,7 @@ async fn run_turn(
 
     // 7. Record cost entry.
     {
+        let cost_usd = price_table.compute_cost(&model, total_input_tokens, total_output_tokens);
         let entry = CostEntry {
             id: Uuid::new_v4(),
             session_id: session_id.clone(),
@@ -1050,7 +1054,7 @@ async fn run_turn(
             model,
             input_tok: i64::from(total_input_tokens),
             output_tok: i64::from(total_output_tokens),
-            cost_usd: 0.0, // ponytail: pricing table deferred
+            cost_usd,
             created_at: now_epoch(),
         };
         let mut ig = ingot.lock().await;
@@ -1487,6 +1491,7 @@ fn spawn_worker(
     gates: Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
     pool: Arc<ProviderPool>,
     assayer: Arc<Assayer>,
+    price_table: Arc<PriceTable>,
 ) -> Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> {
     let handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
     let handles_inner = Arc::clone(&handles);
@@ -1520,8 +1525,9 @@ fn spawn_worker(
                     let g = Arc::clone(&gates);
                     let pl = Arc::clone(&pool);
                     let as_ = Arc::clone(&assayer);
+                    let pt = Arc::clone(&price_table);
                     let handle =
-                        tokio::spawn(run_turn(ig, dp, session_id, turn_id, g, pl, as_));
+                        tokio::spawn(run_turn(ig, dp, session_id, turn_id, g, pl, as_, pt));
                     handles_inner.lock().await.push(handle);
                 }
                 // ignore non-Started events
@@ -2290,12 +2296,31 @@ fn build_router(
                 .get("session_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| missing_param("session_id"))?;
-            let total_usd = ig
-                .lock()
-                .await
+            let ig_guard = ig.lock().await;
+            let total_usd = ig_guard
                 .session_cost(session_id)
                 .map_err(|e| ingot_err(&e))?;
-            Ok(json!({ "session_id": session_id, "total_usd": total_usd }))
+            let rows: Vec<CostRow> = ig_guard
+                .session_cost_entries(session_id)
+                .map_err(|e| ingot_err(&e))?;
+            let breakdown: Vec<Value> = rows
+                .into_iter()
+                .map(|r| {
+                    json!({
+                        "model": r.model,
+                        "runner": r.runner,
+                        "turns": r.turns,
+                        "input_tok": r.input_tok,
+                        "output_tok": r.output_tok,
+                        "cost_usd": r.cost_usd,
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "session_id": session_id,
+                "total_usd": total_usd,
+                "breakdown": breakdown,
+            }))
         }
     });
 
@@ -3289,6 +3314,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let assayer = Arc::new(assayer);
+    let price_table = Arc::new(PriceTable::embedded());
 
     let router = build_router(
         &ingot,
@@ -3305,6 +3331,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&gates),
         Arc::clone(&pool),
         Arc::clone(&assayer),
+        Arc::clone(&price_table),
     );
 
     // ACP HTTP server — activated by SMEDJA_ACP_PORT.

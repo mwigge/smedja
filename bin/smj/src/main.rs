@@ -733,7 +733,29 @@ async fn main() -> Result<()> {
                 .await
                 .context("session.cost failed")?;
             let usd = resp["total_usd"].as_f64().unwrap_or(0.0);
-            println!("Session {session_id}: ${usd:.6}");
+            println!("SESSION  {session_id}  TOTAL  ${usd:.6}");
+            if let Some(rows) = resp["breakdown"].as_array() {
+                if !rows.is_empty() {
+                    println!();
+                    println!(
+                        "{:<32}  {:<12}  {:>5}  {:>8}  {:>8}  {:>10}",
+                        "MODEL", "RUNNER", "TURNS", "INPUT", "OUTPUT", "COST"
+                    );
+                    println!("{}", "-".repeat(82));
+                    for row in rows {
+                        let model = row["model"].as_str().unwrap_or("-");
+                        let runner = row["runner"].as_str().unwrap_or("-");
+                        let turns = row["turns"].as_i64().unwrap_or(0);
+                        let input = row["input_tok"].as_i64().unwrap_or(0);
+                        let output = row["output_tok"].as_i64().unwrap_or(0);
+                        let cost = row["cost_usd"].as_f64().unwrap_or(0.0);
+                        println!(
+                            "{:<32}  {:<12}  {:>5}  {:>8}  {:>8}  ${cost:.6}",
+                            model, runner, turns, input, output,
+                        );
+                    }
+                }
+            }
         }
         Cmd::Workspace { action } => match action {
             WorkspaceCmd::Agents {
