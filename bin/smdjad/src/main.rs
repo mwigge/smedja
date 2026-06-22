@@ -3,6 +3,7 @@ pub mod alert;
 pub mod compact;
 pub mod cowork;
 pub mod embedder;
+pub mod executor;
 pub mod local_provider;
 pub mod mcp_http;
 pub mod mcp_oauth;
@@ -25,7 +26,7 @@ use opentelemetry::{
 use serde_json::{json, Value};
 use smedja_adapter::types::{Message as AdapterMessage, Role as AdapterRole};
 use smedja_adapter::{CallOptions, Delta};
-use smedja_assayer::{Assayer, BashArity, Complexity, Role as AgentRole, Route, Runner, Tier, WorktreePool};
+use smedja_assayer::{Assayer, Complexity, Role as AgentRole, Route, Runner, Tier, WorktreePool};
 
 use crate::price_table::PriceTable;
 use crate::provider_pool::{build_provider_pool, ProviderPool};
@@ -41,7 +42,7 @@ use uuid::Uuid;
 use smedja_telemetry as tel;
 
 use crate::cowork::{ApprovalPrompt, CoworkGate, Decision};
-use crate::sandbox::SandboxExecutor;
+use crate::executor::{execute_tool, parse_tool_call};
 
 fn socket_path() -> PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
@@ -74,13 +75,6 @@ fn now_epoch() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
-}
-
-/// In-memory store for content blocks addressed by SHA-256 hash.
-/// Used by the `smedja_retrieve` tool to look up compressed context blocks.
-fn retrieve_store() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
-    static STORE: OnceLock<tokio::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
-    STORE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
 /// In-memory map from smedja sessions to provider-native resume identifiers.
@@ -159,6 +153,8 @@ fn runner_session_key(runner: Runner) -> &'static str {
         Runner::Codex => "codex-cli",
         Runner::Local => "local",
         Runner::Copilot => "copilot",
+        Runner::Minimax => "minimax",
+        Runner::Berget => "berget",
     }
 }
 
@@ -171,6 +167,8 @@ fn parse_runner_str(s: &str) -> Option<Runner> {
         "codex" | "codex-cli" => Some(Runner::Codex),
         "local" => Some(Runner::Local),
         "copilot" => Some(Runner::Copilot),
+        "minimax" => Some(Runner::Minimax),
+        "berget" => Some(Runner::Berget),
         _ => None,
     }
 }
@@ -301,14 +299,6 @@ async fn drain_stream(
     ))
 }
 
-/// Returns `true` when the session's mode permits write-arity bash commands.
-///
-/// The `"review"` mode is read-only by default; all other modes are unrestricted.
-fn role_allows_write_bash(session: &Session) -> bool {
-    // ponytail: review role is read-only by default; all others are unrestricted
-    session.mode.as_deref() != Some("review")
-}
-
 /// Executes a bash command in `workspace` using `sh -c`, returning stdout or a
 /// formatted error string.
 async fn exec_bash(cmd: &str, workspace: &std::path::Path) -> String {
@@ -340,7 +330,7 @@ fn effective_max_tool_turns() -> usize {
 
 /// Executes a single turn: loads the task, calls the LLM, handles tool calls,
 /// stores the final response.
-#[allow(clippy::too_many_lines, clippy::items_after_statements)]
+#[allow(clippy::too_many_lines, clippy::items_after_statements, clippy::too_many_arguments)] // TurnOrchestrator extraction is the long-term fix
 async fn run_turn(
     ingot: Arc<Mutex<Ingot>>,
     dispatcher: Arc<Dispatcher>,
@@ -914,14 +904,7 @@ async fn run_turn(
                 // Local tools are an explicit allowlist; anything not on the list
                 // is an MCP extension. Using a substring match on "mcp" would
                 // allow a tool named "bash_mcp_wrapper" to intercept bash calls.
-                const LOCAL_TOOLS: &[&str] = &[
-                    "bash", "run_command",
-                    "read_file", "write_file", "edit_file", "list_files",
-                    "smedja_vault_search", "smedja_vault_store",
-                    "graph_query",
-                    "otel_query", "metric_query", "log_tail",
-                ];
-                let tool_type_val = if LOCAL_TOOLS.contains(&tool_name.as_str()) {
+                let tool_type_val = if crate::executor::LOCAL_TOOLS.contains(&tool_name.as_str()) {
                     if matches!(tool_name.as_str(), "smedja_vault_search" | "smedja_vault_store" | "graph_query") {
                         "datastore"
                     } else {
@@ -1226,442 +1209,6 @@ async fn run_turn(
     });
 }
 
-/// Finds the first JSON object with a `"tool"` key anywhere in `text`.
-///
-/// Uses `serde_json` streaming deserialization: for each `{` byte position,
-/// a `Deserializer` is created so that valid JSON is consumed and trailing
-/// text is ignored, without a custom brace-counting scanner.
-fn find_tool_call_json(text: &str) -> Option<serde_json::Value> {
-    use serde::de::Deserialize as _;
-    let bytes = text.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'{' {
-            let mut de = serde_json::Deserializer::from_str(&text[i..]);
-            if let Ok(v) = serde_json::Value::deserialize(&mut de) {
-                if v.get("tool").is_some() {
-                    return Some(v);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Parses a tool call embedded in `text`, returning `(tool_name, input_json_string)`.
-///
-/// Looks for a JSON object with a `"tool"` key anywhere in the text.
-/// Returns `None` when no tool call is detected.
-fn parse_tool_call(text: &str) -> Option<(String, String)> {
-    let v = find_tool_call_json(text)?;
-    let tool_name = v.get("tool").and_then(Value::as_str)?.to_owned();
-    let input = v
-        .get("input")
-        .map_or_else(|| "{}".to_owned(), std::string::ToString::to_string);
-    Some((tool_name, input))
-}
-
-/// Executes the named tool with the given JSON input string.
-///
-/// Supported tools: `bash`, `run_command`, `read_file`, `list_files`.
-/// Unknown tools return a formatted error string.
-#[allow(clippy::too_many_lines)]
-async fn execute_tool(
-    tool_name: &str,
-    tool_input: &str,
-    workspace: &std::path::Path,
-    session: Option<&Session>,
-    ingot: &Arc<Mutex<Ingot>>,
-    vault: &Arc<Mutex<Vault>>,
-) -> String {
-    let input: Value = serde_json::from_str(tool_input).unwrap_or(Value::Null);
-
-    // Least-privilege enforcement: block write tools for read-only (review) sessions.
-    if session.is_some_and(|s| s.mode.as_deref() == Some("review")) {
-        const WRITE_TOOLS: &[&str] = &["edit_file", "bash", "write_file", "run_command"];
-        if WRITE_TOOLS.contains(&tool_name) {
-            tracing::warn!(
-                tool = tool_name,
-                "smedja.security.tool_blocked: write tool blocked for read-only session"
-            );
-            return format!(
-                "error: tool '{tool_name}' is blocked for read-only roles (TOOL_BLOCKED)"
-            );
-        }
-    }
-
-    // Path traversal guard: reject write_file / edit_file paths outside workspace.
-    if matches!(tool_name, "write_file" | "edit_file") {
-        if let Some(path_str) = input.get("path").and_then(Value::as_str) {
-            let raw_join = workspace.join(path_str);
-            let full = match raw_join.canonicalize() {
-                Ok(p) => p,
-                Err(_) => {
-                    let workspace_canon =
-                        workspace.canonicalize().unwrap_or_else(|_| workspace.to_owned());
-                    let tentative = workspace.join(path_str);
-                    if !tentative.starts_with(&workspace_canon) {
-                        tracing::warn!(
-                            tool = tool_name,
-                            path = path_str,
-                            "smedja.security.data_access_blocked: write outside workspace rejected"
-                        );
-                        return r#"{"error": "path outside workspace"}"#.to_owned();
-                    }
-                    tentative
-                }
-            };
-            let workspace_canon =
-                workspace.canonicalize().unwrap_or_else(|_| workspace.to_owned());
-            if !full.starts_with(&workspace_canon) {
-                tracing::warn!(
-                    tool = tool_name,
-                    path = path_str,
-                    "smedja.security.data_access_blocked: write outside workspace rejected"
-                );
-                return r#"{"error": "path outside workspace"}"#.to_owned();
-            }
-        }
-    }
-
-    match tool_name {
-        "bash" | "run_command" => {
-            let cmd = input
-                .get("command")
-                .or_else(|| input.get("cmd"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-
-            // Enforce read-only mode for review sessions.
-            if session.is_some_and(|s| !role_allows_write_bash(s)) {
-                let arity = smedja_assayer::classify_bash(cmd);
-                if arity == BashArity::Write {
-                    return "permission denied: review mode sessions cannot execute write commands"
-                        .to_owned();
-                }
-            }
-
-            // SandboxExecutor: use Docker sandbox when configured and tool is not exempt.
-            let sandbox = SandboxExecutor::new();
-            if sandbox.available && !SandboxExecutor::is_exempt(tool_name) {
-                match sandbox.exec(cmd, workspace).await {
-                    Ok(out) => out,
-                    Err(e) => format!("error: {e}"),
-                }
-            } else {
-                exec_bash(cmd, workspace).await
-            }
-        }
-        "read_file" => {
-            let path_str = input
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let raw_join = workspace.join(path_str);
-            let full = match raw_join.canonicalize() {
-                Ok(p) => p,
-                Err(_) => {
-                    let workspace_canon =
-                        workspace.canonicalize().unwrap_or_else(|_| workspace.to_owned());
-                    let tentative = workspace.join(path_str);
-                    if !tentative.starts_with(&workspace_canon) {
-                        return r#"{"error": "path outside workspace"}"#.to_owned();
-                    }
-                    tentative
-                }
-            };
-            let workspace_canon =
-                workspace.canonicalize().unwrap_or_else(|_| workspace.to_owned());
-            if !full.starts_with(&workspace_canon) {
-                return r#"{"error": "path outside workspace"}"#.to_owned();
-            }
-            match tokio::fs::read_to_string(&full).await {
-                Ok(contents) => contents,
-                Err(e) => format!("error reading {path_str}: {e}"),
-            }
-        }
-        "list_files" => {
-            let dir_str = input.get("path").and_then(Value::as_str).unwrap_or(".");
-            let raw_join = workspace.join(dir_str);
-            let full = match raw_join.canonicalize() {
-                Ok(p) => p,
-                Err(_) => {
-                    let workspace_canon =
-                        workspace.canonicalize().unwrap_or_else(|_| workspace.to_owned());
-                    let tentative = workspace.join(dir_str);
-                    if !tentative.starts_with(&workspace_canon) {
-                        return r#"{"error": "path outside workspace"}"#.to_owned();
-                    }
-                    tentative
-                }
-            };
-            let workspace_canon =
-                workspace.canonicalize().unwrap_or_else(|_| workspace.to_owned());
-            if !full.starts_with(&workspace_canon) {
-                return r#"{"error": "path outside workspace"}"#.to_owned();
-            }
-            match tokio::fs::read_dir(&full).await {
-                Ok(mut rd) => {
-                    let mut entries = Vec::new();
-                    while let Ok(Some(entry)) = rd.next_entry().await {
-                        entries.push(entry.file_name().to_string_lossy().into_owned());
-                    }
-                    entries.join("\n")
-                }
-                Err(e) => format!("error listing {dir_str}: {e}"),
-            }
-        }
-        "smedja_vault_search" => {
-            let query_text = input
-                .get("query")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned();
-            let k = usize::try_from(
-                input.get("k").and_then(Value::as_u64).unwrap_or(5),
-            )
-            .unwrap_or(5);
-            let ns = input
-                .get("namespace")
-                .and_then(Value::as_str)
-                .unwrap_or("default")
-                .to_owned();
-            let vault = Arc::clone(vault);
-            tokio::task::spawn_blocking(move || {
-                let query_vec = embedder::embed(&query_text);
-                let guard = vault.blocking_lock();
-                match guard.search(&query_vec, &query_text, &ns, k) {
-                    Ok(entries) => {
-                        let results: Vec<serde_json::Value> = entries
-                            .into_iter()
-                            .map(|e| {
-                                serde_json::json!({
-                                    "id": e.id,
-                                    "content": e.content,
-                                    "namespace": e.namespace,
-                                    "payload": e.payload,
-                                })
-                            })
-                            .collect();
-                        serde_json::json!({ "results": results }).to_string()
-                    }
-                    Err(e) => format!("error: vault search failed: {e}"),
-                }
-            })
-            .await
-            .unwrap_or_else(|e| format!("error: vault search task panicked: {e}"))
-        }
-        "smedja_vault_store" => {
-            let content = input
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned();
-            let ns = input
-                .get("namespace")
-                .and_then(Value::as_str)
-                .unwrap_or("default")
-                .to_owned();
-            let entry_id = input
-                .get("id")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| Uuid::new_v4().to_string());
-            let payload = input
-                .get("payload")
-                .cloned()
-                .unwrap_or(serde_json::json!({}));
-            let source_file = input
-                .get("source_file")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            let added_by = input
-                .get("added_by")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            let vault = Arc::clone(vault);
-            tokio::task::spawn_blocking(move || {
-                let embedding = embedder::embed(&content);
-                let entry = VaultEntry {
-                    id: entry_id,
-                    embedding,
-                    payload,
-                    namespace: ns,
-                    content,
-                    source_file,
-                    added_by,
-                    chunk_index: None,
-                    parent_id: None,
-                    created_at: 0.0,
-                };
-                let mut guard = vault.blocking_lock();
-                match guard.upsert(&entry) {
-                    Ok(()) => serde_json::json!({ "id": entry.id, "stored": true }).to_string(),
-                    Err(e) => format!("error: vault store failed: {e}"),
-                }
-            })
-            .await
-            .unwrap_or_else(|e| format!("error: vault store task panicked: {e}"))
-        }
-        "smedja_retrieve" => {
-            let hash = input.get("hash").and_then(Value::as_str).unwrap_or("");
-            let store = retrieve_store().lock().await;
-            if let Some(content) = store.get(hash) {
-                // ponytail: audit deferred; log the retrieval.
-                tracing::info!(hash, "smedja_retrieve hit");
-                content.clone()
-            } else {
-                tracing::debug!(hash, "smedja_retrieve: hash not found");
-                format!("error: hash not found: {hash}")
-            }
-        }
-        "graph_query" => {
-            let query = input.get("query").and_then(Value::as_str).unwrap_or("");
-            let depth =
-                u8::try_from(input.get("depth").and_then(Value::as_u64).unwrap_or(2)).unwrap_or(2);
-            let graph_db_path = workspace.join(".smedja").join("graph.db");
-            if !graph_db_path.exists() {
-                tracing::debug!("graph.db not found; returning empty symbols");
-                return serde_json::json!({ "symbols": [] }).to_string();
-            }
-            match smedja_graph::GraphStore::open(&graph_db_path) {
-                Ok(store) => match store.graph_query(query, 10, depth) {
-                    Ok(symbols) => {
-                        let sym_json: Vec<serde_json::Value> = symbols
-                            .iter()
-                            .map(|s| {
-                                serde_json::json!({
-                                    "name": s.name,
-                                    "kind": s.kind.as_str(),
-                                    "file": s.file_path,
-                                    "line": s.start_line,
-                                    "snippet": s.snippet,
-                                })
-                            })
-                            .collect();
-                        serde_json::json!({ "symbols": sym_json }).to_string()
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "graph_query error");
-                        serde_json::json!({ "symbols": [], "error": e.to_string() }).to_string()
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to open graph store");
-                    serde_json::json!({ "symbols": [] }).to_string()
-                }
-            }
-        }
-        "alert_list" => {
-            let alerts = crate::alert::drain_alerts(50).await;
-            serde_json::to_string(&alerts).unwrap_or_default()
-        }
-        "otel_query" => {
-            let service = input
-                .get("service")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let filter = input.get("filter").and_then(|v| v.as_str());
-            let range = input
-                .get("range_minutes")
-                .and_then(Value::as_i64)
-                .and_then(|n| u32::try_from(n).ok())
-                .unwrap_or(60);
-            if let Ok(cfg) = smedja_sre::SreConfig::from_env() {
-                let client = reqwest::Client::new();
-                match smedja_sre::otel_query(&client, &cfg, service, filter, range).await {
-                    Ok(v) => serde_json::to_string(&v).unwrap_or_default(),
-                    Err(e) => format!("error: {e}"),
-                }
-            } else {
-                "SRE config not available (set SMEDJA_OTLP_ENDPOINT)".into()
-            }
-        }
-        "metric_query" => {
-            let promql = input.get("promql").and_then(|v| v.as_str()).unwrap_or("");
-            let range = input
-                .get("range_minutes")
-                .and_then(Value::as_i64)
-                .and_then(|n| u32::try_from(n).ok())
-                .unwrap_or(60);
-            if let Ok(cfg) = smedja_sre::SreConfig::from_env() {
-                let client = reqwest::Client::new();
-                match smedja_sre::metric_query(&client, &cfg, promql, range).await {
-                    Ok(v) => serde_json::to_string(&v).unwrap_or_default(),
-                    Err(e) => format!("error: {e}"),
-                }
-            } else {
-                "SRE config not available (set SMEDJA_PROMETHEUS_ENDPOINT)".into()
-            }
-        }
-        "log_tail" => {
-            let service = input
-                .get("service")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let filter = input.get("filter").and_then(|v| v.as_str()).unwrap_or("");
-            let lines = input
-                .get("lines")
-                .and_then(Value::as_i64)
-                .and_then(|n| u32::try_from(n).ok())
-                .unwrap_or(100);
-            if let Ok(cfg) = smedja_sre::SreConfig::from_env() {
-                let client = reqwest::Client::new();
-                match smedja_sre::log_tail(&client, &cfg, service, filter, lines).await {
-                    Ok(v) => serde_json::to_string(&v).unwrap_or_default(),
-                    Err(e) => format!("error: {e}"),
-                }
-            } else {
-                "SRE config not available (set SMEDJA_LOKI_ENDPOINT)".into()
-            }
-        }
-        other => dispatch_mcp_tool(other, &input, ingot).await,
-    }
-}
-
-/// Dispatches a tool call to the MCP server that owns `tool_name`.
-///
-/// Queries the ingot registry for a registered MCP server whose `tools_json`
-/// contains an entry named `tool_name`, then forwards the call to that server
-/// via `McpHttpClient::call_tool`.  Returns an error string if no server owns
-/// the tool or if the HTTP call fails.
-async fn dispatch_mcp_tool(
-    tool_name: &str,
-    input: &serde_json::Value,
-    ingot: &Arc<Mutex<Ingot>>,
-) -> String {
-    let server = {
-        let ig = ingot.lock().await;
-        match ig.find_mcp_server_for_tool(tool_name) {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                tracing::debug!(tool = tool_name, "no MCP server registered for tool");
-                return format!("error: tool '{tool_name}' is not available");
-            }
-            Err(e) => {
-                tracing::warn!(tool = tool_name, error = %e, "ingot error looking up MCP tool");
-                return format!("error: tool '{tool_name}' is not available");
-            }
-        }
-    };
-
-    let client = match crate::mcp_http::McpHttpClient::new(&server.url, "") {
-        Ok(c) => c,
-        Err(e) => return format!("error: could not connect to MCP server '{}': {e}", server.name),
-    };
-
-    tracing::debug!(
-        tool = tool_name,
-        server = %server.name,
-        url = %server.url,
-        "dispatching MCP tool call"
-    );
-
-    match client.call_tool(tool_name, input).await {
-        Ok(result) => result,
-        Err(e) => format!("error: MCP tool call failed: {e}"),
-    }
-}
-
 /// Subscribes to [`TurnEvent::Started`] and spawns a [`run_turn`] task for each.
 ///
 /// Returns a shared handle store so that the caller can drain in-flight tasks
@@ -1751,7 +1298,7 @@ fn is_safe_mcp_url(url: &str) -> bool {
     true
 }
 
-#[allow(clippy::too_many_lines)] // all RPC methods live in one function per the spec
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // all RPC methods live in one function per the spec
 fn build_router(
     ingot: &Arc<Mutex<Ingot>>,
     dispatcher: Arc<Dispatcher>,
@@ -4063,77 +3610,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_mcp_tool_returns_error_when_no_server_registered() {
-        let ig = Arc::new(Mutex::new(
-            smedja_ingot::Ingot::open_in_memory().expect("in-memory Ingot must open"),
-        ));
-        let result =
-            super::dispatch_mcp_tool("unknown_tool", &serde_json::json!({}), &ig).await;
-        assert!(
-            result.starts_with("error:"),
-            "unregistered tool must return an error; got: {result}"
-        );
-        assert!(
-            result.contains("unknown_tool"),
-            "error must include the tool name; got: {result}"
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_mcp_tool_routes_to_registered_server() {
-        use tokio::net::TcpListener;
-
-        // Spawn a minimal mock MCP server that responds to tools/call.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server_url = format!("http://{addr}");
-
-        tokio::spawn(async move {
-            let app = axum::Router::new().route(
-                "/",
-                axum::routing::post(|| async {
-                    axum::Json(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "result": {
-                            "content": [{ "type": "text", "text": "dispatched-ok" }],
-                            "isError": false
-                        }
-                    }))
-                }),
-            );
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-        // Register the mock server in an in-memory Ingot.
-        let ig = Arc::new(Mutex::new(
-            smedja_ingot::Ingot::open_in_memory().expect("in-memory Ingot must open"),
-        ));
-        {
-            let mut guard = ig.lock().await;
-            guard
-                .register_mcp_server(&smedja_ingot::McpServer {
-                    id: "mock-1".into(),
-                    name: "mock-server".into(),
-                    url: server_url,
-                    transport: "http".into(),
-                    tools_json: r#"[{"name":"greet","description":"Greet"}]"#.into(),
-                    last_refresh: 1.0,
-                })
-                .expect("register_mcp_server must succeed");
-        }
-
-        let result =
-            super::dispatch_mcp_tool("greet", &serde_json::json!({"name": "world"}), &ig).await;
-        assert!(
-            result.contains("dispatched-ok"),
-            "must return the mock server's response; got: {result}"
-        );
-    }
-
-    #[tokio::test]
     async fn provider_pool_builds_without_panic() {
         // build_provider_pool is infallible — just verify no panic regardless
         // of what environment variables are set in the test runner.
@@ -4407,99 +3883,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vault_search_returns_empty_when_no_entries() {
-        use smedja_ingot::Ingot;
-        use smedja_vault::Vault;
-
-        let ingot = Arc::new(Mutex::new(Ingot::open_in_memory().unwrap()));
-        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
-
-        let result = super::execute_tool(
-            "smedja_vault_search",
-            r#"{"query":"rust async"}"#,
-            std::path::Path::new("/tmp"),
-            None,
-            &ingot,
-            &vault,
-        )
-        .await;
-
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v["results"].as_array().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn vault_store_then_search_finds_entry() {
-        use smedja_ingot::Ingot;
-        use smedja_vault::Vault;
-
-        let ingot = Arc::new(Mutex::new(Ingot::open_in_memory().unwrap()));
-        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
-
-        let store_result = super::execute_tool(
-            "smedja_vault_store",
-            r#"{"content":"tokio async runtime executor","namespace":"test"}"#,
-            std::path::Path::new("/tmp"),
-            None,
-            &ingot,
-            &vault,
-        )
-        .await;
-        let stored: serde_json::Value = serde_json::from_str(&store_result).unwrap();
-        assert_eq!(stored["stored"], true);
-
-        let search_result = super::execute_tool(
-            "smedja_vault_search",
-            r#"{"query":"tokio async","namespace":"test","k":5}"#,
-            std::path::Path::new("/tmp"),
-            None,
-            &ingot,
-            &vault,
-        )
-        .await;
-        let v: serde_json::Value = serde_json::from_str(&search_result).unwrap();
-        let results = v["results"].as_array().unwrap();
-        assert_eq!(results.len(), 1, "stored entry must be found");
-        assert_eq!(results[0]["namespace"], "test");
-    }
-
-    #[tokio::test]
-    async fn vault_search_respects_k_limit() {
-        use smedja_ingot::Ingot;
-        use smedja_vault::Vault;
-
-        let ingot = Arc::new(Mutex::new(Ingot::open_in_memory().unwrap()));
-        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
-
-        for i in 0..5_u8 {
-            super::execute_tool(
-                "smedja_vault_store",
-                &format!(r#"{{"content":"rust programming language crate {i}","namespace":"ns"}}"#),
-                std::path::Path::new("/tmp"),
-                None,
-                &ingot,
-                &vault,
-            )
-            .await;
-        }
-
-        let result = super::execute_tool(
-            "smedja_vault_search",
-            r#"{"query":"rust programming","namespace":"ns","k":2}"#,
-            std::path::Path::new("/tmp"),
-            None,
-            &ingot,
-            &vault,
-        )
-        .await;
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(
-            v["results"].as_array().unwrap().len() <= 2,
-            "k=2 must cap results at 2"
-        );
-    }
-
-    #[tokio::test]
     async fn warm_snapshot_writes_vault_entries_for_session_checkpoints() {
         use smedja_ingot::Checkpoint;
         use smedja_vault::Vault;
@@ -4688,102 +4071,4 @@ mod tests {
         assert_eq!(cold_count, 2);
     }
 
-    // ── parse_tool_call / find_tool_call_json ─────────────────────────────────
-
-    #[test]
-    fn parse_tool_call_returns_none_for_plain_text() {
-        let result = super::parse_tool_call("hello world, no JSON here");
-        assert!(result.is_none(), "plain text must yield None");
-    }
-
-    #[test]
-    fn parse_tool_call_returns_some_for_valid_tool_json() {
-        let json = r#"{"tool":"bash","input":{"command":"ls"}}"#;
-        let result = super::parse_tool_call(json);
-        assert!(result.is_some(), "valid tool JSON must yield Some");
-        let (tool_name, input_str) = result.unwrap();
-        assert_eq!(tool_name, "bash");
-        let input_val: serde_json::Value = serde_json::from_str(&input_str).unwrap();
-        assert_eq!(input_val["command"], "ls");
-    }
-
-    #[test]
-    fn parse_tool_call_returns_none_for_json_without_tool_key() {
-        let json = r#"{"action":"bash","input":{"command":"ls"}}"#;
-        let result = super::parse_tool_call(json);
-        assert!(result.is_none(), "JSON without 'tool' key must yield None");
-    }
-
-    #[test]
-    fn find_tool_call_json_handles_json_embedded_in_text() {
-        let text = r#"Here is the call: {"tool":"read_file","input":{"path":"foo.txt"}} done."#;
-        let result = super::find_tool_call_json(text);
-        assert!(result.is_some(), "embedded JSON must be found");
-        let v = result.unwrap();
-        assert_eq!(v["tool"], "read_file");
-        assert_eq!(v["input"]["path"], "foo.txt");
-    }
-
-    #[tokio::test]
-    async fn smedja_vault_search_returns_results_when_vault_has_matching_entries() {
-        use smedja_ingot::Ingot;
-        use smedja_vault::Vault;
-
-        let ingot = Arc::new(Mutex::new(Ingot::open_in_memory().unwrap()));
-        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
-
-        // Insert a known entry via the store tool so the embedding path is exercised.
-        let store_result = super::execute_tool(
-            "smedja_vault_store",
-            r#"{"content":"Rust ownership model borrow checker lifetimes","namespace":"search-test"}"#,
-            std::path::Path::new("/tmp"),
-            None,
-            &ingot,
-            &vault,
-        )
-        .await;
-        let stored: serde_json::Value = serde_json::from_str(&store_result).unwrap();
-        assert_eq!(stored["stored"], true, "entry must be stored before searching");
-
-        // Query with text similar to the inserted entry.
-        let search_result = super::execute_tool(
-            "smedja_vault_search",
-            r#"{"query":"Rust ownership borrow checker","namespace":"search-test","k":5}"#,
-            std::path::Path::new("/tmp"),
-            None,
-            &ingot,
-            &vault,
-        )
-        .await;
-
-        let v: serde_json::Value = serde_json::from_str(&search_result).unwrap();
-        let results = v["results"].as_array().expect("results must be an array");
-        assert!(
-            !results.is_empty(),
-            "smedja_vault_search must return at least one result for a matching query"
-        );
-
-        // Verify the returned entry has a positive cosine similarity by checking
-        // that the vault itself scores the entry > 0 when searched directly.
-        let similarity = {
-            let guard = vault.lock().await;
-            let qv = crate::embedder::embed("Rust ownership borrow checker");
-            let entries = guard
-                .search(&qv, "Rust ownership borrow checker", "search-test", 1)
-                .unwrap();
-            if entries.is_empty() {
-                return;
-            }
-            // Re-score using the embedder to confirm similarity is positive.
-            let stored_vec = crate::embedder::embed("Rust ownership model borrow checker lifetimes");
-            qv.iter()
-                .zip(stored_vec.iter())
-                .map(|(a, b)| a * b)
-                .sum::<f32>()
-        };
-        assert!(
-            similarity > 0.0,
-            "cosine similarity between query and stored entry must be > 0, got {similarity}"
-        );
-    }
 }
