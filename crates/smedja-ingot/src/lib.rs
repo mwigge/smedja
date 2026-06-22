@@ -32,7 +32,46 @@ pub use task::Task;
 pub use token_snapshot::TokenSnapshot;
 
 /// The current schema version applied by [`Ingot::migrate`].
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+
+/// Aggregated statistics for a single multi-agent conversation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConversationRollup {
+    /// Conversation identifier — primary key.
+    pub conversation_id: String,
+    /// Unix epoch (seconds) when the first event for this conversation was recorded.
+    pub started_at: i64,
+    /// Unix epoch (seconds) of the most recent event.
+    pub last_seen_at: i64,
+    /// Number of distinct agents that contributed events.
+    pub agent_count: i64,
+    /// Total number of LLM-call events (`action_type = "llm"`).
+    pub llm_call_count: i64,
+    /// Total number of tool-call events (`action_type = "tool"`).
+    pub tool_call_count: i64,
+    /// Total number of events with `status = "error"`.
+    pub failure_count: i64,
+    /// Sum of `input_tok` across all events in this conversation.
+    pub input_token_total: i64,
+    /// Sum of `output_tok` across all events in this conversation.
+    pub output_token_total: i64,
+}
+
+/// Parses a W3C `traceparent` header into `(trace_id, span_id)`.
+///
+/// Format: `00-<trace_id>-<parent_id>-<flags>`
+///
+/// Returns `None` when the input does not conform to the format or the version
+/// field is not `"00"`.
+#[must_use]
+pub fn parse_traceparent(tp: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = tp.splitn(4, '-').collect();
+    if parts.len() == 4 && parts[0] == "00" {
+        Some((parts[1].to_owned(), parts[2].to_owned()))
+    } else {
+        None
+    }
+}
 
 /// `SQLite` persistence handle for smedja.
 ///
@@ -185,31 +224,80 @@ impl Ingot {
             ",
         )?;
 
-        // Add response column to existing databases — SQLite returns an error if the
+        // Add response column to existing databases -- SQLite returns an error if the
         // column already exists; we suppress it so migrate() stays idempotent.
         let _ = self
             .conn
             .execute_batch("ALTER TABLE tasks ADD COLUMN response TEXT;");
 
-        // Add cowork_mode column to existing sessions tables — suppressed if already present.
+        // Add cowork_mode column to existing sessions tables -- suppressed if already present.
         let _ = self.conn.execute_batch(
             "ALTER TABLE sessions ADD COLUMN cowork_mode INTEGER NOT NULL DEFAULT 0;",
         );
 
-        // Add workspace_root column to existing sessions tables — suppressed if already present.
+        // Add workspace_root column to existing sessions tables -- suppressed if already present.
         let _ = self
             .conn
             .execute_batch("ALTER TABLE sessions ADD COLUMN workspace_root TEXT;");
 
-        // Add model_override column to existing sessions tables — suppressed if already present.
+        // Add model_override column to existing sessions tables -- suppressed if already present.
         let _ = self
             .conn
             .execute_batch("ALTER TABLE sessions ADD COLUMN model_override TEXT;");
 
-        // Add role_id column to audit_events — suppressed if already present.
+        // Add role_id column to audit_events -- suppressed if already present.
         let _ = self
             .conn
             .execute_batch("ALTER TABLE audit_events ADD COLUMN role_id TEXT;");
+
+        // schema version 2: timeline columns on audit_events.
+        // Each ALTER TABLE is independent so a failure on one (column already
+        // exists) does not prevent the remaining columns from being added.
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE audit_events ADD COLUMN conversation_id TEXT;");
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE audit_events ADD COLUMN trace_id TEXT;");
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE audit_events ADD COLUMN span_id TEXT;");
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE audit_events ADD COLUMN parent_span_id TEXT;");
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE audit_events ADD COLUMN agent_name TEXT;");
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE audit_events ADD COLUMN operation_name TEXT;");
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE audit_events ADD COLUMN status TEXT;");
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE audit_events ADD COLUMN error_kind TEXT;");
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE audit_events ADD COLUMN error_count INTEGER;");
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE audit_events ADD COLUMN tool_call_id TEXT;");
+
+        // schema version 2: conversation_rollups table.
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS conversation_rollups (
+                conversation_id    TEXT PRIMARY KEY,
+                started_at         INTEGER NOT NULL,
+                last_seen_at       INTEGER NOT NULL,
+                agent_count        INTEGER NOT NULL DEFAULT 0,
+                llm_call_count     INTEGER NOT NULL DEFAULT 0,
+                tool_call_count    INTEGER NOT NULL DEFAULT 0,
+                failure_count      INTEGER NOT NULL DEFAULT 0,
+                input_token_total  INTEGER NOT NULL DEFAULT 0,
+                output_token_total INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
 
         // Record (or ignore) the schema version marker.
         self.conn.execute(
@@ -220,7 +308,7 @@ impl Ingot {
         Ok(())
     }
 
-    // ── audit_events ────────────────────────────────────────────────────────
+    // audit_events -----------------------------------------------------------
 
     /// Appends an [`AuditEvent`] to the immutable audit log.
     ///
@@ -228,7 +316,7 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the INSERT fails.
     #[must_use = "check the Result to confirm the event was persisted"]
-    pub fn insert_audit_event(&mut self, event: &AuditEvent) -> Result<(), IngotError> {
+    pub fn insert_audit_event(&self, event: &AuditEvent) -> Result<(), IngotError> {
         audit::insert(&self.conn, event)
     }
 
@@ -242,7 +330,114 @@ impl Ingot {
         audit::list_by_session(&self.conn, session_id)
     }
 
-    // ── sessions ─────────────────────────────────────────────────────────────
+    /// Persists a timeline event and, when the event carries a `conversation_id`,
+    /// upserts the matching [`ConversationRollup`] counters atomically.
+    ///
+    /// - `llm_call_count` incremented when `action_type == "llm"`
+    /// - `tool_call_count` incremented when `action_type == "tool"`
+    /// - `failure_count` incremented when `status == Some("error")`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if either the event INSERT or the rollup upsert fails.
+    #[must_use = "check the Result to confirm the timeline event was recorded"]
+    pub fn record_timeline_event(&self, event: &AuditEvent) -> Result<(), IngotError> {
+        audit::insert(&self.conn, event)?;
+
+        let Some(ref conv_id) = event.conversation_id else {
+            return Ok(());
+        };
+
+        #[allow(clippy::cast_possible_truncation)] // intentional: subsecond precision is not needed
+        let now_secs = now_epoch() as i64;
+        let is_llm = i64::from(event.action_type == "llm");
+        let is_tool = i64::from(event.action_type == "tool");
+        let is_failure = i64::from(event.status.as_deref() == Some("error"));
+
+        self.conn.execute(
+            "INSERT INTO conversation_rollups \
+             (conversation_id, started_at, last_seen_at, agent_count, \
+              llm_call_count, tool_call_count, failure_count, \
+              input_token_total, output_token_total) \
+             VALUES (?1, ?2, ?2, 0, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(conversation_id) DO UPDATE SET \
+               last_seen_at       = excluded.last_seen_at, \
+               agent_count        = (SELECT COUNT(DISTINCT COALESCE(agent_name, actor)) \
+                                     FROM audit_events WHERE conversation_id = ?1), \
+               llm_call_count     = llm_call_count     + excluded.llm_call_count, \
+               tool_call_count    = tool_call_count    + excluded.tool_call_count, \
+               failure_count      = failure_count      + excluded.failure_count, \
+               input_token_total  = input_token_total  + excluded.input_token_total, \
+               output_token_total = output_token_total + excluded.output_token_total",
+            rusqlite::params![
+                conv_id,
+                now_secs,
+                is_llm,
+                is_tool,
+                is_failure,
+                event.input_tok,
+                event.output_tok,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the most recent `limit` [`ConversationRollup`]s ordered by
+    /// `last_seen_at` descending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned rollups"]
+    pub fn recent_conversations(&self, limit: u32) -> Result<Vec<ConversationRollup>, IngotError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT conversation_id, started_at, last_seen_at, agent_count, \
+                    llm_call_count, tool_call_count, failure_count, \
+                    input_token_total, output_token_total \
+             FROM conversation_rollups \
+             ORDER BY last_seen_at DESC \
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit], |row| {
+            Ok(ConversationRollup {
+                conversation_id: row.get(0)?,
+                started_at: row.get(1)?,
+                last_seen_at: row.get(2)?,
+                agent_count: row.get(3)?,
+                llm_call_count: row.get(4)?,
+                tool_call_count: row.get(5)?,
+                failure_count: row.get(6)?,
+                input_token_total: row.get(7)?,
+                output_token_total: row.get(8)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(IngotError::Db)
+    }
+
+    /// Returns all timeline events for `conversation_id`, ordered by `rowid` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned events"]
+    pub fn conversation_timeline(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<AuditEvent>, IngotError> {
+        audit::list_by_conversation(&self.conn, conversation_id)
+    }
+
+    /// Returns timeline events with `status = 'error'` for `conversation_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned events"]
+    pub fn failed_events(&self, conversation_id: &str) -> Result<Vec<AuditEvent>, IngotError> {
+        audit::list_failed_by_conversation(&self.conn, conversation_id)
+    }
+
+    // sessions ---------------------------------------------------------------
 
     /// Inserts a new [`Session`].
     ///
@@ -382,7 +577,7 @@ impl Ingot {
         session::update_cowork_mode(&self.conn, session_id, enabled)
     }
 
-    // ── mcp_servers ──────────────────────────────────────────────────────────
+    // mcp_servers ------------------------------------------------------------
 
     /// Registers (or replaces) an [`McpServer`] in the registry.
     ///
@@ -458,7 +653,7 @@ impl Ingot {
         mcp::by_name(&self.conn, name)
     }
 
-    // ── tasks ─────────────────────────────────────────────────────────────────
+    // tasks ------------------------------------------------------------------
 
     /// Inserts a new [`Task`].
     ///
@@ -514,7 +709,7 @@ impl Ingot {
         task::update_response(&self.conn, id, response)
     }
 
-    // ── checkpoints ──────────────────────────────────────────────────────────
+    // checkpoints ------------------------------------------------------------
 
     /// Saves a [`Checkpoint`], replacing any existing checkpoint for the same
     /// `(session_id, turn_n)` pair.
@@ -581,7 +776,7 @@ impl Ingot {
         checkpoint::rollback_session(&self.conn, session_id, turn_n)
     }
 
-    // ── cost_ledger ──────────────────────────────────────────────────────────
+    // cost_ledger ------------------------------------------------------------
 
     /// Appends a [`CostEntry`] to the cost ledger.
     ///
@@ -605,7 +800,7 @@ impl Ingot {
         cost::session_total(&self.conn, session_id)
     }
 
-    // ── JSONL export / import ─────────────────────────────────────────────────
+    // JSONL export / import --------------------------------------------------
 
     /// Exports tasks and their associated audit events as a JSONL stream.
     ///
@@ -618,19 +813,16 @@ impl Ingot {
     /// events.  When `change` is `None`, all tasks and all audit events are
     /// exported.
     ///
-    /// The order is: task row, then all `audit_event` rows for that task's
-    /// `session_id` (ordered by `ts` ascending), repeated for each task.
-    ///
     /// # Errors
     ///
     /// Returns [`IngotError::Db`] if any query fails, or [`IngotError::Json`]
     /// if serialisation fails.
+    #[must_use = "check the Result and use the returned JSONL records"]
     pub fn export_jsonl(&self, change: Option<&str>) -> Result<Vec<serde_json::Value>, IngotError> {
         let tasks = self.list_tasks(None)?;
         let mut out: Vec<serde_json::Value> = Vec::new();
 
         for t in tasks {
-            // Apply optional change-name filter.
             if let Some(name) = change {
                 if !t.title.contains(name) {
                     continue;
@@ -641,7 +833,6 @@ impl Ingot {
             task_obj["type"] = serde_json::Value::String("task".to_owned());
             out.push(task_obj);
 
-            // Emit associated audit events when the task is linked to a session.
             if let Some(ref sid) = t.session_id {
                 let events = self.list_audit_events(sid)?;
                 for ev in events {
@@ -667,13 +858,13 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Json`] if an object cannot be deserialised, or
     /// [`IngotError::Db`] if a database INSERT fails.
+    #[must_use = "check the Result and inspect the returned import count"]
     pub fn import_jsonl(&mut self, records: &[serde_json::Value]) -> Result<usize, IngotError> {
         let mut imported = 0usize;
         for rec in records {
             match rec["type"].as_str() {
                 Some("task") => {
                     let t: Task = serde_json::from_value(rec.clone())?;
-                    // Use INSERT OR IGNORE so re-imports are idempotent.
                     let result = self.conn.execute(
                         "INSERT OR IGNORE INTO tasks \
                          (id, title, description, status, created_at, session_id, response) \
@@ -695,8 +886,12 @@ impl Ingot {
                     let result = self.conn.execute(
                         "INSERT OR IGNORE INTO audit_events \
                          (id, ts, session_id, turn_id, action_type, actor, tool_name, \
-                          input_tok, output_tok, latency_ms, traceparent, tier, role_id) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                          input_tok, output_tok, latency_ms, traceparent, tier, role_id, \
+                          conversation_id, trace_id, span_id, parent_span_id, \
+                          agent_name, operation_name, status, error_kind, error_count, \
+                          tool_call_id) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
+                                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
                         rusqlite::params![
                             ev.id.to_string(),
                             ev.ts,
@@ -711,12 +906,21 @@ impl Ingot {
                             ev.traceparent,
                             ev.tier,
                             ev.role_id,
+                            ev.conversation_id,
+                            ev.trace_id,
+                            ev.span_id,
+                            ev.parent_span_id,
+                            ev.agent_name,
+                            ev.operation_name,
+                            ev.status,
+                            ev.error_kind,
+                            ev.error_count,
+                            ev.tool_call_id,
                         ],
                     )?;
                     imported += result;
                 }
                 _ => {
-                    // Unknown type — skip silently.
                     tracing::debug!(
                         record = ?rec,
                         "import_jsonl: skipping record with unrecognised type"
@@ -727,7 +931,7 @@ impl Ingot {
         Ok(imported)
     }
 
-    // ── token_snapshots ───────────────────────────────────────────────────────
+    // token_snapshots --------------------------------------------------------
 
     /// Saves a [`TokenSnapshot`], replacing any existing snapshot for the same
     /// `(session_id, turn_n)` pair.
@@ -753,7 +957,7 @@ impl Ingot {
         token_snapshot::list_by_session(&self.conn, session_id)
     }
 
-    // ── loops ─────────────────────────────────────────────────────────────────
+    // loops ------------------------------------------------------------------
 
     /// Inserts a new [`LoopRecord`] into the `loops` table.
     ///
@@ -832,7 +1036,7 @@ impl Ingot {
         loop_state::list_by_status(&self.conn, status)
     }
 
-    // ── prompt_hashes ─────────────────────────────────────────────────────────
+    // prompt_hashes ----------------------------------------------------------
 
     /// Records a prompt content hash for `(change, role)` at the current time.
     ///
@@ -870,7 +1074,7 @@ impl Ingot {
         prompt_hash::list_by_change(&self.conn, change)
     }
 
-    // ── audit_events (all) ────────────────────────────────────────────────────
+    // audit_events (all) -----------------------------------------------------
 
     /// Returns all [`AuditEvent`]s ordered by `ts` ascending.
     ///
@@ -898,14 +1102,12 @@ mod tests {
 
     #[test]
     fn open_in_memory_is_idempotent() {
-        // Calling open_in_memory twice must not fail.
         let _a = Ingot::open_in_memory().unwrap();
         let _b = Ingot::open_in_memory().unwrap();
     }
 
     #[test]
     fn migrate_is_idempotent_on_same_connection() {
-        // Directly call migrate() a second time on the same connection — must not fail.
         let ingot = Ingot::open_in_memory().unwrap();
         ingot.migrate().unwrap();
         ingot.migrate().unwrap();
@@ -925,7 +1127,7 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
     }
 
-    // ── export / import round-trip ────────────────────────────────────────────
+    // export / import round-trip ---------------------------------------------
 
     fn make_task(title: &str) -> Task {
         Task {
@@ -944,16 +1146,13 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             ts: 1_700_000_001.0,
             session_id: session_id.to_owned(),
-            turn_id: None,
             action_type: "tool_exec".to_owned(),
             actor: "coder".to_owned(),
             tool_name: Some("bash".to_owned()),
             input_tok: 10,
             output_tok: 5,
             latency_ms: 42,
-            traceparent: None,
-            tier: None,
-            role_id: None,
+            ..AuditEvent::default()
         }
     }
 
@@ -1007,7 +1206,6 @@ mod tests {
 
         let records = ingot.export_jsonl(None).unwrap();
 
-        // Importing the same records twice must not insert duplicates.
         let first = ingot.import_jsonl(&records).unwrap();
         assert_eq!(first, 0, "rows already exist; INSERT OR IGNORE should skip");
         let tasks = ingot.list_tasks(None).unwrap();
@@ -1018,7 +1216,6 @@ mod tests {
     fn export_jsonl_includes_audit_events_for_session_tasks() {
         let mut ingot = Ingot::open_in_memory().unwrap();
 
-        // Create a session first so the FK is valid.
         let session = crate::session::Session {
             id: uuid::Uuid::new_v4(),
             created_at: 1_700_000_000.0,
@@ -1040,7 +1237,6 @@ mod tests {
         ingot.insert_audit_event(&ev).unwrap();
 
         let records = ingot.export_jsonl(None).unwrap();
-        // Should have 1 task + 1 audit_event.
         assert_eq!(records.len(), 2);
         let types: Vec<&str> = records.iter().filter_map(|r| r["type"].as_str()).collect();
         assert!(types.contains(&"task"));
@@ -1053,5 +1249,175 @@ mod tests {
         let unknown = serde_json::json!({ "type": "unknown_record", "data": 42 });
         let imported = ingot.import_jsonl(&[unknown]).unwrap();
         assert_eq!(imported, 0);
+    }
+
+    // section 2 timeline tests -----------------------------------------------
+
+    #[test]
+    fn fresh_db_has_new_columns() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let ev = AuditEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: "sess-1".into(),
+            conversation_id: Some("conv-001".into()),
+            trace_id: Some("abc123".into()),
+            span_id: Some("def456".into()),
+            ..AuditEvent::default()
+        };
+        ingot.insert_audit_event(&ev).unwrap();
+    }
+
+    #[test]
+    fn parse_traceparent_extracts_ids() {
+        let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let (tid, sid) = parse_traceparent(tp).unwrap();
+        assert_eq!(tid, "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(sid, "00f067aa0ba902b7");
+    }
+
+    #[test]
+    fn parse_traceparent_rejects_invalid() {
+        assert!(parse_traceparent("not-a-traceparent").is_none());
+        assert!(parse_traceparent("01-trace-span-01").is_none());
+        assert!(parse_traceparent("").is_none());
+    }
+
+    #[test]
+    fn record_timeline_event_updates_rollup() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let ev = AuditEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: "sess-1".into(),
+            conversation_id: Some("conv-test".into()),
+            action_type: "llm".into(),
+            ..AuditEvent::default()
+        };
+        ingot.record_timeline_event(&ev).unwrap();
+        let rollups = ingot.recent_conversations(10).unwrap();
+        assert_eq!(rollups.len(), 1);
+        assert_eq!(rollups[0].conversation_id, "conv-test");
+        assert_eq!(rollups[0].llm_call_count, 1);
+    }
+
+    #[test]
+    fn record_timeline_event_accumulates_across_calls() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let conv_id = Some("conv-accum".to_owned());
+
+        let llm_ev = AuditEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: "s".into(),
+            conversation_id: conv_id.clone(),
+            action_type: "llm".into(),
+            input_tok: 100,
+            output_tok: 50,
+            ..AuditEvent::default()
+        };
+        let tool_ev = AuditEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: "s".into(),
+            conversation_id: conv_id.clone(),
+            action_type: "tool".into(),
+            input_tok: 10,
+            output_tok: 5,
+            ..AuditEvent::default()
+        };
+        let err_ev = AuditEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: "s".into(),
+            conversation_id: conv_id,
+            action_type: "llm".into(),
+            status: Some("error".into()),
+            input_tok: 20,
+            output_tok: 0,
+            ..AuditEvent::default()
+        };
+
+        ingot.record_timeline_event(&llm_ev).unwrap();
+        ingot.record_timeline_event(&tool_ev).unwrap();
+        ingot.record_timeline_event(&err_ev).unwrap();
+
+        let rollups = ingot.recent_conversations(10).unwrap();
+        assert_eq!(rollups.len(), 1);
+        let r = &rollups[0];
+        assert_eq!(r.llm_call_count, 2);
+        assert_eq!(r.tool_call_count, 1);
+        assert_eq!(r.failure_count, 1);
+        assert_eq!(r.input_token_total, 130);
+        assert_eq!(r.output_token_total, 55);
+    }
+
+    #[test]
+    fn record_timeline_event_without_conversation_id_skips_rollup() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let ev = AuditEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: "sess-no-conv".into(),
+            action_type: "llm".into(),
+            ..AuditEvent::default()
+        };
+        ingot.record_timeline_event(&ev).unwrap();
+        let rollups = ingot.recent_conversations(10).unwrap();
+        assert!(rollups.is_empty());
+    }
+
+    #[test]
+    fn conversation_timeline_returns_ordered_events() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        for i in 0..3 {
+            let ev = AuditEvent {
+                id: uuid::Uuid::new_v4(),
+                session_id: format!("sess-{i}"),
+                conversation_id: Some("conv-order".into()),
+                ..AuditEvent::default()
+            };
+            ingot.record_timeline_event(&ev).unwrap();
+        }
+        let events = ingot.conversation_timeline("conv-order").unwrap();
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn failed_events_returns_only_error_status() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let conv_id = Some("conv-fail".to_owned());
+
+        let ok_ev = AuditEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: "s".into(),
+            conversation_id: conv_id.clone(),
+            status: Some("ok".into()),
+            ..AuditEvent::default()
+        };
+        let err_ev = AuditEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: "s".into(),
+            conversation_id: conv_id,
+            status: Some("error".into()),
+            ..AuditEvent::default()
+        };
+
+        ingot.record_timeline_event(&ok_ev).unwrap();
+        ingot.record_timeline_event(&err_ev).unwrap();
+
+        let failures = ingot.failed_events("conv-fail").unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].status.as_deref(), Some("error"));
+    }
+
+    #[test]
+    fn recent_conversations_respects_limit() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        for i in 0..5 {
+            let ev = AuditEvent {
+                id: uuid::Uuid::new_v4(),
+                session_id: "s".into(),
+                conversation_id: Some(format!("conv-{i}")),
+                ..AuditEvent::default()
+            };
+            ingot.record_timeline_event(&ev).unwrap();
+        }
+        let rollups = ingot.recent_conversations(3).unwrap();
+        assert_eq!(rollups.len(), 3);
     }
 }

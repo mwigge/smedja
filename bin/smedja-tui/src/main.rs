@@ -117,6 +117,11 @@ struct AppState {
     /// True while a turn is awaiting a response from the daemon.
     #[allow(dead_code)] // wired at init; read path lands once streaming poll is complete
     turn_in_flight: bool,
+    /// Number of consecutive unexpected (non-done) poll responses received.
+    ///
+    /// Used to rate-limit the "waiting for turn…" status message so it does not
+    /// flood the panel on rapid retries.
+    poll_retry_count: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -546,7 +551,7 @@ async fn handle_key(
                 let start = std::time::Instant::now();
                 let session_id = state.session_id.clone();
                 let health_result = client
-                    .call("session.get", json!({ "session_id": session_id }))
+                    .call("session.get", json!({ "id": session_id }))
                     .await;
                 let latency_ms = start.elapsed().as_millis();
                 let text = match health_result {
@@ -839,6 +844,7 @@ async fn main() -> Result<()> {
         slash_popup_visible: false,
         slash_cursor: 0,
         turn_in_flight: false,
+        poll_retry_count: 0,
     };
 
     // Connect banner — shown on every startup so the user knows what's connected.
@@ -903,77 +909,116 @@ async fn main() -> Result<()> {
 
         terminal.draw(|f| render(f, &state))?;
 
-        // Poll for pending task result (every 200 ms).
+        // Subscribe to the in-flight turn result (replaces the old task.get poll
+        // loop).  turn.subscribe blocks on the daemon side until the turn
+        // reaches a terminal state, so a 50 ms guard prevents hammering the
+        // socket if the server returns early for any reason.
         if let Some(task_id) = state.pending_task_id.clone() {
-            let should_poll = state
+            let should_call = state
                 .last_poll
-                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(200));
-            if should_poll {
+                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(50));
+            if should_call {
                 state.last_poll = Some(std::time::Instant::now());
-                if let Ok(v) = client.call("task.get", json!({"id": task_id})).await {
-                    let status = v["status"].as_str().unwrap_or("");
-                    if status == "complete" {
-                        let response = v["response"].as_str().unwrap_or("(no response)").to_owned();
-                        let elapsed_ms = state.turn_submitted_at.map_or(0, |t| {
-                            u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
-                        });
-                        state.turn_submitted_at = None;
-                        if let Some(mut block) = state.current_block.take() {
-                            block.push_text(&response);
-                            block.complete(elapsed_ms);
-                            let width = 80usize;
-                            for line in block.render_lines(width) {
-                                let msg = Message {
-                                    role: Role::System,
-                                    text: line,
-                                };
-                                state.main_panel.push_line(msg.text.clone());
-                                state.messages.push(msg);
-                            }
-                            // Store completed block in history.
-                            state.block_store.push(block);
-                        } else {
+                match client
+                    .call("turn.subscribe", json!({ "task_id": task_id }))
+                    .await
+                {
+                    Ok(v) if v["done"].as_bool() == Some(true) => {
+                        if let Some(error) = v["error"].as_str() {
                             let msg = Message {
                                 role: Role::System,
-                                text: response,
+                                text: format!("error: {error}"),
                             };
                             state.main_panel.push_line(msg.text.clone());
                             state.messages.push(msg);
+                            if let Some(mut block) = state.current_block.take() {
+                                block.fail();
+                                state.block_store.push(block);
+                            }
+                        } else {
+                            let response = v["response"].as_str().unwrap_or("").to_owned();
+                            let input_tok = v["input_tok"].as_i64().unwrap_or(0);
+                            let output_tok = v["output_tok"].as_i64().unwrap_or(0);
+                            let elapsed_ms = state.turn_submitted_at.map_or(0, |t| {
+                                u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+                            });
+                            state.turn_submitted_at = None;
+
+                            if let Some(mut block) = state.current_block.take() {
+                                block.push_text(&response);
+                                block.complete(elapsed_ms);
+                                for line in block.render_lines(80) {
+                                    let msg = Message {
+                                        role: Role::System,
+                                        text: line,
+                                    };
+                                    state.main_panel.push_line(msg.text.clone());
+                                    state.messages.push(msg);
+                                }
+                                state.block_store.push(block);
+                            } else {
+                                if !response.is_empty() {
+                                    state.main_panel.push_delta(&response);
+                                }
+                                let msg = Message {
+                                    role: Role::System,
+                                    text: response,
+                                };
+                                state.messages.push(msg);
+                            }
+
+                            // Turn footer: token counts and wall-clock latency.
+                            let footer =
+                                format!("↳ {input_tok}↑ {output_tok}↓ tokens · {elapsed_ms}ms");
+                            state.main_panel.push_line(footer);
                         }
                         state.pending_task_id = None;
                         state.last_poll = None;
                         state.turn_in_flight = false;
-                    } else if status == "failed" {
-                        if let Some(mut block) = state.current_block.take() {
-                            block.fail();
-                            for line in block.render_lines(80) {
-                                let msg = Message {
-                                    role: Role::System,
-                                    text: line,
-                                };
-                                state.main_panel.push_line(msg.text.clone());
-                                state.messages.push(msg);
-                            }
-                            // Store failed block in history too.
-                            state.block_store.push(block);
-                        } else {
-                            let msg = Message {
-                                role: Role::System,
-                                text: "turn failed".to_owned(),
-                            };
-                            state.main_panel.push_line(msg.text.clone());
-                            state.messages.push(msg);
+                        state.poll_retry_count = 0;
+                    }
+                    Ok(_) => {
+                        // turn.subscribe returned Ok but the response was not
+                        // done=true — retry on the next tick.
+                        state.poll_retry_count += 1;
+                        state.last_poll = None;
+                        // Surface a status line every 5 retries so the user is
+                        // not left staring at a silent spinner.
+                        if state.poll_retry_count % 5 == 1 {
+                            state.main_panel.push_line(format!(
+                                "waiting for turn… (poll attempt {})",
+                                state.poll_retry_count
+                            ));
                         }
+                        // After 60 unexpected retries surface an error to avoid
+                        // an indefinitely silent hang.
+                        if state.poll_retry_count >= 60 {
+                            state.main_panel.push_line(
+                                "turn appears stuck — no done=true after 60 polls; giving up"
+                                    .to_owned(),
+                            );
+                            state.pending_task_id = None;
+                            state.last_poll = None;
+                            state.turn_in_flight = false;
+                            state.poll_retry_count = 0;
+                        }
+                    }
+                    Err(e) => {
+                        let text = if e.code == smedja_rpc::codes::TIMEOUT {
+                            "turn timed out (>60 s) — the daemon is still running the turn in the background".to_owned()
+                        } else {
+                            format!("turn error: {e}")
+                        };
+                        let msg = Message {
+                            role: Role::System,
+                            text,
+                        };
+                        state.main_panel.push_line(msg.text.clone());
+                        state.messages.push(msg);
                         state.pending_task_id = None;
                         state.last_poll = None;
                         state.turn_in_flight = false;
-                    } else if status == "in_progress" {
-                        // Show partial response if available (soft streaming).
-                        if let Some(partial) = v["response_partial"].as_str() {
-                            if !partial.is_empty() {
-                                state.main_panel.push_delta(partial);
-                            }
-                        }
+                        state.poll_retry_count = 0;
                     }
                 }
             }
@@ -1087,6 +1132,7 @@ mod tests {
             slash_popup_visible: false,
             slash_cursor: 0,
             turn_in_flight: false,
+            poll_retry_count: 0,
         }
     }
 
@@ -1208,6 +1254,26 @@ mod tests {
         assert!(
             content.contains("sess-health"),
             "health output should show session ID"
+        );
+    }
+
+    #[test]
+    fn health_command_param_key_is_id() {
+        // The /health handler must pass "id", not "session_id", to session.get.
+        let session_id = "sess-health";
+        let payload = json!({ "id": session_id });
+        assert!(
+            payload.get("id").is_some(),
+            "RPC payload must contain key \"id\""
+        );
+        assert!(
+            payload.get("session_id").is_none(),
+            "RPC payload must not contain key \"session_id\""
+        );
+        assert_eq!(
+            payload["id"].as_str().unwrap(),
+            session_id,
+            "\"id\" value must match the session id"
         );
     }
 
@@ -1396,6 +1462,28 @@ mod tests {
         assert!(
             content.contains("health"),
             "main panel should contain health output after /health command; got: {content:?}"
+        );
+    }
+
+    // Verifies that the token-count footer pushed after a turn completes
+    // appears in the rendered frame buffer.
+    #[test]
+    fn turn_footer_shows_token_counts() {
+        let mut state = make_state("sess-footer");
+        // Simulate what the subscribe completion path does.
+        state.main_panel.push_delta("response text");
+        state
+            .main_panel
+            .push_line("↳ 10↑ 20↓ tokens · 250ms".into());
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            content.contains("tokens"),
+            "turn footer should show token count label in the rendered buffer"
         );
     }
 }

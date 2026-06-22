@@ -18,12 +18,14 @@ impl Codec {
 
     /// # Errors
     /// Returns an error if serialisation or the socket write fails.
+    #[must_use = "check the Result to confirm the request was written to the socket"]
     pub async fn send_request(&mut self, req: &Request) -> Result<()> {
         self.write_line(&serde_json::to_string(req)?).await
     }
 
     /// # Errors
     /// Returns an error if serialisation or the socket write fails.
+    #[must_use = "check the Result to confirm the response was written to the socket"]
     pub async fn send_response(&mut self, resp: &Response) -> Result<()> {
         self.write_line(&serde_json::to_string(resp)?).await
     }
@@ -31,6 +33,7 @@ impl Codec {
     /// # Errors
     /// Returns an error if the socket read or JSON deserialisation fails.
     /// Returns `Ok(None)` on EOF.
+    #[must_use = "check the Result and handle the Option; None means EOF"]
     pub async fn recv_request(&mut self) -> Result<Option<Request>> {
         self.read_line_as().await
     }
@@ -38,6 +41,7 @@ impl Codec {
     /// # Errors
     /// Returns an error if the socket read or JSON deserialisation fails.
     /// Returns `Ok(None)` on EOF.
+    #[must_use = "check the Result and handle the Option; None means EOF"]
     pub async fn recv_response(&mut self) -> Result<Option<Response>> {
         self.read_line_as().await
     }
@@ -46,6 +50,7 @@ impl Codec {
     ///
     /// # Errors
     /// Returns an error if send, recv, or deserialisation fails, or if the connection closes.
+    #[must_use = "check the Result; transport failures and missing responses are both Err"]
     pub async fn call(&mut self, req: &Request) -> Result<Response> {
         self.send_request(req).await?;
         self.recv_response()

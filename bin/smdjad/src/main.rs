@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures_util::StreamExt;
 use opentelemetry::{
     global,
-    trace::{Span as _, Tracer as _},
+    trace::{Span as _, Status as SpanStatus, Tracer as _},
     KeyValue,
 };
 use serde_json::{json, Value};
@@ -34,12 +34,28 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use smedja_telemetry as tel;
+
 use crate::cowork::{ApprovalPrompt, CoworkGate, Decision};
 use crate::sandbox::SandboxExecutor;
 
 fn socket_path() -> PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(base).join("smdjad.sock")
+}
+
+/// RAII guard that removes the Unix socket file when dropped.
+///
+/// This ensures the socket is cleaned up on both clean shutdown and error
+/// propagation (e.g. when `server.serve()` returns `Err` and `?` exits early).
+struct SocketGuard {
+    path: PathBuf,
+}
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 fn now_epoch() -> f64 {
@@ -67,7 +83,7 @@ fn open_ingot() -> anyhow::Result<Ingot> {
         let db_path = dir.join("smedja.db");
         Ingot::open(&db_path).map_err(anyhow::Error::from)
     } else {
-        warn!("cannot create data directory; using in-memory store");
+        tracing::error!("cannot create data directory; using in-memory store — all session data will be lost on restart");
         Ingot::open_in_memory().map_err(anyhow::Error::from)
     }
 }
@@ -102,46 +118,58 @@ fn missing_param(name: &str) -> RpcError {
 /// 9. Local rs-llmctl endpoint health check → [`LocalProvider`]
 ///
 /// Returns `Err(reason)` only when all options are unavailable.
-async fn build_provider() -> Result<Box<dyn Provider>, String> {
+/// Returns `(provider, runner_name, default_model)` for the first available
+/// provider, in priority order.  The `runner_name` and `default_model` values
+/// are derived from the concrete provider type, not re-checked from the
+/// environment after selection.
+async fn build_provider() -> Result<(Box<dyn Provider>, &'static str, &'static str), String> {
     // CLI subscription providers take priority over API key providers.
     if let Some(p) = ClaudeCliProvider::detect(None) {
         info!(
             provider = "claude-cli",
             "provider selected via claude CLI subscription"
         );
-        return Ok(Box::new(p));
+        return Ok((Box::new(p), "claude-cli", "claude-haiku-4-5-20251001"));
     }
     if let Some(p) = CodexCliProvider::detect(None) {
         info!(
             provider = "codex-cli",
             "provider selected via codex CLI subscription"
         );
-        return Ok(Box::new(p));
+        return Ok((Box::new(p), "codex-cli", "gpt-4o-mini"));
     }
     if let Some(p) = CopilotProvider::detect() {
         info!(provider = "copilot", "provider selected");
-        return Ok(Box::new(p));
+        return Ok((Box::new(p), "copilot", "gpt-4o-mini"));
     }
     if let Some(p) = PoolsideProvider::detect() {
         info!(provider = "poolside", "provider selected");
-        return Ok(Box::new(p));
+        return Ok((Box::new(p), "poolside", "poolside-muse"));
     }
     // API key providers as fallback from CLI subscription providers.
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         info!(provider = "anthropic", "provider selected");
-        return Ok(Box::new(AnthropicProvider::new(key)));
+        return Ok((
+            Box::new(AnthropicProvider::new(key)),
+            "anthropic",
+            "claude-haiku-4-5-20251001",
+        ));
     }
     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         info!(provider = "openai", "provider selected");
-        return Ok(Box::new(OpenAiProvider::new("https://api.openai.com", key)));
+        return Ok((
+            Box::new(OpenAiProvider::new("https://api.openai.com", key)),
+            "openai",
+            "gpt-4o-mini",
+        ));
     }
     if let Some(p) = MinimaxProvider::detect() {
         info!(provider = "minimax", "provider selected");
-        return Ok(Box::new(p));
+        return Ok((Box::new(p), "minimax", "abab6.5s-chat"));
     }
     if let Some(p) = BergetProvider::detect() {
         info!(provider = "berget", "provider selected");
-        return Ok(Box::new(p));
+        return Ok((Box::new(p), "berget", "gpt-4o-mini"));
     }
     // Fall back to the local rs-llmctl endpoint.
     let local = LocalProvider::connect().await;
@@ -151,7 +179,7 @@ async fn build_provider() -> Result<Box<dyn Provider>, String> {
             model_id = %local.capability.model_id,
             "provider selected",
         );
-        return Ok(Box::new(local));
+        return Ok((Box::new(local), "local", "local"));
     }
     warn!("no provider available — all options exhausted");
     Err("no LLM API key and local endpoint unreachable".to_owned())
@@ -159,31 +187,68 @@ async fn build_provider() -> Result<Box<dyn Provider>, String> {
 
 /// Drains `stream`, accumulating text deltas into a single string.
 ///
-/// Returns `Ok((full_response, output_tokens))` on success, or `Err(reason)` if
-/// the stream yields an error item.  Each `Delta::Text` chunk is forwarded to
-/// `dispatcher` as a [`TurnEvent::AssistantDelta`].
+/// Returns `Ok((full_response, input_tokens, output_tokens))` on success, or
+/// `Err(reason)` if the stream yields an error item.  Each `Delta::Text` chunk
+/// is forwarded to `dispatcher` as a [`TurnEvent::AssistantDelta`].
+/// Error returned by [`drain_stream`], distinguishing rate-limit responses from
+/// other failures so callers can apply an appropriate retry strategy.
+enum DrainError {
+    /// The provider returned HTTP 429; back off for `retry_after` before retrying.
+    RateLimited {
+        retry_after: Option<std::time::Duration>,
+    },
+    /// Any other stream-level error; treat as fatal for this turn.
+    Other(String),
+}
+
+impl std::fmt::Display for DrainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RateLimited { retry_after } => {
+                write!(f, "rate limited by provider (retry after {retry_after:?})")
+            }
+            Self::Other(s) => f.write_str(s),
+        }
+    }
+}
+
 async fn drain_stream(
     mut stream: smedja_adapter::DeltaStream,
     dispatcher: &Dispatcher,
-) -> Result<(String, u32), String> {
+) -> Result<(String, u32, u32), DrainError> {
     let mut full_response = String::new();
+    let mut input_tokens = 0u32;
     let mut output_tokens = 0u32;
     loop {
         match stream.next().await {
             None => break,
             Some(Ok(Delta::Text(t))) => {
                 full_response.push_str(&t);
-                dispatcher.publish(TurnEvent::AssistantDelta { content: t });
+                dispatcher.publish(TurnEvent::AssistantDelta {
+                    content: t,
+                    conversation_id: None,
+                    trace_id: None,
+                    span_id: None,
+                    parent_span_id: None,
+                    operation_name: None,
+                    agent_name: None,
+                    status: None,
+                });
             }
             Some(Ok(Delta::Usage {
-                output_tokens: n, ..
+                input_tokens: i,
+                output_tokens: n,
             })) => {
+                input_tokens = i;
                 output_tokens = n;
             }
-            Some(Err(e)) => return Err(e.to_string()),
+            Some(Err(smedja_adapter::AdapterError::RateLimited { retry_after })) => {
+                return Err(DrainError::RateLimited { retry_after });
+            }
+            Some(Err(e)) => return Err(DrainError::Other(e.to_string())),
         }
     }
-    Ok((full_response, output_tokens))
+    Ok((full_response, input_tokens, output_tokens))
 }
 
 /// Returns `true` when the session's mode permits write-arity bash commands.
@@ -215,7 +280,7 @@ const MAX_TOOL_TURNS: usize = 10;
 
 /// Executes a single turn: loads the task, calls the LLM, handles tool calls,
 /// stores the final response.
-#[allow(clippy::too_many_lines)] // all turn lifecycle steps live in one function per the spec
+#[allow(clippy::too_many_lines, clippy::items_after_statements)]
 async fn run_turn(
     ingot: Arc<Mutex<Ingot>>,
     dispatcher: Arc<Dispatcher>,
@@ -237,49 +302,68 @@ async fn run_turn(
                     session_id,
                     turn_id,
                     reason: "task not found".to_owned(),
+                    conversation_id: None,
+                    trace_id: None,
+                    span_id: None,
+                    parent_span_id: None,
+                    operation_name: None,
+                    agent_name: None,
+                    status: None,
                 });
+                turn_span.set_status(SpanStatus::error("task not found"));
+                turn_span.end();
                 return;
             }
             Err(e) => {
-                warn!(turn_id = %turn_id, error = %e, "failed to load task");
+                warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to load task");
+                let reason = e.to_string();
                 dispatcher.publish(TurnEvent::Failed {
                     session_id,
                     turn_id,
-                    reason: e.to_string(),
+                    reason: reason.clone(),
+                    conversation_id: None,
+                    trace_id: None,
+                    span_id: None,
+                    parent_span_id: None,
+                    operation_name: None,
+                    agent_name: None,
+                    status: None,
                 });
+                turn_span.set_status(SpanStatus::error(reason));
+                turn_span.end();
                 return;
             }
         }
     };
 
     // 2. Select provider from environment.
-    let provider = match build_provider().await {
-        Ok(p) => p,
+    let (provider, provider_runner, provider_default_model) = match build_provider().await {
+        Ok(triple) => triple,
         Err(reason) => {
-            warn!("no LLM API key set; turn cannot execute");
+            warn!(session_id = %session_id, turn_id = %turn_id, "no LLM provider available; turn cannot execute");
             let _ = ingot.lock().await.update_task_status(&turn_id, "failed");
             dispatcher.publish(TurnEvent::Failed {
                 session_id,
                 turn_id,
-                reason,
+                reason: reason.clone(),
+                conversation_id: None,
+                trace_id: None,
+                span_id: None,
+                parent_span_id: None,
+                operation_name: None,
+                agent_name: None,
+                status: None,
             });
+            turn_span.set_status(SpanStatus::error(reason));
+            turn_span.end();
             return;
         }
     };
 
-    // Derive model and runner together once from the environment.
-    let (model, runner) = if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-        (
-            std::env::var("SMEDJA_MODEL")
-                .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_owned()),
-            "anthropic".to_owned(),
-        )
-    } else {
-        (
-            std::env::var("SMEDJA_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_owned()),
-            "openai".to_owned(),
-        )
-    };
+    // Derive model and runner from the concrete provider type selected above.
+    // SMEDJA_MODEL can override the default model name but never changes the runner.
+    let runner = provider_runner.to_owned();
+    let model = std::env::var("SMEDJA_MODEL").unwrap_or_else(|_| provider_default_model.to_owned());
 
     // 3. Load session for workspace root, cowork mode, and task context.
     let session = {
@@ -293,6 +377,12 @@ async fn run_turn(
         .as_ref()
         .and_then(|s| s.model_override.clone())
         .unwrap_or(model);
+
+    // Attach mandatory GenAI semantic-convention attributes to the turn span now
+    // that model and runner are resolved.
+    turn_span.set_attribute(KeyValue::new(tel::GEN_AI_SYSTEM, runner.clone()));
+    turn_span.set_attribute(KeyValue::new(tel::REQUEST_MODEL, model.clone()));
+    turn_span.set_attribute(KeyValue::new(tel::CONV_ID, session_id.clone()));
 
     // Derive workspace root: prefer session.workspace_root, then SMEDJA_WORKSPACE env, then ".".
     let workspace_root = {
@@ -545,25 +635,105 @@ async fn run_turn(
         );
     }
 
+    // Maximum number of rate-limit retries per turn before giving up.
+    const MAX_RATE_LIMIT_RETRIES: u32 = 4;
+    // Initial back-off when no Retry-After header is present.
+    const RATE_LIMIT_BACKOFF_BASE_SECS: u64 = 1;
+
     let mut full_response = String::new();
+    let mut total_input_tokens = 0u32;
     let mut total_output_tokens = 0u32;
 
     'tool_loop: for _iteration in 0..MAX_TOOL_TURNS {
-        // 5a. Stream LLM response.
-        let stream = provider.stream_chat(&messages, &opts);
-        let (response_text, output_tokens) = match drain_stream(stream, &dispatcher).await {
-            Ok(pair) => pair,
-            Err(reason) => {
-                warn!(turn_id = %turn_id, error = %reason, "stream error during turn");
-                let _ = ingot.lock().await.update_task_status(&turn_id, "failed");
-                dispatcher.publish(TurnEvent::Failed {
-                    session_id,
-                    turn_id,
-                    reason,
-                });
-                return;
+        // 5a. Stream LLM response with rate-limit retry (up to MAX_RATE_LIMIT_RETRIES).
+        let (response_text, input_tokens, output_tokens) = {
+            let mut backoff_secs = RATE_LIMIT_BACKOFF_BASE_SECS;
+            let mut attempt = 0u32;
+            loop {
+                let stream = provider.stream_chat(&messages, &opts);
+                let drain_result = tokio::time::timeout(
+                    std::time::Duration::from_mins(5),
+                    drain_stream(stream, &dispatcher),
+                )
+                .await;
+                match drain_result {
+                    Ok(Ok(triple)) => break triple,
+                    Ok(Err(DrainError::RateLimited { retry_after })) => {
+                        attempt += 1;
+                        if attempt > MAX_RATE_LIMIT_RETRIES {
+                            let reason =
+                                "rate limited by provider; retry limit exceeded".to_owned();
+                            warn!(turn_id = %turn_id, "rate limit retry limit exceeded");
+                            let _ = ingot.lock().await.update_task_status(&turn_id, "failed");
+                            dispatcher.publish(TurnEvent::Failed {
+                                session_id,
+                                turn_id,
+                                reason: reason.clone(),
+                                conversation_id: None,
+                                trace_id: None,
+                                span_id: None,
+                                parent_span_id: None,
+                                operation_name: None,
+                                agent_name: None,
+                                status: None,
+                            });
+                            turn_span.set_status(SpanStatus::error(reason));
+                            turn_span.end();
+                            return;
+                        }
+                        let sleep_secs = retry_after.map_or(backoff_secs, |d| d.as_secs().max(1));
+                        warn!(
+                            turn_id = %turn_id,
+                            attempt,
+                            sleep_secs,
+                            "rate limited by provider; backing off"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(60);
+                    }
+                    Ok(Err(DrainError::Other(reason))) => {
+                        warn!(turn_id = %turn_id, error = %reason, "stream error during turn");
+                        let _ = ingot.lock().await.update_task_status(&turn_id, "failed");
+                        dispatcher.publish(TurnEvent::Failed {
+                            session_id,
+                            turn_id,
+                            reason: reason.clone(),
+                            conversation_id: None,
+                            trace_id: None,
+                            span_id: None,
+                            parent_span_id: None,
+                            operation_name: None,
+                            agent_name: None,
+                            status: None,
+                        });
+                        turn_span.set_status(SpanStatus::error(reason));
+                        turn_span.end();
+                        return;
+                    }
+                    Err(_elapsed) => {
+                        let reason = "stream timed out after 300s".to_owned();
+                        warn!(turn_id = %turn_id, "provider stream timed out");
+                        let _ = ingot.lock().await.update_task_status(&turn_id, "failed");
+                        dispatcher.publish(TurnEvent::Failed {
+                            session_id,
+                            turn_id,
+                            reason: reason.clone(),
+                            conversation_id: None,
+                            trace_id: None,
+                            span_id: None,
+                            parent_span_id: None,
+                            operation_name: None,
+                            agent_name: None,
+                            status: None,
+                        });
+                        turn_span.set_status(SpanStatus::error(reason));
+                        turn_span.end();
+                        return;
+                    }
+                }
             }
         };
+        total_input_tokens = total_input_tokens.saturating_add(input_tokens);
         total_output_tokens = total_output_tokens.saturating_add(output_tokens);
 
         // 5b. Parse tool calls from the response text.
@@ -572,10 +742,28 @@ async fn run_turn(
         let tool_call = parse_tool_call(&response_text);
 
         if let Some((tool_name, tool_input)) = tool_call {
+            // Generate a per-invocation correlation ID so the ToolCalled event
+            // and the corresponding AuditEvent can be joined in the audit log.
+            let tool_call_id = Uuid::new_v4().to_string();
+
             // Append assistant response to message history.
             messages.push(AdapterMessage {
                 role: AdapterRole::Assistant,
                 content: response_text.clone(),
+            });
+
+            // Emit the ToolCalled event with the correlation ID.
+            dispatcher.publish(TurnEvent::ToolCalled {
+                tool_name: tool_name.clone(),
+                input_summary: tool_input.chars().take(120).collect(),
+                conversation_id: None,
+                trace_id: None,
+                span_id: None,
+                parent_span_id: None,
+                operation_name: None,
+                agent_name: None,
+                status: None,
+                tool_call_id: Some(tool_call_id.clone()),
             });
 
             // 5c. Cowork gate intercept (when session has cowork mode enabled).
@@ -616,9 +804,16 @@ async fn run_turn(
             };
 
             // 5e. Append tool result as a user message and continue the loop.
+            // Escape XML angle brackets in the raw tool output so that a
+            // malicious or unexpected response cannot break out of the
+            // <tool_result> wrapper and inject new XML structure into the
+            // prompt (prompt-injection mitigation).
+            let escaped_result = tool_result.replace('<', "&lt;").replace('>', "&gt;");
             messages.push(AdapterMessage {
                 role: AdapterRole::User,
-                content: format!("<tool_result tool=\"{tool_name}\">{tool_result}</tool_result>"),
+                content: format!(
+                    "<tool_result tool=\"{tool_name}\">{escaped_result}</tool_result>"
+                ),
             });
 
             full_response = response_text;
@@ -636,12 +831,22 @@ async fn run_turn(
         .await
         .set_task_response(&turn_id, &full_response)
     {
-        warn!(turn_id = %turn_id, error = %e, "failed to store task response");
+        let reason = e.to_string();
+        warn!(turn_id = %turn_id, error = %reason, "failed to store task response");
         dispatcher.publish(TurnEvent::Failed {
             session_id,
             turn_id,
-            reason: e.to_string(),
+            reason: reason.clone(),
+            conversation_id: None,
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            operation_name: None,
+            agent_name: None,
+            status: None,
         });
+        turn_span.set_status(SpanStatus::error(reason));
+        turn_span.end();
         return;
     }
 
@@ -660,35 +865,51 @@ async fn run_turn(
             turn_n,
             runner: runner.clone(),
             model,
-            input_tok: 0,
+            input_tok: i64::from(total_input_tokens),
             output_tok: i64::from(total_output_tokens),
             cost_usd: 0.0, // ponytail: pricing table deferred
             created_at: now_epoch(),
         };
         let mut ig = ingot.lock().await;
         if let Err(e) = ig.insert_cost(&entry) {
-            warn!(error = %e, "failed to record cost entry");
+            warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to record cost entry");
         }
     }
 
-    // 8. Save checkpoint.
+    // 8. Save checkpoint — persist the full accumulated message history so that
+    //    tool-call/tool-result pairs from the loop are not lost.
     {
+        let messages_json_value: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "role": match m.role {
+                        AdapterRole::User => "user",
+                        AdapterRole::Assistant => "assistant",
+                        AdapterRole::System => "system",
+                        AdapterRole::Tool => "tool",
+                    },
+                    "content": m.content,
+                })
+            })
+            .collect();
         let cp = Checkpoint {
             id: Uuid::new_v4(),
             session_id: session_id.clone(),
             turn_n,
-            messages_json: serde_json::json!([{"role":"assistant","content":full_response}])
-                .to_string(),
+            messages_json: serde_json::to_string(&messages_json_value)
+                .unwrap_or_else(|_| "[]".to_owned()),
             created_at: now_epoch(),
         };
         let mut ig = ingot.lock().await;
         if let Err(e) = ig.save_checkpoint(&cp) {
-            warn!(error = %e, "failed to save checkpoint");
+            warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to save checkpoint");
         }
     }
 
     // 9. Save per-turn token snapshot with running cumulative totals.
     {
+        let input_tok = i64::from(total_input_tokens);
         let output_tok = i64::from(total_output_tokens);
         let mut ig = ingot.lock().await;
         // Compute cumulative totals by summing all prior snapshots.
@@ -703,23 +924,26 @@ async fn run_turn(
             id: Uuid::new_v4(),
             session_id: session_id.clone(),
             turn_n,
-            input_tok: 0, // ponytail: input token count deferred to adapter usage events
+            input_tok,
             output_tok,
-            cumulative_input: prior_in,
+            cumulative_input: prior_in + input_tok,
             cumulative_output: prior_out + output_tok,
             created_at: now_epoch(),
         };
         if let Err(e) = ig.save_token_snapshot(&snap) {
-            warn!(error = %e, "failed to save token snapshot");
+            warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to save token snapshot");
         }
     }
 
-    turn_span.set_attribute(KeyValue::new("gen_ai.usage.input_tokens", 0i64));
     turn_span.set_attribute(KeyValue::new(
-        "gen_ai.usage.output_tokens",
+        tel::INPUT_TOKENS,
+        i64::from(total_input_tokens),
+    ));
+    turn_span.set_attribute(KeyValue::new(
+        tel::OUTPUT_TOKENS,
         i64::from(total_output_tokens),
     ));
-    turn_span.set_attribute(KeyValue::new("smedja.tier", runner));
+    turn_span.set_attribute(KeyValue::new(tel::TIER, runner.clone()));
     turn_span.set_attribute(KeyValue::new(
         "smedja.agent.kind",
         session
@@ -728,12 +952,49 @@ async fn run_turn(
             .unwrap_or("impl")
             .to_owned(),
     ));
+
+    // Extract trace context before ending the span so the traceparent field
+    // is populated in the audit event.
+    let sc = turn_span.span_context().clone();
+    let span_trace_id = format!("{}", sc.trace_id());
+    let span_span_id = format!("{}", sc.span_id());
+    let traceparent = format!("00-{span_trace_id}-{span_span_id}-01");
+
     turn_span.end();
+
+    // 10. Record audit event for this turn with the OTel span context.
+    {
+        let audit_ev = smedja_ingot::AuditEvent {
+            id: Uuid::new_v4(),
+            ts: now_epoch(),
+            session_id: session_id.clone(),
+            turn_id: Some(turn_id.clone()),
+            action_type: "llm".into(),
+            actor: "smdjad".into(),
+            input_tok: i64::from(total_input_tokens),
+            output_tok: i64::from(total_output_tokens),
+            traceparent: Some(traceparent),
+            trace_id: Some(span_trace_id),
+            span_id: Some(span_span_id),
+            ..smedja_ingot::AuditEvent::default()
+        };
+        let ig = ingot.lock().await;
+        if let Err(e) = ig.insert_audit_event(&audit_ev) {
+            warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to record turn audit event");
+        }
+    }
 
     dispatcher.publish(TurnEvent::Completed {
         session_id,
         turn_id,
         output_tokens: total_output_tokens,
+        conversation_id: None,
+        trace_id: None,
+        span_id: None,
+        parent_span_id: None,
+        operation_name: None,
+        agent_name: None,
+        status: None,
     });
 }
 
@@ -1022,11 +1283,16 @@ async fn execute_tool(
 }
 
 /// Subscribes to [`TurnEvent::Started`] and spawns a [`run_turn`] task for each.
+///
+/// Returns a shared handle store so that the caller can drain in-flight tasks
+/// before exiting (graceful shutdown).
 fn spawn_worker(
     ingot: Arc<Mutex<Ingot>>,
     dispatcher: Arc<Dispatcher>,
     gates: Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
-) {
+) -> Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> {
+    let handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+    let handles_inner = Arc::clone(&handles);
     tokio::spawn(async move {
         let mut rx = dispatcher.subscribe();
         loop {
@@ -1049,17 +1315,20 @@ fn spawn_worker(
                 if let TurnEvent::Started {
                     session_id,
                     turn_id,
+                    ..
                 } = event
                 {
                     let ig = Arc::clone(&ingot);
                     let dp = Arc::clone(&dispatcher);
                     let g = Arc::clone(&gates);
-                    tokio::spawn(run_turn(ig, dp, session_id, turn_id, g));
+                    let handle = tokio::spawn(run_turn(ig, dp, session_id, turn_id, g));
+                    handles_inner.lock().await.push(handle);
                 }
                 // ignore non-Started events
             }
         }
     });
+    handles
 }
 
 #[allow(clippy::too_many_lines)] // all RPC methods live in one function per the spec
@@ -1305,45 +1574,57 @@ fn build_router(
             let session_id = params
                 .get("session_id")
                 .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("session_id"))?;
+                .ok_or_else(|| missing_param("session_id"))?
+                .to_owned();
 
-            let mut guard = ig.lock().await;
+            // Each DB call acquires and immediately releases the lock so other
+            // concurrent RPC handlers (including turn.subscribe's polling loop)
+            // are not serialised behind the entire fork sequence.
+            let parent = {
+                let guard = ig.lock().await;
+                guard
+                    .get_session(&session_id)
+                    .map_err(|e| ingot_err(&e))?
+                    .ok_or_else(|| {
+                        RpcError::new(
+                            codes::INTERNAL_ERROR,
+                            format!("session not found: {session_id}"),
+                        )
+                    })?
+            };
 
-            let parent = guard
-                .get_session(session_id)
-                .map_err(|e| ingot_err(&e))?
-                .ok_or_else(|| {
-                    RpcError::new(
-                        codes::INTERNAL_ERROR,
-                        format!("session not found: {session_id}"),
-                    )
-                })?;
-
-            let latest_cp = guard
-                .latest_checkpoint(session_id)
-                .map_err(|e| ingot_err(&e))?;
+            let latest_cp = {
+                let guard = ig.lock().await;
+                guard
+                    .latest_checkpoint(&session_id)
+                    .map_err(|e| ingot_err(&e))?
+            };
 
             let now = now_epoch();
             let new_id = Uuid::new_v4().to_string();
 
-            guard
-                .create_session(&Session {
-                    id: Uuid::parse_str(&new_id).map_err(|e| {
-                        RpcError::new(codes::INTERNAL_ERROR, format!("uuid error: {e}"))
-                    })?,
-                    created_at: now,
-                    updated_at: now,
-                    status: "active".into(),
-                    task_id: None,
-                    mode: parent.mode.clone(),
-                    cowork_mode: parent.cowork_mode,
-                    workspace_root: parent.workspace_root.clone(),
-                    model_override: parent.model_override.clone(),
-                })
-                .map_err(|e| ingot_err(&e))?;
+            {
+                let mut guard = ig.lock().await;
+                guard
+                    .create_session(&Session {
+                        id: Uuid::parse_str(&new_id).map_err(|e| {
+                            RpcError::new(codes::INTERNAL_ERROR, format!("uuid error: {e}"))
+                        })?,
+                        created_at: now,
+                        updated_at: now,
+                        status: "active".into(),
+                        task_id: None,
+                        mode: parent.mode.clone(),
+                        cowork_mode: parent.cowork_mode,
+                        workspace_root: parent.workspace_root.clone(),
+                        model_override: parent.model_override.clone(),
+                    })
+                    .map_err(|e| ingot_err(&e))?;
+            }
 
             let has_checkpoint = latest_cp.is_some();
             if let Some(cp) = latest_cp {
+                let mut guard = ig.lock().await;
                 guard
                     .save_checkpoint(&Checkpoint {
                         id: Uuid::new_v4(),
@@ -1360,6 +1641,75 @@ fn build_router(
                 "forked_from": session_id,
                 "has_checkpoint": has_checkpoint,
             }))
+        }
+    });
+
+    // ── turn.subscribe ──────────────────────────────────────────────────────
+    // Blocks until the named task reaches a terminal status (complete / failed)
+    // or a 60-second deadline expires.  Returns a single response envelope so
+    // callers do not need to poll task.get in a loop.
+    let ig = Arc::clone(ingot);
+    router.register("turn.subscribe", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        async move {
+            let task_id = params
+                .get("task_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| missing_param("task_id"))?
+                .to_owned();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+            loop {
+                let task = {
+                    let guard = ig.lock().await;
+                    guard.get_task(&task_id).map_err(|e| ingot_err(&e))?
+                };
+                match task {
+                    None => {
+                        return Err(RpcError::new(
+                            codes::INTERNAL_ERROR,
+                            format!("task not found: {task_id}"),
+                        ))
+                    }
+                    Some(t) if t.status == "complete" => {
+                        // Best-effort: look up the latest token snapshot for
+                        // this task's session so the TUI can display counts.
+                        let (input_tok, output_tok) = if let Some(ref sid) = t.session_id {
+                            ig.lock().await.session_token_snapshots(sid).map_or(
+                                (0i64, 0i64),
+                                |snaps| {
+                                    snaps
+                                        .last()
+                                        .map_or((0i64, 0i64), |s| (s.input_tok, s.output_tok))
+                                },
+                            )
+                        } else {
+                            (0i64, 0i64)
+                        };
+                        return Ok(json!({
+                            "done": true,
+                            "response": t.response.unwrap_or_default(),
+                            "input_tok": input_tok,
+                            "output_tok": output_tok,
+                        }));
+                    }
+                    Some(t) if t.status == "failed" => {
+                        return Ok(json!({
+                            "done": true,
+                            "error": t.response.unwrap_or_else(|| "turn failed".into()),
+                        }));
+                    }
+                    Some(_) => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(RpcError::new(
+                                codes::TIMEOUT,
+                                "turn.subscribe timed out after 60s",
+                            ));
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
         }
     });
 
@@ -1510,6 +1860,13 @@ fn build_router(
             dispatcher.publish(TurnEvent::Started {
                 session_id,
                 turn_id: task_id.to_string(),
+                conversation_id: None,
+                trace_id: None,
+                span_id: None,
+                parent_span_id: None,
+                operation_name: None,
+                agent_name: None,
+                status: None,
             });
 
             Ok(json!({ "task_id": task_id }))
@@ -1609,7 +1966,7 @@ fn build_router(
                 "Summarise this conversation in 3–5 bullet points, then state the current goal. \
                  Be concise.\n\nConversation history:\n{messages_json}"
             );
-            let provider = build_provider()
+            let (provider, _, _) = build_provider()
                 .await
                 .map_err(|e| RpcError::new(codes::INTERNAL_ERROR, format!("no provider: {e}")))?;
             let opts = CallOptions {
@@ -1628,7 +1985,7 @@ fn build_router(
                 &opts,
             );
             let dispatcher = Dispatcher::new(1);
-            let (summary, _) = drain_stream(stream, &dispatcher).await.map_err(|e| {
+            let (summary, _, _) = drain_stream(stream, &dispatcher).await.map_err(|e| {
                 RpcError::new(codes::INTERNAL_ERROR, format!("compaction failed: {e}"))
             })?;
 
@@ -2431,6 +2788,13 @@ fn build_router(
                     bg_dispatcher.publish(TurnEvent::Started {
                         session_id: session_id.to_string(),
                         turn_id: task_id.to_string(),
+                        conversation_id: None,
+                        trace_id: None,
+                        span_id: None,
+                        parent_span_id: None,
+                        operation_name: None,
+                        agent_name: None,
+                        status: None,
                     });
 
                     // Poll until the task leaves "planned" / "in_progress".
@@ -2517,6 +2881,30 @@ fn write_acp_secret(token: &str) {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
+    // Install an OTLP exporter when SMEDJA_OTLP_ENDPOINT is set.
+    // Without this, all OTel spans are silently discarded by the no-op provider.
+    if let Ok(endpoint) = std::env::var("SMEDJA_OTLP_ENDPOINT") {
+        use opentelemetry_otlp::WithExportConfig as _;
+        let build_result = opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_endpoint(&endpoint)
+            .build();
+        match build_result {
+            Ok(exporter) => {
+                let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+                    .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+                    .build();
+                opentelemetry::global::set_tracer_provider(provider);
+                info!(endpoint = %endpoint, "OTLP trace exporter installed");
+            }
+            Err(e) => {
+                warn!(error = %e, endpoint = %endpoint, "failed to install OTLP exporter; traces will not be exported");
+            }
+        }
+    } else {
+        warn!("SMEDJA_OTLP_ENDPOINT not set; OTel traces will not be exported");
+    }
+
     let path = socket_path();
 
     // Remove stale socket if it exists.
@@ -2524,6 +2912,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Bind BEFORE spawning so a port-conflict error exits cleanly.
     let listener = UnixListener::bind(&path)?;
+    // Guard removes the socket on any exit path (clean shutdown or error propagation).
+    let _socket_guard = SocketGuard { path: path.clone() };
 
     // Set Unix socket permissions to 0o600 immediately after binding.
     #[cfg(unix)]
@@ -2625,12 +3015,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let dispatcher = Arc::new(Dispatcher::new(32));
+    // Capacity 256: lifecycle events (Started/Completed/Failed) must never be
+    // dropped by streaming delta overflow.  256 provides enough headroom for
+    // bursts of AssistantDelta chunks without discarding control events.
+    let dispatcher = Arc::new(Dispatcher::new(256));
     let gates: Arc<Mutex<HashMap<String, Arc<CoworkGate>>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let router = build_router(&ingot, Arc::clone(&dispatcher), &gates);
 
-    spawn_worker(
+    let turn_handles = spawn_worker(
         Arc::clone(&ingot),
         Arc::clone(&dispatcher),
         Arc::clone(&gates),
@@ -2681,9 +3074,28 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Drain any in-flight run_turn tasks before cleaning up, so that turns that
+    // are mid-stream can complete (or fail cleanly) rather than being silently
+    // abandoned.  A 30 s deadline prevents indefinite blocking on a stuck task.
+    {
+        let handles: Vec<tokio::task::JoinHandle<()>> =
+            std::mem::take(&mut *turn_handles.lock().await);
+        if !handles.is_empty() {
+            info!(
+                count = handles.len(),
+                "waiting for in-flight turns to finish (up to 30 s)"
+            );
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                futures_util::future::join_all(handles),
+            )
+            .await;
+        }
+    }
+
     info!("smdjad stopped");
     let _ = std::fs::remove_file(&pid_path);
-    let _ = std::fs::remove_file(&path);
+    // Socket is removed by _socket_guard's Drop impl on function exit.
 
     Ok(())
 }

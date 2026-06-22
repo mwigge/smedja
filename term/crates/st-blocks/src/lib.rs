@@ -88,6 +88,12 @@ pub struct Block {
     pub tier: Option<String>,
     /// W3C `traceparent` header for distributed tracing correlation.
     pub traceparent: Option<String>,
+    /// W3C trace-id extracted from the span that produced this block.
+    pub trace_id: Option<String>,
+    /// W3C span-id from the span that produced this block.
+    pub span_id: Option<String>,
+    /// Tool-call identifier for tool-entry blocks.
+    pub tool_call_id: Option<String>,
     /// First terminal row covered by this block.
     pub start_row: u16,
     /// Last terminal row covered by this block (inclusive).
@@ -110,6 +116,9 @@ impl Block {
             turn_id: None,
             tier: None,
             traceparent: None,
+            trace_id: None,
+            span_id: None,
+            tool_call_id: None,
             start_row,
             end_row: start_row,
         }
@@ -170,6 +179,9 @@ const MIGRATE_SQL: &str = "
         turn_id      TEXT,
         tier         TEXT,
         traceparent  TEXT,
+        tool_call_id TEXT,
+        trace_id     TEXT,
+        span_id      TEXT,
         start_row    INTEGER NOT NULL DEFAULT 0,
         end_row      INTEGER NOT NULL DEFAULT 0
     );
@@ -220,8 +232,9 @@ impl BlockStore {
         self.conn.execute(
             "INSERT INTO term_blocks
                (id, pane_id, block_type, cmd, output, exit_code, duration_ms,
-                ts, turn_id, tier, traceparent, start_row, end_row)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                ts, turn_id, tier, traceparent, tool_call_id, trace_id, span_id,
+                start_row, end_row)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
             rusqlite::params![
                 block.id.to_string(),
                 block.pane_id.to_string(),
@@ -234,6 +247,9 @@ impl BlockStore {
                 block.turn_id.map(|u| u.to_string()),
                 block.tier.as_deref(),
                 block.traceparent.as_deref(),
+                block.tool_call_id.as_deref(),
+                block.trace_id.as_deref(),
+                block.span_id.as_deref(),
                 i64::from(block.start_row),
                 i64::from(block.end_row),
             ],
@@ -252,7 +268,8 @@ impl BlockStore {
     pub fn get(&self, id: &Uuid) -> Result<Option<Block>, BlockError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, pane_id, block_type, cmd, output, exit_code, duration_ms,
-                    ts, turn_id, tier, traceparent, start_row, end_row
+                    ts, turn_id, tier, traceparent, tool_call_id, trace_id, span_id,
+                    start_row, end_row
              FROM term_blocks WHERE id = ?1",
         )?;
         let mut rows = stmt.query(rusqlite::params![id.to_string()])?;
@@ -267,7 +284,8 @@ impl BlockStore {
     pub fn list_by_pane(&self, pane_id: &Uuid) -> Result<Vec<Block>, BlockError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, pane_id, block_type, cmd, output, exit_code, duration_ms,
-                    ts, turn_id, tier, traceparent, start_row, end_row
+                    ts, turn_id, tier, traceparent, tool_call_id, trace_id, span_id,
+                    start_row, end_row
              FROM term_blocks
              WHERE pane_id = ?1
              ORDER BY ts ASC",
@@ -326,8 +344,11 @@ fn row_to_block(row: &rusqlite::Row<'_>) -> Result<Block, rusqlite::Error> {
     let turn_str: Option<String> = row.get(8)?;
     let tier: Option<String> = row.get(9)?;
     let traceparent: Option<String> = row.get(10)?;
-    let start_row: i64 = row.get(11)?;
-    let end_row: i64 = row.get(12)?;
+    let tool_call_id: Option<String> = row.get(11)?;
+    let trace_id: Option<String> = row.get(12)?;
+    let span_id: Option<String> = row.get(13)?;
+    let start_row: i64 = row.get(14)?;
+    let end_row: i64 = row.get(15)?;
 
     // Parse UUIDs — map errors to rusqlite::Error::InvalidColumnType so the
     // query_map combinator can report them uniformly.
@@ -361,6 +382,9 @@ fn row_to_block(row: &rusqlite::Row<'_>) -> Result<Block, rusqlite::Error> {
         turn_id,
         tier,
         traceparent,
+        tool_call_id,
+        trace_id,
+        span_id,
         start_row: start_row as u16,
         end_row: end_row as u16,
     })
@@ -484,5 +508,48 @@ mod tests {
         let store = BlockStore::in_memory().unwrap();
         // Call migrate again — must not error.
         store.migrate().unwrap();
+    }
+
+    // ── Phase 6 ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn block_stores_trace_and_span_ids() {
+        let pane = Uuid::new_v4();
+        let mut block = Block::new(pane, BlockType::Agent, None, 0);
+        block.trace_id = Some("trace-abc".into());
+        block.span_id = Some("span-xyz".into());
+        assert_eq!(block.trace_id.as_deref(), Some("trace-abc"));
+        assert_eq!(block.span_id.as_deref(), Some("span-xyz"));
+        assert!(block.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn block_stores_tool_call_id() {
+        let pane = Uuid::new_v4();
+        let mut block = Block::new(pane, BlockType::Agent, None, 0);
+        block.tool_call_id = Some("call-99".into());
+        assert_eq!(block.tool_call_id.as_deref(), Some("call-99"));
+    }
+
+    #[test]
+    fn block_trace_fields_default_to_none() {
+        let pane = Uuid::new_v4();
+        let block = Block::new(pane, BlockType::Shell, None, 0);
+        assert!(block.trace_id.is_none());
+        assert!(block.span_id.is_none());
+        assert!(block.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn agent_block_exposes_trace_fields_via_inner_block() {
+        let pane = Uuid::new_v4();
+        let mut block = Block::new(pane, BlockType::Agent, None, 0);
+        block.trace_id = Some("tr".into());
+        block.span_id = Some("sp".into());
+        block.tool_call_id = Some("tc".into());
+        let ab = AgentBlock::new(block, "claude-opus".into());
+        assert_eq!(ab.block.trace_id.as_deref(), Some("tr"));
+        assert_eq!(ab.block.span_id.as_deref(), Some("sp"));
+        assert_eq!(ab.block.tool_call_id.as_deref(), Some("tc"));
     }
 }

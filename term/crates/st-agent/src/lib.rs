@@ -496,6 +496,11 @@ impl AgentManager {
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }
+
+    /// Returns an iterator over all active sessions.
+    pub fn sessions(&self) -> impl Iterator<Item = &AgentSession> {
+        self.sessions.values()
+    }
 }
 
 /// Thread-safe wrapper around [`AgentManager`].
@@ -760,6 +765,45 @@ mod tests {
     fn agent_session_suppress_flag_defaults_false() {
         let s = AgentSession::new("b", "m");
         assert!(!s.suppress_pty_output);
+    }
+
+    // ── Phase 6 ───────────────────────────────────────────────────────────
+
+    /// Verifies that `smedja_bellows::event::TurnEvent` can decode JSON that
+    /// includes the new optional correlation fields (`conversation_id`,
+    /// `trace_id`, etc.) without error, and that the decoded variant is
+    /// `TurnEvent::Started`.  The correlation fields are available for
+    /// forwarding to the renderer via the event stream.
+    #[test]
+    fn st_agent_decodes_enriched_started_event() {
+        let json = r#"{"Started":{"session_id":"s","turn_id":"t","conversation_id":"c","trace_id":"tid"}}"#;
+        let ev: smedja_bellows::event::TurnEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(ev, smedja_bellows::event::TurnEvent::Started { .. }),
+            "expected TurnEvent::Started"
+        );
+    }
+
+    /// Verifies backward compatibility: a JSON payload that has no correlation
+    /// fields (e.g. from an older daemon) still deserializes successfully and
+    /// all new optional fields default to `None`.
+    #[test]
+    fn st_agent_decodes_legacy_started_event() {
+        let json = r#"{"Started":{"session_id":"old","turn_id":"t0"}}"#;
+        let ev: smedja_bellows::event::TurnEvent = serde_json::from_str(json).unwrap();
+        if let smedja_bellows::event::TurnEvent::Started {
+            conversation_id,
+            trace_id,
+            agent_name,
+            ..
+        } = ev
+        {
+            assert!(conversation_id.is_none());
+            assert!(trace_id.is_none());
+            assert!(agent_name.is_none());
+        } else {
+            panic!("expected TurnEvent::Started");
+        }
     }
 
     // ── Test helpers ─────────────────────────────────────────────────────
