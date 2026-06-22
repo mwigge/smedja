@@ -53,6 +53,8 @@ pub struct ModuleContext {
     pub context_window: usize,
     /// Short description of the task currently in progress.
     pub active_task: Option<String>,
+    /// Exit code of the last shell command (from OSC 133 D).
+    pub last_exit_code: Option<i32>,
 }
 
 // ── StatusModule trait ────────────────────────────────────────────────────────
@@ -186,9 +188,29 @@ impl StatusModule for TaskModule {
 }
 
 /// Displays the current git branch using `git rev-parse --abbrev-ref HEAD`.
-pub struct GitBranchModule;
+///
+/// The branch prefix symbol defaults to `"* "` but can be overridden via
+/// [`GitBranchModule::with_symbol`] to match a Starship `git_branch.symbol`.
+pub struct GitBranchModule {
+    symbol: Option<String>,
+}
+
+impl Default for GitBranchModule {
+    fn default() -> Self {
+        Self { symbol: None }
+    }
+}
 
 impl GitBranchModule {
+    /// Creates a module that prefixes the branch name with `sym`.
+    pub fn with_symbol(sym: Option<String>) -> Self {
+        Self { symbol: sym }
+    }
+
+    fn prefix(&self) -> &str {
+        self.symbol.as_deref().unwrap_or("* ")
+    }
+
     /// Evaluate in an explicit working directory (useful for testing).
     pub fn evaluate_in(&self, _ctx: &ModuleContext, cwd: &Path) -> Option<Segment> {
         let output = std::process::Command::new("git")
@@ -206,7 +228,8 @@ impl GitBranchModule {
         if branch.is_empty() {
             return None;
         }
-        Some(plain_segment("git_branch", format!("* {branch}")))
+        let prefix = self.prefix();
+        Some(plain_segment("git_branch", format!("{prefix}{branch}")))
     }
 }
 
@@ -357,6 +380,31 @@ impl StatusModule for BatteryModule {
             "\u{1f50b}"
         };
         Some(plain_segment("battery", format!("{symbol} {capacity}%")))
+    }
+}
+
+/// Displays the exit code of the last shell command when it is non-zero.
+///
+/// Reads [`ModuleContext::last_exit_code`] — returns `None` for exit code 0
+/// or when no code has been received yet.  Non-zero codes render as `✘ N` in
+/// red to match Starship's default `character` module behaviour.
+pub struct ExitCodeModule;
+
+impl StatusModule for ExitCodeModule {
+    fn name(&self) -> &'static str {
+        "exit_code"
+    }
+
+    fn evaluate(&self, ctx: &ModuleContext) -> Option<Segment> {
+        let code = ctx.last_exit_code?;
+        if code == 0 {
+            return None;
+        }
+        Some(coloured_segment(
+            "exit_code",
+            format!("\u{2718} {code}"),
+            Color { r: 200, g: 0, b: 0 },
+        ))
     }
 }
 
@@ -535,6 +583,7 @@ mod tests {
             context_used: 0,
             context_window: 0,
             active_task: None,
+            last_exit_code: None,
         }
     }
 
@@ -624,7 +673,7 @@ mod tests {
     #[test]
     fn git_branch_module_not_in_repo_returns_none() {
         // Evaluate against /tmp which is guaranteed not to be inside a git repo.
-        let result = GitBranchModule.evaluate_in(&make_ctx(), Path::new("/tmp"));
+        let result = GitBranchModule::default().evaluate_in(&make_ctx(), Path::new("/tmp"));
         assert!(
             result.is_none(),
             "expected None for non-git directory, got {result:?}"
@@ -708,6 +757,79 @@ mod tests {
             segments.iter().any(|s| s.text == "[local]"),
             "expected [local] segment in {segments:?}"
         );
+    }
+
+    // 12
+    #[test]
+    fn exit_code_module_zero_returns_none() {
+        let ctx = ModuleContext {
+            last_exit_code: Some(0),
+            ..make_ctx()
+        };
+        assert!(ExitCodeModule.evaluate(&ctx).is_none());
+    }
+
+    // 13
+    #[test]
+    fn exit_code_module_nonzero_returns_red_segment() {
+        let ctx = ModuleContext {
+            last_exit_code: Some(1),
+            ..make_ctx()
+        };
+        let seg = ExitCodeModule.evaluate(&ctx).expect("should return Some for exit 1");
+        assert!(seg.text.contains('1'), "text should include exit code");
+        assert!(seg.text.contains('\u{2718}'), "text should contain ✘");
+        let fg = seg.style.fg.as_ref().expect("should have fg colour");
+        assert_eq!(fg.r, 200, "should be red");
+        assert_eq!(fg.g, 0);
+        assert_eq!(fg.b, 0);
+    }
+
+    // 14
+    #[test]
+    fn exit_code_module_absent_returns_none() {
+        assert!(ExitCodeModule.evaluate(&make_ctx()).is_none());
+    }
+
+    // 15
+    #[test]
+    fn git_branch_module_with_symbol_uses_symbol() {
+        let module = GitBranchModule::with_symbol(Some(" ".to_owned()));
+        // Evaluate against the smedja repo itself — must be on a branch.
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        if let Some(seg) = module.evaluate_in(&make_ctx(), repo_root) {
+            assert!(
+                seg.text.starts_with(' '),
+                "expected segment to start with symbol, got '{}'",
+                seg.text
+            );
+        }
+    }
+
+    // 16
+    #[test]
+    fn git_branch_module_default_uses_asterisk() {
+        let module = GitBranchModule::default();
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        if let Some(seg) = module.evaluate_in(&make_ctx(), repo_root) {
+            assert!(
+                seg.text.starts_with("* "),
+                "expected segment to start with '* ', got '{}'",
+                seg.text
+            );
+        }
     }
 
     // 11
