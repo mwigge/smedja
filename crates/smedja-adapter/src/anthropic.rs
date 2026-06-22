@@ -383,6 +383,7 @@ mod tests {
             temperature: None,
             system: None,
             tools: None,
+            provider_session_id: None,
         }
     }
 

@@ -72,6 +72,12 @@ fn retrieve_store() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
     STORE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
+/// In-memory map from smedja sessions to provider-native resume identifiers.
+fn provider_session_store() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
+    static STORE: OnceLock<tokio::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
+    STORE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
 fn open_ingot() -> anyhow::Result<Ingot> {
     // Try to open the persistent store under ~/.local/share/smedja/smedja.db.
     // If the data directory cannot be created, fall back to in-memory.
@@ -187,7 +193,7 @@ async fn build_provider() -> Result<(Box<dyn Provider>, &'static str, &'static s
 
 /// Drains `stream`, accumulating text deltas into a single string.
 ///
-/// Returns `Ok((full_response, input_tokens, output_tokens))` on success, or
+/// Returns `Ok((full_response, input_tokens, output_tokens, provider_session_id))` on success, or
 /// `Err(reason)` if the stream yields an error item.  Each `Delta::Text` chunk
 /// is forwarded to `dispatcher` as a [`TurnEvent::AssistantDelta`].
 /// Error returned by [`drain_stream`], distinguishing rate-limit responses from
@@ -215,10 +221,11 @@ impl std::fmt::Display for DrainError {
 async fn drain_stream(
     mut stream: smedja_adapter::DeltaStream,
     dispatcher: &Dispatcher,
-) -> Result<(String, u32, u32), DrainError> {
+) -> Result<(String, u32, u32, Option<String>), DrainError> {
     let mut full_response = String::new();
     let mut input_tokens = 0u32;
     let mut output_tokens = 0u32;
+    let mut provider_session_id = None;
     loop {
         match stream.next().await {
             None => break,
@@ -242,13 +249,67 @@ async fn drain_stream(
                 input_tokens = i;
                 output_tokens = n;
             }
+            Some(Ok(Delta::ToolCall { name, input })) => {
+                let input_summary: String = input.to_string().chars().take(120).collect();
+                let line = format!("▶ {name}({input_summary})");
+                full_response.push_str(&line);
+                full_response.push('\n');
+                dispatcher.publish(TurnEvent::ToolCalled {
+                    tool_name: name,
+                    input_summary,
+                    conversation_id: None,
+                    trace_id: None,
+                    span_id: None,
+                    parent_span_id: None,
+                    operation_name: Some(tel::OPERATION_EXECUTE_TOOL.to_owned()),
+                    agent_name: None,
+                    status: None,
+                    tool_call_id: None,
+                });
+                dispatcher.publish(TurnEvent::AssistantDelta {
+                    content: line,
+                    conversation_id: None,
+                    trace_id: None,
+                    span_id: None,
+                    parent_span_id: None,
+                    operation_name: None,
+                    agent_name: None,
+                    status: None,
+                });
+            }
+            Some(Ok(Delta::ToolResult {
+                tool_use_id,
+                content,
+            })) => {
+                let line = format!("✓ {tool_use_id} -> {} chars", content.chars().count());
+                full_response.push_str(&line);
+                full_response.push('\n');
+                dispatcher.publish(TurnEvent::AssistantDelta {
+                    content: line,
+                    conversation_id: None,
+                    trace_id: None,
+                    span_id: None,
+                    parent_span_id: None,
+                    operation_name: None,
+                    agent_name: None,
+                    status: None,
+                });
+            }
+            Some(Ok(Delta::SessionId(id))) => {
+                provider_session_id = Some(id);
+            }
             Some(Err(smedja_adapter::AdapterError::RateLimited { retry_after })) => {
                 return Err(DrainError::RateLimited { retry_after });
             }
             Some(Err(e)) => return Err(DrainError::Other(e.to_string())),
         }
     }
-    Ok((full_response, input_tokens, output_tokens))
+    Ok((
+        full_response,
+        input_tokens,
+        output_tokens,
+        provider_session_id,
+    ))
 }
 
 /// Returns `true` when the session's mode permits write-arity bash commands.
@@ -559,6 +620,16 @@ async fn run_turn(
 
     let all_tools: Vec<serde_json::Value> = builtin_tools.into_iter().chain(mcp_tools).collect();
 
+    let provider_session_id = if runner == "claude-cli" {
+        provider_session_store()
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+    } else {
+        None
+    };
+
     let opts = CallOptions {
         model: model.clone(),
         max_tokens: Some(2048),
@@ -569,6 +640,7 @@ async fn run_turn(
         } else {
             Some(all_tools)
         },
+        provider_session_id,
     };
 
     // 4. Mark in_progress.
@@ -661,7 +733,7 @@ async fn run_turn(
 
     'tool_loop: for _iteration in 0..MAX_TOOL_TURNS {
         // 5a. Stream LLM response with rate-limit retry (up to MAX_RATE_LIMIT_RETRIES).
-        let (response_text, input_tokens, output_tokens) = {
+        let (response_text, input_tokens, output_tokens, native_session_id) = {
             let mut backoff_secs = RATE_LIMIT_BACKOFF_BASE_SECS;
             let mut attempt = 0u32;
             loop {
@@ -748,6 +820,14 @@ async fn run_turn(
                 }
             }
         };
+        if runner == "claude-cli" {
+            if let Some(native_session_id) = native_session_id {
+                provider_session_store()
+                    .lock()
+                    .await
+                    .insert(session_id.clone(), native_session_id);
+            }
+        }
         total_input_tokens = total_input_tokens.saturating_add(input_tokens);
         total_output_tokens = total_output_tokens.saturating_add(output_tokens);
 
@@ -2133,6 +2213,7 @@ fn build_router(
                 temperature: Some(0.3),
                 system: Some("You are a summarisation assistant.".to_owned()),
                 tools: None,
+                provider_session_id: None,
             };
             let stream = provider.stream_chat(
                 &[AdapterMessage {
@@ -2142,7 +2223,7 @@ fn build_router(
                 &opts,
             );
             let dispatcher = Dispatcher::new(1);
-            let (summary, _, _) = drain_stream(stream, &dispatcher).await.map_err(|e| {
+            let (summary, _, _, _) = drain_stream(stream, &dispatcher).await.map_err(|e| {
                 RpcError::new(codes::INTERNAL_ERROR, format!("compaction failed: {e}"))
             })?;
 

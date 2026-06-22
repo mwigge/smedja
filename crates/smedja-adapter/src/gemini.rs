@@ -325,6 +325,7 @@ mod tests {
             temperature: None,
             system: Some("Be helpful.".to_owned()),
             tools: None,
+            provider_session_id: None,
         };
         let contents = build_contents(&[], &opts);
         assert_eq!(contents.len(), 1);
@@ -341,6 +342,7 @@ mod tests {
             temperature: None,
             system: None,
             tools: None,
+            provider_session_id: None,
         };
         let messages = vec![Message {
             role: Role::Assistant,

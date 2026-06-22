@@ -101,6 +101,7 @@ mod tests {
             temperature: None,
             system: None,
             tools: None,
+            provider_session_id: None,
         };
         let mut stream = p.stream_chat(&messages, &opts);
         let first = stream.next().await;
@@ -135,6 +136,7 @@ mod tests {
             temperature: None,
             system: None,
             tools: None,
+            provider_session_id: None,
         };
         let mut stream = p.stream_chat(&messages, &opts);
         let mut collected = String::new();

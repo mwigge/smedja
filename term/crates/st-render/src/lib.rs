@@ -27,7 +27,6 @@ use bytemuck::{Pod, Zeroable};
 use cosmic_text::{fontdb, FontSystem, SwashCache};
 use st_statusbar::Segment;
 use thiserror::Error;
-use tracing::debug;
 
 // Re-export so callers don't have to depend on winit/wgpu directly.
 pub use wgpu;
@@ -391,13 +390,7 @@ impl GlyphAtlas {
                                 vec![0u8; (w * h) as usize]
                             }
                         };
-                        pixel_data = Some((
-                            data,
-                            w,
-                            h,
-                            image.placement.left,
-                            image.placement.top,
-                        ));
+                        pixel_data = Some((data, w, h, image.placement.left, image.placement.top));
                         break;
                     }
                 }
@@ -434,7 +427,14 @@ impl GlyphAtlas {
             },
         );
 
-        let entry = GlyphEntry { x, y, w, h, bearing_x, bearing_y };
+        let entry = GlyphEntry {
+            x,
+            y,
+            w,
+            h,
+            bearing_x,
+            bearing_y,
+        };
         self.glyphs.insert(key, entry);
         Some(entry)
     }
@@ -809,7 +809,7 @@ impl Renderer {
         self.surface_config.width = new_size.width;
         self.surface_config.height = new_size.height;
         self.surface.configure(&self.device, &self.surface_config);
-        debug!("renderer resized to {}×{}", new_size.width, new_size.height);
+        tracing::debug!("renderer resized to {}×{}", new_size.width, new_size.height);
     }
 
     /// Updates the cell grid from a slice of [`Cell`]s.
@@ -829,7 +829,10 @@ impl Renderer {
         for cell in &self.cells {
             // Skip spaces and already-cached glyphs (fast HashMap check).
             if cell.ch != ' '
-                && !self.atlas.glyphs.contains_key(&(cell.ch, false, false, font_size_key))
+                && !self
+                    .atlas
+                    .glyphs
+                    .contains_key(&(cell.ch, false, false, font_size_key))
             {
                 let _ = self.atlas.get_or_insert(
                     &self.device,
@@ -854,7 +857,11 @@ impl Renderer {
             .filter(|&c| c != ' ')
             .collect();
         for ch in sb_chars {
-            if !self.atlas.glyphs.contains_key(&(ch, false, false, sb_font_size_key)) {
+            if !self
+                .atlas
+                .glyphs
+                .contains_key(&(ch, false, false, sb_font_size_key))
+            {
                 let _ = self.atlas.get_or_insert(
                     &self.device,
                     &self.queue,
@@ -1207,7 +1214,11 @@ impl Renderer {
             }
             // Look up glyph entry from atlas (read-only view — we cannot call
             // get_or_insert here because we'd need &mut self; use cached value).
-            let Some(&entry) = self.atlas.glyphs.get(&(cell.ch, false, false, eff_font_key)) else {
+            let Some(&entry) = self
+                .atlas
+                .glyphs
+                .get(&(cell.ch, false, false, eff_font_key))
+            else {
                 tracing::warn!(ch = %cell.ch, "glyph atlas miss — cell skipped");
                 continue;
             };
@@ -1216,14 +1227,9 @@ impl Renderer {
             let u1 = (entry.x + entry.w) as f32 / atlas_size_f;
             let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
 
-            // Position glyph using swash placement bearings.
-            // Baseline is placed at 2/3 of cell height (ascent ≈ 0.8×em,
-            // line-height = 1.2×em → baseline/line-height ≈ 0.8/1.2 = 2/3).
-            // bearing_x is clamped to ≥0 so characters with negative optical
-            // overhang (e.g. 'j') don't drift left into the preceding cell.
             let baseline_y = f32::from(cell.row) * ch + ch * (2.0 / 3.0);
             let glyph_top = baseline_y - entry.bearing_y as f32;
-            let glyph_left = f32::from(cell.col) * cw + (entry.bearing_x as f32).max(0.0);
+            let glyph_left = f32::from(cell.col) * cw + (cw - entry.w as f32) / 2.0;
             let (x0, y0, x1, y1) = self.px_to_ndc(
                 glyph_left,
                 glyph_top,
@@ -1317,8 +1323,12 @@ impl Renderer {
                 let glyph_left = col_px + (sb_cw - glyph_w) / 2.0;
                 let baseline = strip_top + sb_h * (2.0 / 3.0);
                 let glyph_top = baseline - entry.bearing_y as f32;
-                let (x0, y0, x1, y1) =
-                    self.px_to_ndc(glyph_left, glyph_top, glyph_left + glyph_w, glyph_top + glyph_h);
+                let (x0, y0, x1, y1) = self.px_to_ndc(
+                    glyph_left,
+                    glyph_top,
+                    glyph_left + glyph_w,
+                    glyph_top + glyph_h,
+                );
                 let c = fg_color;
                 verts.extend_from_slice(&[
                     GlyphVertex {
@@ -1381,7 +1391,9 @@ impl Renderer {
                             continue;
                         }
                         let Some(&entry) =
-                            self.atlas.glyphs.get(&(glyph_ch, false, false, eff_font_key))
+                            self.atlas
+                                .glyphs
+                                .get(&(glyph_ch, false, false, eff_font_key))
                         else {
                             col += 1;
                             continue;
@@ -1392,7 +1404,7 @@ impl Renderer {
                         let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
                         let baseline_y = f32::from(line_row) * ch + ch * (2.0 / 3.0);
                         let glyph_top = baseline_y - entry.bearing_y as f32;
-                        let glyph_left = f32::from(col) * cw + (entry.bearing_x as f32).max(0.0);
+                        let glyph_left = f32::from(col) * cw + (cw - entry.w as f32) / 2.0;
                         let (x0, y0, x1, y1) = self.px_to_ndc(
                             glyph_left,
                             glyph_top,
@@ -1527,7 +1539,14 @@ mod tests {
     fn glyph_atlas_key_distinguishes_bold_and_italic() {
         use std::collections::HashMap;
         let sz = 28.0_f32.to_bits();
-        let entry = |x: u32| GlyphEntry { x, y: 0, w: 8, h: 12, bearing_x: 0, bearing_y: 10 };
+        let entry = |x: u32| GlyphEntry {
+            x,
+            y: 0,
+            w: 8,
+            h: 12,
+            bearing_x: 0,
+            bearing_y: 10,
+        };
         let mut map: HashMap<(char, bool, bool, u32), GlyphEntry> = HashMap::new();
         map.insert(('A', false, false, sz), entry(0));
         map.insert(('A', true, false, sz), entry(8));
@@ -1560,13 +1579,23 @@ mod tests {
     fn renderer_glyph_atlas_key_stores_bold_and_regular_separately() {
         use std::collections::HashMap;
         let sz = 28.0_f32.to_bits();
-        let entry = |x: u32| GlyphEntry { x, y: 0, w: 8, h: 12, bearing_x: 0, bearing_y: 10 };
+        let entry = |x: u32| GlyphEntry {
+            x,
+            y: 0,
+            w: 8,
+            h: 12,
+            bearing_x: 0,
+            bearing_y: 10,
+        };
         let mut glyphs: HashMap<(char, bool, bool, u32), GlyphEntry> = HashMap::new();
         glyphs.insert(('A', false, false, sz), entry(0));
         glyphs.insert(('A', true, false, sz), entry(8));
         assert!(glyphs.contains_key(&('A', false, false, sz)));
         assert!(glyphs.contains_key(&('A', true, false, sz)));
-        assert_ne!(glyphs[&('A', false, false, sz)].x, glyphs[&('A', true, false, sz)].x);
+        assert_ne!(
+            glyphs[&('A', false, false, sz)].x,
+            glyphs[&('A', true, false, sz)].x
+        );
     }
 
     #[cfg_attr(not(feature = "gpu-tests"), ignore)]
