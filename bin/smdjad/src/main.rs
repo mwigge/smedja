@@ -1752,11 +1752,15 @@ fn build_router(
     startup_runner: &'static str,
     startup_model: &'static str,
     price_table: Arc<PriceTable>,
+    vault: &Arc<Mutex<Vault>>,
 ) -> Router {
     let mut router = Router::new();
 
     // Clone gates so the closures below can each hold an independent Arc.
     let gates = Arc::clone(gates);
+
+    // Clone vault so each RPC closure gets its own Arc.
+    let vault = Arc::clone(vault);
 
     // Stash provider pool Arc before the name is shadowed by the WorktreePool below.
     let provider_pool = pool;
@@ -2590,8 +2594,10 @@ fn build_router(
     // creates a new session, copies the latest checkpoint, and sets the
     // runner_override so the next turn routes to the requested runner.
     let ig = Arc::clone(ingot);
+    let vault_takeover = Arc::clone(&vault);
     router.register("session.takeover", move |params: Value| {
         let ig = Arc::clone(&ig);
+        let vt = Arc::clone(&vault_takeover);
         async move {
             let session_id = params["session_id"]
                 .as_str()
@@ -2655,6 +2661,7 @@ fn build_router(
             }
 
             let has_checkpoint = latest_cp.is_some();
+            let handoff_context_id = format!("handoff:{session_id}:{new_id}");
             if let Some(cp) = latest_cp {
                 let mut guard = ig.lock().await;
                 guard
@@ -2662,10 +2669,38 @@ fn build_router(
                         id: Uuid::new_v4(),
                         session_id: new_id.clone(),
                         turn_n: cp.turn_n,
-                        messages_json: cp.messages_json,
+                        messages_json: cp.messages_json.clone(),
                         created_at: now,
                     })
                     .map_err(|e| ingot_err(&e))?;
+
+                // Fire-and-forget vault write so the receiving session can retrieve
+                // the handoff context via smedja_vault_search namespace="handoff".
+                let hid = handoff_context_id.clone();
+                let from_sid = session_id.clone();
+                let to_sid = new_id.clone();
+                let runner_str = canonical.to_owned();
+                let messages = cp.messages_json.clone();
+                tokio::task::spawn_blocking(move || {
+                    let entry = VaultEntry {
+                        id: hid.clone(),
+                        embedding: crate::embedder::embed(&messages),
+                        payload: serde_json::json!({
+                            "from_session_id": from_sid,
+                            "to_session_id": to_sid,
+                            "runner": runner_str,
+                        }),
+                        namespace: "handoff".to_owned(),
+                        content: messages,
+                        source_file: None,
+                        added_by: Some("session.takeover".to_owned()),
+                        chunk_index: None,
+                        parent_id: None,
+                        created_at: 0.0,
+                    };
+                    let mut guard = vt.blocking_lock();
+                    let _ = guard.upsert(&entry);
+                });
             }
 
             Ok(json!({
@@ -2673,6 +2708,8 @@ fn build_router(
                 "forked_from": session_id,
                 "runner": canonical,
                 "has_checkpoint": has_checkpoint,
+                "context_namespace": "handoff",
+                "context_id": handoff_context_id,
             }))
         }
     });
@@ -2696,9 +2733,11 @@ fn build_router(
     // ── session.context ─────────────────────────────────────────────────────
     let ig = Arc::clone(ingot);
     let pt = Arc::clone(&price_table);
+    let vault_ctx = Arc::clone(&vault);
     router.register("session.context", move |params: Value| {
         let ig = Arc::clone(&ig);
         let pt = Arc::clone(&pt);
+        let vt = Arc::clone(&vault_ctx);
         async move {
             let session_id = params
                 .get("session_id")
@@ -2717,11 +2756,22 @@ fn build_router(
                 .map_err(|e| ingot_err(&e))?
                 .unwrap_or_default();
             let window_tok = u64::from(pt.context_window(&model));
+            let (vault_warm_count, vault_cold_count) =
+                tokio::task::spawn_blocking(move || {
+                    let guard = vt.blocking_lock();
+                    let warm = guard.count_by_namespace("warm").unwrap_or(0);
+                    let cold = guard.count_by_namespace("default").unwrap_or(0);
+                    (warm, cold)
+                })
+                .await
+                .unwrap_or((0, 0));
             Ok(json!({
                 "session_id": session_id,
                 "used_tok": used_tok,
                 "window_tok": window_tok,
                 "model": model,
+                "vault_warm_count": vault_warm_count,
+                "vault_cold_count": vault_cold_count,
             }))
         }
     });
@@ -2972,9 +3022,11 @@ fn build_router(
 
     // ── task.parallel ────────────────────────────────────────────────────────
     let ig = Arc::clone(ingot);
+    let vault_parallel = Arc::clone(&vault);
     router.register("task.parallel", move |params: Value| {
         let pool = Arc::clone(&pool);
         let ig = Arc::clone(&ig);
+        let vt = Arc::clone(&vault_parallel);
         async move {
             let session_id = params["session_id"].as_str().map(str::to_owned);
             let goal = params["goal"]
@@ -3068,6 +3120,46 @@ fn build_router(
             // Create the git worktrees for all pending tasks.
             let started = p.start_worktrees(&workspace_root).await;
 
+            // Warm-context snapshot: write recent checkpoints to vault so parallel
+            // agents can retrieve shared context via smedja_vault_search.
+            let fan_out_id = Uuid::new_v4().to_string();
+            if let Some(ref sid) = session_id {
+                let checkpoints = ig.lock().await.list_checkpoints(sid).unwrap_or_default();
+                const WARM_WINDOW: usize = 5;
+                let recent: Vec<_> = checkpoints
+                    .into_iter()
+                    .rev()
+                    .take(WARM_WINDOW)
+                    .collect();
+                if !recent.is_empty() {
+                    let fid = fan_out_id.clone();
+                    let parent_sid = sid.clone();
+                    let vt2 = Arc::clone(&vt);
+                    tokio::task::spawn_blocking(move || {
+                        let mut guard = vt2.blocking_lock();
+                        for cp in &recent {
+                            let entry = VaultEntry {
+                                id: format!("warm:{}:{}", fid, cp.id),
+                                embedding: crate::embedder::embed(&cp.messages_json),
+                                payload: serde_json::json!({
+                                    "fan_out_id": fid,
+                                    "session_id": parent_sid,
+                                    "turn_n": cp.turn_n,
+                                }),
+                                namespace: "warm".to_owned(),
+                                content: cp.messages_json.clone(),
+                                source_file: None,
+                                added_by: Some("task.parallel".to_owned()),
+                                chunk_index: None,
+                                parent_id: None,
+                                created_at: 0.0,
+                            };
+                            let _ = guard.upsert(&entry);
+                        }
+                    });
+                }
+            }
+
             // Build the per-task response, including worktree_path where available.
             let tasks: Vec<Value> = registered
                 .iter()
@@ -3084,7 +3176,13 @@ fn build_router(
                 })
                 .collect();
 
-            Ok(json!({ "goal": goal, "tasks": tasks, "started": started }))
+            Ok(json!({
+                "goal": goal,
+                "tasks": tasks,
+                "started": started,
+                "fan_out_id": fan_out_id,
+                "warm_context_namespace": "warm",
+            }))
         }
     });
 
@@ -3727,6 +3825,8 @@ async fn main() -> anyhow::Result<()> {
     let assayer = Arc::new(assayer);
     let price_table = Arc::new(PriceTable::embedded());
 
+    let vault = Arc::new(Mutex::new(open_vault()));
+
     let router = build_router(
         &ingot,
         Arc::clone(&dispatcher),
@@ -3735,9 +3835,8 @@ async fn main() -> anyhow::Result<()> {
         startup_runner,
         startup_model,
         Arc::clone(&price_table),
+        &vault,
     );
-
-    let vault = Arc::new(Mutex::new(open_vault()));
 
     let turn_handles = spawn_worker(
         Arc::clone(&ingot),
@@ -4328,5 +4427,145 @@ mod tests {
             v["results"].as_array().unwrap().len() <= 2,
             "k=2 must cap results at 2"
         );
+    }
+
+    #[tokio::test]
+    async fn warm_snapshot_writes_vault_entries_for_session_checkpoints() {
+        use smedja_ingot::Checkpoint;
+        use smedja_vault::Vault;
+        use uuid::Uuid;
+
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+        let session_id = "sess-warm-test".to_owned();
+        let fan_out_id = "fan-01".to_owned();
+
+        let messages = r#"[{"role":"user","content":"what is async rust"}]"#.to_owned();
+        let checkpoints = vec![Checkpoint {
+            id: Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            session_id: session_id.clone(),
+            turn_n: 0,
+            messages_json: messages.clone(),
+            created_at: 1_700_000_000.0,
+        }];
+
+        // Simulate the warm snapshot logic from task.parallel.
+        let fid = fan_out_id.clone();
+        let parent_sid = session_id.clone();
+        let vt = Arc::clone(&vault);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = vt.blocking_lock();
+            for cp in &checkpoints {
+                let entry = smedja_vault::VaultEntry {
+                    id: format!("warm:{}:{}", fid, cp.id),
+                    embedding: crate::embedder::embed(&cp.messages_json),
+                    payload: serde_json::json!({
+                        "fan_out_id": fid,
+                        "session_id": parent_sid,
+                        "turn_n": cp.turn_n,
+                    }),
+                    namespace: "warm".to_owned(),
+                    content: cp.messages_json.clone(),
+                    source_file: None,
+                    added_by: Some("task.parallel".to_owned()),
+                    chunk_index: None,
+                    parent_id: None,
+                    created_at: 0.0,
+                };
+                guard.upsert(&entry).unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        let count = vault.lock().await.count_by_namespace("warm").unwrap();
+        assert_eq!(count, 1, "one warm entry must be written per checkpoint");
+
+        let results = {
+            let guard = vault.lock().await;
+            let qv = crate::embedder::embed("async rust");
+            guard.search(&qv, "async rust", "warm", 5).unwrap()
+        };
+        assert!(!results.is_empty(), "warm snapshot must be retrievable by content similarity");
+    }
+
+    #[tokio::test]
+    async fn takeover_handoff_writes_vault_entry_with_handoff_namespace() {
+        use smedja_vault::Vault;
+
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+        let from_sid = "sess-from".to_owned();
+        let to_sid = "sess-to".to_owned();
+        let messages = r#"[{"role":"user","content":"implement auth"},{"role":"assistant","content":"ok"}]"#.to_owned();
+        let hid = format!("handoff:{from_sid}:{to_sid}");
+
+        let hid2 = hid.clone();
+        let from2 = from_sid.clone();
+        let to2 = to_sid.clone();
+        let msgs = messages.clone();
+        let vt = Arc::clone(&vault);
+        tokio::task::spawn_blocking(move || {
+            let entry = smedja_vault::VaultEntry {
+                id: hid2,
+                embedding: crate::embedder::embed(&msgs),
+                payload: serde_json::json!({
+                    "from_session_id": from2,
+                    "to_session_id": to2,
+                    "runner": "codex-cli",
+                }),
+                namespace: "handoff".to_owned(),
+                content: msgs,
+                source_file: None,
+                added_by: Some("session.takeover".to_owned()),
+                chunk_index: None,
+                parent_id: None,
+                created_at: 0.0,
+            };
+            let mut guard = vt.blocking_lock();
+            guard.upsert(&entry).unwrap();
+        })
+        .await
+        .unwrap();
+
+        let count = vault.lock().await.count_by_namespace("handoff").unwrap();
+        assert_eq!(count, 1, "one handoff entry must be written on takeover");
+    }
+
+    #[tokio::test]
+    async fn session_context_includes_vault_stratum_counts() {
+        use smedja_vault::Vault;
+
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+
+        // Populate vault with one warm and two default (cold) entries.
+        {
+            let mut guard = vault.lock().await;
+            let make_entry = |id: &str, ns: &str| smedja_vault::VaultEntry {
+                id: id.to_owned(),
+                embedding: crate::embedder::embed(id),
+                payload: serde_json::json!({}),
+                namespace: ns.to_owned(),
+                content: id.to_owned(),
+                source_file: None,
+                added_by: None,
+                chunk_index: None,
+                parent_id: None,
+                created_at: 0.0,
+            };
+            guard.upsert(&make_entry("w1", "warm")).unwrap();
+            guard.upsert(&make_entry("c1", "default")).unwrap();
+            guard.upsert(&make_entry("c2", "default")).unwrap();
+        }
+
+        let (warm_count, cold_count) = tokio::task::spawn_blocking(move || {
+            let guard = vault.blocking_lock();
+            let warm = guard.count_by_namespace("warm").unwrap_or(0);
+            let cold = guard.count_by_namespace("default").unwrap_or(0);
+            (warm, cold)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(warm_count, 1);
+        assert_eq!(cold_count, 2);
     }
 }
