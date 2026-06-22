@@ -15,7 +15,8 @@ opentelemetry_sdk      = { workspace = true }
 reqwest      = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
-smedja-rpc   = { path = "../smedja-rpc" }
+smedja-rpc       = { path = "../smedja-rpc" }
+smedja-telemetry = { path = "../smedja-telemetry" }
 thiserror    = { workspace = true }
 tokio        = { workspace = true }
 tokio-stream = { workspace = true }

@@ -66,11 +66,21 @@ pub enum PaneEvent {
         turn_id: String,
         tier: String,
         model: String,
+        /// W3C trace-id for distributed tracing correlation.
+        trace_id: Option<String>,
+        /// W3C span-id from the span that produced this event.
+        span_id: Option<String>,
     },
     /// The agent is invoking a tool.
     ToolCall {
         tool_name: String,
         args_summary: String,
+        /// Tool-call identifier for correlating the call with its result.
+        tool_call_id: Option<String>,
+        /// W3C trace-id for distributed tracing correlation.
+        trace_id: Option<String>,
+        /// W3C span-id from the span that produced this event.
+        span_id: Option<String>,
     },
     /// The agent requires interactive approval before executing a tool.
     ApprovalPrompt {
@@ -105,6 +115,11 @@ impl PaneEvent {
                     turn_id: p.get("turn_id")?.as_str()?.to_owned(),
                     tier: p.get("tier")?.as_str()?.to_owned(),
                     model: p.get("model")?.as_str()?.to_owned(),
+                    trace_id: p
+                        .get("trace_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned),
+                    span_id: p.get("span_id").and_then(|v| v.as_str()).map(str::to_owned),
                 })
             }
             "tool_call" => {
@@ -112,6 +127,15 @@ impl PaneEvent {
                 Some(Self::ToolCall {
                     tool_name: p.get("tool_name")?.as_str()?.to_owned(),
                     args_summary: p.get("args_summary")?.as_str()?.to_owned(),
+                    tool_call_id: p
+                        .get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned),
+                    trace_id: p
+                        .get("trace_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned),
+                    span_id: p.get("span_id").and_then(|v| v.as_str()).map(str::to_owned),
                 })
             }
             "approval_prompt" => {
@@ -668,6 +692,7 @@ mod tests {
             turn_id,
             tier,
             model,
+            ..
         } = event
         {
             assert_eq!(session_id, "s1");
@@ -686,6 +711,7 @@ mod tests {
         if let PaneEvent::ToolCall {
             tool_name,
             args_summary,
+            ..
         } = event
         {
             assert_eq!(tool_name, "bash");

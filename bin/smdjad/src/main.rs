@@ -289,7 +289,7 @@ async fn run_turn(
     gates: Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
 ) {
     let tracer = global::tracer("smedja");
-    let mut turn_span = tracer.start("smedja.turn");
+    let mut turn_span = tracer.start(tel::SPAN_AGENT_INVOKE);
 
     // 1. Load the task to retrieve user content.
     let task = {
@@ -383,6 +383,21 @@ async fn run_turn(
     turn_span.set_attribute(KeyValue::new(tel::GEN_AI_SYSTEM, runner.clone()));
     turn_span.set_attribute(KeyValue::new(tel::REQUEST_MODEL, model.clone()));
     turn_span.set_attribute(KeyValue::new(tel::CONV_ID, session_id.clone()));
+    turn_span.set_attribute(KeyValue::new(
+        tel::OPERATION_NAME,
+        tel::OPERATION_INVOKE_AGENT,
+    ));
+    turn_span.set_attribute(KeyValue::new(tel::SESSION_ID, session_id.clone()));
+    turn_span.set_attribute(KeyValue::new(tel::TURN_ID, turn_id.clone()));
+    // agent_name: use session mode or "interactive" for user-facing sessions
+    turn_span.set_attribute(KeyValue::new(
+        tel::AGENT_NAME,
+        session
+            .as_ref()
+            .and_then(|s| s.mode.as_deref())
+            .unwrap_or("interactive")
+            .to_owned(),
+    ));
 
     // Derive workspace root: prefer session.workspace_root, then SMEDJA_WORKSPACE env, then ".".
     let workspace_root = {
@@ -752,16 +767,33 @@ async fn run_turn(
                 content: response_text.clone(),
             });
 
+            // Extract current span IDs to correlate event with the tool span.
+            let (ev_trace_id, ev_span_id) = {
+                use opentelemetry::trace::TraceContextExt as _;
+                let cx = opentelemetry::Context::current();
+                let sc = cx.span().span_context().clone();
+                if sc.is_valid() {
+                    (
+                        Some(format!("{}", sc.trace_id())),
+                        Some(format!("{}", sc.span_id())),
+                    )
+                } else {
+                    (None, None)
+                }
+            };
             // Emit the ToolCalled event with the correlation ID.
             dispatcher.publish(TurnEvent::ToolCalled {
                 tool_name: tool_name.clone(),
                 input_summary: tool_input.chars().take(120).collect(),
-                conversation_id: None,
-                trace_id: None,
-                span_id: None,
+                conversation_id: Some(session_id.clone()),
+                trace_id: ev_trace_id,
+                span_id: ev_span_id,
                 parent_span_id: None,
-                operation_name: None,
-                agent_name: None,
+                operation_name: Some(tel::OPERATION_EXECUTE_TOOL.to_owned()),
+                agent_name: session
+                    .as_ref()
+                    .and_then(|s| s.mode.as_deref())
+                    .map(str::to_owned),
                 status: None,
                 tool_call_id: Some(tool_call_id.clone()),
             });
@@ -795,13 +827,112 @@ async fn run_turn(
             let tool_result = if let Some(denial) = cowork_denied {
                 denial
             } else {
-                let mut tool_span = tracer.start("smedja.tool");
-                tool_span.set_attribute(KeyValue::new("smedja.tool.name", tool_name.clone()));
+                // Classify tool type per the design contract.
+                let tool_type_val = if tool_name.starts_with("mcp_") || tool_name.contains("mcp") {
+                    "extension"
+                } else if matches!(
+                    tool_name.as_str(),
+                    "vault_search" | "graph_query" | "retrieve"
+                ) {
+                    "datastore"
+                } else {
+                    "function"
+                };
+                let mut tool_span = tracer.start(tel::SPAN_TOOL_EXECUTE);
+                tool_span.set_attribute(KeyValue::new(
+                    tel::OPERATION_NAME,
+                    tel::OPERATION_EXECUTE_TOOL,
+                ));
+                tool_span.set_attribute(KeyValue::new(tel::TOOL_NAME, tool_name.clone()));
+                tool_span.set_attribute(KeyValue::new(tel::TOOL_TYPE, tool_type_val));
+                tool_span.set_attribute(KeyValue::new(tel::TOOL_CALL_ID, tool_call_id.clone()));
+                // Capture policy for tool args (section 7.1).
+                match tel::tool_args_capture_mode() {
+                    tel::CaptureMode::Hash => {
+                        tool_span.set_attribute(KeyValue::new(
+                            tel::TOOL_ARGS_HASH,
+                            tel::content_hash(&tool_input),
+                        ));
+                    }
+                    tel::CaptureMode::Scrubbed | tel::CaptureMode::Full => {
+                        tool_span.set_attribute(KeyValue::new(
+                            tel::TOOL_ARGS_HASH,
+                            tel::content_hash(&tool_input),
+                        ));
+                        tool_span.set_attribute(KeyValue::new(
+                            "gen_ai.tool.args",
+                            tel::scrub_and_summarise(&tool_input),
+                        ));
+                    }
+                }
                 let result =
                     execute_tool(&tool_name, &tool_input, &workspace_root, session.as_ref()).await;
+                tool_span.set_attribute(KeyValue::new(
+                    tel::TOOL_RESULT_HASH,
+                    tel::content_hash(&result),
+                ));
+                tool_span.set_attribute(KeyValue::new(
+                    tel::TOOL_RESULT_TOKENS,
+                    i64::try_from(result.split_whitespace().count()).unwrap_or(0),
+                ));
+                // rough word-count approximation; good enough for telemetry
+                if result.starts_with("error:") || result.starts_with("permission denied") {
+                    use opentelemetry::trace::Span as _;
+                    tool_span.set_status(opentelemetry::trace::Status::error(
+                        result.chars().take(120).collect::<String>(),
+                    ));
+                } else {
+                    use opentelemetry::trace::Span as _;
+                    tool_span.set_status(opentelemetry::trace::Status::Ok);
+                }
                 tool_span.end();
                 result
             };
+
+            // Persist tool execution as a timeline event (section 5.7).
+            {
+                // Get current span IDs for correlation.
+                let tool_sc = {
+                    use opentelemetry::trace::TraceContextExt as _;
+                    let cx = opentelemetry::Context::current();
+                    cx.span().span_context().clone()
+                };
+                let (t_trace_id, t_span_id) = if tool_sc.is_valid() {
+                    (
+                        Some(format!("{}", tool_sc.trace_id())),
+                        Some(format!("{}", tool_sc.span_id())),
+                    )
+                } else {
+                    (None, None)
+                };
+                let tool_audit = smedja_ingot::AuditEvent {
+                    id: Uuid::new_v4(),
+                    ts: now_epoch(),
+                    session_id: session_id.clone(),
+                    turn_id: Some(turn_id.clone()),
+                    action_type: "tool_exec".into(),
+                    actor: "smdjad".into(),
+                    tool_name: Some(tool_name.clone()),
+                    traceparent: None,
+                    trace_id: t_trace_id,
+                    span_id: t_span_id,
+                    conversation_id: Some(session_id.clone()),
+                    tool_call_id: Some(tool_call_id.clone()),
+                    operation_name: Some(tel::OPERATION_EXECUTE_TOOL.to_owned()),
+                    status: if tool_result.starts_with("error:")
+                        || tool_result.starts_with("permission denied")
+                    {
+                        Some("error".to_owned())
+                    } else {
+                        Some("ok".to_owned())
+                    },
+                    ..smedja_ingot::AuditEvent::default()
+                };
+                let ig = ingot.lock().await;
+                if let Err(e) = ig.record_timeline_event(&tool_audit) {
+                    warn!(turn_id = %turn_id, error = %e, "failed to record tool audit event");
+                }
+            }
 
             // 5e. Append tool result as a user message and continue the loop.
             // Escape XML angle brackets in the raw tool output so that a
@@ -964,37 +1095,49 @@ async fn run_turn(
 
     // 10. Record audit event for this turn with the OTel span context.
     {
+        let agent_name_val = session
+            .as_ref()
+            .and_then(|s| s.mode.as_deref())
+            .unwrap_or("interactive")
+            .to_owned();
         let audit_ev = smedja_ingot::AuditEvent {
             id: Uuid::new_v4(),
             ts: now_epoch(),
             session_id: session_id.clone(),
             turn_id: Some(turn_id.clone()),
-            action_type: "llm".into(),
+            action_type: "turn_end".into(),
             actor: "smdjad".into(),
             input_tok: i64::from(total_input_tokens),
             output_tok: i64::from(total_output_tokens),
             traceparent: Some(traceparent),
             trace_id: Some(span_trace_id),
             span_id: Some(span_span_id),
+            conversation_id: Some(session_id.clone()),
+            agent_name: Some(agent_name_val),
+            operation_name: Some(tel::OPERATION_INVOKE_AGENT.to_owned()),
+            status: Some("ok".to_owned()),
             ..smedja_ingot::AuditEvent::default()
         };
         let ig = ingot.lock().await;
-        if let Err(e) = ig.insert_audit_event(&audit_ev) {
+        if let Err(e) = ig.record_timeline_event(&audit_ev) {
             warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to record turn audit event");
         }
     }
 
     dispatcher.publish(TurnEvent::Completed {
-        session_id,
-        turn_id,
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
         output_tokens: total_output_tokens,
-        conversation_id: None,
-        trace_id: None,
+        conversation_id: Some(session_id.clone()),
+        trace_id: None, // span already ended before this
         span_id: None,
         parent_span_id: None,
-        operation_name: None,
-        agent_name: None,
-        status: None,
+        operation_name: Some(tel::OPERATION_INVOKE_AGENT.to_owned()),
+        agent_name: session
+            .as_ref()
+            .and_then(|s| s.mode.as_deref())
+            .map(str::to_owned),
+        status: Some("ok".to_owned()),
     });
 }
 
@@ -1857,15 +2000,29 @@ fn build_router(
                 .create_task(&task)
                 .map_err(|e| ingot_err(&e))?;
 
+            // Extract current span IDs for turn start event correlation.
+            let (ts_trace_id, ts_span_id) = {
+                use opentelemetry::trace::TraceContextExt as _;
+                let cx = opentelemetry::Context::current();
+                let sc = cx.span().span_context().clone();
+                if sc.is_valid() {
+                    (
+                        Some(format!("{}", sc.trace_id())),
+                        Some(format!("{}", sc.span_id())),
+                    )
+                } else {
+                    (None, None)
+                }
+            };
             dispatcher.publish(TurnEvent::Started {
-                session_id,
+                session_id: session_id.clone(),
                 turn_id: task_id.to_string(),
-                conversation_id: None,
-                trace_id: None,
-                span_id: None,
+                conversation_id: Some(session_id.clone()),
+                trace_id: ts_trace_id,
+                span_id: ts_span_id,
                 parent_span_id: None,
-                operation_name: None,
-                agent_name: None,
+                operation_name: Some(tel::OPERATION_INVOKE_AGENT.to_owned()),
+                agent_name: Some("interactive".to_owned()),
                 status: None,
             });
 
@@ -2785,15 +2942,29 @@ fn build_router(
                         let _ = guard.create_task(&task);
                     }
 
+                    // Extract current span IDs for loop turn start event correlation.
+                    let (loop_ts_trace_id, loop_ts_span_id) = {
+                        use opentelemetry::trace::TraceContextExt as _;
+                        let cx = opentelemetry::Context::current();
+                        let sc = cx.span().span_context().clone();
+                        if sc.is_valid() {
+                            (
+                                Some(format!("{}", sc.trace_id())),
+                                Some(format!("{}", sc.span_id())),
+                            )
+                        } else {
+                            (None, None)
+                        }
+                    };
                     bg_dispatcher.publish(TurnEvent::Started {
                         session_id: session_id.to_string(),
                         turn_id: task_id.to_string(),
-                        conversation_id: None,
-                        trace_id: None,
-                        span_id: None,
+                        conversation_id: Some(session_id.to_string()),
+                        trace_id: loop_ts_trace_id,
+                        span_id: loop_ts_span_id,
                         parent_span_id: None,
-                        operation_name: None,
-                        agent_name: None,
+                        operation_name: Some(tel::OPERATION_INVOKE_AGENT.to_owned()),
+                        agent_name: Some("interactive".to_owned()),
                         status: None,
                     });
 
