@@ -2113,4 +2113,73 @@ mod tests {
         let state = make_state("s");
         assert_eq!(state.input_cursor, 0);
     }
+
+    // ── provider-display: session.create response parsing ───────────────────
+
+    fn parse_session_resp(
+        resp: &serde_json::Value,
+        cli_tier: Option<String>,
+    ) -> (String, Option<String>, Option<String>) {
+        let runner = resp
+            .get("runner")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_owned();
+        let model: Option<String> = resp
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let resp_tier: Option<String> = resp
+            .get("tier")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let effective_tier = cli_tier.or(resp_tier);
+        (runner, model, effective_tier)
+    }
+
+    #[test]
+    fn startup_runner_populated_from_session_resp() {
+        let resp = serde_json::json!({
+            "id": "x",
+            "runner": "claude-cli",
+            "model": "claude-sonnet-4-6",
+            "tier": "fast",
+        });
+        let (runner, model, tier) = parse_session_resp(&resp, None);
+        assert_eq!(runner, "claude-cli");
+        assert_eq!(model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(tier.as_deref(), Some("fast"));
+    }
+
+    #[test]
+    fn startup_fields_fall_back_gracefully_when_missing() {
+        let resp = serde_json::json!({ "id": "x" });
+        let (runner, model, tier) = parse_session_resp(&resp, None);
+        assert_eq!(runner, "unknown");
+        assert!(model.is_none());
+        assert!(tier.is_none());
+    }
+
+    #[test]
+    fn cli_tier_arg_takes_precedence_over_response_tier() {
+        let resp = serde_json::json!({ "id": "x", "tier": "local" });
+        let (_runner, _model, tier) = parse_session_resp(&resp, Some("deep".into()));
+        assert_eq!(tier.as_deref(), Some("deep"));
+    }
+
+    #[test]
+    fn status_bar_shows_runner_when_set() {
+        let mut state = make_state("sess-runner");
+        state.runner = "anthropic".to_owned();
+        let buf = render_frame(&state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            content.contains("anthropic"),
+            "status bar must render the runner; got: {content}"
+        );
+    }
 }
