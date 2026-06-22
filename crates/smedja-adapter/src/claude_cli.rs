@@ -341,6 +341,7 @@ mod tests {
             system: None,
             tools: None,
             provider_session_id: Some("resume-123".into()),
+            stable_prefix_len: None,
         };
         let messages = vec![Message {
             role: crate::Role::User,
