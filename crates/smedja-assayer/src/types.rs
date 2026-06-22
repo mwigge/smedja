@@ -40,7 +40,7 @@ pub enum Complexity {
 }
 
 /// The execution tier that controls latency vs. capability trade-offs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tier {
     /// Low latency, small context window, cheap.
     Fast,
@@ -51,7 +51,7 @@ pub enum Tier {
 }
 
 /// The model runner backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Runner {
     /// Anthropic Claude (cloud).
     Claude,
