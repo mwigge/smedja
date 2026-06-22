@@ -124,6 +124,16 @@ struct AppState {
     /// Used to rate-limit the "waiting for turn…" status message so it does not
     /// flood the panel on rapid retries.
     poll_retry_count: u32,
+    /// Whether the messages panel has scroll focus (input bar is inactive).
+    scroll_focus: bool,
+    /// Whether visual line-selection mode is active within the messages panel.
+    selection_mode: bool,
+    /// Anchor line index for the current selection (0 = oldest line).
+    selection_anchor: usize,
+    /// Moving end line index for the current selection.
+    selection_end: usize,
+    /// First `g` press received; waiting for a second `g` to jump to top.
+    g_pending: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +213,31 @@ fn push_system_message(state: &mut AppState, text: impl Into<String>) {
     };
     state.main_panel.push_line(msg.text.clone());
     state.messages.push(msg);
+}
+
+fn yank_to_clipboard(lines: &[String]) {
+    use std::io::Write as _;
+    let text = lines.join("\n");
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("pbcopy");
+    #[cfg(not(target_os = "macos"))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xclip");
+        c.args(["-selection", "clipboard"]);
+        c
+    };
+    let result = cmd
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(text.as_bytes())?;
+            }
+            child.wait()
+        });
+    if let Err(e) = result {
+        tracing::debug!(error = %e, "clipboard write failed");
+    }
 }
 
 fn accept_slash_completion(state: &mut AppState, append_space: bool) -> bool {
@@ -376,6 +411,74 @@ async fn handle_key(
         return Ok(());
     }
 
+    // ------------------------------------------------------------------
+    // Scroll / visual-selection mode intercept.
+    // ------------------------------------------------------------------
+    if state.scroll_focus {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if state.selection_mode {
+                    state.selection_end += 1;
+                } else {
+                    state.main_panel.scroll_down();
+                }
+                state.g_pending = false;
+                return Ok(());
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if state.selection_mode {
+                    state.selection_end = state.selection_end.saturating_sub(1);
+                } else {
+                    state.main_panel.scroll_up();
+                }
+                state.g_pending = false;
+                return Ok(());
+            }
+            KeyCode::Char('G') => {
+                state.main_panel.scroll_to_bottom();
+                state.g_pending = false;
+                return Ok(());
+            }
+            KeyCode::Char('g') => {
+                if state.g_pending {
+                    state.main_panel.scroll_to_top();
+                    state.g_pending = false;
+                } else {
+                    state.g_pending = true;
+                }
+                return Ok(());
+            }
+            KeyCode::Char('v') if !state.selection_mode => {
+                state.selection_mode = true;
+                state.selection_anchor = state.main_panel.scroll;
+                state.selection_end = state.main_panel.scroll;
+                state.g_pending = false;
+                return Ok(());
+            }
+            KeyCode::Char('y') if state.selection_mode => {
+                let lo = state.selection_anchor.min(state.selection_end);
+                let hi = state.selection_anchor.max(state.selection_end);
+                let lines = state.main_panel.lines_text(lo, hi);
+                let count = lines.len();
+                yank_to_clipboard(&lines);
+                state.clipboard = Some(lines.join("\n"));
+                state.selection_mode = false;
+                push_system_message(state, format!("\u{2713} {count} lines copied"));
+                return Ok(());
+            }
+            KeyCode::Char('i') | KeyCode::Char('a') => {
+                state.scroll_focus = false;
+                state.selection_mode = false;
+                state.g_pending = false;
+                return Ok(());
+            }
+            KeyCode::Esc => {
+                // Fall through to the main Esc handler below.
+            }
+            _ => return Ok(()), // consume unknown keys in scroll mode
+        }
+    }
+
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.quit = true;
@@ -389,10 +492,14 @@ async fn handle_key(
         KeyCode::Esc => {
             if state.diff_overlay.is_some() {
                 state.diff_overlay = None;
+            } else if state.selection_mode {
+                state.selection_mode = false;
+            } else if state.scroll_focus {
+                state.scroll_focus = false;
             } else if state.block_browser_open {
                 state.block_browser_open = false;
             } else {
-                state.quit = true;
+                state.scroll_focus = true;
             }
         }
 
@@ -765,7 +872,14 @@ fn render(frame: &mut ratatui::Frame, state: &AppState) {
     };
 
     // L122: render MainPanel from state.main_panel.
-    state.main_panel.render(main_area, frame);
+    let selection = if state.selection_mode {
+        let lo = state.selection_anchor.min(state.selection_end);
+        let hi = state.selection_anchor.max(state.selection_end);
+        Some((lo, hi))
+    } else {
+        None
+    };
+    state.main_panel.render(main_area, frame, selection);
 
     // Overlay a one-row "⠿ thinking…" indicator at the bottom of the main area.
     if state.turn_in_flight && main_area.height >= 1 {
@@ -989,6 +1103,11 @@ async fn main() -> Result<()> {
         slash_cursor: 0,
         turn_in_flight: false,
         poll_retry_count: 0,
+        scroll_focus: false,
+        selection_mode: false,
+        selection_anchor: 0,
+        selection_end: 0,
+        g_pending: false,
     };
 
     // Connect banner — shown on every startup so the user knows what's connected.
@@ -1325,6 +1444,11 @@ mod tests {
             slash_cursor: 0,
             turn_in_flight: false,
             poll_retry_count: 0,
+            scroll_focus: false,
+            selection_mode: false,
+            selection_anchor: 0,
+            selection_end: 0,
+            g_pending: false,
         }
     }
 
