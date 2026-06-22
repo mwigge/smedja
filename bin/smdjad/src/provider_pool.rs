@@ -79,6 +79,25 @@ impl ProviderPool {
         }
         out
     }
+
+    /// Returns all pool entries as `(runner_name, tier, default_model)` triples.
+    ///
+    /// Sorted by runner name then tier so callers get a stable, human-readable order.
+    #[must_use]
+    pub fn list_all_entries(&self) -> Vec<(&'static str, &'static str, &'static str)> {
+        let tier_str = |t: &Tier| match t {
+            Tier::Fast => "fast",
+            Tier::Deep => "deep",
+            Tier::Local => "local",
+        };
+        let mut out: Vec<_> = self
+            .entries
+            .iter()
+            .map(|((_, tier), entry)| (entry.runner_name, tier_str(tier), entry.default_model))
+            .collect();
+        out.sort_by_key(|&(runner, tier, _)| (runner, tier));
+        out
+    }
 }
 
 /// Probes all available providers and returns a populated pool.
@@ -320,5 +339,37 @@ mod tests {
         // All routes fall back to local.
         let entry = pool.get(Runner::Claude, Tier::Deep).unwrap();
         assert_eq!(entry.runner_name, "local");
+    }
+
+    #[test]
+    fn list_all_entries_returns_runner_tier_model_triples() {
+        let pool = pool_with(vec![
+            (
+                (Runner::Claude, Tier::Fast),
+                "claude-cli",
+                "claude-haiku-4-5-20251001",
+            ),
+            (
+                (Runner::Claude, Tier::Deep),
+                "claude-cli",
+                "claude-sonnet-4-6",
+            ),
+            ((Runner::Local, Tier::Local), "local", "qwen3-14b"),
+        ]);
+        let entries = pool.list_all_entries();
+        assert_eq!(entries.len(), 3);
+        let tiers: Vec<&str> = entries.iter().map(|&(_, t, _)| t).collect();
+        assert!(
+            tiers.contains(&"fast"),
+            "fast tier must appear in list_all_entries"
+        );
+        assert!(
+            tiers.contains(&"deep"),
+            "deep tier must appear in list_all_entries"
+        );
+        assert!(
+            tiers.contains(&"local"),
+            "local tier must appear in list_all_entries"
+        );
     }
 }

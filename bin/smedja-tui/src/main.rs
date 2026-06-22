@@ -68,7 +68,24 @@ struct Message {
 }
 
 /// Available slash-command completions shown in the popup.
-const SLASH_COMPLETIONS: &[&str] = &["/agent", "/health", "/tier", "/spec", "/tdd", "/ponytail"];
+const SLASH_COMPLETIONS: &[&str] = &[
+    "/agent",
+    "/agents",
+    "/approve",
+    "/approvals",
+    "/briefing",
+    "/deny",
+    "/health",
+    "/login",
+    "/metrics",
+    "/model",
+    "/ponytail",
+    "/quota",
+    "/review",
+    "/spec",
+    "/tdd",
+    "/tier",
+];
 
 #[allow(clippy::struct_excessive_bools)] // AppState is a TUI dispatch table; enum-splitting would add indirection without clarity
 #[derive(Debug)]
@@ -464,8 +481,287 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
             push_system_message(state, "mode set to ponytail");
             Ok(true)
         }
+        "model" => {
+            let session_id = state.session_id.clone();
+            if args.is_empty() || args == "reset" {
+                let result = client.call("runner.list", json!({})).await;
+                let text = match result {
+                    Ok(v) => format_model_list(&v),
+                    Err(e) => format!("runner.list error: {e}"),
+                };
+                push_system_message(state, text);
+            } else {
+                let model = args.to_owned();
+                let result = client
+                    .call(
+                        "session.set_model",
+                        json!({ "session_id": session_id, "model": model }),
+                    )
+                    .await;
+                match result {
+                    Ok(_) => {
+                        state.model = Some(model.clone());
+                        push_system_message(state, format!("model set to {model}"));
+                    }
+                    Err(e) => push_system_message(state, format!("session.set_model error: {e}")),
+                }
+            }
+            Ok(true)
+        }
+        "agents" => {
+            let result = client.call("runner.list", json!({})).await;
+            let text = match result {
+                Ok(v) => format_agents_table(&v),
+                Err(e) => format!("runner.list error: {e}"),
+            };
+            push_system_message(state, text);
+            Ok(true)
+        }
+        "metrics" => {
+            let session_id = state.session_id.clone();
+            let usage_result = client
+                .call("session.token_usage", json!({ "session_id": session_id }))
+                .await;
+            let cost_result = client
+                .call("session.cost", json!({ "session_id": &state.session_id }))
+                .await;
+            let text = format_metrics(&usage_result, &cost_result, &state.session_id);
+            push_system_message(state, text);
+            Ok(true)
+        }
+        "approvals" => {
+            let session_id = state.session_id.clone();
+            let result = client
+                .call("cowork.pending", json!({ "session_id": session_id }))
+                .await;
+            let text = match result {
+                Ok(v) => format_approvals_list(&v),
+                Err(e) => format!("cowork.pending error: {e}"),
+            };
+            push_system_message(state, text);
+            Ok(true)
+        }
+        "approve" => {
+            if args.is_empty() {
+                push_system_message(state, "usage: /approve <id>");
+                return Ok(true);
+            }
+            let id = args.to_owned();
+            let session_id = state.session_id.clone();
+            let result = client
+                .call("cowork.approve", json!({ "session_id": session_id, "id": id }))
+                .await;
+            match result {
+                Ok(v) => {
+                    let resolved = v.get("resolved").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let text = if resolved {
+                        format!("approved: {id}")
+                    } else {
+                        format!("item not found: {id}")
+                    };
+                    push_system_message(state, text);
+                }
+                Err(e) => push_system_message(state, format!("cowork.approve error: {e}")),
+            }
+            Ok(true)
+        }
+        "deny" => {
+            if args.is_empty() {
+                push_system_message(state, "usage: /deny <id> [reason]");
+                return Ok(true);
+            }
+            let mut parts = args.splitn(2, ' ');
+            let id = parts.next().unwrap_or_default().to_owned();
+            let reason = parts.next().unwrap_or("denied").to_owned();
+            let session_id = state.session_id.clone();
+            let result = client
+                .call(
+                    "cowork.deny",
+                    json!({ "session_id": session_id, "id": id, "reason": reason }),
+                )
+                .await;
+            match result {
+                Ok(v) => {
+                    let resolved = v.get("resolved").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let text = if resolved {
+                        format!("denied: {id}")
+                    } else {
+                        format!("item not found: {id}")
+                    };
+                    push_system_message(state, text);
+                }
+                Err(e) => push_system_message(state, format!("cowork.deny error: {e}")),
+            }
+            Ok(true)
+        }
+        "review" => {
+            let focus = if args.is_empty() {
+                String::new()
+            } else {
+                format!("\n\nFocus on: {args}")
+            };
+            let diff = match std::process::Command::new("git")
+                .args(["diff", "HEAD"])
+                .output()
+            {
+                Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
+                Err(e) => {
+                    push_system_message(state, format!("git diff failed: {e}"));
+                    return Ok(true);
+                }
+            };
+            if diff.trim().is_empty() {
+                push_system_message(state, "no unstaged changes to review (diff HEAD is empty)");
+                return Ok(true);
+            }
+            let message = format!("Review the following git diff:{focus}\n\n```diff\n{diff}```");
+            submit(&message, state, client).await?;
+            Ok(true)
+        }
+        "briefing" => {
+            let session_id = state.session_id.clone();
+            let result = client
+                .call("session.compact", json!({ "session_id": session_id }))
+                .await;
+            match result {
+                Ok(v) => {
+                    let summary = v
+                        .get("summary")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("(no summary)")
+                        .to_owned();
+                    push_system_message(state, format!("briefing:\n{summary}"));
+                }
+                Err(e) => push_system_message(state, format!("session.compact error: {e}")),
+            }
+            Ok(true)
+        }
+        "quota" => {
+            push_system_message(
+                state,
+                "quota data is not available for this runner. Check your provider dashboard.",
+            );
+            Ok(true)
+        }
+        "login" => {
+            let guidance = if args.is_empty() {
+                "usage: /login <runner>\n\
+                 runners: claude | codex | openai\n\
+                 set ANTHROPIC_API_KEY, OPENAI_API_KEY, or install the claude/codex CLI"
+                    .to_owned()
+            } else {
+                match args {
+                    "claude" => "install claude CLI: https://claude.ai/download\n\
+                                 then set ANTHROPIC_API_KEY in your shell profile"
+                        .to_owned(),
+                    "codex" => "install codex CLI: npm install -g @openai/codex\n\
+                                 then set OPENAI_API_KEY in your shell profile"
+                        .to_owned(),
+                    "openai" => "set OPENAI_API_KEY=<your-key> in your shell profile".to_owned(),
+                    other => format!("unknown runner: {other}"),
+                }
+            };
+            push_system_message(state, guidance);
+            Ok(true)
+        }
         _ => Ok(false),
     }
+}
+
+fn format_model_list(v: &serde_json::Value) -> String {
+    let runners = v.get("runners").and_then(|r| r.as_array());
+    let Some(runners) = runners else {
+        return "no runners available".to_owned();
+    };
+    let mut lines = vec!["available models:".to_owned()];
+    for r in runners {
+        let runner = r.get("runner").and_then(|v| v.as_str()).unwrap_or("?");
+        let tier = r.get("tier").and_then(|v| v.as_str()).unwrap_or("?");
+        let model = r.get("model").and_then(|v| v.as_str()).unwrap_or("?");
+        lines.push(format!("  {runner} ({tier}): {model}"));
+    }
+    lines.join("\n")
+}
+
+fn format_agents_table(v: &serde_json::Value) -> String {
+    let runners = v.get("runners").and_then(|r| r.as_array());
+    let Some(runners) = runners else {
+        return "no runners configured".to_owned();
+    };
+    if runners.is_empty() {
+        return "no runners available".to_owned();
+    }
+    let mut lines = vec![
+        format!(
+            " {:<14} {:<8} {}",
+            "runner", "tier", "model"
+        ),
+        format!(" {}", "─".repeat(60)),
+    ];
+    for r in runners {
+        let runner = r.get("runner").and_then(|v| v.as_str()).unwrap_or("?");
+        let tier = r.get("tier").and_then(|v| v.as_str()).unwrap_or("?");
+        let model = r.get("model").and_then(|v| v.as_str()).unwrap_or("?");
+        lines.push(format!(" {runner:<14} {tier:<8} {model}"));
+    }
+    lines.join("\n")
+}
+
+fn format_metrics(
+    usage: &Result<serde_json::Value, smedja_rpc::RpcError>,
+    cost: &Result<serde_json::Value, smedja_rpc::RpcError>,
+    session_id: &str,
+) -> String {
+    let (turn_count, total_input, total_output) = match usage {
+        Ok(v) => {
+            let turns = v.get("turns").and_then(|t| t.as_array());
+            turns.map_or((0usize, 0i64, 0i64), |arr| {
+                let last = arr.last();
+                let total_in = last
+                    .and_then(|r| r.get("cumulative_input"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let total_out = last
+                    .and_then(|r| r.get("cumulative_output"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                (arr.len(), total_in, total_out)
+            })
+        }
+        Err(_) => (0, 0, 0),
+    };
+    let cost_usd = match cost {
+        Ok(v) => v
+            .get("total_usd")
+            .and_then(|c| c.as_f64())
+            .unwrap_or(0.0),
+        Err(_) => 0.0,
+    };
+    let total_tok = total_input.saturating_add(total_output);
+    format!(
+        "session: {session_id}\n\
+         turns: {turn_count}   tokens: {total_tok}\n\
+         cost: ${cost_usd:.4}   input: {total_input}   output: {total_output}"
+    )
+}
+
+fn format_approvals_list(v: &serde_json::Value) -> String {
+    let items = v.as_array();
+    let Some(items) = items else {
+        return "cowork: unexpected response format".to_owned();
+    };
+    if items.is_empty() {
+        return "cowork: no pending approvals".to_owned();
+    }
+    let mut lines = vec!["pending approvals:".to_owned()];
+    for item in items {
+        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("?");
+        let args = item.get("args").and_then(|v| v.as_str()).unwrap_or("");
+        lines.push(format!("  [{id}] {tool}: {args}"));
+    }
+    lines.push("use /approve <id> or /deny <id> [reason]".to_owned());
+    lines.join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -1730,8 +2026,8 @@ mod tests {
     // L129: filtered_completions returns only matching entries.
     #[test]
     fn slash_completions_filter_by_prefix() {
-        let completions = filtered_completions("/a");
-        assert_eq!(completions, vec!["/agent"]);
+        let completions = filtered_completions("/bri");
+        assert_eq!(completions, vec!["/briefing"]);
     }
 
     // L129: typing "/" returns all completions.
@@ -1751,8 +2047,8 @@ mod tests {
     #[test]
     fn slash_accept_space_inserts_completion_with_trailing_space() {
         let mut state = make_state("test-session");
-        state.input = "/t".to_owned();
-        state.slash_completions = filtered_completions("/t");
+        state.input = "/ti".to_owned();
+        state.slash_completions = filtered_completions("/ti");
         state.slash_popup_visible = true;
         state.slash_cursor = 0;
 
@@ -1863,6 +2159,106 @@ mod tests {
         let text = apply_agent("review", &mut state);
         assert_eq!(state.mode.as_deref(), Some("review"));
         assert_eq!(text, "agent mode set to review");
+    }
+
+    #[test]
+    fn format_agents_table_renders_header_and_rows() {
+        let v = serde_json::json!({
+            "runners": [
+                { "runner": "claude-cli", "tier": "fast", "model": "claude-haiku-4-5-20251001" },
+                { "runner": "claude-cli", "tier": "deep", "model": "claude-sonnet-4-6" },
+            ]
+        });
+        let out = format_agents_table(&v);
+        assert!(out.contains("runner"), "header must include 'runner'");
+        assert!(out.contains("claude-cli"), "table must list runner name");
+        assert!(out.contains("fast"), "table must list tier");
+        assert!(out.contains("claude-haiku-4-5-20251001"), "table must list model");
+    }
+
+    #[test]
+    fn format_agents_table_empty_runners_returns_message() {
+        let v = serde_json::json!({ "runners": [] });
+        let out = format_agents_table(&v);
+        assert!(out.contains("no runners"), "empty pool must say no runners");
+    }
+
+    #[test]
+    fn format_metrics_aggregates_token_and_cost_data() {
+        let usage = Ok(serde_json::json!({
+            "session_id": "sess-1",
+            "turns": [
+                { "turn_n": 1, "input_tok": 100, "output_tok": 50, "cumulative_input": 100, "cumulative_output": 50 }
+            ]
+        }));
+        let cost = Ok(serde_json::json!({
+            "session_id": "sess-1",
+            "total_usd": 0.0025,
+            "breakdown": []
+        }));
+        let out = format_metrics(&usage, &cost, "sess-1");
+        assert!(out.contains("sess-1"), "metrics must include session id");
+        assert!(out.contains("turns: 1"), "metrics must include turn count");
+        assert!(out.contains("0.0025"), "metrics must include cost");
+    }
+
+    #[test]
+    fn format_metrics_handles_rpc_errors_gracefully() {
+        let usage: Result<serde_json::Value, smedja_rpc::RpcError> =
+            Err(smedja_rpc::RpcError::new(-32600, "unavailable"));
+        let cost: Result<serde_json::Value, smedja_rpc::RpcError> =
+            Err(smedja_rpc::RpcError::new(-32600, "unavailable"));
+        let out = format_metrics(&usage, &cost, "sess-err");
+        assert!(
+            out.contains("sess-err"),
+            "metrics must still show session id on error"
+        );
+    }
+
+    #[test]
+    fn format_approvals_list_shows_items() {
+        let v = serde_json::json!([
+            { "id": "item-1", "tool": "Bash", "args": "git push origin main", "step_n": 1 }
+        ]);
+        let out = format_approvals_list(&v);
+        assert!(out.contains("item-1"), "must include id");
+        assert!(out.contains("Bash"), "must include tool name");
+        assert!(out.contains("git push"), "must include args");
+        assert!(out.contains("/approve"), "must include usage hint");
+    }
+
+    #[test]
+    fn format_approvals_list_empty_shows_no_pending_message() {
+        let v = serde_json::json!([]);
+        let out = format_approvals_list(&v);
+        assert!(out.contains("no pending"), "empty list must say no pending approvals");
+    }
+
+    #[test]
+    fn format_model_list_renders_all_entries() {
+        let v = serde_json::json!({
+            "runners": [
+                { "runner": "claude-cli", "tier": "fast", "model": "claude-haiku-4-5-20251001" }
+            ]
+        });
+        let out = format_model_list(&v);
+        assert!(out.contains("claude-cli"), "must include runner name");
+        assert!(out.contains("fast"), "must include tier");
+        assert!(out.contains("claude-haiku-4-5-20251001"), "must include model");
+    }
+
+    #[test]
+    fn slash_completions_include_new_commands() {
+        let required = [
+            "/agents", "/approve", "/approvals", "/briefing",
+            "/deny", "/login", "/metrics", "/model", "/quota", "/review",
+        ];
+        for cmd in required {
+            assert!(
+                SLASH_COMPLETIONS.contains(&cmd),
+                "{cmd} must be in SLASH_COMPLETIONS"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
