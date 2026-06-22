@@ -75,6 +75,7 @@ fn role_to_str(role: &Role) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 impl Provider for OpenAiProvider {
     fn stream_chat(&self, messages: &[Message], opts: &CallOptions) -> DeltaStream {
         let url = format!("{}/v1/chat/completions", self.base_url);
@@ -121,6 +122,19 @@ impl Provider for OpenAiProvider {
                     return;
                 }
             };
+
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(std::time::Duration::from_secs);
+                let _ = tx
+                    .send(Err(AdapterError::RateLimited { retry_after }))
+                    .await;
+                return;
+            }
 
             if !resp.status().is_success() {
                 let status = resp.status();

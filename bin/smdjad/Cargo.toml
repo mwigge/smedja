@@ -15,7 +15,9 @@ anyhow             = { workspace = true }
 axum               = { workspace = true }
 chrono             = { workspace = true }
 futures-util       = { workspace = true }
-opentelemetry      = { workspace = true }
+opentelemetry          = { workspace = true }
+opentelemetry-otlp     = { workspace = true }
+opentelemetry_sdk      = { workspace = true }
 reqwest            = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
@@ -28,6 +30,7 @@ smedja-memory      = { path = "../../crates/smedja-memory" }
 smedja-methodology = { path = "../../crates/smedja-methodology" }
 smedja-rpc         = { path = "../../crates/smedja-rpc" }
 smedja-sre         = { path = "../../crates/smedja-sre" }
+smedja-telemetry   = { path = "../../crates/smedja-telemetry" }
 smedja-vault       = { path = "../../crates/smedja-vault" }
 tokio              = { workspace = true }
 toml               = { workspace = true }

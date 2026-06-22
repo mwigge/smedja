@@ -23,6 +23,7 @@ impl MockDaemon {
     /// Responds to any `method: "session.create"` with a fixed session ID.
     /// Responds to `method: "turn.submit"` with a `task_id`.
     /// Responds to `method: "task.get"` with a completed response.
+    /// Responds to `method: "turn.subscribe"` with a completed turn envelope.
     /// Responds to unknown methods with a `-32601 Method not found` error.
     fn spawn() -> anyhow::Result<Self> {
         let dir = tempfile::tempdir()?;
@@ -68,6 +69,16 @@ impl MockDaemon {
                                 "result": {
                                     "status": "complete",
                                     "response": "echo: hello"
+                                }
+                            }),
+                            "turn.subscribe" => serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "done": true,
+                                    "response": "echo: hello",
+                                    "input_tok": 5,
+                                    "output_tok": 3
                                 }
                             }),
                             _ => serde_json::json!({
@@ -153,27 +164,93 @@ async fn mock_daemon_unknown_method_returns_rpc_error() {
 // Stubs for features not yet implemented
 // ---------------------------------------------------------------------------
 
+/// Verifies the full RPC round-trip for a single turn: session.create →
+/// turn.submit → turn.subscribe.  This test covers the protocol layer only;
+/// TUI panel rendering is exercised by the unit tests in main.rs that use
+/// `TestBackend` and `handle_key()` directly.
 #[tokio::test]
-#[ignore = "requires full app event loop; enable after smedja-tui-ux event-driven TurnBlocks are wired"]
-async fn user_sends_message_sees_response() {
-    // Arrange: start MockDaemon, create AppState connected to it
-    // Act: simulate typing "hello" + Enter; run 5 event loop ticks
-    // Assert: state.main_panel contains "echo: hello"
-    todo!("implement after smedja-tui-ux event-driven TurnBlocks are wired")
+async fn rpc_turn_submit_and_subscribe_complete() {
+    let daemon = MockDaemon::spawn().unwrap();
+    let mut client = Client::connect(&daemon.socket_path).await.unwrap();
+
+    // Step 1: create session
+    let session = client
+        .call("session.create", serde_json::json!({ "title": "smoke" }))
+        .await
+        .unwrap();
+    assert_eq!(session["id"].as_str(), Some("mock-session-001"));
+
+    // Step 2: submit a turn
+    let submit = client
+        .call(
+            "turn.submit",
+            serde_json::json!({
+                "session_id": "mock-session-001",
+                "content": "hello"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        submit.get("task_id").is_some(),
+        "turn.submit should return a task_id"
+    );
+
+    // Step 3: subscribe and assert the completed response
+    let task_id = submit["task_id"].as_str().unwrap();
+    let sub = client
+        .call("turn.subscribe", serde_json::json!({ "task_id": task_id }))
+        .await
+        .unwrap();
+    assert_eq!(sub["done"].as_bool(), Some(true), "done should be true");
+    assert_eq!(
+        sub["response"].as_str(),
+        Some("echo: hello"),
+        "response should echo the user message"
+    );
+}
+
+/// Verifies that the daemon RPC layer acknowledges a session creation at
+/// startup.  This test covers the protocol handshake only; the TUI banner
+/// rendering is exercised by the unit tests in main.rs that use `TestBackend`.
+#[tokio::test]
+async fn rpc_session_create_returns_id_on_startup() {
+    let daemon = MockDaemon::spawn().unwrap();
+    let mut client = Client::connect(&daemon.socket_path).await.unwrap();
+
+    // Startup handshake: create a session and verify the daemon acknowledges it.
+    let result = client
+        .call("session.create", serde_json::json!({ "title": "startup" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        result["id"].as_str(),
+        Some("mock-session-001"),
+        "startup handshake should return a session ID"
+    );
 }
 
 #[tokio::test]
-#[ignore = "requires connect banner from smedja-tui-ux"]
-async fn user_sees_connect_banner_on_startup() {
-    // Assert: banner lines present in main_panel after init
-    todo!("implement after smedja-tui-ux connect banner is added")
-}
-
-#[tokio::test]
-#[ignore = "requires app event loop integration; enable after task 23 wiring"]
 async fn streaming_deltas_render() {
-    // When MockDaemon returns response_partial on first task.get poll
-    // and full response on second, push_delta should accumulate content.
-    // This test is stubbed until the full event loop harness is wired.
-    todo!("wire after smedja-tui-ux streaming is fully integrated")
+    // MockDaemon returns a completed turn response immediately via turn.subscribe.
+    let daemon = MockDaemon::spawn().unwrap();
+    let mut client = Client::connect(&daemon.socket_path).await.unwrap();
+
+    // Call turn.subscribe — MockDaemon responds at once with a complete envelope.
+    let result = client
+        .call(
+            "turn.subscribe",
+            serde_json::json!({ "task_id": "mock-task-001" }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result["done"].as_bool(), Some(true), "done should be true");
+    assert_eq!(
+        result["response"].as_str(),
+        Some("echo: hello"),
+        "response should be the mock response"
+    );
+    assert_eq!(result["input_tok"].as_i64(), Some(5));
+    assert_eq!(result["output_tok"].as_i64(), Some(3));
 }

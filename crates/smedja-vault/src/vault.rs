@@ -102,6 +102,7 @@ impl Vault {
     ///
     /// Returns [`VaultError::Db`] if the database cannot be opened or the
     /// schema bootstrap fails.
+    #[must_use = "check the Result; a failed open means the vault is unavailable"]
     pub fn open(path: &std::path::Path) -> Result<Self, VaultError> {
         let conn = rusqlite::Connection::open(path)?;
         let vault = Self { conn };
@@ -117,6 +118,7 @@ impl Vault {
     ///
     /// Returns [`VaultError::Db`] if the in-memory connection cannot be
     /// established or the schema bootstrap fails.
+    #[must_use = "check the Result; a failed open means the in-memory vault is unavailable"]
     pub fn open_in_memory() -> Result<Self, VaultError> {
         let conn = rusqlite::Connection::open_in_memory()?;
         let vault = Self { conn };
@@ -143,6 +145,7 @@ impl Vault {
     /// Returns [`VaultError::EmbedderMismatch`] on dimension mismatch with the stored
     /// identity, [`VaultError::Db`] on a database failure, or [`VaultError::Json`] if
     /// the payload cannot be serialised.
+    #[must_use = "check the Result to confirm the entry was persisted"]
     pub fn insert(&mut self, entry: &VaultEntry) -> Result<(), VaultError> {
         // 1. Normalise namespace.
         let namespace = if entry.namespace.is_empty() {
@@ -238,6 +241,7 @@ impl Vault {
     ///
     /// Returns [`VaultError::Db`] if the database write fails, or
     /// [`VaultError::Json`] if `entry.payload` cannot be serialised.
+    #[must_use = "check the Result to confirm the upsert succeeded"]
     pub fn upsert(&mut self, entry: &VaultEntry) -> Result<(), VaultError> {
         let embedding_bytes = bytemuck::cast_slice::<f32, u8>(&entry.embedding);
         let payload_str = serde_json::to_string(&entry.payload)?;
@@ -407,6 +411,7 @@ impl Vault {
     /// # Errors
     ///
     /// Returns [`VaultError::Db`] if the database write fails.
+    #[must_use = "check the Result to confirm the diary entry was written"]
     pub fn diary_write(&mut self, role: &str, entry: &str) -> Result<(), VaultError> {
         let created_at = now_secs();
         self.conn.execute(
@@ -444,6 +449,7 @@ impl Vault {
     /// # Errors
     ///
     /// Returns [`VaultError::Db`] if the database write fails.
+    #[must_use = "check the Result to confirm the embedder identity was stored"]
     pub fn set_embedder_identity(&mut self, identity: &EmbedderIdentity) -> Result<(), VaultError> {
         let json = format!(
             r#"{{"model":"{}","dimensions":{}}}"#,
@@ -548,6 +554,7 @@ impl Vault {
     /// # Errors
     ///
     /// Returns [`VaultError::Db`] if the database write fails.
+    #[must_use = "check the Result to confirm the entry was removed"]
     pub fn remove(&mut self, id: &str) -> Result<(), VaultError> {
         self.conn.execute(
             "DELETE FROM vault_entries WHERE id = ?1",

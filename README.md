@@ -101,11 +101,11 @@ Every session runs through three memory strata. Context budget is allocated per 
   <img src="assets/diagrams/readme-session-memory.png" alt="session memory strata: hot, warm, cold, and archive" width="760" />
 </div>
 
-Compaction produces structured JSON, not a free-text summary. Each compacted turn becomes a structured object that can be expanded and replayed — `smj session rollback <id> <turn>` reconstructs any point in history.
+Compaction produces structured JSON, not a free-text summary. Each compacted turn becomes a structured object that can be expanded and replayed — `smj session rollback <id> <turn>` reconstructs any point in history. (**Note:** `smj session rollback` is on the roadmap; the underlying compaction format is in place.)
 
 ### How Parallel Agents Share Memory
 
-When tasks fan out to parallel worktrees, agents share **read** access to `smedja-vault` (cold store) but write to isolated working trees. The orchestrator merges vault writes on task completion:
+When tasks fan out to parallel worktrees, agents share **read** access to `smedja-vault` (cold store) but write to isolated working trees. The orchestrator merges vault writes on task completion. (**Note:** `smedja-vault` storage and cosine-similarity retrieval are implemented; the `smedja_vault_search` tool exposed to agents currently returns empty results — daemon wiring is in progress.)
 
 <div align="center">
   <img src="assets/diagrams/readme-parallel-memory.png" alt="parallel agents share read access to smedja-vault while writing to isolated worktrees" width="760" />
@@ -117,13 +117,11 @@ Both agents pull from the same cold memory — they know what was decided in pre
 
 ## Context Budget Control
 
-Before each request hits the provider, `smedja-adapter` runs three transforms:
+**SmartCrusher** (`smedja-adapter`) strips JSON nulls, zero-value arrays, and repeated keys from tool results before serialisation. Tool-heavy sessions see 30–60% token reduction on tool_result content alone. Implemented and tested.
 
-**SmartCrusher** strips JSON nulls, zero-value arrays, and repeated keys from tool results before serialisation. Tool-heavy sessions see 30–60% token reduction on tool_result content alone.
+**Stable-prefix / CacheAligner** (`smedja-memory`) tracks a `stable_prefix` boundary in the working window. The foundation is wired — `seal_prefix()` marks turns below the compaction line so they are never reordered or discarded. The adapter-side `BuildPrompt` integration that freezes provider cache hints is on the roadmap.
 
-**CacheAligner** freezes the system prompt and first N turns as a `stablePrefix`. BuildPrompt never reorders or compacts below that line, so the provider's KV cache stays warm across consecutive turns — no full re-encode on every call.
-
-**Verbosity steering** appends a short `<conciseness>` directive to the system prompt when context exceeds 60% of the window. Roughly 15–30% output token reduction with no measurable task-quality loss.
+**Verbosity steering** (`smedja-memory`) appends a `<conciseness>` directive to the system prompt when context exceeds 60% of the window. Implemented and tested.
 
 ---
 
@@ -151,13 +149,15 @@ TOML-configured, Starship-compatible module format. The milliways-specific modul
 
 ### Cowork Gate
 
-In cowork mode, every tool call pauses for approval — not just Codex, every runner:
+In cowork mode, every tool call pauses for approval — not just Codex, every runner. The daemon-side gate (`cowork.set` / `cowork.approve` / `cowork.deny` / `cowork.modify` RPC methods) is fully implemented and tested.
 
 <div align="center">
   <img src="assets/diagrams/readme-cowork-gate.png" alt="cowork approval gate for an edit_file tool call" width="900" />
 </div>
 
 Deny sends the reason back as a tool error — the agent re-plans from there. Modify replaces the arguments before execution. Every decision is recorded in `smedja-ingot` as an audit event with `tool_name`, `decision`, and `agent_reasoning`.
+
+**Current state:** Enable cowork mode from `smedja-tui` with `/cowork on`. Approval prompts appear as text lines in the agent block. An interactive inline approval widget (keyboard `y`/`n`/`m` shortcuts) is on the roadmap.
 
 ### Context Rail
 
@@ -201,7 +201,9 @@ A GPU-accelerated terminal emulator. wgpu on Metal / Vulkan / DX12, `cosmic-text
 
 The difference from WezTerm: `smedja` knows what a smdjad session is. Agent turns render as `AgentBlock` widgets — tier badge, token count, traceparent, inline cowork gate — not raw byte streams. Shell commands render as standard `Block` units (Warp-style): selectable, copyable, independently scrollable.
 
-Custom glyphs (tier badges, status icons, block decorations) register via the **Glyph Protocol** — APC sequences that map vector shapes to Unicode PUA codepoints. No Nerd Font patches required.
+**Current state:** Text renders using system fonts via `cosmic-text`. Startup is non-blocking — `FontSystem` initialises with an empty database (< 5 ms) and loads system fonts lazily on first glyph rasterisation. Individual glyph atlas misses are logged as warnings but do not crash the renderer. Background image blit is not yet implemented. The TUI approval widget for cowork gate is on the roadmap; approval events currently display as text lines in the agent block.
+
+Custom glyphs (tier badges, status icons, block decorations) register via the **Glyph Protocol** — APC sequences that map vector shapes to Unicode PUA codepoints. No Nerd Font patches required. (Roadmap — the protocol is specified; PUA glyph registration is not yet wired.)
 
 <div align="center">
   <img src="assets/diagrams/readme-smedja-term.png" alt="smedja window with shell blocks, agent blocks, cowork gate, and status bar" width="900" />
@@ -215,23 +217,37 @@ Config is TOML. A migration tool converts existing WezTerm Lua config.
 
 ## Install
 
-```sh
-curl -fsSL https://github.com/mwigge/smedja/releases/latest/download/install.sh | sh
+No release binaries are published yet. Build from source:
+
+```bash
+git clone https://github.com/mwigge/smedja
+cd smedja
+cargo build --release --workspace
 ```
 
-Installs `smdjad`, `smj`, `smedja` (GPU terminal), and `smedja-tui` (agent dashboard) to `~/.local/bin`. Linux (x86\_64, aarch64) and macOS (x86\_64, aarch64) are supported. Pin a version with `SMEDJA_VERSION=v0.1.0`; change the install directory with `SMEDJA_DIR=/usr/local/bin`.
+Requires Rust stable ≥ 1.82. On Linux, `lld` is recommended for link speed. Copy the produced binaries from `target/release/` to a directory on your `$PATH`:
+
+```bash
+cp target/release/{smdjad,smj,smedja-tui} ~/.local/bin/
+# optional: GPU terminal (requires wgpu-capable GPU or Mesa software renderer)
+cp target/release/smedja ~/.local/bin/
+```
 
 ## Getting Started
 
 ```bash
-# start the daemon
-smdjad --sock /run/user/1000/smdjad.sock
+# 1. start the daemon (socket auto-placed at $XDG_RUNTIME_DIR/smdjad.sock)
+smdjad
 
-# open the GPU terminal
+# 2a. open the agent dashboard TUI inside any terminal
+smedja-tui
+# optional flags: --mode impl|review|test|sre  --tier fast|deep  --sock /path/to/smdjad.sock
+
+# 2b. or open the GPU terminal (launches smedja-tui as its default app)
 smedja
 
-# or launch the agent dashboard TUI inside any terminal
-smedja-tui --mode impl
+# 3. send a message — type in the TUI input bar and press Enter
+#    the daemon routes the turn to the configured provider and streams the reply
 
 # control CLI
 smj session list
@@ -239,7 +255,7 @@ smj session cost
 smj workspace agents
 ```
 
-**Build from source:** `cargo build --workspace` — requires Rust stable ≥ 1.82, `lld` on Linux, `cargo-sort` for the pre-commit gate.
+The daemon reads `$XDG_RUNTIME_DIR/smdjad.sock` (falls back to `/tmp/smdjad.sock`). The TUI and `smj` CLI use the same default; override with `--sock` or `SMEDJA_SOCK`.
 
 ---
 

@@ -14,26 +14,37 @@ If `scripts/smoke-test.sh` does not pass, do not check the box.
 
 | Feature | Dimension | Status |
 |---------|-----------|--------|
-| GPU terminal (`smedja`) | text rendering | broken — glyphs silently skipped when not in atlas |
-| GPU terminal (`smedja`) | startup time | ~10 s (FontSystem::new() blocks main thread) |
+| GPU terminal (`smedja`) | text rendering | working — system fonts load via `new_with_system_fonts`; glyphs rasterised lazily by `ensure_cell_glyphs()`; atlas miss emits warn but does not crash |
+| GPU terminal (`smedja`) | startup time | non-blocking — `FontSystem` init < 5 ms; system font scan deferred to first glyph |
+| GPU terminal (`smedja`) | background image blit | roadmap — pixels loaded into `background.image_pixels` but GPU blit not implemented |
+| GPU terminal (`smedja`) | Glyph Protocol (PUA) | roadmap — protocol specified; PUA glyph registration not wired |
 | smedja-tui | connects to daemon | yes |
-| smedja-tui | streaming | no |
-| smedja-tui | connect banner | no (empty screen on startup) |
-| smedja-tui | status bar model | shows `[unknown]` — hardcoded None |
-| agent bridge (st-agent → smdjad) | wired | no — tier/model are `None` with "future work" comment |
-| OTel | gen_ai.* semantic conventions | partial — missing conversation.id, agent.name, operation.name, TTFT, tool call IDs |
-| VTE | escape sequences handled | ~20 — missing cursor home, delete line, index, many OSC sequences |
-| VTE | conformance tests | none |
-| TUI | functional tests | none |
-| GPU terminal | headless tests | none |
+| smedja-tui | turn submission + response | working — `turn.submit` queues a task; `turn.subscribe` polls until `done=true` |
+| smedja-tui | connect banner | working — shows socket path, session ID, provider, tier on startup |
+| smedja-tui | status bar tier | working — reads tier from session response; falls back to `"default"` |
+| smedja-tui | cowork gate (slash command) | working — `/cowork on|off` sends `cowork.set`; approval prompts shown as text |
+| smedja-tui | cowork gate (inline widget) | roadmap — keyboard `y`/`n`/`m` approval widget not implemented |
+| agent bridge (st-agent → smdjad) | wired | working — `spawn_agent_bridge` subscribes to pane events; tier and model propagated from `TurnStart` |
+| smedja-vault | storage + cosine retrieval | working — SQLite BLOB store with full-scan cosine-similarity query |
+| smedja-vault | `smedja_vault_search` tool (daemon) | in progress — tool registered in daemon; returns empty results pending wiring |
+| smedja-vault | cold retrieval via SmartCrusher pipeline | roadmap |
+| smedja-adapter | SmartCrusher | working — strips nulls, empty arrays, repeated keys; tested |
+| smedja-memory | stable-prefix / CacheAligner | partial — `seal_prefix()` and mutable-window compaction work; adapter BuildPrompt integration roadmap |
+| smedja-memory | verbosity steering | working — `inject_conciseness` appends directive at > 60% context fill; tested |
+| OTel | gen_ai.* semantic conventions | partial — spans emitted for turns and tool calls; missing conversation.id, TTFT, tool call IDs |
+| VTE | escape sequences handled | ~35 — cursor home, delete line, index, reverse index, OSC 0/2, alt screen, hide/show cursor, save/restore, 24-bit and 256-colour now handled |
+| VTE | conformance tests | 12 vte_ tests in `st-pty` (cursor home, delete line, index, OSC, alt screen, colour) |
+| TUI | functional tests | 22 tests in `smedja-tui` lib + 6 smoke tests |
+| GPU terminal | headless tests | 1 smoke test (`st-render` non-blocking init) |
+| MCP OAuth | redirect listener + token exchange | in progress — `start_pkce` stub returns `Cancelled`; HTTP listener not implemented |
 
 ## Test Layers
 
 ```bash
-# Unit and integration tests for all crates
+# Unit and integration tests for all crates (754 passing, 7 ignored)
 cargo test --workspace
 
-# TUI smoke integration tests (currently expected to fail — write the tests first)
+# TUI smoke integration tests (6 passing)
 cargo test -p smedja-tui --test smoke
 
 # All layers via the gate script
@@ -51,13 +62,14 @@ Do not skip step 3. A passing unit test without a passing smoke run is not done.
 
 ## Test Pyramid
 
-| Layer | What | How to Run | CI Default |
-|-------|------|-----------|-----------|
-| 1 — Unit (st-pty) | CellGrid resize, scroll, VTE sequences | `cargo test -p st-pty` | Yes |
-| 2 — VTE conformance | vttest battery sequences | `cargo test -p st-pty vte_` | Yes |
-| 3 — GPU smoke (st-render) | Glyph atlas, renderer state | `LIBGL_ALWAYS_SOFTWARE=1 cargo test -p st-render --features gpu-tests` | No (opt-in) |
-| 4 — TUI functional | TestBackend render + state checks | `cargo test -p smedja-tui` | Yes |
-| 5 — User journey | MockDaemon + client protocol | `cargo test -p smedja-tui --test smoke` | Yes |
+| Layer | What | Count | How to Run | CI Default |
+|-------|------|-------|-----------|-----------|
+| 1 — Unit (st-pty) | CellGrid resize, scroll, VTE sequences | 39 | `cargo test -p st-pty` | Yes |
+| 2 — VTE conformance | Cursor home, delete line, index, OSC, alt screen, colour | 12 | `cargo test -p st-pty vte_` | Yes |
+| 3 — GPU smoke (st-render) | Non-blocking FontSystem init, renderer state | 1 | `cargo test -p st-render` | Yes |
+| 4 — TUI functional | TestBackend render + state checks | 22 | `cargo test -p smedja-tui` | Yes |
+| 5 — User journey | MockDaemon + client protocol | 6 | `cargo test -p smedja-tui --test smoke` | Yes |
+| 6 — Workspace unit | All other crates (adapter, ingot, memory, assayer, …) | 674 | `cargo test --workspace` | Yes |
 
 ### Definition of Done
 

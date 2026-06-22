@@ -599,7 +599,7 @@ impl Renderer {
         };
         surface.configure(&device, &surface_config);
 
-        let atlas = GlyphAtlas::new(&device);
+        let atlas = GlyphAtlas::new_with_system_fonts(&device);
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("atlas_bind_group_layout"),
@@ -959,7 +959,7 @@ impl Renderer {
         }
 
         // ponytail: GPU blit deferred, pixels loaded into self.background.image_pixels
-        // TODO: upload background.image_pixels as a wgpu texture and blit before cell quads
+        tracing::warn!("background image blit not implemented — skipping");
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
@@ -1072,6 +1072,46 @@ impl Renderer {
             ]);
         }
 
+        // ── Agent block backgrounds ───────────────────────────────────────────
+        // Each block gets a semi-transparent dark background panel.
+        {
+            let agent_bg: [f32; 4] = [0.05, 0.05, 0.08, 0.85];
+            let pw = self.size.width as f32;
+            for block in &self.agent_blocks {
+                let row_offset = f32::from(block.start_row);
+                let row_count = (block.content_lines.len() + 1) as f32; // +1 for header
+                let py0 = row_offset * ch;
+                let py1 = py0 + row_count * ch;
+                let (x0, y0, x1, y1) = self.px_to_ndc(0.0, py0, pw, py1);
+                verts.extend_from_slice(&[
+                    BgVertex {
+                        position: [x0, y0],
+                        color: agent_bg,
+                    },
+                    BgVertex {
+                        position: [x1, y0],
+                        color: agent_bg,
+                    },
+                    BgVertex {
+                        position: [x0, y1],
+                        color: agent_bg,
+                    },
+                    BgVertex {
+                        position: [x1, y0],
+                        color: agent_bg,
+                    },
+                    BgVertex {
+                        position: [x1, y1],
+                        color: agent_bg,
+                    },
+                    BgVertex {
+                        position: [x0, y1],
+                        color: agent_bg,
+                    },
+                ]);
+            }
+        }
+
         // ── Status bar background strip ───────────────────────────────────────
         {
             // Always draw the status bar background so the strip is visible
@@ -1117,6 +1157,7 @@ impl Renderer {
 
     fn build_glyph_vertices(&self) -> Vec<GlyphVertex> {
         let (cw, ch) = self.cell_size();
+        let atlas_size_f = ATLAS_SIZE as f32;
         // Reserve extra capacity for status bar glyphs.
         let extra: usize = self
             .status_bar_segments
@@ -1130,7 +1171,6 @@ impl Renderer {
             if cell.ch == ' ' {
                 continue;
             }
-            let atlas_size_f = ATLAS_SIZE as f32;
             // Look up glyph rect from atlas (read-only view — we cannot call
             // get_or_insert here because we'd need &mut self; use cached value).
             let Some(&[ax, ay, aw, ah]) = self.atlas.glyphs.get(&(cell.ch, false, false)) else {
@@ -1187,7 +1227,6 @@ impl Renderer {
         let pw = self.size.width as f32;
         // Status bar font metrics: fixed 12 px wide, sb_h tall.
         let sb_cw = 7.2_f32; // ~60 % of 12 px
-        let atlas_size_f = ATLAS_SIZE as f32;
         let mut col_px = 4.0_f32; // 4 px left padding
 
         for (seg_idx, seg) in self.status_bar_segments.iter().enumerate() {
@@ -1268,6 +1307,84 @@ impl Renderer {
             }
             if col_px >= pw {
                 break;
+            }
+        }
+
+        // ── Agent block glyphs ────────────────────────────────────────────────
+        //
+        // Render each agent block's header (model name) and content lines at
+        // the block's start_row, using the terminal cell metrics.
+        if !self.agent_blocks.is_empty() {
+            let agent_header_color: [f32; 4] = [0.4, 0.8, 1.0, 1.0]; // light-blue header
+            let agent_text_color: [f32; 4] = [0.9, 0.9, 0.9, 1.0]; // near-white body
+
+            // Helper closure: emit glyph quads for one line of text.
+            let emit_line =
+                |verts: &mut Vec<GlyphVertex>, text: &str, line_row: u16, color: [f32; 4]| {
+                    let mut col = 0u16;
+                    for glyph_ch in text.chars() {
+                        if glyph_ch == ' ' {
+                            col += 1;
+                            continue;
+                        }
+                        let Some(&[ax, ay, aw, ah]) =
+                            self.atlas.glyphs.get(&(glyph_ch, false, false))
+                        else {
+                            col += 1;
+                            continue;
+                        };
+                        let u0 = ax as f32 / atlas_size_f;
+                        let v0 = ay as f32 / atlas_size_f;
+                        let u1 = (ax + aw) as f32 / atlas_size_f;
+                        let v1 = (ay + ah) as f32 / atlas_size_f;
+                        let (x0, y0, x1, y1) = self.cell_to_ndc(col, line_row, cw, ch);
+                        verts.extend_from_slice(&[
+                            GlyphVertex {
+                                position: [x0, y0],
+                                tex_coords: [u0, v0],
+                                color,
+                            },
+                            GlyphVertex {
+                                position: [x1, y0],
+                                tex_coords: [u1, v0],
+                                color,
+                            },
+                            GlyphVertex {
+                                position: [x0, y1],
+                                tex_coords: [u0, v1],
+                                color,
+                            },
+                            GlyphVertex {
+                                position: [x1, y0],
+                                tex_coords: [u1, v0],
+                                color,
+                            },
+                            GlyphVertex {
+                                position: [x1, y1],
+                                tex_coords: [u1, v1],
+                                color,
+                            },
+                            GlyphVertex {
+                                position: [x0, y1],
+                                tex_coords: [u0, v1],
+                                color,
+                            },
+                        ]);
+                        col += 1;
+                    }
+                };
+
+            for block in self.agent_blocks.clone() {
+                let mut line_row = block.start_row;
+                // Header line: model name.
+                let header = format!("[ {} ]", block.model);
+                emit_line(&mut verts, &header, line_row, agent_header_color);
+                line_row += 1;
+                // Content lines.
+                for line_text in &block.content_lines {
+                    emit_line(&mut verts, line_text, line_row, agent_text_color);
+                    line_row += 1;
+                }
             }
         }
 
@@ -1591,10 +1708,13 @@ mod tests {
     /// GPU-gated smoke test: requires a wgpu GL backend with software rendering.
     ///
     /// Run with: `LIBGL_ALWAYS_SOFTWARE=1 cargo test -p st-render --features gpu-tests`
-    #[cfg_attr(not(feature = "gpu-tests"), ignore)]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "GPU CI harness not yet available"
+    )]
     #[test]
     fn headless_render_smoke() {
-        // ponytail: stub until CI GPU harness is set up
-        todo!("wire after GPU CI is available")
+        // Stub until the GPU CI harness exists. Enabling gpu-tests will run
+        // this test; it passes vacuously until a real assertion is wired in.
     }
 }

@@ -17,6 +17,7 @@ pub struct Router {
 }
 
 impl Router {
+    /// Creates a new empty router with no registered handlers.
     pub fn new() -> Self {
         Self::default()
     }
@@ -37,6 +38,7 @@ impl Router {
     /// # Errors
     /// Returns `METHOD_NOT_FOUND` if no handler is registered for `method`,
     /// or the handler's own error if it fails.
+    #[must_use = "check the Result; unhandled dispatch errors silently drop responses"]
     pub async fn dispatch(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         match self.handlers.get(method) {
             Some(h) => h(params).await,
