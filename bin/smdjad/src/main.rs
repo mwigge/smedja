@@ -2389,9 +2389,11 @@ fn build_router(
     // ── session.compact ──────────────────────────────────────────────────────
     let ig = Arc::clone(ingot);
     let compact_pool = Arc::clone(&provider_pool);
+    let vault_compact = Arc::clone(&vault);
     router.register("session.compact", move |params: Value| {
         let ig = Arc::clone(&ig);
         let pool = Arc::clone(&compact_pool);
+        let vt = Arc::clone(&vault_compact);
         async move {
             let session_id = params
                 .get("session_id")
@@ -2463,6 +2465,29 @@ fn build_router(
                     warn!(error = %e, "failed to save pre-compaction checkpoint");
                 }
             }
+
+            // Fire-and-forget: index compaction summary into vault cold storage.
+            let compact_sid = session_id.clone();
+            let compact_summary = summary.clone();
+            tokio::task::spawn_blocking(move || {
+                let entry = VaultEntry {
+                    id: format!("compact:{compact_sid}:{turn_count}"),
+                    embedding: crate::embedder::embed(&compact_summary),
+                    payload: serde_json::json!({
+                        "session_id": compact_sid,
+                        "turn_count": turn_count,
+                    }),
+                    namespace: "compact".to_owned(),
+                    content: compact_summary,
+                    source_file: None,
+                    added_by: Some("session.compact".to_owned()),
+                    chunk_index: None,
+                    parent_id: None,
+                    created_at: 0.0,
+                };
+                let mut guard = vt.blocking_lock();
+                let _ = guard.upsert(&entry);
+            });
 
             Ok(json!({
                 "session_id": session_id,
@@ -4530,6 +4555,55 @@ mod tests {
 
         let count = vault.lock().await.count_by_namespace("handoff").unwrap();
         assert_eq!(count, 1, "one handoff entry must be written on takeover");
+    }
+
+    #[tokio::test]
+    async fn compact_writes_summary_to_vault_compact_namespace() {
+        use smedja_vault::Vault;
+
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+        let session_id = "sess-compact-test".to_owned();
+        let summary = "• Implemented auth\n• Tests pass\nGoal: ship v1".to_owned();
+        let turn_count: i64 = 7;
+
+        // Simulate the vault write logic from session.compact.
+        let compact_sid = session_id.clone();
+        let compact_summary = summary.clone();
+        let vt = Arc::clone(&vault);
+        tokio::task::spawn_blocking(move || {
+            let entry = smedja_vault::VaultEntry {
+                id: format!("compact:{compact_sid}:{turn_count}"),
+                embedding: crate::embedder::embed(&compact_summary),
+                payload: serde_json::json!({
+                    "session_id": compact_sid,
+                    "turn_count": turn_count,
+                }),
+                namespace: "compact".to_owned(),
+                content: compact_summary,
+                source_file: None,
+                added_by: Some("session.compact".to_owned()),
+                chunk_index: None,
+                parent_id: None,
+                created_at: 0.0,
+            };
+            let mut guard = vt.blocking_lock();
+            guard.upsert(&entry).unwrap();
+        })
+        .await
+        .unwrap();
+
+        let count = vault.lock().await.count_by_namespace("compact").unwrap();
+        assert_eq!(count, 1, "one compact entry must be written per compaction");
+
+        let results = {
+            let guard = vault.lock().await;
+            let qv = crate::embedder::embed("auth tests");
+            guard.search(&qv, "auth tests", "compact", 5).unwrap()
+        };
+        assert!(
+            !results.is_empty(),
+            "compact summary must be retrievable by semantic search"
+        );
     }
 
     #[tokio::test]
