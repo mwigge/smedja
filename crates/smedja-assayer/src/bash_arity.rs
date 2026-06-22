@@ -19,13 +19,34 @@ pub enum BashArity {
 /// Compound commands separated by `;`, `&`, or `|` are split and the worst
 /// classification wins — if any segment is [`BashArity::Write`], the whole
 /// command is classified as `Write`.
+///
+/// Output redirection operators (`>` and `>>`) are detected before segment
+/// splitting and immediately force a `Write` classification regardless of the
+/// command name that precedes them.  This closes the blind spot where
+/// `cat foo > /etc/passwd` would otherwise be classified as `Read` because
+/// the first token (`cat`) is in the read-only allowlist.
 pub fn classify_bash(cmd: &str) -> BashArity {
+    if contains_output_redirection(cmd) {
+        return BashArity::Write;
+    }
     for part in split_compound(cmd) {
         if classify_single(part.trim()) == BashArity::Write {
             return BashArity::Write;
         }
     }
     BashArity::Read
+}
+
+/// Returns `true` if `cmd` contains an output redirection operator (`>` or
+/// `>>`).
+///
+/// This check is deliberately conservative: the presence of `>` anywhere in
+/// the command string is treated as a potential output redirection.  This
+/// avoids false negatives at the cost of possible false positives for commands
+/// that include `>` inside quoted strings, but for a security gate that
+/// trade-off is correct.
+fn contains_output_redirection(cmd: &str) -> bool {
+    cmd.contains('>')
 }
 
 /// Splits `cmd` on the shell compound-command operators `;`, `|`, `&`, `\n`,
@@ -35,6 +56,10 @@ pub fn classify_bash(cmd: &str) -> BashArity {
 /// to bash (e.g. via a here-doc or a shell variable) can embed arbitrary
 /// commands after a newline — omitting them would allow write-capable commands
 /// to escape classification.
+///
+/// Output redirection operators (`>` / `>>`) are **not** used as delimiters
+/// here; they are handled earlier by [`contains_output_redirection`] before
+/// this function is called.
 ///
 /// This is intentionally naive — it is sufficient for the guard use-case
 /// where the goal is conservative classification, not full shell parsing.
@@ -138,5 +163,31 @@ mod tests {
             classify_bash("cat foo.rs\ngrep bar foo.rs"),
             BashArity::Read
         );
+    }
+
+    // ── output redirection operator tests ───────────────────────────────────
+
+    // `cat` is normally Read, but `>` makes it Write.
+    #[test]
+    fn cat_with_redirect_is_write() {
+        assert_eq!(classify_bash("cat foo > /tmp/out"), BashArity::Write);
+    }
+
+    // `ls` is normally Read, but redirecting to /dev/null is still Write.
+    #[test]
+    fn ls_redirect_to_devnull_is_write() {
+        assert_eq!(classify_bash("ls > /dev/null"), BashArity::Write);
+    }
+
+    // Append operator `>>` must also be treated as Write.
+    #[test]
+    fn echo_append_redirect_is_write() {
+        assert_eq!(classify_bash("echo hi >> log.txt"), BashArity::Write);
+    }
+
+    // Plain `cat` without redirection must remain Read.
+    #[test]
+    fn cat_without_redirect_is_read() {
+        assert_eq!(classify_bash("cat foo"), BashArity::Read);
     }
 }

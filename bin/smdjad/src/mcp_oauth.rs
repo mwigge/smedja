@@ -109,15 +109,13 @@ impl TokenStore {
 
     /// Returns the path where `server_url`'s token is stored.
     ///
-    /// Uses [`DefaultHasher`] to produce a compact, filename-safe hex name.
-    /// Collision probability is negligible for the number of MCP servers a
-    /// user is likely to register.
+    /// Uses the first 16 hex characters of a SHA-256 digest (64 bits) to
+    /// produce a compact, deterministic, filename-safe name.  SHA-256 is
+    /// stable across Rust versions and compilers, unlike `DefaultHasher`.
     fn token_path(&self, server_url: &str) -> PathBuf {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash as _, Hasher as _};
-        let mut h = DefaultHasher::new();
-        server_url.hash(&mut h);
-        self.dir.join(format!("{:016x}.json", h.finish()))
+        use sha2::{Digest as _, Sha256};
+        let hash = format!("{:x}", Sha256::digest(server_url.as_bytes()));
+        self.dir.join(format!("{}.json", &hash[..16]))
     }
 
     /// Saves a token for `server_url`.
@@ -204,5 +202,19 @@ mod tests {
     async fn start_pkce_returns_cancelled() {
         let result = start_pkce("https://mcp.example.com").await;
         assert!(matches!(result, Err(PkceError::Cancelled)));
+    }
+
+    #[test]
+    fn token_path_is_deterministic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TokenStore::new(tmp.path().to_path_buf());
+
+        let url = "https://mcp.example.com";
+        let path_a = store.token_path(url);
+        let path_b = store.token_path(url);
+        assert_eq!(path_a, path_b, "same URL must produce same path");
+
+        let path_other = store.token_path("https://other.example.com");
+        assert_ne!(path_a, path_other, "different URLs must produce different paths");
     }
 }

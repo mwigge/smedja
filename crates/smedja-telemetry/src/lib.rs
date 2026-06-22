@@ -257,21 +257,19 @@ pub fn tool_results_capture_mode() -> CaptureMode {
 
 // ─── Content fingerprinting ───────────────────────────────────────────────────
 
-/// Returns a 16-character hex prefix of a hash of `content`.
+/// Returns a 16-character hex prefix of a SHA-256 hash of `content`.
 ///
 /// Used as the `Hash` capture mode representation for prompts, responses,
 /// and tool data. The prefix is long enough to distinguish entries while
 /// remaining safe to log.
 ///
-/// Note: uses `std::collections::hash_map::DefaultHasher` which is not
-/// cryptographically stable across Rust releases. Use only for deduplication
-/// and log correlation, not for security or integrity verification.
+/// Output is stable across Rust releases, making stored vault/ingot keys
+/// permanently reachable.
 #[must_use]
 pub fn content_hash(content: &str) -> String {
-    use std::hash::Hasher as _;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash_slice(content.as_bytes(), &mut hasher);
-    format!("{:016x}", hasher.finish())
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(content.as_bytes());
+    format!("{hash:x}")[..16].to_owned()
 }
 
 /// Scrubs common secrets from `content` and returns a one-line summary.
@@ -364,8 +362,11 @@ mod tests {
     fn content_hash_is_deterministic() {
         let h1 = content_hash("hello world");
         let h2 = content_hash("hello world");
-        assert_eq!(h1, h2);
-        assert_eq!(h1.len(), 16);
+        assert_eq!(h1, h2, "same input must produce same hash");
+        assert_eq!(h1.len(), 16, "output must be exactly 16 characters");
+
+        let h3 = content_hash("different input");
+        assert_ne!(h1, h3, "different inputs must produce different hashes");
     }
 
     #[test]
