@@ -115,13 +115,14 @@ impl CoworkGate {
         self.resolve(id, Decision::Modify(instruction)).await
     }
 
-    /// Lists pending approval IDs and their tool names.
-    pub async fn list_pending(&self) -> Vec<(ApprovalId, String)> {
+    /// Lists pending approvals with their full prompts, ordered by insertion UUID
+    /// (arbitrary but stable within a poll interval).
+    pub async fn list_pending(&self) -> Vec<(ApprovalId, ApprovalPrompt)> {
         self.pending
             .lock()
             .await
             .iter()
-            .map(|(id, p)| (id.clone(), p.prompt.tool.clone()))
+            .map(|(id, p)| (id.clone(), p.prompt.clone()))
             .collect()
     }
 
@@ -270,7 +271,7 @@ mod tests {
             1,
             "intercept must create a pending entry for any runner"
         );
-        assert_eq!(pending[0].1, "bash");
+        assert_eq!(pending[0].1.tool, "bash");
 
         // Clean up: approve so the spawned task can finish.
         let id = pending[0].0.clone();

@@ -1,6 +1,7 @@
 pub mod action_log;
 mod blocks;
 mod context_rail;
+mod cowork_widget;
 pub mod main_panel;
 mod staging;
 mod statusbar;
@@ -25,7 +26,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Terminal;
-use serde_json::json;
+use serde_json::{json, Value};
 use smedja_rpc::client::Client;
 
 // ---------------------------------------------------------------------------
@@ -141,6 +142,14 @@ struct AppState {
     /// Byte offset of the insertion cursor within `input`.
     /// Invariant: always on a UTF-8 char boundary, 0 ≤ cursor ≤ input.len().
     input_cursor: usize,
+    /// Pending cowork approvals waiting for a decision.
+    pending_cowork: Vec<cowork_widget::CoworkItem>,
+    /// True when the user pressed `m` to enter modify-instruction mode.
+    cowork_modify_mode: bool,
+    /// Current content of the modify instruction input.
+    cowork_modify_input: String,
+    /// Timestamp of the last `cowork.pending` poll.
+    last_cowork_poll: Option<std::time::Instant>,
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +401,81 @@ async fn handle_key(
     client: &mut Client,
     editor: &mut rustyline::DefaultEditor,
 ) -> Result<()> {
+    // ------------------------------------------------------------------
+    // Cowork gate widget intercepts keys when there are pending approvals.
+    // ------------------------------------------------------------------
+    if !state.pending_cowork.is_empty() {
+        if state.cowork_modify_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    state.cowork_modify_mode = false;
+                    state.cowork_modify_input.clear();
+                }
+                KeyCode::Enter => {
+                    if let Some(item) = state.pending_cowork.first() {
+                        let id = item.id.clone();
+                        let instruction = std::mem::take(&mut state.cowork_modify_input);
+                        let _ = client
+                            .call(
+                                "cowork.modify",
+                                json!({
+                                    "session_id": state.session_id,
+                                    "id": id,
+                                    "instruction": instruction,
+                                }),
+                            )
+                            .await;
+                        state.pending_cowork.remove(0);
+                    }
+                    state.cowork_modify_mode = false;
+                }
+                KeyCode::Backspace => {
+                    state.cowork_modify_input.pop();
+                }
+                KeyCode::Char(c) => {
+                    state.cowork_modify_input.push(c);
+                }
+                _ => {}
+            }
+        } else {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    if let Some(item) = state.pending_cowork.first() {
+                        let id = item.id.clone();
+                        let _ = client
+                            .call(
+                                "cowork.approve",
+                                json!({ "session_id": state.session_id, "id": id }),
+                            )
+                            .await;
+                        state.pending_cowork.remove(0);
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    if let Some(item) = state.pending_cowork.first() {
+                        let id = item.id.clone();
+                        let _ = client
+                            .call(
+                                "cowork.deny",
+                                json!({
+                                    "session_id": state.session_id,
+                                    "id": id,
+                                    "reason": "denied",
+                                }),
+                            )
+                            .await;
+                        state.pending_cowork.remove(0);
+                    }
+                }
+                KeyCode::Char('m') | KeyCode::Char('M') => {
+                    state.cowork_modify_mode = true;
+                }
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
+
     // ------------------------------------------------------------------
     // Slash-completion popup intercepts most keys when visible.
     // ------------------------------------------------------------------
@@ -1009,6 +1093,19 @@ fn render(frame: &mut ratatui::Frame, state: &AppState) {
         frame.render_widget(rail, rail_rect);
     }
 
+    // -- Cowork gate overlay --------------------------------------------------
+    if !state.pending_cowork.is_empty() {
+        let cw_rect = cowork_widget::overlay_rect(body_area);
+        frame.render_widget(
+            cowork_widget::CoworkWidget {
+                items: &state.pending_cowork,
+                modify_mode: state.cowork_modify_mode,
+                modify_input: &state.cowork_modify_input,
+            },
+            cw_rect,
+        );
+    }
+
     // -- Diff overlay ---------------------------------------------------------
     if let Some((_idx, ref lines)) = state.diff_overlay {
         // Centre 80% of the main area.
@@ -1194,6 +1291,10 @@ async fn main() -> Result<()> {
         selection_end: 0,
         g_pending: false,
         input_cursor: 0,
+        pending_cowork: Vec::new(),
+        cowork_modify_mode: false,
+        cowork_modify_input: String::new(),
+        last_cowork_poll: None,
     };
 
     // Connect banner — shown on every startup so the user knows what's connected.
@@ -1382,6 +1483,45 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Poll cowork.pending every 200 ms when a turn is in flight to surface
+        // any gate waiting for a human decision.
+        let should_poll_cowork = state
+            .last_cowork_poll
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(200));
+        if should_poll_cowork && state.pending_task_id.is_some() {
+            state.last_cowork_poll = Some(std::time::Instant::now());
+            if let Ok(Value::Array(items)) = client
+                .call("cowork.pending", json!({ "session_id": state.session_id }))
+                .await
+            {
+                let mut parsed: Vec<cowork_widget::CoworkItem> = items
+                    .iter()
+                    .filter_map(|v| {
+                        let id = v["id"].as_str()?.to_owned();
+                        let tool = v["tool"].as_str().unwrap_or("?").to_owned();
+                        let step_n = v["step_n"].as_u64().unwrap_or(0) as u32;
+                        let args_display = v["args"]
+                            .as_object()
+                            .map_or_else(|| v["args"].to_string(), |_| v["args"].to_string());
+                        let reasoning = v["reasoning"].as_str().unwrap_or("").to_owned();
+                        Some(cowork_widget::CoworkItem {
+                            id,
+                            tool,
+                            step_n,
+                            args_display,
+                            reasoning,
+                        })
+                    })
+                    .collect();
+                // Keep items already confirmed in the widget (user already see
+                // them); only add genuinely new IDs.
+                let existing_ids: std::collections::HashSet<String> =
+                    state.pending_cowork.iter().map(|i| i.id.clone()).collect();
+                parsed.retain(|i| !existing_ids.contains(&i.id));
+                state.pending_cowork.extend(parsed);
+            }
+        }
+
         if state.quit {
             break;
         }
@@ -1554,6 +1694,10 @@ mod tests {
             selection_end: 0,
             g_pending: false,
             input_cursor: 0,
+            pending_cowork: Vec::new(),
+            cowork_modify_mode: false,
+            cowork_modify_input: String::new(),
+            last_cowork_poll: None,
         }
     }
 
