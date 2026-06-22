@@ -115,6 +115,14 @@ pub enum TurnEvent {
         turn_id: String,
         /// Number of output tokens generated during this turn.
         output_tokens: u32,
+        /// Number of input tokens consumed during this turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_tokens: Option<u32>,
+        /// W3C `traceparent` string for this turn's root span.
+        ///
+        /// Format: `"00-<trace_id_hex32>-<span_id_hex16>-01"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traceparent: Option<String>,
         /// Conversation grouping identifier.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation_id: Option<String>,
@@ -297,6 +305,8 @@ mod tests {
             session_id: "s".into(),
             turn_id: "t".into(),
             output_tokens: 7,
+            input_tokens: Some(42),
+            traceparent: Some("00-abc-def-01".into()),
             conversation_id: Some("conv-1".into()),
             trace_id: None,
             span_id: None,
@@ -311,12 +321,16 @@ mod tests {
             conversation_id,
             agent_name,
             status,
+            input_tokens,
+            traceparent,
             ..
         } = decoded
         {
             assert_eq!(conversation_id.as_deref(), Some("conv-1"));
             assert_eq!(agent_name.as_deref(), Some("orchestrator"));
             assert_eq!(status.as_deref(), Some("ok"));
+            assert_eq!(input_tokens, Some(42));
+            assert_eq!(traceparent.as_deref(), Some("00-abc-def-01"));
         } else {
             panic!("wrong variant");
         }

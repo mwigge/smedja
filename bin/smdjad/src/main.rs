@@ -1243,7 +1243,7 @@ async fn run_turn(
             actor: "smdjad".into(),
             input_tok: i64::from(total_input_tokens),
             output_tok: i64::from(total_output_tokens),
-            traceparent: Some(traceparent),
+            traceparent: Some(traceparent.clone()),
             trace_id: Some(span_trace_id),
             span_id: Some(span_span_id),
             conversation_id: Some(session_id.clone()),
@@ -1262,6 +1262,8 @@ async fn run_turn(
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
         output_tokens: total_output_tokens,
+        input_tokens: Some(total_input_tokens),
+        traceparent: Some(traceparent),
         conversation_id: Some(session_id.clone()),
         trace_id: None, // span already ended before this
         span_id: None,

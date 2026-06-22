@@ -173,6 +173,8 @@ struct AppState {
     stream_rx: Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>,
     /// Path of the smdjad stream socket (`<rpc_sock>.stream`).
     stream_sock_path: PathBuf,
+    /// W3C traceparent from the most recently completed turn.
+    last_traceparent: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,6 +1039,14 @@ async fn handle_key(
                 push_system_message(state, format!("\u{2713} {count} lines copied"));
                 return Ok(());
             }
+            KeyCode::Char('t') => {
+                if let Some(tp) = state.last_traceparent.clone() {
+                    yank_to_clipboard(&[tp.clone()]);
+                    state.clipboard = Some(tp.clone());
+                    push_system_message(state, format!("trace: {tp}  (copied)"));
+                }
+                return Ok(());
+            }
             KeyCode::Char('i') | KeyCode::Char('a') => {
                 state.scroll_focus = false;
                 state.selection_mode = false;
@@ -1744,6 +1754,7 @@ async fn main() -> Result<()> {
         last_cowork_poll: None,
         stream_rx: None,
         stream_sock_path,
+        last_traceparent: None,
     };
 
     // Connect banner — shown on every startup so the user knows what's connected.
@@ -1852,17 +1863,24 @@ async fn main() -> Result<()> {
                     }
                     Some("done") => {
                         let output_tok = event["output_tok"].as_u64().unwrap_or(0);
+                        let input_tok = event["input_tok"].as_u64().unwrap_or(0);
+                        let tp = event["traceparent"].as_str().map(str::to_owned);
                         let elapsed_ms = state.turn_submitted_at.map_or(0, |t| {
                             u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
                         });
                         state.turn_submitted_at = None;
+                        state.last_traceparent = tp.clone();
 
                         if let Some(mut block) = state.current_block.take() {
                             block.complete(elapsed_ms);
                             state.block_store.push(block);
                         }
 
-                        let footer = format!("↳ {output_tok}↓ tokens · {elapsed_ms}ms");
+                        let footer = if let Some(ref tp_str) = tp {
+                            format!("↳ {input_tok}↑ {output_tok}↓ · trace: {tp_str}")
+                        } else {
+                            format!("↳ {input_tok}↑ {output_tok}↓ tokens · {elapsed_ms}ms")
+                        };
                         state.main_panel.push_line(footer);
 
                         turn_done = true;
@@ -1947,6 +1965,7 @@ async fn main() -> Result<()> {
                             let footer =
                                 format!("↳ {input_tok}↑ {output_tok}↓ tokens · {elapsed_ms}ms");
                             state.main_panel.push_line(footer);
+                            state.last_traceparent = None;
                         }
                         state.pending_task_id = None;
                         state.last_poll = None;
@@ -2486,6 +2505,7 @@ mod tests {
             last_cowork_poll: None,
             stream_rx: None,
             stream_sock_path: PathBuf::from("/tmp/smdjad.sock.stream"),
+            last_traceparent: None,
         }
     }
 

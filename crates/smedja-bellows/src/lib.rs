@@ -181,6 +181,8 @@ mod tests {
                 session_id: "sess-2".to_owned(),
                 turn_id: "turn-2".to_owned(),
                 output_tokens: 42,
+                input_tokens: None,
+                traceparent: None,
                 conversation_id: None,
                 trace_id: None,
                 span_id: None,
