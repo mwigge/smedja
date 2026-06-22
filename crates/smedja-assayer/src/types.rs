@@ -28,40 +28,7 @@ pub enum Role {
     Orchestrator,
 }
 
-/// Estimated complexity of the task being assigned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Complexity {
-    /// Trivial change: config tweak, one-liner fix, doc update.
-    Simple,
-    /// Moderate change: single module, a few functions, straightforward logic.
-    Coding,
-    /// High-effort change: cross-module, design-sensitive, or multi-step.
-    Complex,
-}
-
-/// The execution tier that controls latency vs. capability trade-offs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Tier {
-    /// Low latency, small context window, cheap.
-    Fast,
-    /// Local model running on device — no cloud egress.
-    Local,
-    /// High capability, large context window, higher latency.
-    Deep,
-}
-
-/// The model runner backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Runner {
-    /// Anthropic Claude (cloud).
-    Claude,
-    /// Local model via smedja-native.
-    Local,
-    /// `OpenAI` Codex (cloud).
-    Codex,
-    /// GitHub Copilot (cloud).
-    Copilot,
-}
+pub use smedja_types::{Complexity, Runner, Tier};
 
 /// The resolved routing destination for a role × complexity combination.
 #[derive(Debug, Clone, PartialEq, Eq)]

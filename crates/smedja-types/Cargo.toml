@@ -1,0 +1,13 @@
+[package]
+name        = "smedja-types"
+description = "Canonical shared types (Runner, Tier, Complexity) for the smedja workspace"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

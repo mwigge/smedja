@@ -608,6 +608,7 @@ pub struct Renderer {
     /// Bind group containing the background image texture and sampler.
     bg_image_bind_group: Option<wgpu::BindGroup>,
     /// 16-byte uniform buffer carrying the opacity value for the image pass.
+    #[allow(dead_code)] // held for RAII lifetime; Drop releases the GPU allocation
     bg_image_params_buf: wgpu::Buffer,
     /// Bind group for [`Self::bg_image_params_buf`].
     bg_image_params_bind_group: wgpu::BindGroup,
