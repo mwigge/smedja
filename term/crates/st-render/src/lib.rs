@@ -236,6 +236,25 @@ impl ShelfPacker {
 
 const ATLAS_SIZE: u32 = 1024;
 
+/// Per-glyph entry stored in the atlas after rasterisation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlyphEntry {
+    /// X origin of the glyph bitmap in atlas pixels.
+    pub x: u32,
+    /// Y origin of the glyph bitmap in atlas pixels.
+    pub y: u32,
+    /// Width of the glyph bitmap in atlas pixels.
+    pub w: u32,
+    /// Height of the glyph bitmap in atlas pixels.
+    pub h: u32,
+    /// Horizontal offset from the cell's cursor position to the left edge of
+    /// the bitmap (positive = right of cursor). From `swash::Placement::left`.
+    pub bearing_x: i32,
+    /// Vertical offset from the baseline to the top edge of the bitmap
+    /// (positive = above baseline). From `swash::Placement::top`.
+    pub bearing_y: i32,
+}
+
 /// GPU texture atlas for rasterised glyphs.
 ///
 /// Glyphs are keyed by `(char, is_bold, is_italic)` and cached after first
@@ -247,8 +266,8 @@ pub struct GlyphAtlas {
     pub view: wgpu::TextureView,
     /// CPU-side packer that tracks free regions.
     pub packer: ShelfPacker,
-    /// Maps `(char, bold, italic)` → atlas UV rect `[x, y, w, h]` in pixels.
-    pub glyphs: HashMap<(char, bool, bool), [u32; 4]>,
+    /// Maps `(char, bold, italic)` → per-glyph atlas entry (position, size, bearing).
+    pub glyphs: HashMap<(char, bool, bool), GlyphEntry>,
     font_system: FontSystem,
     swash_cache: SwashCache,
 }
@@ -299,8 +318,8 @@ impl GlyphAtlas {
         s
     }
 
-    /// Returns the cached UV rect for `ch`, or rasterises and uploads it if not
-    /// yet cached.
+    /// Returns the cached [`GlyphEntry`] for `ch`, or rasterises and uploads it
+    /// if not yet cached.
     ///
     /// Returns `None` if the atlas is full or rasterisation fails.
     pub fn get_or_insert(
@@ -311,10 +330,10 @@ impl GlyphAtlas {
         font_size: f32,
         bold: bool,
         italic: bool,
-    ) -> Option<[u32; 4]> {
+    ) -> Option<GlyphEntry> {
         let key = (ch, bold, italic);
-        if let Some(&rect) = self.glyphs.get(&key) {
-            return Some(rect);
+        if let Some(&entry) = self.glyphs.get(&key) {
+            return Some(entry);
         }
 
         // Rasterise the glyph using cosmic-text + swash.
@@ -346,8 +365,8 @@ impl GlyphAtlas {
         );
         buffer.shape_until_scroll(&mut self.font_system, false);
 
-        // Collect pixel data from swash.
-        let mut pixel_data: Option<(Vec<u8>, u32, u32)> = None;
+        // Collect pixel data and placement offsets from swash.
+        let mut pixel_data: Option<(Vec<u8>, u32, u32, i32, i32)> = None;
 
         for run in buffer.layout_runs() {
             for glyph in run.glyphs {
@@ -369,7 +388,13 @@ impl GlyphAtlas {
                                 vec![0u8; (w * h) as usize]
                             }
                         };
-                        pixel_data = Some((data, w, h));
+                        pixel_data = Some((
+                            data,
+                            w,
+                            h,
+                            image.placement.left,
+                            image.placement.top,
+                        ));
                         break;
                     }
                 }
@@ -379,9 +404,9 @@ impl GlyphAtlas {
             }
         }
 
-        let (data, w, h) = pixel_data.unwrap_or_else(|| {
+        let (data, w, h, bearing_x, bearing_y) = pixel_data.unwrap_or_else(|| {
             // Fallback: blank 1×1 glyph so the atlas entry is valid.
-            (vec![0u8], 1, 1)
+            (vec![0u8], 1, 1, 0, 0)
         });
 
         let [x, y] = self.packer.alloc(w, h)?;
@@ -406,9 +431,9 @@ impl GlyphAtlas {
             },
         );
 
-        let rect = [x, y, w, h];
-        self.glyphs.insert(key, rect);
-        Some(rect)
+        let entry = GlyphEntry { x, y, w, h, bearing_x, bearing_y };
+        self.glyphs.insert(key, entry);
+        Some(entry)
     }
 }
 
@@ -958,9 +983,6 @@ impl Renderer {
             drop(render_pass);
         }
 
-        // ponytail: GPU blit deferred, pixels loaded into self.background.image_pixels
-        tracing::warn!("background image blit not implemented — skipping");
-
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
         Ok(())
@@ -1171,18 +1193,30 @@ impl Renderer {
             if cell.ch == ' ' {
                 continue;
             }
-            // Look up glyph rect from atlas (read-only view — we cannot call
+            // Look up glyph entry from atlas (read-only view — we cannot call
             // get_or_insert here because we'd need &mut self; use cached value).
-            let Some(&[ax, ay, aw, ah]) = self.atlas.glyphs.get(&(cell.ch, false, false)) else {
+            let Some(&entry) = self.atlas.glyphs.get(&(cell.ch, false, false)) else {
                 tracing::warn!(ch = %cell.ch, "glyph atlas miss — cell skipped");
                 continue;
             };
-            let u0 = ax as f32 / atlas_size_f;
-            let v0 = ay as f32 / atlas_size_f;
-            let u1 = (ax + aw) as f32 / atlas_size_f;
-            let v1 = (ay + ah) as f32 / atlas_size_f;
+            let u0 = entry.x as f32 / atlas_size_f;
+            let v0 = entry.y as f32 / atlas_size_f;
+            let u1 = (entry.x + entry.w) as f32 / atlas_size_f;
+            let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
 
-            let (x0, y0, x1, y1) = self.cell_to_ndc(cell.col, cell.row, cw, ch);
+            // Position glyph at its correct sub-cell location using swash
+            // placement bearings rather than stretching to fill the full cell.
+            // Baseline is placed at 2/3 of cell height (ascent ≈ 0.8×em,
+            // line-height = 1.2×em → baseline/line-height ≈ 0.8/1.2 = 2/3).
+            let baseline_y = f32::from(cell.row) * ch + ch * (2.0 / 3.0);
+            let glyph_top = baseline_y - entry.bearing_y as f32;
+            let glyph_left = f32::from(cell.col) * cw + entry.bearing_x as f32;
+            let (x0, y0, x1, y1) = self.px_to_ndc(
+                glyph_left,
+                glyph_top,
+                glyph_left + entry.w as f32,
+                glyph_top + entry.h as f32,
+            );
             let c = cell.fg;
             verts.extend_from_slice(&[
                 GlyphVertex {
@@ -1252,15 +1286,15 @@ impl Renderer {
                     col_px += sb_cw;
                     continue;
                 }
-                let Some(&[ax, ay, aw, ah]) = self.atlas.glyphs.get(&(ch, false, false)) else {
+                let Some(&entry) = self.atlas.glyphs.get(&(ch, false, false)) else {
                     tracing::warn!(ch = %ch, "glyph atlas miss — status-bar cell skipped");
                     col_px += sb_cw;
                     continue;
                 };
-                let u0 = ax as f32 / atlas_size_f;
-                let v0 = ay as f32 / atlas_size_f;
-                let u1 = (ax + aw) as f32 / atlas_size_f;
-                let v1 = (ay + ah) as f32 / atlas_size_f;
+                let u0 = entry.x as f32 / atlas_size_f;
+                let v0 = entry.y as f32 / atlas_size_f;
+                let u1 = (entry.x + entry.w) as f32 / atlas_size_f;
+                let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
 
                 let py0 = ph - sb_h;
                 let py1 = ph;
@@ -1327,17 +1361,25 @@ impl Renderer {
                             col += 1;
                             continue;
                         }
-                        let Some(&[ax, ay, aw, ah]) =
+                        let Some(&entry) =
                             self.atlas.glyphs.get(&(glyph_ch, false, false))
                         else {
                             col += 1;
                             continue;
                         };
-                        let u0 = ax as f32 / atlas_size_f;
-                        let v0 = ay as f32 / atlas_size_f;
-                        let u1 = (ax + aw) as f32 / atlas_size_f;
-                        let v1 = (ay + ah) as f32 / atlas_size_f;
-                        let (x0, y0, x1, y1) = self.cell_to_ndc(col, line_row, cw, ch);
+                        let u0 = entry.x as f32 / atlas_size_f;
+                        let v0 = entry.y as f32 / atlas_size_f;
+                        let u1 = (entry.x + entry.w) as f32 / atlas_size_f;
+                        let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
+                        let baseline_y = f32::from(line_row) * ch + ch * (2.0 / 3.0);
+                        let glyph_top = baseline_y - entry.bearing_y as f32;
+                        let glyph_left = f32::from(col) * cw + entry.bearing_x as f32;
+                        let (x0, y0, x1, y1) = self.px_to_ndc(
+                            glyph_left,
+                            glyph_top,
+                            glyph_left + entry.w as f32,
+                            glyph_top + entry.h as f32,
+                        );
                         verts.extend_from_slice(&[
                             GlyphVertex {
                                 position: [x0, y0],
@@ -1465,13 +1507,14 @@ mod tests {
     #[test]
     fn glyph_atlas_key_distinguishes_bold_and_italic() {
         use std::collections::HashMap;
-        let mut map: HashMap<(char, bool, bool), [u32; 4]> = HashMap::new();
-        map.insert(('A', false, false), [0, 0, 8, 12]);
-        map.insert(('A', true, false), [8, 0, 8, 12]);
-        map.insert(('A', false, true), [16, 0, 8, 12]);
+        let entry = |x: u32| GlyphEntry { x, y: 0, w: 8, h: 12, bearing_x: 0, bearing_y: 10 };
+        let mut map: HashMap<(char, bool, bool), GlyphEntry> = HashMap::new();
+        map.insert(('A', false, false), entry(0));
+        map.insert(('A', true, false), entry(8));
+        map.insert(('A', false, true), entry(16));
         assert_ne!(map[&('A', false, false)], map[&('A', true, false)]);
         assert_ne!(map[&('A', false, false)], map[&('A', false, true)]);
-        assert_eq!(map[&('A', false, false)], [0, 0, 8, 12]);
+        assert_eq!(map[&('A', false, false)].x, 0);
     }
 
     // ── GPU-gated smoke tests ─────────────────────────────────────────────────
@@ -1496,15 +1539,13 @@ mod tests {
     #[test]
     fn renderer_glyph_atlas_key_stores_bold_and_regular_separately() {
         use std::collections::HashMap;
-        let mut glyphs: HashMap<(char, bool, bool), [u32; 4]> = HashMap::new();
-        glyphs.insert(('A', false, false), [0, 0, 8, 12]);
-        glyphs.insert(('A', true, false), [8, 0, 8, 12]);
+        let entry = |x: u32| GlyphEntry { x, y: 0, w: 8, h: 12, bearing_x: 0, bearing_y: 10 };
+        let mut glyphs: HashMap<(char, bool, bool), GlyphEntry> = HashMap::new();
+        glyphs.insert(('A', false, false), entry(0));
+        glyphs.insert(('A', true, false), entry(8));
         assert!(glyphs.contains_key(&('A', false, false)));
         assert!(glyphs.contains_key(&('A', true, false)));
-        assert_ne!(
-            glyphs[&('A', false, false)][0],
-            glyphs[&('A', true, false)][0]
-        );
+        assert_ne!(glyphs[&('A', false, false)].x, glyphs[&('A', true, false)].x);
     }
 
     #[cfg_attr(not(feature = "gpu-tests"), ignore)]
