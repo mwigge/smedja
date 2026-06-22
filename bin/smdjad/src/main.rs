@@ -2588,7 +2588,15 @@ fn build_router(
             let pending = gate.list_pending().await;
             let out: Vec<Value> = pending
                 .into_iter()
-                .map(|(id, tool)| json!({ "id": id, "tool": tool }))
+                .map(|(id, p)| {
+                    json!({
+                        "id": id,
+                        "tool": p.tool,
+                        "step_n": p.step_n,
+                        "args": p.args_scrubbed,
+                        "reasoning": p.reasoning,
+                    })
+                })
                 .collect();
             Ok(Value::Array(out))
         }
