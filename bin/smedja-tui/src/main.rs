@@ -134,6 +134,9 @@ struct AppState {
     selection_end: usize,
     /// First `g` press received; waiting for a second `g` to jump to top.
     g_pending: bool,
+    /// Byte offset of the insertion cursor within `input`.
+    /// Invariant: always on a UTF-8 char boundary, 0 ≤ cursor ≤ input.len().
+    input_cursor: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +218,33 @@ fn push_system_message(state: &mut AppState, text: impl Into<String>) {
     state.messages.push(msg);
 }
 
+fn render_input_with_cursor(input: &str, cursor: usize) -> String {
+    let cursor = cursor.min(input.len());
+    let before = &input[..cursor];
+    let after = &input[cursor..];
+    format!("{before}_{after}")
+}
+
+fn prev_char_boundary(s: &str, pos: usize) -> usize {
+    let mut p = pos;
+    while p > 0 && !s.is_char_boundary(p) {
+        p -= 1;
+    }
+    p.saturating_sub(s[..p].chars().next_back().map_or(0, char::len_utf8))
+}
+
+fn next_char_boundary(s: &str, pos: usize) -> usize {
+    let mut p = pos;
+    while p < s.len() && !s.is_char_boundary(p) {
+        p += 1;
+    }
+    if p < s.len() {
+        p + s[p..].chars().next().map_or(0, char::len_utf8)
+    } else {
+        p
+    }
+}
+
 fn yank_to_clipboard(lines: &[String]) {
     use std::io::Write as _;
     let text = lines.join("\n");
@@ -249,6 +279,7 @@ fn accept_slash_completion(state: &mut AppState, append_space: bool) -> bool {
     if append_space {
         state.input.push(' ');
     }
+    state.input_cursor = state.input.len();
     state.slash_popup_visible = false;
     state.slash_completions.clear();
     state.slash_cursor = 0;
@@ -380,6 +411,7 @@ async fn handle_key(
             KeyCode::Enter => {
                 if accept_slash_completion(state, false) {
                     let input = std::mem::take(&mut state.input);
+                    state.input_cursor = 0;
                     let _ = editor.add_history_entry(&input);
                     if !dispatch_slash(&input, state, client).await? {
                         submit(&input, state, client).await?;
@@ -387,7 +419,11 @@ async fn handle_key(
                 }
             }
             KeyCode::Backspace => {
-                state.input.pop();
+                if state.input_cursor > 0 {
+                    let new_pos = prev_char_boundary(&state.input, state.input_cursor);
+                    state.input.drain(new_pos..state.input_cursor);
+                    state.input_cursor = new_pos;
+                }
                 if state.input.is_empty() {
                     state.slash_popup_visible = false;
                 } else {
@@ -398,7 +434,8 @@ async fn handle_key(
                 }
             }
             KeyCode::Char(c) => {
-                state.input.push(c);
+                state.input.insert(state.input_cursor, c);
+                state.input_cursor += c.len_utf8();
                 let completions = filtered_completions(&state.input);
                 state.slash_cursor = 0;
                 if completions.is_empty() {
@@ -523,7 +560,11 @@ async fn handle_key(
         }
 
         KeyCode::Backspace => {
-            state.input.pop();
+            if state.input_cursor > 0 {
+                let new_pos = prev_char_boundary(&state.input, state.input_cursor);
+                state.input.drain(new_pos..state.input_cursor);
+                state.input_cursor = new_pos;
+            }
         }
 
         KeyCode::Char('b') => {
@@ -541,7 +582,8 @@ async fn handle_key(
                     state.clipboard = Some(block.render_lines(80).join("\n"));
                 }
             } else {
-                state.input.push('c');
+                state.input.insert(state.input_cursor, 'c');
+                state.input_cursor += 1;
             }
         }
 
@@ -564,7 +606,8 @@ async fn handle_key(
                     submit(&content, state, client).await?;
                 }
             } else {
-                state.input.push('r');
+                state.input.insert(state.input_cursor, 'r');
+                state.input_cursor += 1;
             }
         }
 
@@ -614,7 +657,8 @@ async fn handle_key(
                     }
                 }
             } else {
-                state.input.push('d');
+                state.input.insert(state.input_cursor, 'd');
+                state.input_cursor += 1;
             }
         }
 
@@ -624,10 +668,12 @@ async fn handle_key(
                 // Strip the trailing backslash and append a newline continuation.
                 state.input.pop();
                 state.input.push('\n');
+                state.input_cursor = state.input.len();
                 return Ok(());
             }
 
             let input = std::mem::take(&mut state.input);
+            state.input_cursor = 0;
 
             // Record in rustyline history (ignore errors — history is advisory).
             let _ = editor.add_history_entry(&input);
@@ -808,16 +854,42 @@ async fn handle_key(
             }
         }
 
+        KeyCode::Left => {
+            state.input_cursor = prev_char_boundary(&state.input, state.input_cursor);
+        }
+
+        KeyCode::Right => {
+            state.input_cursor = next_char_boundary(&state.input, state.input_cursor);
+        }
+
+        KeyCode::Home => {
+            state.input_cursor = 0;
+        }
+
+        KeyCode::End => {
+            state.input_cursor = state.input.len();
+        }
+
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.input_cursor = 0;
+        }
+
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.input_cursor = state.input.len();
+        }
+
         KeyCode::Char('/') if state.input.is_empty() => {
             // L129: open slash popup when `/` is the first character typed.
-            state.input.push('/');
+            state.input.insert(state.input_cursor, '/');
+            state.input_cursor += 1;
             state.slash_completions = filtered_completions("/");
             state.slash_cursor = 0;
             state.slash_popup_visible = true;
         }
 
         KeyCode::Char(c) => {
-            state.input.push(c);
+            state.input.insert(state.input_cursor, c);
+            state.input_cursor += c.len_utf8();
         }
 
         _ => {}
@@ -909,11 +981,13 @@ fn render(frame: &mut ratatui::Frame, state: &AppState) {
     // -- Input area -----------------------------------------------------------
     // L128: show continuation prefix when input contains a newline.
     let input_display = if state.input.contains('\n') {
-        // Show the last logical line with continuation indicator.
-        let last_line = state.input.rsplit('\n').next().unwrap_or("");
-        format!("... {last_line}_")
+        // Show the last logical line with the cursor placed correctly within it.
+        let prefix_len = state.input.rfind('\n').map_or(0, |i| i + 1);
+        let cursor_in_line = state.input_cursor.saturating_sub(prefix_len);
+        let last_line = &state.input[prefix_len..];
+        format!("... {}", render_input_with_cursor(last_line, cursor_in_line))
     } else {
-        format!("> {}_", state.input)
+        format!("> {}", render_input_with_cursor(&state.input, state.input_cursor))
     };
     let input_widget = Paragraph::new(input_display);
     frame.render_widget(input_widget, input_area);
@@ -1112,6 +1186,7 @@ async fn main() -> Result<()> {
         selection_anchor: 0,
         selection_end: 0,
         g_pending: false,
+        input_cursor: 0,
     };
 
     // Connect banner — shown on every startup so the user knows what's connected.
@@ -1453,6 +1528,7 @@ mod tests {
             selection_anchor: 0,
             selection_end: 0,
             g_pending: false,
+            input_cursor: 0,
         }
     }
 
@@ -1805,5 +1881,67 @@ mod tests {
             content.contains("tokens"),
             "turn footer should show token count label in the rendered buffer"
         );
+    }
+
+    // --- input cursor tests ---
+
+    #[test]
+    fn render_input_with_cursor_splits_at_position() {
+        assert_eq!(render_input_with_cursor("hello", 2), "he_llo");
+    }
+
+    #[test]
+    fn render_input_with_cursor_at_zero() {
+        assert_eq!(render_input_with_cursor("hello", 0), "_hello");
+    }
+
+    #[test]
+    fn render_input_with_cursor_at_end() {
+        assert_eq!(render_input_with_cursor("hello", 5), "hello_");
+    }
+
+    #[test]
+    fn render_input_with_cursor_empty_input() {
+        assert_eq!(render_input_with_cursor("", 0), "_");
+    }
+
+    #[test]
+    fn prev_char_boundary_moves_back_one_ascii() {
+        assert_eq!(prev_char_boundary("hello", 3), 2);
+    }
+
+    #[test]
+    fn prev_char_boundary_at_zero_stays_zero() {
+        assert_eq!(prev_char_boundary("hello", 0), 0);
+    }
+
+    #[test]
+    fn next_char_boundary_moves_forward_one_ascii() {
+        assert_eq!(next_char_boundary("hello", 2), 3);
+    }
+
+    #[test]
+    fn next_char_boundary_at_end_stays_at_end() {
+        assert_eq!(next_char_boundary("hello", 5), 5);
+    }
+
+    #[test]
+    fn prev_char_boundary_unicode_moves_by_char() {
+        // 'é' encodes as 2 bytes (U+00E9); cursor at 2 should move to 0.
+        let s = "é";
+        assert_eq!(s.len(), 2);
+        assert_eq!(prev_char_boundary(s, 2), 0);
+    }
+
+    #[test]
+    fn next_char_boundary_unicode_moves_by_char() {
+        let s = "é";
+        assert_eq!(next_char_boundary(s, 0), 2);
+    }
+
+    #[test]
+    fn input_cursor_defaults_to_zero_in_make_state() {
+        let state = make_state("s");
+        assert_eq!(state.input_cursor, 0);
     }
 }
