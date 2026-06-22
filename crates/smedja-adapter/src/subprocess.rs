@@ -102,6 +102,7 @@ mod tests {
             system: None,
             tools: None,
             provider_session_id: None,
+            stable_prefix_len: None,
         };
         let mut stream = p.stream_chat(&messages, &opts);
         let first = stream.next().await;
@@ -137,6 +138,7 @@ mod tests {
             system: None,
             tools: None,
             provider_session_id: None,
+            stable_prefix_len: None,
         };
         let mut stream = p.stream_chat(&messages, &opts);
         let mut collected = String::new();

@@ -616,6 +616,7 @@ async fn run_turn(
             Some(all_tools)
         },
         provider_session_id,
+        stable_prefix_len: if runner == "anthropic" { Some(0) } else { None },
     };
 
     // 4. Mark in_progress.
@@ -2215,6 +2216,7 @@ fn build_router(
                 system: Some("You are a summarisation assistant.".to_owned()),
                 tools: None,
                 provider_session_id: None,
+                stable_prefix_len: None,
             };
             let stream = provider.stream_chat(
                 &[AdapterMessage {

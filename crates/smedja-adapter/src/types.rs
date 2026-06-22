@@ -61,6 +61,14 @@ pub struct CallOptions {
     /// Provider-native session identifier used by CLI adapters that support
     /// resume semantics.
     pub provider_session_id: Option<String>,
+    /// Number of leading messages (after the system prompt) that form the
+    /// stable KV-cache prefix.
+    ///
+    /// When set, providers that support prompt caching (Anthropic) will mark
+    /// the system prompt, the last tool definition, and the message at index
+    /// `stable_prefix_len - 1` with a cache-control hint.  `Some(0)` caches
+    /// only the system prompt and tools; `None` disables cache hints entirely.
+    pub stable_prefix_len: Option<usize>,
 }
 
 /// A single unit of streamed output from a provider.

@@ -326,6 +326,7 @@ mod tests {
             system: Some("Be helpful.".to_owned()),
             tools: None,
             provider_session_id: None,
+            stable_prefix_len: None,
         };
         let contents = build_contents(&[], &opts);
         assert_eq!(contents.len(), 1);
@@ -343,6 +344,7 @@ mod tests {
             system: None,
             tools: None,
             provider_session_id: None,
+            stable_prefix_len: None,
         };
         let messages = vec![Message {
             role: Role::Assistant,
