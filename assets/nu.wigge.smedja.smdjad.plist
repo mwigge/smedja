@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>nu.wigge.smedja.smdjad</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>PLACEHOLDER_INSTALL_DIR/smdjad</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>PLACEHOLDER_INSTALL_DIR:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>XDG_RUNTIME_DIR</key>
+    <string>/tmp</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>PLACEHOLDER_HOME/Library/Logs/smedja/smdjad.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>PLACEHOLDER_HOME/Library/Logs/smedja/smdjad-error.log</string>
+
+  <key>WorkingDirectory</key>
+  <string>PLACEHOLDER_HOME</string>
+</dict>
+</plist>
