@@ -6,17 +6,22 @@ use serde::Deserialize;
 
 const BUNDLED: &str = include_str!("../prices.toml");
 
+/// Default context window in tokens used when a model is not in `[windows]`.
+const DEFAULT_WINDOW: u32 = 200_000;
+
 #[derive(Debug, Deserialize)]
 struct RawPrices {
     input: HashMap<String, f64>,
     output: HashMap<String, f64>,
+    windows: HashMap<String, u32>,
 }
 
-/// Per-model pricing in USD per 1 M tokens.
+/// Per-model pricing and context window sizes.
 #[derive(Debug)]
 pub struct PriceTable {
     input: HashMap<String, f64>,
     output: HashMap<String, f64>,
+    windows: HashMap<String, u32>,
 }
 
 impl PriceTable {
@@ -32,6 +37,7 @@ impl PriceTable {
         Self {
             input: raw.input,
             output: raw.output,
+            windows: raw.windows,
         }
     }
 
@@ -44,9 +50,16 @@ impl PriceTable {
     pub fn compute_cost(&self, model: &str, input_tok: u32, output_tok: u32) -> f64 {
         let in_price = self.input.get(model).copied().unwrap_or(0.0);
         let out_price = self.output.get(model).copied().unwrap_or(0.0);
-        let cost =
-            (f64::from(input_tok) * in_price + f64::from(output_tok) * out_price) / 1_000_000.0;
-        cost
+        (f64::from(input_tok) * in_price + f64::from(output_tok) * out_price) / 1_000_000.0
+    }
+
+    /// Returns the context window size in tokens for `model`.
+    ///
+    /// Falls back to [`DEFAULT_WINDOW`] (200 K) when the model is not in the
+    /// table — safe to display as a best-effort estimate.
+    #[must_use]
+    pub fn context_window(&self, model: &str) -> u32 {
+        self.windows.get(model).copied().unwrap_or(DEFAULT_WINDOW)
     }
 }
 
@@ -94,5 +107,35 @@ mod tests {
         let pt = PriceTable::embedded();
         let cost = pt.compute_cost("claude-sonnet-4-6", 0, 0);
         assert!(cost.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn context_window_known_claude_model() {
+        let pt = PriceTable::embedded();
+        assert_eq!(
+            pt.context_window("claude-sonnet-4-6"),
+            200_000,
+            "Claude Sonnet should have 200K window"
+        );
+    }
+
+    #[test]
+    fn context_window_known_openai_model() {
+        let pt = PriceTable::embedded();
+        assert_eq!(
+            pt.context_window("gpt-4o-mini"),
+            128_000,
+            "gpt-4o-mini should have 128K window"
+        );
+    }
+
+    #[test]
+    fn context_window_unknown_model_defaults_to_200k() {
+        let pt = PriceTable::embedded();
+        assert_eq!(
+            pt.context_window("unknown-model"),
+            DEFAULT_WINDOW,
+            "unknown model should fall back to DEFAULT_WINDOW"
+        );
     }
 }
