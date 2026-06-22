@@ -32,6 +32,7 @@ pub struct ActionLog {
 
 impl ActionLog {
     /// Creates a new [`ActionLog`] with the given ring-buffer capacity.
+    #[must_use]
     pub fn new(max: usize) -> Self {
         Self {
             events: VecDeque::new(),
@@ -49,11 +50,13 @@ impl ActionLog {
     }
 
     /// Number of retained events.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.events.len()
     }
 
     /// Returns `true` when no events are stored.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }

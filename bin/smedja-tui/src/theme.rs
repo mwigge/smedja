@@ -8,6 +8,7 @@ use crossterm::style::Color;
 ///
 /// Keys: `"local"`, `"fast"`, `"deep"`, `"error"`, `"success"`, `"warn"`,
 /// `"border"`, `"highlight"`.
+#[must_use]
 pub fn agent_theme() -> HashMap<&'static str, Color> {
     let mut m = HashMap::new();
     m.insert("local", Color::Cyan);

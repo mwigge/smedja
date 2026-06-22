@@ -1559,6 +1559,8 @@ fn build_router(
     ingot: &Arc<Mutex<Ingot>>,
     dispatcher: Arc<Dispatcher>,
     gates: &Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
+    startup_runner: &'static str,
+    startup_model: &'static str,
 ) -> Router {
     let mut router = Router::new();
 
@@ -1710,12 +1712,16 @@ fn build_router(
             // The gate map is owned by build_router; session.create handles the DB flag
             // only here. Callers that need the gate active must also call cowork.set.
 
+            let tier = if startup_runner.contains("local") { "local" } else { "fast" };
             Ok(json!({
                 "id": session.id,
                 "title": title,
                 "created_at": session.created_at,
                 "cowork_mode": cowork_mode,
                 "task_id": task_id,
+                "runner": startup_runner,
+                "model": startup_model,
+                "tier": tier,
             }))
         }
     });
@@ -3273,7 +3279,16 @@ async fn main() -> anyhow::Result<()> {
     let dispatcher = Arc::new(Dispatcher::new(256));
     let gates: Arc<Mutex<HashMap<String, Arc<CoworkGate>>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    let router = build_router(&ingot, Arc::clone(&dispatcher), &gates);
+    let (startup_runner, startup_model) = build_provider()
+        .await
+        .map_or(("unknown", ""), |(_, r, m)| (r, m));
+    let router = build_router(
+        &ingot,
+        Arc::clone(&dispatcher),
+        &gates,
+        startup_runner,
+        startup_model,
+    );
 
     let turn_handles = spawn_worker(
         Arc::clone(&ingot),

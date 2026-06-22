@@ -75,6 +75,8 @@ struct AppState {
     session_id: String,
     mode: Option<String>,
     tier: Option<String>,
+    runner: String,
+    model: Option<String>,
     messages: Vec<Message>,
     input: String,
     quit: bool,
@@ -742,6 +744,7 @@ fn render(frame: &mut ratatui::Frame, state: &AppState) {
         session_id: &state.session_id,
         mode: state.mode.as_deref(),
         tier: state.tier.as_deref(),
+        runner: Some(&state.runner),
         pending: state.pending_task_id.is_some(),
     };
     let status_text = render_status_bar(&ctx);
@@ -943,10 +946,26 @@ async fn main() -> Result<()> {
 
     tracing::debug!(session_id = %session_id, "session created");
 
+    let startup_runner = session_resp
+        .get("runner")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_owned();
+    let startup_model = session_resp
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let startup_tier = session_resp
+        .get("tier")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+
     let mut state = AppState {
         session_id,
         mode: cli.mode,
-        tier: cli.tier,
+        tier: cli.tier.or(startup_tier),
+        runner: startup_runner,
+        model: startup_model,
         messages: Vec::new(),
         input: String::new(),
         quit: false,
@@ -980,24 +999,17 @@ async fn main() -> Result<()> {
     state
         .main_panel
         .push_line(format!("session {}", state.session_id));
-    let provider = session_resp
-        .get("provider")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_owned();
-    state.main_panel.push_line(format!("provider: {provider}"));
-    let tier_str = state.tier.as_deref().unwrap_or("default");
+    state
+        .main_panel
+        .push_line(format!("provider: {}", state.runner));
+    if let Some(ref m) = state.model {
+        state.main_panel.push_line(format!("model: {m}"));
+    }
+    let tier_str = state.tier.as_deref().unwrap_or("fast");
     state.main_panel.push_line(format!("tier: {tier_str}"));
     state
         .main_panel
         .push_line("type a message or /help for commands".into());
-
-    // Detect tier from session response if not set via CLI.
-    if state.tier.is_none() {
-        if let Some(t) = session_resp.get("tier").and_then(|v| v.as_str()) {
-            state.tier = Some(t.to_owned());
-        }
-    }
 
     enable_raw_mode().context("enable raw mode")?;
     execute!(stdout(), EnterAlternateScreen).context("enter alternate screen")?;
@@ -1288,6 +1300,8 @@ mod tests {
             session_id: session_id.to_owned(),
             mode: None,
             tier: None,
+            runner: String::from("unknown"),
+            model: None,
             messages: Vec::new(),
             input: String::new(),
             quit: false,
