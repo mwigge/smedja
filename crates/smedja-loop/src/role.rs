@@ -6,33 +6,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 
-/// The model runner backend for a loop role.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Runner {
-    /// Anthropic Claude (cloud).
-    Claude,
-    /// Local model via rs-llmctl.
-    Local,
-    /// `OpenAI` Codex (cloud).
-    Codex,
-    /// `MiniMax` (cloud).
-    Minimax,
-    /// Berget (cloud).
-    Berget,
-}
-
-/// Execution tier controlling latency vs. capability trade-offs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Tier {
-    /// Low latency, small context window, cheap.
-    Fast,
-    /// Local model — no cloud egress.
-    Local,
-    /// High capability, large context window, higher latency.
-    Deep,
-}
+pub use smedja_types::{Runner, Tier};
 
 /// Data exposure boundaries for a loop role.
 ///

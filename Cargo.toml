@@ -14,6 +14,7 @@ members = [
     "crates/smedja-rpc",
     "crates/smedja-sre",
     "crates/smedja-telemetry",
+    "crates/smedja-types",
     "crates/smedja-vault",
     "term/bin/smedja",
     "term/crates/st-agent",

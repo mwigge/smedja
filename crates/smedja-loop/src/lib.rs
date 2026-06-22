@@ -1,4 +1,4 @@
-//! `smedja-loop` — bounded multi-role pipeline over an `OpenSpec` work envelope.
+//! Types for the loop pipeline — execution logic lives in smdjad's loop.run RPC handler.
 //!
 //! Provides the core types, state machine states, `OTel` telemetry helpers,
 //! verification gate, and failure-mining utilities for the smedja loop engine.

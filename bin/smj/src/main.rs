@@ -1370,6 +1370,8 @@ fn cmd_workspace_agents() -> Result<()> {
             Runner::Local => "local",
             Runner::Codex => "codex",
             Runner::Copilot => "copilot",
+            Runner::Minimax => "minimax",
+            Runner::Berget => "berget",
         };
         let tier = match route.tier {
             Tier::Fast => "fast",

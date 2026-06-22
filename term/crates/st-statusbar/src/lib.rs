@@ -191,14 +191,9 @@ impl StatusModule for TaskModule {
 ///
 /// The branch prefix symbol defaults to `"* "` but can be overridden via
 /// [`GitBranchModule::with_symbol`] to match a Starship `git_branch.symbol`.
+#[derive(Default)]
 pub struct GitBranchModule {
     symbol: Option<String>,
-}
-
-impl Default for GitBranchModule {
-    fn default() -> Self {
-        Self { symbol: None }
-    }
 }
 
 impl GitBranchModule {
