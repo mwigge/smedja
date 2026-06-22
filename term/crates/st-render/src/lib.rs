@@ -266,8 +266,11 @@ pub struct GlyphAtlas {
     pub view: wgpu::TextureView,
     /// CPU-side packer that tracks free regions.
     pub packer: ShelfPacker,
-    /// Maps `(char, bold, italic)` → per-glyph atlas entry (position, size, bearing).
-    pub glyphs: HashMap<(char, bool, bool), GlyphEntry>,
+    /// Maps `(char, bold, italic, font_size_bits)` → per-glyph atlas entry.
+    ///
+    /// `font_size_bits` is `font_size.to_bits()` so that glyphs rasterised at
+    /// different sizes (e.g. terminal grid vs status-bar) never share a slot.
+    pub glyphs: HashMap<(char, bool, bool, u32), GlyphEntry>,
     font_system: FontSystem,
     swash_cache: SwashCache,
 }
@@ -331,7 +334,7 @@ impl GlyphAtlas {
         bold: bool,
         italic: bool,
     ) -> Option<GlyphEntry> {
-        let key = (ch, bold, italic);
+        let key = (ch, bold, italic, font_size.to_bits());
         if let Some(&entry) = self.glyphs.get(&key) {
             return Some(entry);
         }
@@ -822,9 +825,12 @@ impl Renderer {
     /// before the draw calls are submitted.
     fn ensure_cell_glyphs(&mut self) {
         let font_size = self.config.font.size * self.scale_factor as f32;
+        let font_size_key = font_size.to_bits();
         for cell in &self.cells {
             // Skip spaces and already-cached glyphs (fast HashMap check).
-            if cell.ch != ' ' && !self.atlas.glyphs.contains_key(&(cell.ch, false, false)) {
+            if cell.ch != ' '
+                && !self.atlas.glyphs.contains_key(&(cell.ch, false, false, font_size_key))
+            {
                 let _ = self.atlas.get_or_insert(
                     &self.device,
                     &self.queue,
@@ -837,9 +843,10 @@ impl Renderer {
         }
 
         // Warm glyphs for status-bar segment text at the status-bar font size.
-        // This ensures status-bar characters are in the atlas before build_glyph_vertices
-        // reads from it, preventing atlas misses and warn! noise on every frame.
+        // Using a separate font size key prevents status-bar glyphs (small) from
+        // evicting or poisoning terminal-grid glyph cache entries (large).
         let sb_font_size = self.status_bar_height_px() as f32 * 0.65;
+        let sb_font_size_key = sb_font_size.to_bits();
         let sb_chars: Vec<char> = self
             .status_bar_segments
             .iter()
@@ -847,7 +854,7 @@ impl Renderer {
             .filter(|&c| c != ' ')
             .collect();
         for ch in sb_chars {
-            if !self.atlas.glyphs.contains_key(&(ch, false, false)) {
+            if !self.atlas.glyphs.contains_key(&(ch, false, false, sb_font_size_key)) {
                 let _ = self.atlas.get_or_insert(
                     &self.device,
                     &self.queue,
@@ -1179,6 +1186,10 @@ impl Renderer {
 
     fn build_glyph_vertices(&self) -> Vec<GlyphVertex> {
         let (cw, ch) = self.cell_size();
+        let eff_font = self.config.font.size * self.scale_factor as f32;
+        let eff_font_key = eff_font.to_bits();
+        let sb_font_size = self.status_bar_height_px() as f32 * 0.65;
+        let sb_font_key = sb_font_size.to_bits();
         let atlas_size_f = ATLAS_SIZE as f32;
         // Reserve extra capacity for status bar glyphs.
         let extra: usize = self
@@ -1195,7 +1206,7 @@ impl Renderer {
             }
             // Look up glyph entry from atlas (read-only view — we cannot call
             // get_or_insert here because we'd need &mut self; use cached value).
-            let Some(&entry) = self.atlas.glyphs.get(&(cell.ch, false, false)) else {
+            let Some(&entry) = self.atlas.glyphs.get(&(cell.ch, false, false, eff_font_key)) else {
                 tracing::warn!(ch = %cell.ch, "glyph atlas miss — cell skipped");
                 continue;
             };
@@ -1286,7 +1297,7 @@ impl Renderer {
                     col_px += sb_cw;
                     continue;
                 }
-                let Some(&entry) = self.atlas.glyphs.get(&(ch, false, false)) else {
+                let Some(&entry) = self.atlas.glyphs.get(&(ch, false, false, sb_font_key)) else {
                     tracing::warn!(ch = %ch, "glyph atlas miss — status-bar cell skipped");
                     col_px += sb_cw;
                     continue;
@@ -1362,7 +1373,7 @@ impl Renderer {
                             continue;
                         }
                         let Some(&entry) =
-                            self.atlas.glyphs.get(&(glyph_ch, false, false))
+                            self.atlas.glyphs.get(&(glyph_ch, false, false, eff_font_key))
                         else {
                             col += 1;
                             continue;
@@ -1507,14 +1518,15 @@ mod tests {
     #[test]
     fn glyph_atlas_key_distinguishes_bold_and_italic() {
         use std::collections::HashMap;
+        let sz = 28.0_f32.to_bits();
         let entry = |x: u32| GlyphEntry { x, y: 0, w: 8, h: 12, bearing_x: 0, bearing_y: 10 };
-        let mut map: HashMap<(char, bool, bool), GlyphEntry> = HashMap::new();
-        map.insert(('A', false, false), entry(0));
-        map.insert(('A', true, false), entry(8));
-        map.insert(('A', false, true), entry(16));
-        assert_ne!(map[&('A', false, false)], map[&('A', true, false)]);
-        assert_ne!(map[&('A', false, false)], map[&('A', false, true)]);
-        assert_eq!(map[&('A', false, false)].x, 0);
+        let mut map: HashMap<(char, bool, bool, u32), GlyphEntry> = HashMap::new();
+        map.insert(('A', false, false, sz), entry(0));
+        map.insert(('A', true, false, sz), entry(8));
+        map.insert(('A', false, true, sz), entry(16));
+        assert_ne!(map[&('A', false, false, sz)], map[&('A', true, false, sz)]);
+        assert_ne!(map[&('A', false, false, sz)], map[&('A', false, true, sz)]);
+        assert_eq!(map[&('A', false, false, sz)].x, 0);
     }
 
     // ── GPU-gated smoke tests ─────────────────────────────────────────────────
@@ -1539,13 +1551,14 @@ mod tests {
     #[test]
     fn renderer_glyph_atlas_key_stores_bold_and_regular_separately() {
         use std::collections::HashMap;
+        let sz = 28.0_f32.to_bits();
         let entry = |x: u32| GlyphEntry { x, y: 0, w: 8, h: 12, bearing_x: 0, bearing_y: 10 };
-        let mut glyphs: HashMap<(char, bool, bool), GlyphEntry> = HashMap::new();
-        glyphs.insert(('A', false, false), entry(0));
-        glyphs.insert(('A', true, false), entry(8));
-        assert!(glyphs.contains_key(&('A', false, false)));
-        assert!(glyphs.contains_key(&('A', true, false)));
-        assert_ne!(glyphs[&('A', false, false)].x, glyphs[&('A', true, false)].x);
+        let mut glyphs: HashMap<(char, bool, bool, u32), GlyphEntry> = HashMap::new();
+        glyphs.insert(('A', false, false, sz), entry(0));
+        glyphs.insert(('A', true, false, sz), entry(8));
+        assert!(glyphs.contains_key(&('A', false, false, sz)));
+        assert!(glyphs.contains_key(&('A', true, false, sz)));
+        assert_ne!(glyphs[&('A', false, false, sz)].x, glyphs[&('A', true, false, sz)].x);
     }
 
     #[cfg_attr(not(feature = "gpu-tests"), ignore)]
