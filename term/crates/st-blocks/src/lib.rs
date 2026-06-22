@@ -138,6 +138,10 @@ pub struct AgentBlock {
     pub content_lines: Vec<String>,
     /// Whether the block is waiting for user approval.
     pub approval_pending: bool,
+    /// W3C trace-id carried from the `TurnStart` correlation fields.
+    pub trace_id: Option<String>,
+    /// W3C span-id carried from the `TurnStart` correlation fields.
+    pub span_id: Option<String>,
 }
 
 impl AgentBlock {
@@ -150,7 +154,20 @@ impl AgentBlock {
             streaming: true,
             content_lines: Vec::new(),
             approval_pending: false,
+            trace_id: None,
+            span_id: None,
         }
+    }
+
+    /// Stores trace correlation fields received from a `TurnStart` event.
+    ///
+    /// Also propagates the values to the inner [`Block`] so they are persisted
+    /// when the block is written to the store.
+    pub fn set_trace_correlation(&mut self, trace_id: Option<String>, span_id: Option<String>) {
+        self.trace_id.clone_from(&trace_id);
+        self.span_id.clone_from(&span_id);
+        self.block.trace_id = trace_id;
+        self.block.span_id = span_id;
     }
 }
 

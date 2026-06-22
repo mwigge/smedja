@@ -113,21 +113,27 @@ fn build_body(messages: &[Message], opts: &CallOptions) -> serde_json::Value {
 }
 
 /// Drives the SSE receive loop, sending parsed [`Delta`] items into `tx`.
+///
+/// Returns `(input_tokens, output_tokens, ttft_ms)` extracted from the stream.
 async fn run_sse_loop(
     resp: reqwest::Response,
     tx: &tokio::sync::mpsc::Sender<Result<Delta, AdapterError>>,
-) {
+    request_start: std::time::Instant,
+) -> (Option<u32>, Option<u32>, Option<i64>) {
     let mut bytes_stream = resp.bytes_stream();
     let mut buf = String::new();
     // Track the current SSE `event:` type across lines.
     let mut current_event: Option<String> = None;
+    let mut input_tok: Option<u32> = None;
+    let mut output_tok: Option<u32> = None;
+    let mut ttft_ms: Option<i64> = None;
 
     while let Some(chunk) = bytes_stream.next().await {
         let chunk = match chunk {
             Ok(c) => c,
             Err(e) => {
                 let _ = tx.send(Err(AdapterError::Http(e))).await;
-                return;
+                return (input_tok, output_tok, ttft_ms);
             }
         };
 
@@ -152,32 +158,119 @@ async fn run_sse_loop(
                 if let Some(ev) = &current_event {
                     match parse_anthropic_event(ev, data) {
                         Ok(Some(delta)) => {
-                            if tx.send(Ok(delta)).await.is_err() {
-                                return;
+                            if matches!(delta, Delta::Text(_)) && ttft_ms.is_none() {
+                                ttft_ms = Some(
+                                    request_start
+                                        .elapsed()
+                                        .as_millis()
+                                        .try_into()
+                                        .unwrap_or(i64::MAX),
+                                );
+                            }
+                            if let Delta::Usage {
+                                input_tokens,
+                                output_tokens,
+                            } = delta
+                            {
+                                input_tok = Some(input_tokens);
+                                output_tok = Some(output_tokens);
+                                if tx
+                                    .send(Ok(Delta::Usage {
+                                        input_tokens,
+                                        output_tokens,
+                                    }))
+                                    .await
+                                    .is_err()
+                                {
+                                    return (input_tok, output_tok, ttft_ms);
+                                }
+                            } else if tx.send(Ok(delta)).await.is_err() {
+                                return (input_tok, output_tok, ttft_ms);
                             }
                         }
                         Ok(None) => {}
                         Err(e) => {
                             let _ = tx.send(Err(e)).await;
-                            return;
+                            return (input_tok, output_tok, ttft_ms);
                         }
                     }
                 }
             }
         }
     }
+    (input_tok, output_tok, ttft_ms)
 }
 
 impl Provider for AnthropicProvider {
+    #[allow(clippy::too_many_lines)]
     fn stream_chat(&self, messages: &[Message], opts: &CallOptions) -> DeltaStream {
         const BASE_URL: &str = "https://api.anthropic.com/v1/messages";
         let api_key = self.api_key.clone();
         let client = self.client.clone();
         let body = build_body(messages, opts);
 
+        // Capture parent context so the LLM span is a child of the agent invoke span.
+        let parent_cx = opentelemetry::Context::current();
+        let model_name_for_span = body["model"].as_str().unwrap_or("").to_owned();
+        let max_tokens_for_span: Option<i64> = body["max_tokens"].as_i64();
+
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Delta, AdapterError>>(64);
 
         tokio::spawn(async move {
+            use opentelemetry::{
+                global,
+                trace::{Span as _, Tracer as _},
+            };
+            use smedja_telemetry as tel;
+
+            let tracer = global::tracer("smedja");
+            let mut llm_span = tracer.start_with_context(tel::SPAN_LLM_CHAT, &parent_cx);
+            llm_span.set_attribute(opentelemetry::KeyValue::new(
+                tel::OPERATION_NAME,
+                tel::OPERATION_CHAT,
+            ));
+            llm_span.set_attribute(opentelemetry::KeyValue::new(
+                tel::GEN_AI_SYSTEM,
+                "anthropic",
+            ));
+            llm_span.set_attribute(opentelemetry::KeyValue::new(
+                tel::REQUEST_MODEL,
+                model_name_for_span.clone(),
+            ));
+            if let Some(mt) = max_tokens_for_span {
+                llm_span.set_attribute(opentelemetry::KeyValue::new(
+                    "gen_ai.request.max_tokens",
+                    mt,
+                ));
+            }
+
+            // Apply capture policy for prompt content (section 7.1-7.3).
+            let system_content: String = body
+                .get("system")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            match tel::prompt_capture_mode() {
+                tel::CaptureMode::Hash => {
+                    llm_span.set_attribute(opentelemetry::KeyValue::new(
+                        "smedja.prompt.hash",
+                        tel::content_hash(&system_content),
+                    ));
+                }
+                tel::CaptureMode::Scrubbed => {
+                    llm_span.set_attribute(opentelemetry::KeyValue::new(
+                        "gen_ai.prompt",
+                        tel::scrub_and_summarise(&system_content),
+                    ));
+                }
+                tel::CaptureMode::Full => {
+                    let scrubbed = tel::scrub_and_summarise(&system_content);
+                    llm_span.set_attribute(opentelemetry::KeyValue::new("gen_ai.prompt", scrubbed));
+                }
+            }
+
+            let request_start = std::time::Instant::now();
+
             let mut headers = reqwest::header::HeaderMap::new();
             // Static header names/values: infallible for these known-good literals.
             if let Ok(val) = reqwest::header::HeaderValue::from_str(&api_key) {
@@ -202,6 +295,8 @@ impl Provider for AnthropicProvider {
             {
                 Ok(r) => r,
                 Err(e) => {
+                    llm_span.set_status(opentelemetry::trace::Status::error("HTTP request failed"));
+                    llm_span.end();
                     let _ = tx.send(Err(AdapterError::Http(e))).await;
                     return;
                 }
@@ -214,13 +309,21 @@ impl Provider for AnthropicProvider {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok())
                     .map(std::time::Duration::from_secs);
-                let _ = tx.send(Err(AdapterError::RateLimited { retry_after })).await;
+                llm_span.set_status(opentelemetry::trace::Status::error("rate limited"));
+                llm_span.end();
+                let _ = tx
+                    .send(Err(AdapterError::RateLimited { retry_after }))
+                    .await;
                 return;
             }
 
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
+                llm_span.set_status(opentelemetry::trace::Status::error(format!(
+                    "HTTP {status}"
+                )));
+                llm_span.end();
                 let _ = tx
                     .send(Err(AdapterError::InvalidResponse(format!(
                         "HTTP {status}: {text}"
@@ -229,7 +332,29 @@ impl Provider for AnthropicProvider {
                 return;
             }
 
-            run_sse_loop(resp, &tx).await;
+            let (in_tok, out_tok, ttft) = run_sse_loop(resp, &tx, request_start).await;
+            if let Some(v) = in_tok {
+                llm_span.set_attribute(opentelemetry::KeyValue::new(
+                    tel::INPUT_TOKENS,
+                    i64::from(v),
+                ));
+            }
+            if let Some(v) = out_tok {
+                llm_span.set_attribute(opentelemetry::KeyValue::new(
+                    tel::OUTPUT_TOKENS,
+                    i64::from(v),
+                ));
+            }
+            if let Some(v) = ttft {
+                llm_span.set_attribute(opentelemetry::KeyValue::new(tel::TTFT_MS, v));
+            }
+            // Record the response capture policy so backends know what to expect.
+            llm_span.set_attribute(opentelemetry::KeyValue::new(
+                "smedja.capture.responses",
+                tel::response_capture_mode().as_str(),
+            ));
+            llm_span.set_status(opentelemetry::trace::Status::Ok);
+            llm_span.end();
         });
 
         Box::pin(ReceiverStream::new(rx))

@@ -156,6 +156,33 @@ pub fn kv_turn_id(id: impl Into<opentelemetry::StringValue>) -> KeyValue {
     KeyValue::new(TURN_ID, id.into())
 }
 
+/// Sets span status to ERROR and records error-kind and exception attributes.
+///
+/// Equivalent to recording an `OTel` exception event and setting the span
+/// status to ERROR in a single call.
+pub fn set_span_error<S: opentelemetry::trace::Span>(
+    span: &mut S,
+    kind: &str,
+    message: &str,
+    retryable: bool,
+) {
+    span.set_status(opentelemetry::trace::Status::error(message.to_owned()));
+    span.set_attribute(KeyValue::new(ERROR_KIND, kind.to_owned()));
+    span.set_attribute(KeyValue::new(ERROR_RETRYABLE, retryable));
+    span.add_event(
+        "exception",
+        vec![
+            KeyValue::new("exception.type", kind.to_owned()),
+            KeyValue::new("exception.message", message.to_owned()),
+        ],
+    );
+}
+
+/// Sets span status to OK.
+pub fn set_span_ok<S: opentelemetry::trace::Span>(span: &mut S) {
+    span.set_status(opentelemetry::trace::Status::Ok);
+}
+
 // ─── Capture policy ──────────────────────────────────────────────────────────
 
 /// Content capture mode for prompts, responses, tool args, and tool results.
@@ -181,6 +208,16 @@ impl CaptureMode {
             Ok("full" | "1") => Self::Full,
             Ok("scrubbed") => Self::Scrubbed,
             _ => Self::Hash,
+        }
+    }
+
+    /// Returns a stable string representation suitable for span attributes.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Hash => "hash",
+            Self::Scrubbed => "scrubbed",
+            Self::Full => "full",
         }
     }
 }
@@ -445,5 +482,35 @@ mod tests {
         let long = "a".repeat(200);
         let result = scrub_and_summarise(&long);
         assert_eq!(result.len(), 120);
+    }
+
+    #[test]
+    fn set_span_error_does_not_panic() {
+        // opentelemetry::trace::noop::NoopSpan is the easiest way to test without a pipeline.
+        let mut span = opentelemetry::trace::noop::NoopSpan::DEFAULT;
+        set_span_error(&mut span, "rate_limit", "429 Too Many Requests", true);
+        set_span_ok(&mut span);
+    }
+
+    // 9.6 — Privacy capture mode tests ----------------------------------------
+
+    #[test]
+    fn default_capture_mode_is_hash() {
+        // Without any env vars set, default should be Hash for prompts and tool_args.
+        // This test only verifies the default when no env override is present.
+        // CI/CD environments must NOT set SMEDJA_CAPTURE_PROMPTS.
+        if std::env::var(ENV_CAPTURE_PROMPTS).is_err() {
+            assert_eq!(prompt_capture_mode(), CaptureMode::Hash);
+        }
+    }
+
+    #[test]
+    fn full_capture_env_overrides_default() {
+        // Temporarily set the env var and verify it changes mode.
+        // SAFETY: single-threaded test, env modification is reverted.
+        std::env::set_var(ENV_CAPTURE_PROMPTS, "1");
+        let mode = prompt_capture_mode();
+        std::env::remove_var(ENV_CAPTURE_PROMPTS);
+        assert_eq!(mode, CaptureMode::Full);
     }
 }
