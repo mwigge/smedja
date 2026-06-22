@@ -4,7 +4,7 @@ use uuid::Uuid;
 use crate::error::IngotError;
 
 /// An immutable audit record capturing a single agent action.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AuditEvent {
     /// Unique event identifier (UUID v4 stored as TEXT).
     pub id: Uuid,
@@ -35,6 +35,37 @@ pub struct AuditEvent {
     /// `None` for events emitted outside a loop context (e.g. plain sessions).
     #[serde(default)]
     pub role_id: Option<String>,
+    // ── section 2 timeline columns ───────────────────────────────────────────
+    /// Conversation grouping identifier (groups multiple turns / agents).
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    /// W3C `trace-id` component extracted from `traceparent`.
+    #[serde(default)]
+    pub trace_id: Option<String>,
+    /// W3C `parent-id` (span-id) component extracted from `traceparent`.
+    #[serde(default)]
+    pub span_id: Option<String>,
+    /// Parent span identifier for distributed tracing correlation.
+    #[serde(default)]
+    pub parent_span_id: Option<String>,
+    /// Agent name that produced this event.
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    /// High-level operation label (e.g. `"chat"`, `"tool_call"`, `"embed"`).
+    #[serde(default)]
+    pub operation_name: Option<String>,
+    /// Terminal status of the operation: `"ok"` or `"error"`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Error category when `status = "error"`.
+    #[serde(default)]
+    pub error_kind: Option<String>,
+    /// Number of errors that occurred during the operation.
+    #[serde(default)]
+    pub error_count: Option<i64>,
+    /// Tool-call identifier for correlation with tool responses.
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
 }
 
 /// Inserts an [`AuditEvent`] into the `audit_events` table.
@@ -47,8 +78,11 @@ pub(crate) fn insert(conn: &rusqlite::Connection, event: &AuditEvent) -> Result<
     conn.execute(
         "INSERT INTO audit_events \
          (id, ts, session_id, turn_id, action_type, actor, tool_name, \
-          input_tok, output_tok, latency_ms, traceparent, tier, role_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+          input_tok, output_tok, latency_ms, traceparent, tier, role_id, \
+          conversation_id, trace_id, span_id, parent_span_id, \
+          agent_name, operation_name, status, error_kind, error_count, tool_call_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
+                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
         rusqlite::params![
             event.id.to_string(),
             event.ts,
@@ -63,10 +97,59 @@ pub(crate) fn insert(conn: &rusqlite::Connection, event: &AuditEvent) -> Result<
             event.traceparent,
             event.tier,
             event.role_id,
+            event.conversation_id,
+            event.trace_id,
+            event.span_id,
+            event.parent_span_id,
+            event.agent_name,
+            event.operation_name,
+            event.status,
+            event.error_kind,
+            event.error_count,
+            event.tool_call_id,
         ],
     )?;
     Ok(())
 }
+
+/// Maps a rusqlite row to an [`AuditEvent`], reading all 23 columns in SELECT order.
+fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEvent> {
+    let id_str: String = row.get(0)?;
+    let id = Uuid::parse_str(&id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    Ok(AuditEvent {
+        id,
+        ts: row.get(1)?,
+        session_id: row.get(2)?,
+        turn_id: row.get(3)?,
+        action_type: row.get(4)?,
+        actor: row.get(5)?,
+        tool_name: row.get(6)?,
+        input_tok: row.get(7)?,
+        output_tok: row.get(8)?,
+        latency_ms: row.get(9)?,
+        traceparent: row.get(10)?,
+        tier: row.get(11)?,
+        role_id: row.get(12)?,
+        conversation_id: row.get(13)?,
+        trace_id: row.get(14)?,
+        span_id: row.get(15)?,
+        parent_span_id: row.get(16)?,
+        agent_name: row.get(17)?,
+        operation_name: row.get(18)?,
+        status: row.get(19)?,
+        error_kind: row.get(20)?,
+        error_count: row.get(21)?,
+        tool_call_id: row.get(22)?,
+    })
+}
+
+/// Column list shared by all SELECT statements in this module.
+const SELECT_COLS: &str = "id, ts, session_id, turn_id, action_type, actor, tool_name, \
+     input_tok, output_tok, latency_ms, traceparent, tier, role_id, \
+     conversation_id, trace_id, span_id, parent_span_id, \
+     agent_name, operation_name, status, error_kind, error_count, tool_call_id";
 
 /// Returns all [`AuditEvent`]s for the given `session_id`, ordered by `ts` ascending.
 ///
@@ -77,36 +160,10 @@ pub(crate) fn list_by_session(
     conn: &rusqlite::Connection,
     session_id: &str,
 ) -> Result<Vec<AuditEvent>, IngotError> {
-    let mut stmt = conn.prepare(
-        "SELECT id, ts, session_id, turn_id, action_type, actor, tool_name, \
-                input_tok, output_tok, latency_ms, traceparent, tier, role_id \
-         FROM audit_events \
-         WHERE session_id = ?1 \
-         ORDER BY ts ASC",
-    )?;
-
-    let rows = stmt.query_map(rusqlite::params![session_id], |row| {
-        let id_str: String = row.get(0)?;
-        let id = Uuid::parse_str(&id_str).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
-        })?;
-        Ok(AuditEvent {
-            id,
-            ts: row.get(1)?,
-            session_id: row.get(2)?,
-            turn_id: row.get(3)?,
-            action_type: row.get(4)?,
-            actor: row.get(5)?,
-            tool_name: row.get(6)?,
-            input_tok: row.get(7)?,
-            output_tok: row.get(8)?,
-            latency_ms: row.get(9)?,
-            traceparent: row.get(10)?,
-            tier: row.get(11)?,
-            role_id: row.get(12)?,
-        })
-    })?;
-
+    let sql =
+        format!("SELECT {SELECT_COLS} FROM audit_events WHERE session_id = ?1 ORDER BY ts ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![session_id], row_to_event)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(IngotError::Db)
 }
 
@@ -116,35 +173,45 @@ pub(crate) fn list_by_session(
 ///
 /// Returns [`IngotError::Db`] if the query fails.
 pub(crate) fn list_all(conn: &rusqlite::Connection) -> Result<Vec<AuditEvent>, IngotError> {
-    let mut stmt = conn.prepare(
-        "SELECT id, ts, session_id, turn_id, action_type, actor, tool_name, \
-                input_tok, output_tok, latency_ms, traceparent, tier, role_id \
-         FROM audit_events \
-         ORDER BY ts ASC",
-    )?;
+    let sql = format!("SELECT {SELECT_COLS} FROM audit_events ORDER BY ts ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_to_event)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(IngotError::Db)
+}
 
-    let rows = stmt.query_map([], |row| {
-        let id_str: String = row.get(0)?;
-        let id = Uuid::parse_str(&id_str).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
-        })?;
-        Ok(AuditEvent {
-            id,
-            ts: row.get(1)?,
-            session_id: row.get(2)?,
-            turn_id: row.get(3)?,
-            action_type: row.get(4)?,
-            actor: row.get(5)?,
-            tool_name: row.get(6)?,
-            input_tok: row.get(7)?,
-            output_tok: row.get(8)?,
-            latency_ms: row.get(9)?,
-            traceparent: row.get(10)?,
-            tier: row.get(11)?,
-            role_id: row.get(12)?,
-        })
-    })?;
+/// Returns all [`AuditEvent`]s for `conversation_id`, ordered by `rowid` ascending.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the query fails.
+pub(crate) fn list_by_conversation(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+) -> Result<Vec<AuditEvent>, IngotError> {
+    let sql = format!(
+        "SELECT {SELECT_COLS} FROM audit_events \
+         WHERE conversation_id = ?1 ORDER BY rowid ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![conversation_id], row_to_event)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(IngotError::Db)
+}
 
+/// Returns [`AuditEvent`]s with `status = 'error'` for `conversation_id`.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the query fails.
+pub(crate) fn list_failed_by_conversation(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+) -> Result<Vec<AuditEvent>, IngotError> {
+    let sql = format!(
+        "SELECT {SELECT_COLS} FROM audit_events \
+         WHERE conversation_id = ?1 AND status = 'error' ORDER BY rowid ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![conversation_id], row_to_event)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(IngotError::Db)
 }
 
@@ -168,12 +235,22 @@ mod tests {
             traceparent: None,
             tier: Some("fast".to_string()),
             role_id: None,
+            conversation_id: None,
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            agent_name: None,
+            operation_name: None,
+            status: None,
+            error_kind: None,
+            error_count: None,
+            tool_call_id: None,
         }
     }
 
     #[test]
     fn insert_then_list_returns_event() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let ev = sample_event("session-abc");
         ingot.insert_audit_event(&ev).unwrap();
 
@@ -187,7 +264,7 @@ mod tests {
 
     #[test]
     fn list_filters_by_session_id() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         ingot
             .insert_audit_event(&sample_event("session-1"))
             .unwrap();
@@ -209,7 +286,7 @@ mod tests {
 
     #[test]
     fn nullable_fields_round_trip() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let ev = AuditEvent {
             id: Uuid::new_v4(),
             ts: 1_700_000_001.0,
@@ -224,6 +301,16 @@ mod tests {
             traceparent: Some("00-trace-span-01".to_string()),
             tier: None,
             role_id: Some("test-role-id".to_string()),
+            conversation_id: Some("conv-nullable".to_string()),
+            trace_id: Some("tid-1".to_string()),
+            span_id: Some("sid-1".to_string()),
+            parent_span_id: None,
+            agent_name: None,
+            operation_name: None,
+            status: None,
+            error_kind: None,
+            error_count: None,
+            tool_call_id: None,
         };
         ingot.insert_audit_event(&ev).unwrap();
         let results = ingot.list_audit_events("s").unwrap();
@@ -231,5 +318,7 @@ mod tests {
         assert!(results[0].turn_id.is_none());
         assert_eq!(results[0].traceparent.as_deref(), Some("00-trace-span-01"));
         assert_eq!(results[0].role_id.as_deref(), Some("test-role-id"));
+        assert_eq!(results[0].conversation_id.as_deref(), Some("conv-nullable"));
+        assert_eq!(results[0].trace_id.as_deref(), Some("tid-1"));
     }
 }

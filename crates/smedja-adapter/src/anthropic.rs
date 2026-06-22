@@ -207,6 +207,17 @@ impl Provider for AnthropicProvider {
                 }
             };
 
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(std::time::Duration::from_secs);
+                let _ = tx.send(Err(AdapterError::RateLimited { retry_after })).await;
+                return;
+            }
+
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();

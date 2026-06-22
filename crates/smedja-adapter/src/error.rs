@@ -20,4 +20,15 @@ pub enum AdapterError {
     /// found or could not be spawned).
     #[error("request error: {0}")]
     Request(String),
+
+    /// The provider returned HTTP 429 Too Many Requests.
+    ///
+    /// `retry_after` is parsed from the `Retry-After` response header when
+    /// present.  Callers should back off for at least this duration before
+    /// retrying.
+    #[error("rate limited by provider (retry after {retry_after:?})")]
+    RateLimited {
+        /// Suggested back-off duration from the provider, if supplied.
+        retry_after: Option<std::time::Duration>,
+    },
 }

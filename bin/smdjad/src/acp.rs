@@ -14,7 +14,7 @@ use axum::Json;
 use axum::Router;
 use serde::Deserialize;
 use serde_json::json;
-use smedja_bellows::{Dispatcher, TurnEvent};
+use smedja_bellows::{Dispatcher, TurnHandle};
 use smedja_ingot::{Ingot, Session, Task};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -119,10 +119,15 @@ async fn submit_prompt(
     };
     match s.ingot.lock().await.create_task(&task) {
         Ok(()) => {
-            s.dispatcher.publish(TurnEvent::Started {
-                session_id: session_id.clone(),
-                turn_id: turn_id.to_string(),
-            });
+            // Emit TurnEvent::Started through TurnHandle so the event is routed
+            // consistently with the main run_turn path.
+            let _handle = TurnHandle::start(
+                session_id.clone(),
+                turn_id.to_string(),
+                Arc::clone(&s.dispatcher),
+            );
+            // Drop the handle immediately — ACP does not drive the turn itself;
+            // spawn_worker will pick up the Started event and call run_turn.
             Json(json!({ "turn_id": turn_id, "session_id": session_id })).into_response()
         }
         Err(e) => (

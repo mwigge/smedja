@@ -1,4 +1,30 @@
 //! Verbosity steering for the smedja context pipeline.
+//!
+//! # Context management pipeline
+//!
+//! Smedja applies context pressure through four cooperating mechanisms, in
+//! approximately this order of precedence:
+//!
+//! 1. **Hot/warm strata windowing** (`smedja-memory/src/memory.rs`).
+//!    Message history is split into a hot window (last 5 exchanges) and a warm
+//!    window (last 30).  Only messages within the active window are forwarded to
+//!    the provider; older messages are silently dropped.
+//!
+//! 2. **Verbosity steering** (this module — `working.rs`).
+//!    When the assembled prompt exceeds 60 % of the provider's context window
+//!    a conciseness directive is appended via [`inject_conciseness`].  The
+//!    directive can be suppressed by setting `SMEDJA_NO_VERBOSITY_STEER=1`.
+//!
+//! 3. **Crush / compression** (`smedja-adapter/src/crush.rs`).
+//!    Before messages reach the provider adapter, the crusher strips null tool
+//!    results, compresses repeated shell commands, and truncates code blocks to
+//!    80 lines.  This runs on every turn and is unaffected by fill percentage.
+//!
+//! 4. **Session compaction** (`session.compact` RPC in `smdjad/src/main.rs`).
+//!    When the operator decides the context is too large, `session.compact`
+//!    summarises the conversation history into 3–5 bullets and replaces the
+//!    accumulated messages with the summary.  This is a destructive, one-way
+//!    operation and must be triggered explicitly.
 
 /// Appends a conciseness directive to `prompt` when the context window is more
 /// than 60% full.

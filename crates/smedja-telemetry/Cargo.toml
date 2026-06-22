@@ -1,0 +1,16 @@
+[package]
+name = "smedja-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GenAI semantic attribute constants and span builder helpers for smedja"
+
+[features]
+sdk = ["dep:opentelemetry_sdk"]
+
+[dependencies]
+opentelemetry     = { workspace = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+
+[dev-dependencies]

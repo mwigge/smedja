@@ -26,8 +26,8 @@ use uuid::Uuid;
 
 /// Returns the path to the smdjad Unix domain socket.
 ///
-/// Uses `$XDG_RUNTIME_DIR/smedja/smdjad.sock` when `XDG_RUNTIME_DIR` is set,
-/// otherwise falls back to `/tmp/smedja/smdjad.sock`.
+/// Uses `$XDG_RUNTIME_DIR/smdjad.sock` when `XDG_RUNTIME_DIR` is set,
+/// otherwise falls back to `/tmp/smdjad.sock`.
 #[must_use]
 pub fn smdjad_socket_path() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
@@ -496,6 +496,11 @@ impl AgentManager {
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }
+
+    /// Returns an iterator over all active sessions.
+    pub fn sessions(&self) -> impl Iterator<Item = &AgentSession> {
+        self.sessions.values()
+    }
 }
 
 /// Thread-safe wrapper around [`AgentManager`].
@@ -630,6 +635,24 @@ mod tests {
     }
 
     #[test]
+    fn socket_path_matches_smdjad() {
+        // st-agent and smdjad must agree on the socket path for a given XDG_RUNTIME_DIR.
+        // This test verifies the st-agent path matches the expected format.
+        let _guard = EnvGuard::set("XDG_RUNTIME_DIR", "/run/user/9999");
+        let path = smdjad_socket_path();
+        assert_eq!(
+            path.to_str().unwrap(),
+            "/run/user/9999/smdjad.sock",
+            "socket path must be $XDG_RUNTIME_DIR/smdjad.sock"
+        );
+        // Confirm no subdirectory: path should not contain /smedja/
+        assert!(
+            !path.to_str().unwrap().contains("/smedja/"),
+            "socket path must not contain /smedja/ subdirectory"
+        );
+    }
+
+    #[test]
     fn smdjad_socket_path_falls_back_to_tmp() {
         let _guard = EnvGuard::remove("XDG_RUNTIME_DIR");
         let path = smdjad_socket_path();
@@ -742,6 +765,45 @@ mod tests {
     fn agent_session_suppress_flag_defaults_false() {
         let s = AgentSession::new("b", "m");
         assert!(!s.suppress_pty_output);
+    }
+
+    // ── Phase 6 ───────────────────────────────────────────────────────────
+
+    /// Verifies that `smedja_bellows::event::TurnEvent` can decode JSON that
+    /// includes the new optional correlation fields (`conversation_id`,
+    /// `trace_id`, etc.) without error, and that the decoded variant is
+    /// `TurnEvent::Started`.  The correlation fields are available for
+    /// forwarding to the renderer via the event stream.
+    #[test]
+    fn st_agent_decodes_enriched_started_event() {
+        let json = r#"{"Started":{"session_id":"s","turn_id":"t","conversation_id":"c","trace_id":"tid"}}"#;
+        let ev: smedja_bellows::event::TurnEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(ev, smedja_bellows::event::TurnEvent::Started { .. }),
+            "expected TurnEvent::Started"
+        );
+    }
+
+    /// Verifies backward compatibility: a JSON payload that has no correlation
+    /// fields (e.g. from an older daemon) still deserializes successfully and
+    /// all new optional fields default to `None`.
+    #[test]
+    fn st_agent_decodes_legacy_started_event() {
+        let json = r#"{"Started":{"session_id":"old","turn_id":"t0"}}"#;
+        let ev: smedja_bellows::event::TurnEvent = serde_json::from_str(json).unwrap();
+        if let smedja_bellows::event::TurnEvent::Started {
+            conversation_id,
+            trace_id,
+            agent_name,
+            ..
+        } = ev
+        {
+            assert!(conversation_id.is_none());
+            assert!(trace_id.is_none());
+            assert!(agent_name.is_none());
+        } else {
+            panic!("expected TurnEvent::Started");
+        }
     }
 
     // ── Test helpers ─────────────────────────────────────────────────────

@@ -156,6 +156,36 @@ impl MainPanel {
     pub fn is_empty(&self) -> bool {
         self.lines.is_empty()
     }
+
+    /// Appends `text` to the last line if one exists, or creates a new one.
+    ///
+    /// Used for streaming turn responses where content arrives incrementally.
+    /// Each call extends the tail of the current in-progress line rather than
+    /// opening a new one, so callers can accumulate partial content until the
+    /// turn completes and `push_line` takes over for the final render.
+    pub fn push_delta(&mut self, text: &str) {
+        if let Some(last) = self.lines.last_mut() {
+            last.text.push_str(text);
+        } else {
+            self.lines.push(StyledLine {
+                text: text.to_owned(),
+                style: LineStyle::Normal,
+            });
+        }
+    }
+
+    /// Returns the full text content of all stored lines joined by newlines.
+    ///
+    /// Only compiled under `#[cfg(test)]` — used by unit tests to inspect panel
+    /// state without coupling them to the internal `Vec<StyledLine>` layout.
+    #[cfg(test)]
+    pub fn visible_text(&self) -> String {
+        self.lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 impl Default for MainPanel {
@@ -336,5 +366,28 @@ mod tests {
         panel.push_line("```".into());
         // The code line (index 1) must be Code style.
         assert_eq!(panel.lines[1].style, LineStyle::Code);
+    }
+
+    // push_delta: appending two deltas to an empty panel produces one line
+    #[test]
+    fn push_delta_appends_to_in_progress_line() {
+        let mut panel = MainPanel::new();
+        panel.push_delta("hello");
+        panel.push_delta(" world");
+        // Should produce one line with "hello world"
+        let content = panel.visible_text();
+        assert!(
+            content.contains("hello world"),
+            "push_delta should append to same line"
+        );
+    }
+
+    // push_delta: first call on an empty panel creates a new line
+    #[test]
+    fn push_delta_creates_new_line_when_empty() {
+        let mut panel = MainPanel::new();
+        panel.push_delta("first");
+        let content = panel.visible_text();
+        assert!(content.contains("first"));
     }
 }
