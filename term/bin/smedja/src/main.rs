@@ -353,6 +353,13 @@ impl ApplicationHandler<UserEvent> for App {
         };
         pty.start_reader_detached();
 
+        // Populate the registry with built-in glyphs so PUA codepoints are
+        // assigned before the renderer starts drawing glyph cells.
+        {
+            let mut reg = pty.glyph_registry.lock();
+            st_glyph::register_builtin_glyphs(&mut reg);
+        }
+
         spawn_agent_bridge(
             self.pane_state.clone(),
             self.agent_manager.clone(),
