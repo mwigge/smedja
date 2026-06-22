@@ -1215,17 +1215,23 @@ impl Renderer {
             let u1 = (entry.x + entry.w) as f32 / atlas_size_f;
             let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
 
-            // Position glyph at its correct sub-cell location using swash
-            // placement bearings rather than stretching to fill the full cell.
-            // Baseline is placed at 2/3 of cell height (ascent ≈ 0.8×em,
-            // line-height = 1.2×em → baseline/line-height ≈ 0.8/1.2 = 2/3).
+            // Position glyph at its correct sub-cell location.
+            //
+            // Vertical: use bearing_y to place the bitmap relative to a fixed
+            // baseline (ascent ≈ 0.8×em / line-height = 1.2×em → 2/3 of cell).
+            //
+            // Horizontal: center the bitmap within the cell.  bearing_x in
+            // monospace fonts is often negative (optical overhang), which would
+            // shift each character left into the previous cell.  Centering avoids
+            // horizontal drift while keeping characters well-spaced.
             let baseline_y = f32::from(cell.row) * ch + ch * (2.0 / 3.0);
             let glyph_top = baseline_y - entry.bearing_y as f32;
-            let glyph_left = f32::from(cell.col) * cw + entry.bearing_x as f32;
+            let glyph_w = entry.w as f32;
+            let glyph_left = f32::from(cell.col) * cw + (cw - glyph_w) / 2.0;
             let (x0, y0, x1, y1) = self.px_to_ndc(
                 glyph_left,
                 glyph_top,
-                glyph_left + entry.w as f32,
+                glyph_left + glyph_w,
                 glyph_top + entry.h as f32,
             );
             let c = cell.fg;
@@ -1384,11 +1390,12 @@ impl Renderer {
                         let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
                         let baseline_y = f32::from(line_row) * ch + ch * (2.0 / 3.0);
                         let glyph_top = baseline_y - entry.bearing_y as f32;
-                        let glyph_left = f32::from(col) * cw + entry.bearing_x as f32;
+                        let glyph_w = entry.w as f32;
+                        let glyph_left = f32::from(col) * cw + (cw - glyph_w) / 2.0;
                         let (x0, y0, x1, y1) = self.px_to_ndc(
                             glyph_left,
                             glyph_top,
-                            glyph_left + entry.w as f32,
+                            glyph_left + glyph_w,
                             glyph_top + entry.h as f32,
                         );
                         verts.extend_from_slice(&[
