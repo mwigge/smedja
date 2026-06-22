@@ -16,14 +16,13 @@ use axum::Router;
 use serde::Deserialize;
 use serde_json::json;
 use smedja_bellows::{Dispatcher, TurnHandle};
-use smedja_ingot::{Ingot, Session, Task};
-use tokio::sync::Mutex;
+use smedja_ingot::{IngotHandle, Session, Task};
 use uuid::Uuid;
 
 /// Shared state for ACP route handlers.
 #[derive(Clone)]
 pub struct AcpState {
-    pub ingot: Arc<Mutex<Ingot>>,
+    pub ingot: IngotHandle,
     pub dispatcher: Arc<Dispatcher>,
     pub auth_token: String,
 }
@@ -89,7 +88,7 @@ async fn create_session(State(s): State<AcpState>) -> impl IntoResponse {
         model_override: None,
         runner_override: None,
     };
-    match s.ingot.lock().await.create_session(&session) {
+    match s.ingot.create_session(session).await {
         Ok(()) => Json(json!({ "session_id": id })).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -120,7 +119,7 @@ async fn submit_prompt(
         response: None,
         created_at: now,
     };
-    match s.ingot.lock().await.create_task(&task) {
+    match s.ingot.create_task(task).await {
         Ok(()) => {
             // Emit TurnEvent::Started through TurnHandle so the event is routed
             // consistently with the main run_turn path.
@@ -153,12 +152,7 @@ async fn set_model(
         )
             .into_response();
     };
-    match s
-        .ingot
-        .lock()
-        .await
-        .update_session_model_override(&id, model)
-    {
+    match s.ingot.update_session_model_override(&id, model).await {
         Ok(()) => Json(json!({ "session_id": id, "model": model })).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -180,7 +174,7 @@ async fn set_mode(
         )
             .into_response();
     };
-    match s.ingot.lock().await.update_session_mode(&id, mode) {
+    match s.ingot.update_session_mode(&id, mode).await {
         Ok(()) => Json(json!({ "session_id": id, "mode": mode })).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -191,7 +185,7 @@ async fn set_mode(
 }
 
 async fn close_session(Path(id): Path<String>, State(s): State<AcpState>) -> impl IntoResponse {
-    match s.ingot.lock().await.delete_session(&id) {
+    match s.ingot.delete_session(&id).await {
         Ok(_) => Json(json!({ "session_id": id, "deleted": true })).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -208,7 +202,6 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use smedja_bellows::Dispatcher;
-    use tokio::sync::Mutex;
     use tower::ServiceExt as _;
 
     use super::{build_acp_router, AcpState};
@@ -216,7 +209,7 @@ mod tests {
     fn test_state() -> AcpState {
         let ingot = smedja_ingot::Ingot::open_in_memory().expect("in-memory ingot");
         AcpState {
-            ingot: Arc::new(Mutex::new(ingot)),
+            ingot: smedja_ingot::IngotHandle::new(ingot),
             dispatcher: Arc::new(Dispatcher::new(32)),
             auth_token: "test-token".to_owned(),
         }
@@ -462,9 +455,8 @@ mod tests {
         // Verify the override was persisted in the DB.
         let fetched = state
             .ingot
-            .lock()
-            .await
             .get_session(&session_id)
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(fetched.model_override.as_deref(), Some("gemma4-27b"));
