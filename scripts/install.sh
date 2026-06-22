@@ -56,6 +56,51 @@ for bin in smdjad smj smedja smedja-tui; do
   fi
 done
 
+# register smdjad as a LaunchAgent (macOS only)
+if [ "$OS" = "darwin" ] && [ -f "$INSTALL_DIR/smdjad" ]; then
+  LAUNCHAGENT_DIR="$HOME/Library/LaunchAgents"
+  LAUNCHAGENT_PLIST="$LAUNCHAGENT_DIR/nu.wigge.smedja.smdjad.plist"
+  LOG_DIR="$HOME/Library/Logs/smedja"
+  mkdir -p "$LAUNCHAGENT_DIR" "$LOG_DIR"
+  cat > "$LAUNCHAGENT_PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>nu.wigge.smedja.smdjad</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$INSTALL_DIR/smdjad</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>$INSTALL_DIR:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>XDG_RUNTIME_DIR</key>
+    <string>/tmp</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>$LOG_DIR/smdjad.log</string>
+  <key>StandardErrorPath</key>
+  <string>$LOG_DIR/smdjad-error.log</string>
+  <key>WorkingDirectory</key>
+  <string>$HOME</string>
+</dict>
+</plist>
+PLIST_EOF
+  # Bootstrap the service into the user session.
+  # launchctl load works on macOS < 11; bootstrap on 11+.  Try both.
+  launchctl load -w "$LAUNCHAGENT_PLIST" 2>/dev/null || \
+    launchctl bootstrap "gui/$(id -u)" "$LAUNCHAGENT_PLIST" 2>/dev/null || true
+  echo "  smdjad LaunchAgent → $LAUNCHAGENT_PLIST"
+  echo "  logs → $LOG_DIR/"
+fi
+
 # register smedja as a .desktop app (Linux only)
 if [ "$OS" = "linux" ] && [ -f "$INSTALL_DIR/smedja" ]; then
   DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
@@ -100,4 +145,8 @@ echo "  smj         — control CLI (smj --help)"
 echo "  smedja      — GPU terminal emulator"
 echo "  smedja-tui  — agent dashboard TUI (run inside smedja)"
 echo ""
-echo "quickstart: smdjad & && smedja"
+if [ "$OS" = "darwin" ]; then
+  echo "quickstart: smedja  (smdjad starts automatically via LaunchAgent)"
+else
+  echo "quickstart: smdjad & && smedja"
+fi
