@@ -23,7 +23,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Terminal;
 use serde_json::json;
 use smedja_rpc::client::Client;
@@ -194,6 +194,121 @@ fn filtered_completions(input: &str) -> Vec<&'static str> {
         .collect()
 }
 
+fn push_system_message(state: &mut AppState, text: impl Into<String>) {
+    let msg = Message {
+        role: Role::System,
+        text: text.into(),
+    };
+    state.main_panel.push_line(msg.text.clone());
+    state.messages.push(msg);
+}
+
+fn accept_slash_completion(state: &mut AppState, append_space: bool) -> bool {
+    let Some(&completion) = state.slash_completions.get(state.slash_cursor) else {
+        state.slash_popup_visible = false;
+        return false;
+    };
+    completion.clone_into(&mut state.input);
+    if append_space {
+        state.input.push(' ');
+    }
+    state.slash_popup_visible = false;
+    state.slash_completions.clear();
+    state.slash_cursor = 0;
+    true
+}
+
+fn apply_tier(args: &str, state: &mut AppState) -> String {
+    match args {
+        "fast" | "deep" | "local" => {
+            state.tier = Some(args.to_owned());
+            format!("tier set to {args}")
+        }
+        "" => "usage: /tier fast|deep|local".to_owned(),
+        other => format!("unknown tier: {other}"),
+    }
+}
+
+fn apply_agent(args: &str, state: &mut AppState) -> String {
+    match args {
+        "impl" | "review" | "test" | "sre" | "explain" => {
+            state.mode = Some(args.to_owned());
+            if args == "sre" {
+                state.tier = Some("deep".to_owned());
+            }
+            format!("agent mode set to {args}")
+        }
+        "" => "usage: /agent impl|review|test|sre|explain".to_owned(),
+        other => format!("unknown agent mode: {other}"),
+    }
+}
+
+async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) -> Result<bool> {
+    let trimmed = input.trim();
+    let Some(command_line) = trimmed.strip_prefix('/') else {
+        return Ok(false);
+    };
+    let mut parts = command_line.splitn(2, ' ');
+    let cmd = parts.next().unwrap_or_default();
+    let args = parts.next().unwrap_or_default().trim();
+
+    match cmd {
+        "tier" => {
+            let text = apply_tier(args, state);
+            push_system_message(state, text);
+            Ok(true)
+        }
+        "agent" => {
+            let text = apply_agent(args, state);
+            if matches!(args, "impl" | "review" | "test" | "sre" | "explain") {
+                let session_id = state.session_id.clone();
+                let _ = client
+                    .call(
+                        "session.set_mode",
+                        json!({
+                            "session_id": session_id,
+                            "mode": args,
+                        }),
+                    )
+                    .await;
+            }
+            push_system_message(state, text);
+            Ok(true)
+        }
+        "health" => {
+            let start = std::time::Instant::now();
+            let session_id = state.session_id.clone();
+            let health_result = client
+                .call("session.get", json!({ "id": session_id }))
+                .await;
+            let latency_ms = start.elapsed().as_millis();
+            let text = match health_result {
+                Ok(_) => {
+                    format!("health: socket=ok session={session_id} latency={latency_ms}ms")
+                }
+                Err(e) => format!("health: error — {e}"),
+            };
+            push_system_message(state, text);
+            Ok(true)
+        }
+        "spec" => {
+            push_system_message(state, "spec picker is not wired yet");
+            Ok(true)
+        }
+        "tdd" => {
+            state.mode = Some("tdd".to_owned());
+            push_system_message(state, "mode set to tdd");
+            Ok(true)
+        }
+        "ponytail" => {
+            state.mode = Some("ponytail".to_owned());
+            push_system_message(state, "mode set to ponytail");
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Key handler
 // ---------------------------------------------------------------------------
@@ -213,7 +328,10 @@ async fn handle_key(
             KeyCode::Esc => {
                 state.slash_popup_visible = false;
             }
-            KeyCode::Tab | KeyCode::Down => {
+            KeyCode::Char(' ') | KeyCode::Tab => {
+                accept_slash_completion(state, true);
+            }
+            KeyCode::Down => {
                 let max = state.slash_completions.len().saturating_sub(1);
                 if state.slash_cursor < max {
                     state.slash_cursor += 1;
@@ -223,11 +341,13 @@ async fn handle_key(
                 state.slash_cursor = state.slash_cursor.saturating_sub(1);
             }
             KeyCode::Enter => {
-                // Complete the selected entry into the input buffer.
-                if let Some(&completion) = state.slash_completions.get(state.slash_cursor) {
-                    completion.clone_into(&mut state.input);
+                if accept_slash_completion(state, false) {
+                    let input = std::mem::take(&mut state.input);
+                    let _ = editor.add_history_entry(&input);
+                    if !dispatch_slash(&input, state, client).await? {
+                        submit(&input, state, client).await?;
+                    }
                 }
-                state.slash_popup_visible = false;
             }
             KeyCode::Backspace => {
                 state.input.pop();
@@ -398,6 +518,10 @@ async fn handle_key(
 
             // Record in rustyline history (ignore errors — history is advisory).
             let _ = editor.add_history_entry(&input);
+
+            if dispatch_slash(&input, state, client).await? {
+                return Ok(());
+            }
 
             if let Some(rest) = input.trim().strip_prefix("/task create ") {
                 let title = rest.trim().to_owned();
@@ -754,6 +878,7 @@ fn render_slash_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, s
         })
         .collect();
 
+    frame.render_widget(Clear, popup_rect);
     let popup =
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("commands"));
     frame.render_widget(popup, popup_rect);
@@ -1095,6 +1220,59 @@ mod tests {
     fn slash_completions_empty_for_no_match() {
         let completions = filtered_completions("/zzz");
         assert!(completions.is_empty());
+    }
+
+    #[test]
+    fn slash_accept_space_inserts_completion_with_trailing_space() {
+        let mut state = make_state("test-session");
+        state.input = "/t".to_owned();
+        state.slash_completions = filtered_completions("/t");
+        state.slash_popup_visible = true;
+        state.slash_cursor = 0;
+
+        assert!(accept_slash_completion(&mut state, true));
+
+        assert_eq!(state.input, "/tier ");
+        assert!(!state.slash_popup_visible);
+        assert!(state.slash_completions.is_empty());
+    }
+
+    #[test]
+    fn slash_accept_enter_inserts_completion_without_space() {
+        let mut state = make_state("test-session");
+        state.input = "/h".to_owned();
+        state.slash_completions = filtered_completions("/h");
+        state.slash_popup_visible = true;
+        state.slash_cursor = 0;
+
+        assert!(accept_slash_completion(&mut state, false));
+
+        assert_eq!(state.input, "/health");
+        assert!(!state.slash_popup_visible);
+    }
+
+    #[test]
+    fn dispatch_tier_fast_sets_state_tier() {
+        let mut state = make_state("test-session");
+        let text = apply_tier("fast", &mut state);
+        assert_eq!(state.tier.as_deref(), Some("fast"));
+        assert_eq!(text, "tier set to fast");
+    }
+
+    #[test]
+    fn dispatch_tier_deep_sets_state_tier() {
+        let mut state = make_state("test-session");
+        let text = apply_tier("deep", &mut state);
+        assert_eq!(state.tier.as_deref(), Some("deep"));
+        assert_eq!(text, "tier set to deep");
+    }
+
+    #[test]
+    fn dispatch_agent_impl_sets_state_mode() {
+        let mut state = make_state("test-session");
+        let text = apply_agent("impl", &mut state);
+        assert_eq!(state.mode.as_deref(), Some("impl"));
+        assert_eq!(text, "agent mode set to impl");
     }
 
     // -----------------------------------------------------------------------
