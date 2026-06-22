@@ -119,6 +119,8 @@ struct App {
     pty: Option<st_pty::PtySession>,
     config: st_config::Config,
     shell: String,
+    /// Subset of `~/.config/starship.toml` used to configure status bar modules.
+    starship_config: Option<st_statusbar::StarshipConfig>,
     /// Tab bar — owns all tabs and the active tab index.
     tab_bar: TabBar,
     /// Per-tab split layout.  Keyed by tab index (positional, not UUID) for
@@ -145,12 +147,17 @@ impl App {
         let root_pane_id = tab_bar.tabs[0].panes[0].id;
         let split_layouts = vec![SplitLayout::new(root_pane_id)];
 
+        let starship_config = dirs::config_dir()
+            .map(|d| d.join("starship.toml"))
+            .and_then(|p| st_statusbar::load_starship_fallback(&p));
+
         Self {
             windows: HashMap::new(),
             renderer: None,
             pty: None,
             config,
             shell,
+            starship_config,
             tab_bar,
             split_layouts,
             modifiers: Modifiers::default(),
@@ -467,19 +474,48 @@ impl ApplicationHandler<UserEvent> for App {
                             (None, None, None)
                         }
                     };
+
+                    // Read last exit code from OSC 133 D markers in the PTY grid.
+                    let last_exit_code = {
+                        let grid = pty.grid.lock();
+                        grid.block_markers.iter().rev().find_map(|m| {
+                            if let st_pty::MarkerKind::CommandDone { exit_code } = m.kind {
+                                exit_code
+                            } else {
+                                None
+                            }
+                        })
+                    };
+
                     let sb_ctx = st_statusbar::ModuleContext {
                         tier,
                         model,
                         context_used: 0,
                         context_window: 0,
                         active_task,
+                        last_exit_code,
                     };
-                    let sb_modules: Vec<Box<dyn st_statusbar::StatusModule>> = vec![
+
+                    let git_branch_disabled = self
+                        .starship_config
+                        .as_ref()
+                        .is_some_and(|c| c.git_branch_disabled);
+                    let git_branch_symbol = self
+                        .starship_config
+                        .as_ref()
+                        .and_then(|c| c.git_branch_symbol.clone());
+
+                    let mut sb_modules: Vec<Box<dyn st_statusbar::StatusModule>> = vec![
                         Box::new(st_statusbar::TierModule),
                         Box::new(st_statusbar::ModelModule),
-                        Box::new(st_statusbar::GitBranchModule),
+                        Box::new(st_statusbar::ExitCodeModule),
                         Box::new(st_statusbar::TimeModule),
                     ];
+                    if !git_branch_disabled {
+                        sb_modules.push(Box::new(
+                            st_statusbar::GitBranchModule::with_symbol(git_branch_symbol),
+                        ));
+                    }
                     let segments =
                         st_statusbar::render_status_bar_parallel(&sb_modules, &sb_ctx, 8);
                     renderer.set_status_bar_segments(&segments);
