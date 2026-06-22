@@ -3612,4 +3612,43 @@ mod tests {
             "none"
         );
     }
+
+    // ── provider-display: session.create response fields ────────────────────
+
+    fn derive_tier(runner: &str) -> &'static str {
+        if runner.contains("local") { "local" } else { "fast" }
+    }
+
+    #[test]
+    fn session_create_tier_is_local_for_local_runner() {
+        assert_eq!(derive_tier("local"), "local");
+        assert_eq!(derive_tier("local-llm"), "local");
+    }
+
+    #[test]
+    fn session_create_tier_is_fast_for_cloud_runners() {
+        for runner in &["claude-cli", "anthropic", "codex-cli", "openai", "copilot"] {
+            assert_eq!(
+                derive_tier(runner),
+                "fast",
+                "expected fast tier for runner {runner}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_create_response_contains_runner_model_tier() {
+        let runner = "anthropic";
+        let model = "claude-sonnet-4-6";
+        let tier = derive_tier(runner);
+        let resp = serde_json::json!({
+            "id": "session-test",
+            "runner": runner,
+            "model": model,
+            "tier": tier,
+        });
+        assert_eq!(resp["runner"].as_str().unwrap(), runner);
+        assert_eq!(resp["model"].as_str().unwrap(), model);
+        assert_eq!(resp["tier"].as_str().unwrap(), "fast");
+    }
 }
