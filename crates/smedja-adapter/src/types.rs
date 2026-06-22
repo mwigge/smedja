@@ -58,6 +58,9 @@ pub struct CallOptions {
     /// etc.). Providers that do not yet support tool injection may ignore this
     /// field.
     pub tools: Option<Vec<serde_json::Value>>,
+    /// Provider-native session identifier used by CLI adapters that support
+    /// resume semantics.
+    pub provider_session_id: Option<String>,
 }
 
 /// A single unit of streamed output from a provider.
@@ -65,6 +68,22 @@ pub struct CallOptions {
 pub enum Delta {
     /// Incremental text emitted by the model.
     Text(String),
+    /// Provider-native tool invocation emitted by an agentic CLI.
+    ToolCall {
+        /// Tool name.
+        name: String,
+        /// Raw provider input payload.
+        input: serde_json::Value,
+    },
+    /// Provider-native tool result emitted by an agentic CLI.
+    ToolResult {
+        /// Provider tool-use identifier, when supplied.
+        tool_use_id: String,
+        /// Result content rendered as text.
+        content: String,
+    },
+    /// Provider-native session ID that can be used to resume future turns.
+    SessionId(String),
     /// Token-usage statistics emitted at the end of the stream.
     Usage {
         /// Number of tokens in the prompt / input.
