@@ -506,6 +506,8 @@ async fn handle_key(
         KeyCode::Up => {
             if state.block_browser_open {
                 state.block_browser_cursor = state.block_browser_cursor.saturating_sub(1);
+            } else {
+                state.main_panel.scroll_up();
             }
         }
 
@@ -515,6 +517,8 @@ async fn handle_key(
                 if state.block_browser_cursor < max {
                     state.block_browser_cursor += 1;
                 }
+            } else {
+                state.main_panel.scroll_down();
             }
         }
 
