@@ -1545,6 +1545,7 @@ fn build_router(
     pool: Arc<ProviderPool>,
     startup_runner: &'static str,
     startup_model: &'static str,
+    price_table: Arc<PriceTable>,
 ) -> Router {
     let mut router = Router::new();
 
@@ -2320,6 +2321,39 @@ fn build_router(
                 "session_id": session_id,
                 "total_usd": total_usd,
                 "breakdown": breakdown,
+            }))
+        }
+    });
+
+    // ── session.context ─────────────────────────────────────────────────────
+    let ig = Arc::clone(ingot);
+    let pt = Arc::clone(&price_table);
+    router.register("session.context", move |params: Value| {
+        let ig = Arc::clone(&ig);
+        let pt = Arc::clone(&pt);
+        async move {
+            let session_id = params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| missing_param("session_id"))?;
+            let ig_guard = ig.lock().await;
+            let snaps = ig_guard
+                .session_token_snapshots(session_id)
+                .map_err(|e| ingot_err(&e))?;
+            let (cumulative_input, cumulative_output) = snaps
+                .last()
+                .map_or((0i64, 0i64), |s| (s.cumulative_input, s.cumulative_output));
+            let used_tok = cumulative_input.saturating_add(cumulative_output);
+            let model = ig_guard
+                .session_last_model(session_id)
+                .map_err(|e| ingot_err(&e))?
+                .unwrap_or_default();
+            let window_tok = u64::from(pt.context_window(&model));
+            Ok(json!({
+                "session_id": session_id,
+                "used_tok": used_tok,
+                "window_tok": window_tok,
+                "model": model,
             }))
         }
     });
@@ -3323,6 +3357,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&pool),
         startup_runner,
         startup_model,
+        Arc::clone(&price_table),
     );
 
     let turn_handles = spawn_worker(

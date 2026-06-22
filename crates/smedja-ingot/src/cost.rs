@@ -1,3 +1,4 @@
+use rusqlite::OptionalExtension as _;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -85,6 +86,26 @@ pub(crate) fn session_total(
         |row| row.get(0),
     )?;
     Ok(total)
+}
+
+/// Returns the model name from the most recent cost entry for `session_id`.
+///
+/// Returns `None` when no entries exist.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the query fails.
+pub(crate) fn last_model(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Option<String>, IngotError> {
+    let mut stmt = conn.prepare(
+        "SELECT model FROM cost_ledger WHERE session_id = ?1 ORDER BY turn_n DESC LIMIT 1",
+    )?;
+    let result = stmt
+        .query_row(rusqlite::params![session_id], |row| row.get(0))
+        .optional()?;
+    Ok(result)
 }
 
 /// Returns per-model/runner aggregate rows for a session, ordered by descending cost.
