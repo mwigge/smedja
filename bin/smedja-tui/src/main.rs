@@ -150,6 +150,10 @@ struct AppState {
     cowork_modify_input: String,
     /// Timestamp of the last `cowork.pending` poll.
     last_cowork_poll: Option<std::time::Instant>,
+    /// NDJSON stream receiver for the current in-flight turn.
+    stream_rx: Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>,
+    /// Path of the smdjad stream socket (`<rpc_sock>.stream`).
+    stream_sock_path: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +165,64 @@ fn socket_path(override_path: Option<PathBuf>) -> PathBuf {
         let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
         PathBuf::from(base).join("smdjad.sock")
     })
+}
+
+fn stream_socket_path(rpc_path: &std::path::Path) -> PathBuf {
+    let mut p = rpc_path.as_os_str().to_owned();
+    p.push(".stream");
+    PathBuf::from(p)
+}
+
+// ---------------------------------------------------------------------------
+// Streaming turn reader
+// ---------------------------------------------------------------------------
+
+/// Connects to the smdjad stream socket and forwards NDJSON events to `tx`
+/// until the terminal `done` or `error` event is received.
+async fn start_stream_reader(
+    sock_path: PathBuf,
+    task_id: String,
+    tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let stream = match UnixStream::connect(&sock_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "stream socket connect failed; falling back to polling");
+            return;
+        }
+    };
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(reader);
+
+    let req = format!("{{\"task_id\":\"{task_id}\"}}\n");
+    if writer.write_all(req.as_bytes()).await.is_err() {
+        return;
+    }
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    let is_terminal =
+                        matches!(v["type"].as_str(), Some("done") | Some("error"));
+                    let _ = tx.send(v);
+                    if is_terminal {
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +258,14 @@ async fn submit(input: &str, state: &mut AppState, client: &mut Client) -> Resul
             state.pending_task_id = Some(task_id.clone());
             state.turn_in_flight = true;
             state.last_poll = Some(std::time::Instant::now());
+
+            // Start streaming reader; events arrive via unbounded channel.
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            state.stream_rx = Some(rx);
+            let sock = state.stream_sock_path.clone();
+            let tid = task_id.clone();
+            tokio::spawn(start_stream_reader(sock, tid, tx));
+
             format!("queued (task: {task_id})")
         }
         Err(ref e) => format!("error: {e}"),
@@ -1254,6 +1324,7 @@ async fn main() -> Result<()> {
         .and_then(|v| v.as_str())
         .map(str::to_owned);
 
+    let stream_sock_path = stream_socket_path(&sock);
     let mut state = AppState {
         session_id,
         mode: cli.mode,
@@ -1295,6 +1366,8 @@ async fn main() -> Result<()> {
         cowork_modify_mode: false,
         cowork_modify_input: String::new(),
         last_cowork_poll: None,
+        stream_rx: None,
+        stream_sock_path,
     };
 
     // Connect banner — shown on every startup so the user knows what's connected.
@@ -1352,11 +1425,109 @@ async fn main() -> Result<()> {
 
         terminal.draw(|f| render(f, &state))?;
 
-        // Subscribe to the in-flight turn result (replaces the old task.get poll
-        // loop).  turn.subscribe blocks on the daemon side until the turn
-        // reaches a terminal state, so a 50 ms guard prevents hammering the
-        // socket if the server returns early for any reason.
-        if let Some(task_id) = state.pending_task_id.clone() {
+        // Drain NDJSON stream events from the background reader task.
+        // When streaming is active (stream_rx is Some), render deltas in real
+        // time and finalise the turn on the terminal event.  When streaming is
+        // not available, fall back to the turn.subscribe blocking poll.
+        if let Some(ref mut rx) = state.stream_rx {
+            let mut turn_done = false;
+            while let Ok(event) = rx.try_recv() {
+                match event["type"].as_str() {
+                    Some("delta") => {
+                        if let Some(text) = event["text"].as_str() {
+                            // Split on newlines so each line is a separate panel entry.
+                            let mut remaining = text;
+                            loop {
+                                match remaining.find('\n') {
+                                    Some(pos) => {
+                                        let chunk = &remaining[..pos];
+                                        if !chunk.is_empty() {
+                                            state.main_panel.push_delta(chunk);
+                                        }
+                                        state.main_panel.push_line(String::new());
+                                        remaining = &remaining[pos + 1..];
+                                        if let Some(ref mut block) = state.current_block {
+                                            block.push_text(chunk);
+                                            block.push_text("\n");
+                                        }
+                                    }
+                                    None => {
+                                        if !remaining.is_empty() {
+                                            state.main_panel.push_delta(remaining);
+                                            if let Some(ref mut block) = state.current_block {
+                                                block.push_text(remaining);
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some("tool_call") => {
+                        let name = event["name"].as_str().unwrap_or("?");
+                        let input = event["input"].as_str().unwrap_or("");
+                        let line = format!("▶ {name}({input})");
+                        state.main_panel.push_line(line.clone());
+                        if let Some(ref mut block) = state.current_block {
+                            block.push_text(&line);
+                            block.push_text("\n");
+                        }
+                    }
+                    Some("done") => {
+                        let output_tok = event["output_tok"].as_u64().unwrap_or(0);
+                        let elapsed_ms = state.turn_submitted_at.map_or(0, |t| {
+                            u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+                        });
+                        state.turn_submitted_at = None;
+
+                        if let Some(mut block) = state.current_block.take() {
+                            block.complete(elapsed_ms);
+                            state.block_store.push(block);
+                        }
+
+                        let footer = format!("↳ {output_tok}↓ tokens · {elapsed_ms}ms");
+                        state.main_panel.push_line(footer);
+
+                        turn_done = true;
+                    }
+                    Some("error") => {
+                        let msg_text = event["message"].as_str().unwrap_or("unknown error");
+                        state.main_panel.push_line(format!("error: {msg_text}"));
+                        if let Some(mut block) = state.current_block.take() {
+                            block.fail();
+                            state.block_store.push(block);
+                        }
+                        turn_done = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            if turn_done {
+                state.pending_task_id = None;
+                state.stream_rx = None;
+                state.turn_in_flight = false;
+                state.poll_retry_count = 0;
+                state.last_poll = None;
+
+                // Refresh context rail after turn completes.
+                if let Ok(ctx) = client
+                    .call("session.context", json!({ "session_id": state.session_id }))
+                    .await
+                {
+                    if let Some(used) = ctx["used_tok"].as_i64() {
+                        state.context_used = u64::try_from(used.max(0)).unwrap_or(0);
+                    }
+                    if let Some(window) = ctx["window_tok"].as_u64() {
+                        if window > 0 {
+                            state.context_window = window;
+                        }
+                    }
+                }
+            }
+        } else if let Some(task_id) = state.pending_task_id.clone() {
+            // Fallback: blocking poll via turn.subscribe (no stream socket available).
             let should_call = state
                 .last_poll
                 .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(50));
@@ -1368,12 +1539,7 @@ async fn main() -> Result<()> {
                 {
                     Ok(v) if v["done"].as_bool() == Some(true) => {
                         if let Some(error) = v["error"].as_str() {
-                            let msg = Message {
-                                role: Role::System,
-                                text: format!("error: {error}"),
-                            };
-                            state.main_panel.push_line(msg.text.clone());
-                            state.messages.push(msg);
+                            state.main_panel.push_line(format!("error: {error}"));
                             if let Some(mut block) = state.current_block.take() {
                                 block.fail();
                                 state.block_store.push(block);
@@ -1391,26 +1557,17 @@ async fn main() -> Result<()> {
                                 block.push_text(&response);
                                 block.complete(elapsed_ms);
                                 for line in block.render_lines(80) {
-                                    let msg = Message {
-                                        role: Role::System,
-                                        text: line,
-                                    };
-                                    state.main_panel.push_line(msg.text.clone());
-                                    state.messages.push(msg);
+                                    state.main_panel.push_line(line.clone());
+                                    state.messages.push(Message { role: Role::System, text: line });
                                 }
                                 state.block_store.push(block);
                             } else {
                                 if !response.is_empty() {
                                     state.main_panel.push_delta(&response);
                                 }
-                                let msg = Message {
-                                    role: Role::System,
-                                    text: response,
-                                };
-                                state.messages.push(msg);
+                                state.messages.push(Message { role: Role::System, text: response });
                             }
 
-                            // Turn footer: token counts and wall-clock latency.
                             let footer =
                                 format!("↳ {input_tok}↑ {output_tok}↓ tokens · {elapsed_ms}ms");
                             state.main_panel.push_line(footer);
@@ -1420,14 +1577,12 @@ async fn main() -> Result<()> {
                         state.turn_in_flight = false;
                         state.poll_retry_count = 0;
 
-                        // Refresh context rail from daemon after the turn completes.
                         if let Ok(ctx) = client
                             .call("session.context", json!({ "session_id": state.session_id }))
                             .await
                         {
                             if let Some(used) = ctx["used_tok"].as_i64() {
-                                state.context_used =
-                                    u64::try_from(used.max(0)).unwrap_or(0);
+                                state.context_used = u64::try_from(used.max(0)).unwrap_or(0);
                             }
                             if let Some(window) = ctx["window_tok"].as_u64() {
                                 if window > 0 {
@@ -1437,23 +1592,17 @@ async fn main() -> Result<()> {
                         }
                     }
                     Ok(_) => {
-                        // turn.subscribe returned Ok but the response was not
-                        // done=true — retry on the next tick.
                         state.poll_retry_count += 1;
                         state.last_poll = None;
-                        // Surface a status line every 5 retries so the user is
-                        // not left staring at a silent spinner.
                         if state.poll_retry_count % 5 == 1 {
                             state.main_panel.push_line(format!(
                                 "waiting for turn… (poll attempt {})",
                                 state.poll_retry_count
                             ));
                         }
-                        // After 60 unexpected retries surface an error to avoid
-                        // an indefinitely silent hang.
                         if state.poll_retry_count >= 60 {
                             state.main_panel.push_line(
-                                "turn appears stuck — no done=true after 60 polls; giving up"
+                                "turn appears stuck — no response after 60 polls; giving up"
                                     .to_owned(),
                             );
                             state.pending_task_id = None;
@@ -1464,16 +1613,12 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => {
                         let text = if e.code == smedja_rpc::codes::TIMEOUT {
-                            "turn timed out (>60 s) — the daemon is still running the turn in the background".to_owned()
+                            "turn timed out (>60 s) — daemon is still running the turn".to_owned()
                         } else {
                             format!("turn error: {e}")
                         };
-                        let msg = Message {
-                            role: Role::System,
-                            text,
-                        };
-                        state.main_panel.push_line(msg.text.clone());
-                        state.messages.push(msg);
+                        state.main_panel.push_line(text.clone());
+                        state.messages.push(Message { role: Role::System, text });
                         state.pending_task_id = None;
                         state.last_poll = None;
                         state.turn_in_flight = false;
@@ -1698,6 +1843,8 @@ mod tests {
             cowork_modify_mode: false,
             cowork_modify_input: String::new(),
             last_cowork_poll: None,
+            stream_rx: None,
+            stream_sock_path: PathBuf::from("/tmp/smdjad.sock.stream"),
         }
     }
 

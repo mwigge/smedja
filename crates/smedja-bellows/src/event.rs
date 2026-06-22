@@ -48,6 +48,9 @@ pub enum TurnEvent {
         tool_name: String,
         /// A short, human-readable description of the tool's input.
         input_summary: String,
+        /// Turn identifier; correlates this event with the enclosing turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
         /// Conversation grouping identifier.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation_id: Option<String>,
@@ -78,6 +81,9 @@ pub enum TurnEvent {
     AssistantDelta {
         /// The incremental text content emitted by the assistant.
         content: String,
+        /// Turn identifier; correlates this delta with the enclosing turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
         /// Conversation grouping identifier.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation_id: Option<String>,
@@ -262,6 +268,7 @@ mod tests {
         let ev = TurnEvent::ToolCalled {
             tool_name: "bash".into(),
             input_summary: "ls".into(),
+            turn_id: None,
             conversation_id: None,
             trace_id: Some("t".into()),
             span_id: None,
@@ -346,6 +353,7 @@ mod tests {
     fn assistant_delta_correlation_fields_roundtrip() {
         let ev = TurnEvent::AssistantDelta {
             content: "hello".into(),
+            turn_id: None,
             conversation_id: Some("c".into()),
             trace_id: None,
             span_id: None,

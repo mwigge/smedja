@@ -97,6 +97,7 @@ impl TurnHandle {
         self.dispatcher.publish(TurnEvent::ToolCalled {
             tool_name: tool_name.into(),
             input_summary: input_summary.into(),
+            turn_id: Some(self.turn_id.clone()),
             conversation_id: None,
             trace_id: self.trace_id.clone(),
             span_id: self.span_id.clone(),
@@ -115,6 +116,7 @@ impl TurnHandle {
     pub fn delta(&self, content: impl Into<String>) {
         self.dispatcher.publish(TurnEvent::AssistantDelta {
             content: content.into(),
+            turn_id: Some(self.turn_id.clone()),
             conversation_id: None,
             trace_id: self.trace_id.clone(),
             span_id: self.span_id.clone(),
