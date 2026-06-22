@@ -30,6 +30,8 @@ use parking_lot::Mutex;
 use thiserror::Error;
 use tracing::{debug, warn};
 
+use st_glyph::GlyphRegistry;
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 /// Errors produced by PTY operations.
@@ -586,10 +588,84 @@ const DEFAULT_PALETTE: [[f32; 4]; 16] = [
     [1.000, 0.945, 0.812, 1.0], // 15 #fff1cf
 ];
 
+// ── APC pre-scanner ───────────────────────────────────────────────────────────
+
+/// State machine that scans raw PTY bytes for `ESC _ … ESC \` (APC) sequences.
+///
+/// vte 0.13 routes APC bytes to its `Ignore` state and never fires a
+/// performer callback, so this scanner runs alongside the vte parser to
+/// intercept smedja Glyph Protocol registrations emitted by child processes.
+#[derive(Debug, Default)]
+struct ApcScanner {
+    state: ApcScanState,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+enum ApcScanState {
+    #[default]
+    Ground,
+    GotEsc,
+    InApc,
+    InApcGotEsc,
+}
+
+impl ApcScanner {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feeds one byte into the scanner.
+    ///
+    /// Returns the completed APC payload bytes when a full `ESC _ … ESC \`
+    /// sequence has been received, or `None` otherwise.
+    fn advance(&mut self, byte: u8) -> Option<Vec<u8>> {
+        match self.state {
+            ApcScanState::Ground => {
+                if byte == 0x1B {
+                    self.state = ApcScanState::GotEsc;
+                }
+                None
+            }
+            ApcScanState::GotEsc => {
+                if byte == b'_' {
+                    self.state = ApcScanState::InApc;
+                    self.payload.clear();
+                } else {
+                    self.state = ApcScanState::Ground;
+                }
+                None
+            }
+            ApcScanState::InApc => {
+                if byte == 0x1B {
+                    self.state = ApcScanState::InApcGotEsc;
+                } else {
+                    self.payload.push(byte);
+                }
+                None
+            }
+            ApcScanState::InApcGotEsc => {
+                if byte == b'\\' {
+                    let payload = std::mem::take(&mut self.payload);
+                    self.state = ApcScanState::Ground;
+                    Some(payload)
+                } else {
+                    // ESC inside APC not followed by '\' — include both bytes in payload.
+                    self.payload.push(0x1B);
+                    self.payload.push(byte);
+                    self.state = ApcScanState::InApc;
+                    None
+                }
+            }
+        }
+    }
+}
+
 // ── VT performer ─────────────────────────────────────────────────────────────
 
 struct VtHandler {
     grid: Arc<Mutex<CellGrid>>,
+    glyph_registry: Arc<Mutex<GlyphRegistry>>,
 }
 
 impl vte::Perform for VtHandler {
@@ -1048,6 +1124,8 @@ pub struct PtySession {
     pub dirty: Arc<AtomicBool>,
     /// Copy-mode state.
     pub copy_mode: CopyMode,
+    /// Glyph registry: maps glyph IDs to PUA codepoints.
+    pub glyph_registry: Arc<Mutex<GlyphRegistry>>,
 }
 
 impl PtySession {
@@ -1106,6 +1184,7 @@ impl PtySession {
 
         let grid = Arc::new(Mutex::new(CellGrid::new(cols, rows)));
         let dirty = Arc::new(AtomicBool::new(false));
+        let glyph_registry = Arc::new(Mutex::new(GlyphRegistry::new()));
 
         Ok(Self {
             master: pair.master,
@@ -1114,6 +1193,7 @@ impl PtySession {
             grid,
             dirty,
             copy_mode: CopyMode::new(),
+            glyph_registry,
         })
     }
 
@@ -1155,6 +1235,7 @@ impl PtySession {
     pub fn start_reader(self: Arc<Self>) {
         let grid = Arc::clone(&self.grid);
         let dirty = Arc::clone(&self.dirty);
+        let glyph_registry = Arc::clone(&self.glyph_registry);
         // ponytail: master.try_clone() is synchronous I/O; reader lives on a
         // dedicated thread so it never blocks the async runtime.
         let mut reader = match self.master.try_clone_reader() {
@@ -1167,7 +1248,8 @@ impl PtySession {
 
         std::thread::spawn(move || {
             let mut parser = vte::Parser::new();
-            let mut handler = VtHandler { grid };
+            let mut handler = VtHandler { grid, glyph_registry };
+            let mut apc_scanner = ApcScanner::new();
             let mut buf = [0u8; 4096];
 
             loop {
@@ -1175,6 +1257,13 @@ impl PtySession {
                     Ok(0) => break, // EOF — child exited
                     Ok(n) => {
                         for &byte in &buf[..n] {
+                            if let Some(payload) = apc_scanner.advance(byte) {
+                                if let Some(reg) = st_glyph::parse_glyph_registration(&payload) {
+                                    let mut registry = handler.glyph_registry.lock();
+                                    registry.register(&reg.id);
+                                    debug!(glyph_id = %reg.id, "registered glyph via APC");
+                                }
+                            }
                             parser.advance(&mut handler, byte);
                         }
                         dirty.store(true, Ordering::Release);
@@ -1202,6 +1291,7 @@ impl PtySession {
     pub fn start_reader_detached(&mut self) {
         let grid = Arc::clone(&self.grid);
         let dirty = Arc::clone(&self.dirty);
+        let glyph_registry = Arc::clone(&self.glyph_registry);
         let mut reader = match self.master.try_clone_reader() {
             Ok(r) => r,
             Err(e) => {
@@ -1211,13 +1301,21 @@ impl PtySession {
         };
         std::thread::spawn(move || {
             let mut parser = vte::Parser::new();
-            let mut handler = VtHandler { grid };
+            let mut handler = VtHandler { grid, glyph_registry };
+            let mut apc_scanner = ApcScanner::new();
             let mut buf = [0u8; 4096];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
                         for &byte in &buf[..n] {
+                            if let Some(payload) = apc_scanner.advance(byte) {
+                                if let Some(reg) = st_glyph::parse_glyph_registration(&payload) {
+                                    let mut registry = handler.glyph_registry.lock();
+                                    registry.register(&reg.id);
+                                    debug!(glyph_id = %reg.id, "registered glyph via APC");
+                                }
+                            }
                             parser.advance(&mut handler, byte);
                         }
                         dirty.store(true, Ordering::Release);
@@ -1264,6 +1362,13 @@ mod tests {
 
     fn make_grid(cols: u16, rows: u16) -> CellGrid {
         CellGrid::new(cols, rows)
+    }
+
+    fn make_handler(grid: Arc<Mutex<CellGrid>>) -> VtHandler {
+        VtHandler {
+            grid,
+            glyph_registry: Arc::new(Mutex::new(st_glyph::GlyphRegistry::new())),
+        }
     }
 
     #[test]
@@ -1377,9 +1482,7 @@ mod tests {
     #[test]
     fn vt_handler_print_writes_cell() {
         let grid = Arc::new(Mutex::new(make_grid(80, 24)));
-        let mut handler = VtHandler {
-            grid: Arc::clone(&grid),
-        };
+        let mut handler = make_handler(Arc::clone(&grid));
         handler.print('X');
         let g = grid.lock();
         assert_eq!(g.cells[0][0].ch, 'X');
@@ -1388,9 +1491,7 @@ mod tests {
     #[test]
     fn vt_handler_execute_carriage_return() {
         let grid = Arc::new(Mutex::new(make_grid(80, 24)));
-        let mut handler = VtHandler {
-            grid: Arc::clone(&grid),
-        };
+        let mut handler = make_handler(Arc::clone(&grid));
         {
             let mut g = grid.lock();
             g.cursor = (10, 5);
@@ -1406,9 +1507,7 @@ mod tests {
             let mut g = grid.lock();
             g.cursor = (0, 5);
         }
-        let handler = VtHandler {
-            grid: Arc::clone(&grid),
-        };
+        let handler = make_handler(Arc::clone(&grid));
         // CSI 3 A (cursor up 3): test via direct grid mutation since constructing
         // Params from scratch is non-trivial in unit tests.
         handler.grid.lock().cursor.1 = 5;
@@ -1475,9 +1574,7 @@ mod tests {
             let mut g = grid.lock();
             g.osc133_seen = false;
         }
-        let mut handler = VtHandler {
-            grid: Arc::clone(&grid),
-        };
+        let mut handler = make_handler(Arc::clone(&grid));
         handler.print('$');
         let g = grid.lock();
         assert!(
@@ -1549,7 +1646,7 @@ mod tests {
     #[test]
     fn newline_at_last_row_scrolls_without_panic() {
         let grid = Arc::new(Mutex::new(make_grid(4, 3)));
-        let mut handler = VtHandler { grid: grid.clone() };
+        let mut handler = make_handler(grid.clone());
         handler.execute(b'\n');
         handler.execute(b'\n');
         handler.execute(b'\n'); // cursor now at last row
@@ -1567,7 +1664,7 @@ mod tests {
             let mut g = grid.lock();
             g.cursor = (10, 5);
         }
-        let mut handler = VtHandler { grid: grid.clone() };
+        let mut handler = make_handler(grid.clone());
         // \x1b[H — cursor home, no params → row=0, col=0
         let params = vte::Params::default();
         handler.csi_dispatch(&params, &[], false, 'H');
@@ -1582,7 +1679,7 @@ mod tests {
             let mut g = grid.lock();
             g.cursor = (5, 3);
         }
-        let mut handler = VtHandler { grid: grid.clone() };
+        let mut handler = make_handler(grid.clone());
         let params = vte::Params::default();
         handler.csi_dispatch(&params, &[], false, 'H');
         let g = grid.lock();
@@ -1597,7 +1694,7 @@ mod tests {
             g.cells[2][0].ch = 'Z';
             g.cursor = (0, 2);
         }
-        let mut handler = VtHandler { grid: grid.clone() };
+        let mut handler = make_handler(grid.clone());
         // \x1b[M — delete current line
         let params = vte::Params::default();
         handler.csi_dispatch(&params, &[], false, 'M');
@@ -1615,7 +1712,7 @@ mod tests {
             let mut g = grid.lock();
             g.cursor = (3, 2);
         }
-        let mut handler = VtHandler { grid: grid.clone() };
+        let mut handler = make_handler(grid.clone());
         // ESC D — Index: move cursor down one row (or scroll if at bottom).
         handler.esc_dispatch(&[], false, b'D');
         let g = grid.lock();
@@ -1629,7 +1726,7 @@ mod tests {
             let mut g = grid.lock();
             g.cursor = (3, 2);
         }
-        let mut handler = VtHandler { grid: grid.clone() };
+        let mut handler = make_handler(grid.clone());
         // ESC M — Reverse Index: move cursor up one row (or scroll down if at top).
         handler.esc_dispatch(&[], false, b'M');
         let g = grid.lock();
@@ -1641,9 +1738,7 @@ mod tests {
     #[test]
     fn vte_osc0_sets_window_title() {
         let grid = Arc::new(Mutex::new(make_grid(80, 24)));
-        let mut handler = VtHandler {
-            grid: Arc::clone(&grid),
-        };
+        let mut handler = make_handler(Arc::clone(&grid));
         let mut parser = vte::Parser::new();
         // OSC 0 ; title BEL
         let seq = b"\x1b]0;my terminal title\x07";
@@ -1661,9 +1756,7 @@ mod tests {
     #[test]
     fn vte_osc2_sets_window_title() {
         let grid = Arc::new(Mutex::new(make_grid(80, 24)));
-        let mut handler = VtHandler {
-            grid: Arc::clone(&grid),
-        };
+        let mut handler = make_handler(Arc::clone(&grid));
         let mut parser = vte::Parser::new();
         // OSC 2 ; title BEL
         let seq = b"\x1b]2;icon title\x07";
@@ -1683,9 +1776,7 @@ mod tests {
     #[test]
     fn vte_esc7_saves_and_esc8_restores_cursor() {
         let grid = Arc::new(Mutex::new(make_grid(80, 24)));
-        let mut handler = VtHandler {
-            grid: Arc::clone(&grid),
-        };
+        let mut handler = make_handler(Arc::clone(&grid));
         let mut parser = vte::Parser::new();
         // Move cursor to (5, 3), save, move to (0, 0), restore.
         let seq = b"\x1b[4;6H\x1b7\x1b[H\x1b8";
@@ -1703,9 +1794,7 @@ mod tests {
     #[test]
     fn vte_cursor_hide_and_show() {
         let grid = Arc::new(Mutex::new(make_grid(80, 24)));
-        let mut handler = VtHandler {
-            grid: Arc::clone(&grid),
-        };
+        let mut handler = make_handler(Arc::clone(&grid));
         let mut parser = vte::Parser::new();
         // Hide cursor.
         let seq = b"\x1b[?25l";
@@ -1732,9 +1821,7 @@ mod tests {
     #[test]
     fn vte_24bit_fg_colour() {
         let grid = Arc::new(Mutex::new(make_grid(80, 24)));
-        let mut handler = VtHandler {
-            grid: Arc::clone(&grid),
-        };
+        let mut handler = make_handler(Arc::clone(&grid));
         let mut parser = vte::Parser::new();
         let seq = b"\x1b[38;2;255;128;0m";
         for &byte in seq {
@@ -1751,9 +1838,7 @@ mod tests {
     #[test]
     fn vte_256_bg_colour() {
         let grid = Arc::new(Mutex::new(make_grid(80, 24)));
-        let mut handler = VtHandler {
-            grid: Arc::clone(&grid),
-        };
+        let mut handler = make_handler(Arc::clone(&grid));
         let mut parser = vte::Parser::new();
         let seq = b"\x1b[48;5;196m";
         for &byte in seq {
@@ -1770,9 +1855,7 @@ mod tests {
     #[test]
     fn vte_alternate_screen_enter_exit() {
         let grid = Arc::new(Mutex::new(make_grid(80, 24)));
-        let mut handler = VtHandler {
-            grid: Arc::clone(&grid),
-        };
+        let mut handler = make_handler(Arc::clone(&grid));
         let mut parser = vte::Parser::new();
         // Enter alt screen.
         let enter = b"\x1b[?1049h";
@@ -1792,5 +1875,84 @@ mod tests {
             let g = grid.lock();
             assert!(!g.alt_screen, "?1049l should exit alt screen");
         }
+    }
+
+    // ── APC scanner ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn apc_scanner_extracts_payload_from_complete_sequence() {
+        let mut scanner = ApcScanner::new();
+        let seq = b"\x1b_hello;world\x1b\\";
+        let mut result = None;
+        for &byte in seq.iter() {
+            if let Some(payload) = scanner.advance(byte) {
+                result = Some(payload);
+            }
+        }
+        assert_eq!(result.as_deref(), Some(b"hello;world" as &[u8]));
+    }
+
+    #[test]
+    fn apc_scanner_returns_none_for_incomplete_sequence() {
+        let mut scanner = ApcScanner::new();
+        for &byte in b"\x1b_incomplete".iter() {
+            assert!(scanner.advance(byte).is_none());
+        }
+    }
+
+    #[test]
+    fn apc_scanner_handles_esc_in_payload_not_followed_by_backslash() {
+        let mut scanner = ApcScanner::new();
+        // ESC followed by 'X' (not backslash) inside APC payload — should be included in payload.
+        let seq = b"\x1b_foo\x1bXbar\x1b\\";
+        let mut result = None;
+        for &byte in seq.iter() {
+            if let Some(payload) = scanner.advance(byte) {
+                result = Some(payload);
+            }
+        }
+        let payload = result.expect("complete APC sequence should yield a payload");
+        assert!(payload.contains(&b'\x1b'), "ESC inside payload should be preserved");
+    }
+
+    #[test]
+    fn glyph_registration_via_apc_updates_registry() {
+        // "PHN2Zy8+" is base64("<svg/>") — hardcoded to avoid adding base64 as test dep
+        let mut apc_seq = Vec::new();
+        apc_seq.extend_from_slice(b"\x1b_");
+        apc_seq.extend_from_slice(b"SMEDJA_GLYPH;id=test.icon;format=svg;data=PHN2Zy8+");
+        apc_seq.extend_from_slice(b"\x1b\\");
+
+        let registry = Arc::new(Mutex::new(st_glyph::GlyphRegistry::new()));
+        let mut scanner = ApcScanner::new();
+
+        for &byte in apc_seq.iter() {
+            if let Some(payload) = scanner.advance(byte) {
+                if let Some(reg) = st_glyph::parse_glyph_registration(&payload) {
+                    let mut r = registry.lock();
+                    r.register(&reg.id);
+                }
+            }
+        }
+
+        assert!(
+            registry.lock().lookup("test.icon").is_some(),
+            "test.icon should be in the registry after APC registration"
+        );
+    }
+
+    #[test]
+    fn startup_sequence_contains_apc_bytes_for_builtins() {
+        let mut registry = st_glyph::GlyphRegistry::new();
+        st_glyph::register_builtin_glyphs(&mut registry);
+        let seq = st_glyph::build_glyph_registration_sequence(&registry);
+        assert!(
+            seq.windows(2).any(|w| w == b"\x1b_"),
+            "startup sequence should contain at least one APC introducer"
+        );
+        assert!(
+            seq.windows(2).any(|w| w == b"\x1b\\"),
+            "startup sequence should contain at least one string terminator"
+        );
     }
 }
