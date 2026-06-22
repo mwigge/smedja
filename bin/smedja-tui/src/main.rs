@@ -369,6 +369,14 @@ fn accept_slash_completion(state: &mut AppState, append_space: bool) -> bool {
     true
 }
 
+fn clear_slash_popup(state: &mut AppState) {
+    state.slash_popup_visible = false;
+    state.slash_completions.clear();
+    state.slash_cursor = 0;
+    state.input.clear();
+    state.input_cursor = 0;
+}
+
 fn apply_tier(args: &str, state: &mut AppState) -> String {
     match args {
         "fast" | "deep" | "local" => {
@@ -552,7 +560,7 @@ async fn handle_key(
     if state.slash_popup_visible {
         match key.code {
             KeyCode::Esc => {
-                state.slash_popup_visible = false;
+                clear_slash_popup(state);
             }
             KeyCode::Char(' ') | KeyCode::Tab => {
                 accept_slash_completion(state, true);
@@ -1791,6 +1799,70 @@ mod tests {
         let text = apply_agent("impl", &mut state);
         assert_eq!(state.mode.as_deref(), Some("impl"));
         assert_eq!(text, "agent mode set to impl");
+    }
+
+    #[test]
+    fn slash_esc_clears_input_and_closes_popup() {
+        let mut state = make_state("test-session");
+        state.input = "/ti".to_owned();
+        state.input_cursor = 3;
+        state.slash_completions = filtered_completions("/ti");
+        state.slash_popup_visible = true;
+        state.slash_cursor = 0;
+
+        clear_slash_popup(&mut state);
+
+        assert!(state.input.is_empty(), "input must be cleared on Esc");
+        assert_eq!(state.input_cursor, 0, "cursor must reset to 0 on Esc");
+        assert!(!state.slash_popup_visible, "popup must close on Esc");
+        assert!(state.slash_completions.is_empty(), "completions must be cleared on Esc");
+        assert_eq!(state.slash_cursor, 0);
+    }
+
+    #[test]
+    fn slash_esc_on_popup_already_closed_is_idempotent() {
+        let mut state = make_state("test-session");
+        state.input = "hello".to_owned();
+        state.input_cursor = 5;
+        state.slash_popup_visible = false;
+
+        clear_slash_popup(&mut state);
+
+        assert!(state.input.is_empty());
+        assert_eq!(state.input_cursor, 0);
+        assert!(!state.slash_popup_visible);
+    }
+
+    #[test]
+    fn slash_tier_fast_routes_correctly_via_apply_tier() {
+        let mut state = make_state("test-session");
+        let text = apply_tier("fast", &mut state);
+        assert_eq!(state.tier.as_deref(), Some("fast"));
+        assert_eq!(text, "tier set to fast");
+    }
+
+    #[test]
+    fn slash_tier_local_routes_correctly_via_apply_tier() {
+        let mut state = make_state("test-session");
+        let text = apply_tier("local", &mut state);
+        assert_eq!(state.tier.as_deref(), Some("local"));
+        assert_eq!(text, "tier set to local");
+    }
+
+    #[test]
+    fn slash_tier_unknown_arg_returns_error_message() {
+        let mut state = make_state("test-session");
+        let text = apply_tier("turbo", &mut state);
+        assert_eq!(text, "unknown tier: turbo");
+        assert!(state.tier.is_none(), "tier must not change on unknown arg");
+    }
+
+    #[test]
+    fn slash_agent_sets_mode_via_apply_agent() {
+        let mut state = make_state("test-session");
+        let text = apply_agent("review", &mut state);
+        assert_eq!(state.mode.as_deref(), Some("review"));
+        assert_eq!(text, "agent mode set to review");
     }
 
     // -----------------------------------------------------------------------
