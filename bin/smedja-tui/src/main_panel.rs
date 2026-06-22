@@ -121,21 +121,30 @@ impl MainPanel {
     }
 
     /// Renders the panel into `frame` at `area`, respecting the scroll offset.
-    pub fn render(&self, area: Rect, frame: &mut Frame) {
+    ///
+    /// `selection` highlights lines from `lo` to `hi` (inclusive) in reverse video.
+    pub fn render(&self, area: Rect, frame: &mut Frame, selection: Option<(usize, usize)>) {
         let height = area.height.saturating_sub(2) as usize; // subtract border rows
 
         let visible: Vec<Line<'_>> = self
             .lines
             .iter()
+            .enumerate()
             .skip(self.scroll)
             .take(height)
-            .map(|sl| {
-                let style = match sl.style {
+            .map(|(abs_line, sl)| {
+                let base = match sl.style {
                     LineStyle::Normal => Style::default(),
                     LineStyle::Added => Style::default().fg(Color::Green),
                     LineStyle::Removed => Style::default().fg(Color::Red),
                     LineStyle::Code => Style::default().fg(Color::Yellow),
                 };
+                let style =
+                    if selection.is_some_and(|(lo, hi)| abs_line >= lo && abs_line <= hi) {
+                        Style::default().fg(Color::Black).bg(Color::White)
+                    } else {
+                        base
+                    };
                 Line::from(Span::styled(sl.text.clone(), style))
             })
             .collect();
@@ -155,6 +164,33 @@ impl MainPanel {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.lines.is_empty()
+    }
+
+    pub fn scroll_up(&mut self) {
+        self.scroll = self.scroll.saturating_sub(1);
+    }
+
+    pub fn scroll_down(&mut self) {
+        let max = self.lines.len().saturating_sub(1);
+        if self.scroll < max {
+            self.scroll += 1;
+        }
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.scroll = 0;
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll = self.lines.len().saturating_sub(1);
+    }
+
+    /// Returns the text of lines from `from` to `to` (inclusive, either order).
+    #[must_use]
+    pub fn lines_text(&self, from: usize, to: usize) -> Vec<String> {
+        let lo = from.min(to);
+        let hi = (from.max(to) + 1).min(self.lines.len());
+        self.lines[lo..hi].iter().map(|l| l.text.clone()).collect()
     }
 
     /// Appends `text` to the last line if one exists, or creates a new one.
@@ -389,5 +425,66 @@ mod tests {
         panel.push_delta("first");
         let content = panel.visible_text();
         assert!(content.contains("first"));
+    }
+
+    #[test]
+    fn scroll_down_clamps_at_last_line() {
+        let mut panel = MainPanel::new();
+        for i in 0..5u32 {
+            panel.push_line(format!("line {i}"));
+        }
+        panel.scroll_to_bottom();
+        let before = panel.scroll;
+        panel.scroll_down();
+        assert_eq!(panel.scroll, before, "scroll must not exceed last line index");
+    }
+
+    #[test]
+    fn scroll_up_clamps_at_zero() {
+        let mut panel = MainPanel::new();
+        panel.push_line("only".into());
+        panel.scroll_up();
+        assert_eq!(panel.scroll, 0);
+    }
+
+    #[test]
+    fn scroll_to_top_sets_zero() {
+        let mut panel = MainPanel::new();
+        for i in 0..5u32 {
+            panel.push_line(format!("line {i}"));
+        }
+        panel.scroll = 4;
+        panel.scroll_to_top();
+        assert_eq!(panel.scroll, 0);
+    }
+
+    #[test]
+    fn scroll_to_bottom_sets_last_index() {
+        let mut panel = MainPanel::new();
+        for i in 0..5u32 {
+            panel.push_line(format!("line {i}"));
+        }
+        panel.scroll_to_bottom();
+        assert_eq!(panel.scroll, 4);
+    }
+
+    #[test]
+    fn lines_text_returns_inclusive_range() {
+        let mut panel = MainPanel::new();
+        for i in 0..5u32 {
+            panel.push_line(format!("L{i}"));
+        }
+        let got = panel.lines_text(1, 3);
+        assert_eq!(got, vec!["L1", "L2", "L3"]);
+    }
+
+    #[test]
+    fn lines_text_handles_reversed_order() {
+        let mut panel = MainPanel::new();
+        for i in 0..5u32 {
+            panel.push_line(format!("L{i}"));
+        }
+        let got = panel.lines_text(3, 1);
+        assert_eq!(got, vec!["L1", "L2", "L3"]);
     }
 }
