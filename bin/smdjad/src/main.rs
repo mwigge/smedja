@@ -620,7 +620,7 @@ async fn run_turn(
 
     let all_tools: Vec<serde_json::Value> = builtin_tools.into_iter().chain(mcp_tools).collect();
 
-    let provider_session_id = if runner == "claude-cli" {
+    let provider_session_id = if runner == "claude-cli" || runner == "codex-cli" {
         provider_session_store()
             .lock()
             .await
@@ -820,7 +820,7 @@ async fn run_turn(
                 }
             }
         };
-        if runner == "claude-cli" {
+        if runner == "claude-cli" || runner == "codex-cli" {
             if let Some(native_session_id) = native_session_id {
                 provider_session_store()
                     .lock()
