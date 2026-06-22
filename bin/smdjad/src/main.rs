@@ -2,6 +2,7 @@ pub mod acp;
 pub mod alert;
 pub mod compact;
 pub mod cowork;
+pub mod embedder;
 pub mod local_provider;
 pub mod mcp_http;
 pub mod mcp_oauth;
@@ -30,6 +31,7 @@ use crate::price_table::PriceTable;
 use crate::provider_pool::{build_provider_pool, ProviderPool};
 use smedja_bellows::{Dispatcher, TurnEvent};
 use smedja_ingot::{Checkpoint, CostEntry, CostRow, Ingot, McpServer, Session, Task, TokenSnapshot};
+use smedja_vault::{Vault, VaultEntry};
 use smedja_rpc::{codes, router::Router, server::Server, RpcError};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -94,6 +96,25 @@ fn open_ingot() -> anyhow::Result<Ingot> {
         tracing::error!("cannot create data directory; using in-memory store — all session data will be lost on restart");
         Ingot::open_in_memory().map_err(anyhow::Error::from)
     }
+}
+
+fn open_vault() -> Vault {
+    // Mirror the ingot path: ~/.local/share/smedja/vault.db.
+    // Falls back to an in-memory vault if the directory cannot be created.
+    let vault_path = dirs_home()
+        .map(|h| h.join(".local").join("share").join("smedja"))
+        .filter(|d| std::fs::create_dir_all(d).is_ok())
+        .map(|dir| dir.join("vault.db"));
+
+    if let Some(path) = vault_path {
+        match Vault::open(&path) {
+            Ok(v) => return v,
+            Err(e) => tracing::warn!(error = %e, "vault open failed; using in-memory vault"),
+        }
+    } else {
+        tracing::warn!("cannot create vault data directory; using in-memory vault");
+    }
+    Vault::open_in_memory().expect("in-memory vault must open")
 }
 
 /// Returns the user's home directory, or `None` if it cannot be determined.
@@ -312,6 +333,7 @@ async fn run_turn(
     pool: Arc<ProviderPool>,
     assayer: Arc<Assayer>,
     price_table: Arc<PriceTable>,
+    vault: Arc<Mutex<Vault>>,
 ) {
     let tracer = global::tracer("smedja");
     let mut turn_span = tracer.start(tel::SPAN_AGENT_INVOKE);
@@ -563,7 +585,7 @@ async fn run_turn(
         tracing::debug!(tool_format = "xml", "local provider tool format: xml");
     }
 
-    // Builtin tools: smedja_vault_search, smedja_retrieve, graph_query
+    // Builtin tools: smedja_vault_search, smedja_vault_store, smedja_retrieve, graph_query
     let mut builtin_tools: Vec<serde_json::Value> = vec![
         serde_json::json!({
             "name": "smedja_vault_search",
@@ -576,6 +598,22 @@ async fn run_turn(
                     "k": { "type": "integer" }
                 },
                 "required": ["query"]
+            }
+        }),
+        serde_json::json!({
+            "name": "smedja_vault_store",
+            "description": "Store an entry in the smedja vault for future retrieval.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string" },
+                    "namespace": { "type": "string" },
+                    "id": { "type": "string" },
+                    "payload": { "type": "object" },
+                    "source_file": { "type": "string" },
+                    "added_by": { "type": "string" }
+                },
+                "required": ["content"]
             }
         }),
         serde_json::json!({
@@ -960,7 +998,7 @@ async fn run_turn(
                     }
                 }
                 let result =
-                    execute_tool(&tool_name, &tool_input, &workspace_root, session.as_ref(), &ingot)
+                    execute_tool(&tool_name, &tool_input, &workspace_root, session.as_ref(), &ingot, &vault)
                         .await;
                 tool_span.set_attribute(KeyValue::new(
                     tel::TOOL_RESULT_HASH,
@@ -1310,6 +1348,7 @@ async fn execute_tool(
     workspace: &std::path::Path,
     session: Option<&Session>,
     ingot: &Arc<Mutex<Ingot>>,
+    vault: &Arc<Mutex<Vault>>,
 ) -> String {
     let input: Value = serde_json::from_str(tool_input).unwrap_or(Value::Null);
 
@@ -1395,16 +1434,96 @@ async fn execute_tool(
             }
         }
         "smedja_vault_search" => {
-            let query = input.get("query").and_then(Value::as_str).unwrap_or("");
-            let k =
-                usize::try_from(input.get("k").and_then(Value::as_u64).unwrap_or(5)).unwrap_or(5);
-            // ponytail: vault not yet wired; stub returns empty results
-            tracing::warn!(
-                query,
-                k,
-                "smedja_vault_search called; vault stub returning empty results"
-            );
-            serde_json::json!({ "results": [] }).to_string()
+            let query_text = input
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let k = usize::try_from(
+                input.get("k").and_then(Value::as_u64).unwrap_or(5),
+            )
+            .unwrap_or(5);
+            let ns = input
+                .get("namespace")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_owned();
+            let vault = Arc::clone(vault);
+            tokio::task::spawn_blocking(move || {
+                let query_vec = embedder::embed(&query_text);
+                let guard = vault.blocking_lock();
+                match guard.search(&query_vec, &query_text, &ns, k) {
+                    Ok(entries) => {
+                        let results: Vec<serde_json::Value> = entries
+                            .into_iter()
+                            .map(|e| {
+                                serde_json::json!({
+                                    "id": e.id,
+                                    "content": e.content,
+                                    "namespace": e.namespace,
+                                    "payload": e.payload,
+                                })
+                            })
+                            .collect();
+                        serde_json::json!({ "results": results }).to_string()
+                    }
+                    Err(e) => format!("error: vault search failed: {e}"),
+                }
+            })
+            .await
+            .unwrap_or_else(|e| format!("error: vault search task panicked: {e}"))
+        }
+        "smedja_vault_store" => {
+            let content = input
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let ns = input
+                .get("namespace")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_owned();
+            let entry_id = input
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            let payload = input
+                .get("payload")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            let source_file = input
+                .get("source_file")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let added_by = input
+                .get("added_by")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let vault = Arc::clone(vault);
+            tokio::task::spawn_blocking(move || {
+                let embedding = embedder::embed(&content);
+                let entry = VaultEntry {
+                    id: entry_id,
+                    embedding,
+                    payload,
+                    namespace: ns,
+                    content,
+                    source_file,
+                    added_by,
+                    chunk_index: None,
+                    parent_id: None,
+                    created_at: 0.0,
+                };
+                let mut guard = vault.blocking_lock();
+                match guard.upsert(&entry) {
+                    Ok(()) => serde_json::json!({ "id": entry.id, "stored": true }).to_string(),
+                    Err(e) => format!("error: vault store failed: {e}"),
+                }
+            })
+            .await
+            .unwrap_or_else(|e| format!("error: vault store task panicked: {e}"))
         }
         "smedja_retrieve" => {
             let hash = input.get("hash").and_then(Value::as_str).unwrap_or("");
@@ -1577,6 +1696,7 @@ fn spawn_worker(
     pool: Arc<ProviderPool>,
     assayer: Arc<Assayer>,
     price_table: Arc<PriceTable>,
+    vault: Arc<Mutex<Vault>>,
 ) -> Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> {
     let handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
     let handles_inner = Arc::clone(&handles);
@@ -1611,8 +1731,9 @@ fn spawn_worker(
                     let pl = Arc::clone(&pool);
                     let as_ = Arc::clone(&assayer);
                     let pt = Arc::clone(&price_table);
+                    let vt = Arc::clone(&vault);
                     let handle =
-                        tokio::spawn(run_turn(ig, dp, session_id, turn_id, g, pl, as_, pt));
+                        tokio::spawn(run_turn(ig, dp, session_id, turn_id, g, pl, as_, pt, vt));
                     handles_inner.lock().await.push(handle);
                 }
                 // ignore non-Started events
@@ -3616,6 +3737,8 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&price_table),
     );
 
+    let vault = Arc::new(Mutex::new(open_vault()));
+
     let turn_handles = spawn_worker(
         Arc::clone(&ingot),
         Arc::clone(&dispatcher),
@@ -3623,6 +3746,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&pool),
         Arc::clone(&assayer),
         Arc::clone(&price_table),
+        Arc::clone(&vault),
     );
 
     // ACP HTTP server — activated by SMEDJA_ACP_PORT.
@@ -4111,5 +4235,98 @@ mod tests {
         let new_sess = ig.lock().await.get_session(&new_id).unwrap().unwrap();
         assert_eq!(new_sess.runner_override.as_deref(), Some("codex-cli"));
         assert_eq!(new_sess.mode.as_deref(), Some("impl"));
+    }
+
+    #[tokio::test]
+    async fn vault_search_returns_empty_when_no_entries() {
+        use smedja_ingot::Ingot;
+        use smedja_vault::Vault;
+
+        let ingot = Arc::new(Mutex::new(Ingot::open_in_memory().unwrap()));
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+
+        let result = super::execute_tool(
+            "smedja_vault_search",
+            r#"{"query":"rust async"}"#,
+            std::path::Path::new("/tmp"),
+            None,
+            &ingot,
+            &vault,
+        )
+        .await;
+
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["results"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn vault_store_then_search_finds_entry() {
+        use smedja_ingot::Ingot;
+        use smedja_vault::Vault;
+
+        let ingot = Arc::new(Mutex::new(Ingot::open_in_memory().unwrap()));
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+
+        let store_result = super::execute_tool(
+            "smedja_vault_store",
+            r#"{"content":"tokio async runtime executor","namespace":"test"}"#,
+            std::path::Path::new("/tmp"),
+            None,
+            &ingot,
+            &vault,
+        )
+        .await;
+        let stored: serde_json::Value = serde_json::from_str(&store_result).unwrap();
+        assert_eq!(stored["stored"], true);
+
+        let search_result = super::execute_tool(
+            "smedja_vault_search",
+            r#"{"query":"tokio async","namespace":"test","k":5}"#,
+            std::path::Path::new("/tmp"),
+            None,
+            &ingot,
+            &vault,
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&search_result).unwrap();
+        let results = v["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "stored entry must be found");
+        assert_eq!(results[0]["namespace"], "test");
+    }
+
+    #[tokio::test]
+    async fn vault_search_respects_k_limit() {
+        use smedja_ingot::Ingot;
+        use smedja_vault::Vault;
+
+        let ingot = Arc::new(Mutex::new(Ingot::open_in_memory().unwrap()));
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+
+        for i in 0..5_u8 {
+            super::execute_tool(
+                "smedja_vault_store",
+                &format!(r#"{{"content":"rust programming language crate {i}","namespace":"ns"}}"#),
+                std::path::Path::new("/tmp"),
+                None,
+                &ingot,
+                &vault,
+            )
+            .await;
+        }
+
+        let result = super::execute_tool(
+            "smedja_vault_search",
+            r#"{"query":"rust programming","namespace":"ns","k":2}"#,
+            std::path::Path::new("/tmp"),
+            None,
+            &ingot,
+            &vault,
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            v["results"].as_array().unwrap().len() <= 2,
+            "k=2 must cap results at 2"
+        );
     }
 }
