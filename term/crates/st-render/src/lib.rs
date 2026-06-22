@@ -523,6 +523,74 @@ impl BgVertex {
     }
 }
 
+// ── Background image vertex and uniform ──────────────────────────────────────
+
+/// Vertex for the full-screen background image quad.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct BgImageVertex {
+    /// NDC position `[x, y]`.
+    pub position: [f32; 2],
+    /// UV texture coordinates `[u, v]` in `[0, 1]`.
+    pub tex_coords: [f32; 2],
+}
+
+impl BgImageVertex {
+    const ATTRIBS: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
+
+    /// Returns the wgpu vertex buffer layout for [`BgImageVertex`].
+    #[must_use]
+    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+
+/// 16-byte uniform block for the background image shader pass.
+///
+/// `opacity` controls how opaque the image is; the remaining three floats are
+/// padding required by the WGSL uniform buffer alignment rules.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct BgImageParams {
+    opacity: f32,
+    _pad: [f32; 3],
+}
+
+// ── Background image shader ───────────────────────────────────────────────────
+
+const BG_IMAGE_SHADER_SRC: &str = r"
+struct VIn {
+    @location(0) position:   vec2<f32>,
+    @location(1) tex_coords: vec2<f32>,
+}
+struct VOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) tex_coords: vec2<f32>,
+}
+@vertex fn vs_bg_img(in: VIn) -> VOut {
+    var out: VOut;
+    out.clip_pos  = vec4<f32>(in.position, 0.0, 1.0);
+    out.tex_coords = in.tex_coords;
+    return out;
+}
+
+@group(0) @binding(0) var t_bg: texture_2d<f32>;
+@group(0) @binding(1) var s_bg: sampler;
+
+struct Params { opacity: f32, _p1: f32, _p2: f32, _p3: f32 }
+@group(1) @binding(0) var<uniform> params: Params;
+
+@fragment fn fs_bg_img(in: VOut) -> @location(0) vec4<f32> {
+    let c = textureSample(t_bg, s_bg, in.tex_coords);
+    return vec4<f32>(c.rgb, c.a * params.opacity);
+}
+";
+
 // ── Renderer ──────────────────────────────────────────────────────────────────
 
 /// The primary renderer: owns the wgpu surface, pipelines, and glyph atlas.
@@ -533,6 +601,16 @@ pub struct Renderer {
     surface_config: wgpu::SurfaceConfiguration,
     glyph_pipeline: wgpu::RenderPipeline,
     bg_pipeline: wgpu::RenderPipeline,
+    /// Pipeline for blitting the optional background image.
+    bg_image_pipeline: wgpu::RenderPipeline,
+    /// Uploaded background image texture (None if no image is configured).
+    bg_image_texture: Option<wgpu::Texture>,
+    /// Bind group containing the background image texture and sampler.
+    bg_image_bind_group: Option<wgpu::BindGroup>,
+    /// 16-byte uniform buffer carrying the opacity value for the image pass.
+    bg_image_params_buf: wgpu::Buffer,
+    /// Bind group for [`Self::bg_image_params_buf`].
+    bg_image_params_bind_group: wgpu::BindGroup,
     atlas: GlyphAtlas,
     bind_group: wgpu::BindGroup,
     /// Current cell grid snapshot.
@@ -756,6 +834,139 @@ impl Renderer {
             cache: None,
         });
 
+        // ── Background image pipeline ──────────────────────────────────────────
+
+        // bind group 0: texture + sampler
+        let bg_img_tex_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bg_img_tex_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        // bind group 1: opacity uniform
+        let bg_img_params_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("bg_img_params_layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let bg_image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("bg_image_shader"),
+            source: wgpu::ShaderSource::Wgsl(BG_IMAGE_SHADER_SRC.into()),
+        });
+
+        let bg_image_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("bg_image_pipeline_layout"),
+                bind_group_layouts: &[&bg_img_tex_layout, &bg_img_params_layout],
+                push_constant_ranges: &[],
+            });
+
+        let bg_image_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("bg_image_pipeline"),
+                layout: Some(&bg_image_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &bg_image_shader,
+                    entry_point: "vs_bg_img",
+                    buffers: &[BgImageVertex::layout()],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &bg_image_shader,
+                    entry_point: "fs_bg_img",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+
+        // Params uniform buffer (initial opacity from config).
+        let initial_params = BgImageParams {
+            opacity: config.window.background_opacity,
+            _pad: [0.0; 3],
+        };
+        let bg_image_params_buf =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bg_image_params_buf"),
+                contents: bytemuck::bytes_of(&initial_params),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let bg_image_params_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bg_image_params_bind_group"),
+            layout: &bg_img_params_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: bg_image_params_buf.as_entire_binding(),
+            }],
+        });
+
+        // Optionally load the background image from disk and upload it.
+        let mut background = BackgroundConfig {
+            image_path: config
+                .window
+                .background_image
+                .as_ref()
+                .map(std::path::PathBuf::from),
+            opacity: config.window.background_opacity,
+            ..BackgroundConfig::default()
+        };
+
+        let (bg_image_texture, bg_image_bind_group) =
+            if background.image_path.is_some() && background.load_image().is_ok() {
+                if let Some(pixels) = background.image_pixels.take() {
+                    let (tex, bg) = upload_bg_image(
+                        &device,
+                        &queue,
+                        &pixels,
+                        background.image_width,
+                        background.image_height,
+                        &bg_img_tex_layout,
+                    );
+                    (Some(tex), Some(bg))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
         // ponytail: lazy warmup on first render — ASCII glyphs are rasterised
         // on-demand by ensure_cell_glyphs() rather than blocking here.
         let initial_cells: Vec<Cell> = Vec::new();
@@ -767,21 +978,18 @@ impl Renderer {
             surface_config,
             glyph_pipeline,
             bg_pipeline,
+            bg_image_pipeline,
+            bg_image_texture,
+            bg_image_bind_group,
+            bg_image_params_buf,
+            bg_image_params_bind_group,
             atlas,
             bind_group,
             cells: initial_cells,
             block_decorations: Vec::new(),
             agent_blocks: Vec::new(),
             config: config.clone(),
-            background: BackgroundConfig {
-                image_path: config
-                    .window
-                    .background_image
-                    .as_ref()
-                    .map(std::path::PathBuf::from),
-                opacity: config.window.background_opacity,
-                ..BackgroundConfig::default()
-            },
+            background,
             size,
             status_bar_segments: Vec::new(),
             scale_factor,
@@ -919,6 +1127,38 @@ impl Renderer {
         self.size.height.saturating_sub(self.status_bar_height_px())
     }
 
+    /// Uploads `pixels` (RGBA8, row-major) as the terminal background image.
+    ///
+    /// Replaces any previously uploaded background image.  Call this after the
+    /// renderer is constructed to install a background image at runtime (e.g.
+    /// when the user changes the setting via a hot-reload mechanism).
+    pub fn upload_background_image(&mut self, pixels: &[u8], width: u32, height: u32) {
+        let tex_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bg_img_tex_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let (tex, bg) = upload_bg_image(&self.device, &self.queue, pixels, width, height, &tex_layout);
+        self.bg_image_texture = Some(tex);
+        self.bg_image_bind_group = Some(bg);
+    }
+
     /// Renders the current cell grid to the window surface.
     ///
     /// # Errors
@@ -963,6 +1203,31 @@ impl Renderer {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
+
+            // Fullscreen background image (drawn before solid cell quads so
+            // that cell backgrounds at opacity < 1.0 blend with it).
+            if let Some(bg_img_group) = &self.bg_image_bind_group {
+                let verts = [
+                    BgImageVertex { position: [-1.0,  1.0], tex_coords: [0.0, 0.0] },
+                    BgImageVertex { position: [ 1.0,  1.0], tex_coords: [1.0, 0.0] },
+                    BgImageVertex { position: [-1.0, -1.0], tex_coords: [0.0, 1.0] },
+                    BgImageVertex { position: [ 1.0,  1.0], tex_coords: [1.0, 0.0] },
+                    BgImageVertex { position: [ 1.0, -1.0], tex_coords: [1.0, 1.0] },
+                    BgImageVertex { position: [-1.0, -1.0], tex_coords: [0.0, 1.0] },
+                ];
+                let buf = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("bg_image_vbuf"),
+                        contents: bytemuck::cast_slice(&verts),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                render_pass.set_pipeline(&self.bg_image_pipeline);
+                render_pass.set_bind_group(0, bg_img_group, &[]);
+                render_pass.set_bind_group(1, &self.bg_image_params_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, buf.slice(..));
+                render_pass.draw(0..6, 0..1);
+            }
 
             // Background quads.
             let bg_verts = self.build_bg_vertices();
@@ -1040,10 +1305,23 @@ impl Renderer {
     fn build_bg_vertices(&self) -> Vec<BgVertex> {
         let (cw, ch) = self.cell_size();
         let mut verts = Vec::with_capacity(self.cells.len() * 6);
+        // When a background image is active, multiply cell-background alpha by
+        // opacity so the image shows through.  Without an image the existing
+        // solid-color behaviour is preserved (alpha unchanged).
+        let cell_alpha_mult = if self.bg_image_bind_group.is_some() {
+            self.background.opacity
+        } else {
+            1.0
+        };
 
         for cell in &self.cells {
             let (x0, y0, x1, y1) = self.cell_to_ndc(cell.col, cell.row, cw, ch);
-            let c = cell.bg;
+            let c = [
+                cell.bg[0],
+                cell.bg[1],
+                cell.bg[2],
+                cell.bg[3] * cell_alpha_mult,
+            ];
             // Two triangles forming a quad.
             verts.extend_from_slice(&[
                 BgVertex {
@@ -1465,6 +1743,80 @@ impl Renderer {
     }
 }
 
+// ── Background image upload helper ────────────────────────────────────────────
+
+/// Creates and uploads a wgpu texture from raw RGBA8 pixels.
+///
+/// Returns `(texture, bind_group)`.  The bind group binds the texture view at
+/// slot 0 and a linear sampler at slot 1, matching the layout expected by
+/// `bg_image_pipeline`.
+fn upload_bg_image(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    layout: &wgpu::BindGroupLayout,
+) -> (wgpu::Texture, wgpu::BindGroup) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("bg_image_texture"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        pixels,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("bg_image_sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("bg_image_bind_group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+    (texture, bind_group)
+}
+
 // wgpu::util::DeviceExt is needed for create_buffer_init.
 use wgpu::util::DeviceExt;
 
@@ -1816,5 +2168,41 @@ mod tests {
     fn headless_render_smoke() {
         // Stub until the GPU CI harness exists. Enabling gpu-tests will run
         // this test; it passes vacuously until a real assertion is wired in.
+    }
+
+    // ── Background image tests ────────────────────────────────────────────────
+
+    #[test]
+    fn bg_image_vertex_layout_stride_matches_size() {
+        let layout = BgImageVertex::layout();
+        assert_eq!(
+            layout.array_stride as usize,
+            std::mem::size_of::<BgImageVertex>()
+        );
+    }
+
+    #[test]
+    fn bg_image_params_size_is_16() {
+        assert_eq!(std::mem::size_of::<BgImageParams>(), 16);
+    }
+
+    #[test]
+    fn background_config_stores_image_path() {
+        let path = std::path::PathBuf::from("/tmp/wall.png");
+        let bg = BackgroundConfig {
+            image_path: Some(path.clone()),
+            ..BackgroundConfig::default()
+        };
+        assert_eq!(bg.image_path, Some(path));
+        assert!(bg.image_pixels.is_none());
+    }
+
+    #[test]
+    fn background_config_load_image_missing_path_returns_err() {
+        let mut bg = BackgroundConfig {
+            image_path: Some(std::path::PathBuf::from("/no/such/image.png")),
+            ..BackgroundConfig::default()
+        };
+        assert!(bg.load_image().is_err(), "loading a missing file must fail");
     }
 }
