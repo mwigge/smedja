@@ -8,6 +8,8 @@ use std::path::Path;
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
+use chrono::Local;
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// A 24-bit RGB colour value.
@@ -204,7 +206,7 @@ impl GitBranchModule {
         if branch.is_empty() {
             return None;
         }
-        Some(plain_segment("git_branch", format!("\u{2387} {branch}")))
+        Some(plain_segment("git_branch", format!("* {branch}")))
     }
 }
 
@@ -321,13 +323,8 @@ impl StatusModule for TimeModule {
     }
 
     fn evaluate(&self, _ctx: &ModuleContext) -> Option<Segment> {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let hours = (secs % 86400) / 3600;
-        let minutes = (secs % 3600) / 60;
-        Some(plain_segment("time", format!("{hours:02}:{minutes:02}")))
+        let now = Local::now();
+        Some(plain_segment("time", now.format("%H:%M").to_string()))
     }
 }
 

@@ -891,14 +891,15 @@ impl Renderer {
         self.status_bar_segments = segments.to_vec();
     }
 
-    /// Returns the pixel height reserved for the status bar.
+    /// Returns the physical pixel height reserved for the status bar.
     ///
-    /// The bar height is the smaller of the configured font size and 18 px so
-    /// that it remains visually independent from the terminal grid.
+    /// Scale factor is applied so the strip is the same logical size on HiDPI
+    /// displays, matching the formula used in the terminal binary when sizing
+    /// the PTY grid.
     #[must_use]
     pub fn status_bar_height_px(&self) -> u32 {
-        // Independent of grid font: cap at 18 px.
-        (self.config.font.size as u32).min(18)
+        let eff = (self.config.font.size * self.scale_factor as f32) as u32;
+        eff.min(36)
     }
 
     /// Returns the height of the usable grid area in pixels (window height
@@ -1215,13 +1216,14 @@ impl Renderer {
             let u1 = (entry.x + entry.w) as f32 / atlas_size_f;
             let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
 
-            // Position glyph at its correct sub-cell location using swash
-            // placement bearings rather than stretching to fill the full cell.
+            // Position glyph using swash placement bearings.
             // Baseline is placed at 2/3 of cell height (ascent ≈ 0.8×em,
             // line-height = 1.2×em → baseline/line-height ≈ 0.8/1.2 = 2/3).
+            // bearing_x is clamped to ≥0 so characters with negative optical
+            // overhang (e.g. 'j') don't drift left into the preceding cell.
             let baseline_y = f32::from(cell.row) * ch + ch * (2.0 / 3.0);
             let glyph_top = baseline_y - entry.bearing_y as f32;
-            let glyph_left = f32::from(cell.col) * cw + entry.bearing_x as f32;
+            let glyph_left = f32::from(cell.col) * cw + (entry.bearing_x as f32).max(0.0);
             let (x0, y0, x1, y1) = self.px_to_ndc(
                 glyph_left,
                 glyph_top,
@@ -1307,10 +1309,16 @@ impl Renderer {
                 let u1 = (entry.x + entry.w) as f32 / atlas_size_f;
                 let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
 
-                let py0 = ph - sb_h;
-                let py1 = ph;
-
-                let (x0, y0, x1, y1) = self.px_to_ndc(col_px, py0, col_px + sb_cw, py1);
+                // Place glyph at natural size — center horizontally in the
+                // allocated cell, use bearing_y for vertical baseline placement.
+                let strip_top = ph - sb_h;
+                let glyph_w = entry.w as f32;
+                let glyph_h = entry.h as f32;
+                let glyph_left = col_px + (sb_cw - glyph_w) / 2.0;
+                let baseline = strip_top + sb_h * (2.0 / 3.0);
+                let glyph_top = baseline - entry.bearing_y as f32;
+                let (x0, y0, x1, y1) =
+                    self.px_to_ndc(glyph_left, glyph_top, glyph_left + glyph_w, glyph_top + glyph_h);
                 let c = fg_color;
                 verts.extend_from_slice(&[
                     GlyphVertex {
@@ -1384,7 +1392,7 @@ impl Renderer {
                         let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
                         let baseline_y = f32::from(line_row) * ch + ch * (2.0 / 3.0);
                         let glyph_top = baseline_y - entry.bearing_y as f32;
-                        let glyph_left = f32::from(col) * cw + entry.bearing_x as f32;
+                        let glyph_left = f32::from(col) * cw + (entry.bearing_x as f32).max(0.0);
                         let (x0, y0, x1, y1) = self.px_to_ndc(
                             glyph_left,
                             glyph_top,
@@ -1657,25 +1665,34 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_height_is_capped_at_18() {
-        // font_size = 14 → bar = min(14, 18) = 14
+    fn status_bar_height_scales_with_dpi_and_caps() {
+        // scale_factor=1 (non-Retina): eff = font_size * 1 = 14, cap at 36 → 14
         let font_size = 14.0f32;
-        let bar_h = (font_size as u32).min(18);
+        let scale_factor = 1.0f32;
+        let bar_h = (font_size * scale_factor) as u32;
+        let bar_h = bar_h.min(36);
         assert_eq!(bar_h, 14);
 
-        // font_size = 24 → bar = min(24, 18) = 18
-        let big_font = 24.0f32;
-        let bar_h_big = (big_font as u32).min(18);
-        assert_eq!(bar_h_big, 18);
+        // scale_factor=2 (Retina): eff = 14 * 2 = 28, cap at 36 → 28
+        let scale_factor_retina = 2.0f32;
+        let bar_h_retina = ((font_size * scale_factor_retina) as u32).min(36);
+        assert_eq!(bar_h_retina, 28);
+
+        // Large font capped: eff = 40 → cap at 36
+        let big_font = 20.0f32;
+        let bar_h_big = ((big_font * scale_factor_retina) as u32).min(36);
+        assert_eq!(bar_h_big, 36);
     }
 
     #[test]
     fn grid_height_is_window_height_minus_status_bar() {
         let window_h = 800u32;
+        // scale_factor=2, font_size=14 → bar = min(28, 36) = 28
         let font_size = 14.0f32;
-        let bar_h = (font_size as u32).min(18);
+        let scale_factor = 2.0f32;
+        let bar_h = ((font_size * scale_factor) as u32).min(36);
         let grid_h = window_h.saturating_sub(bar_h);
-        assert_eq!(grid_h, 786);
+        assert_eq!(grid_h, 772);
     }
 
     #[test]

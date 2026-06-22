@@ -657,7 +657,7 @@ fn status_bar_height_for_font(font_size: f32) -> u32 {
     // Clamp to zero before truncating so negative font sizes don't wrap.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let px = font_size.max(0.0) as u32;
-    px.min(18)
+    px.min(36)
 }
 
 // ── Subcommand handlers ────────────────────────────────────────────────────────

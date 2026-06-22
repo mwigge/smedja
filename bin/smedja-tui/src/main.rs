@@ -23,7 +23,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Terminal;
 use serde_json::json;
 use smedja_rpc::client::Client;
@@ -754,6 +754,7 @@ fn render_slash_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, s
         })
         .collect();
 
+    frame.render_widget(Clear, popup_rect);
     let popup =
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("commands"));
     frame.render_widget(popup, popup_rect);
