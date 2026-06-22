@@ -42,6 +42,7 @@ impl Provider for CodexCliProvider {
 fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
     let prompt = messages.last().map_or_else(String::new, |m| m.content.clone());
     let resume_id = opts.provider_session_id.clone();
+    let model = opts.model.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::spawn(async move {
@@ -65,7 +66,13 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
 
         command
             .arg("--json")
-            .arg("--dangerously-bypass-approvals-and-sandbox")
+            .arg("--dangerously-bypass-approvals-and-sandbox");
+
+        if !model.is_empty() {
+            command.arg("-m").arg(&model);
+        }
+
+        command
             .arg(&prompt)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -187,6 +194,65 @@ fn parse_codex_line(line: &str) -> Option<Delta> {
         }
     }
 
+    // Pattern 4: OpenAI Responses API — completed function_call output item.
+    // {"type":"response.output_item.done","item":{"type":"function_call","call_id":"...","name":"...","arguments":"..."}}
+    if v.get("type").and_then(serde_json::Value::as_str) == Some("response.output_item.done") {
+        let item = v.get("item")?;
+        if item.get("type").and_then(serde_json::Value::as_str) == Some("function_call") {
+            let name = item.get("name").and_then(serde_json::Value::as_str)?;
+            let raw_args = item
+                .get("arguments")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("{}");
+            let input = serde_json::from_str::<serde_json::Value>(raw_args)
+                .unwrap_or(serde_json::Value::String(raw_args.to_owned()));
+            return Some(Delta::ToolCall {
+                name: name.to_owned(),
+                input,
+            });
+        }
+        // function_call_output — the tool result codex fed back to the model.
+        if item.get("type").and_then(serde_json::Value::as_str) == Some("function_call_output") {
+            let call_id = item
+                .get("call_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let output = item
+                .get("output")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            if !call_id.is_empty() {
+                return Some(Delta::ToolResult {
+                    tool_use_id: call_id,
+                    content: output,
+                });
+            }
+        }
+    }
+
+    // Pattern 5: {"type":"response.completed","response":{"usage":{"input_tokens":N,"output_tokens":M}}}
+    if v.get("type").and_then(serde_json::Value::as_str) == Some("response.completed") {
+        let usage = v.get("response").and_then(|r| r.get("usage"))?;
+        let input = usage
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let output = usage
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if input > 0 || output > 0 {
+            return Some(Delta::Usage {
+                #[allow(clippy::cast_possible_truncation)] // token counts fit in u32
+                input_tokens: input as u32,
+                #[allow(clippy::cast_possible_truncation)]
+                output_tokens: output as u32,
+            });
+        }
+    }
+
     // Unrecognised JSON shape — skip.
     None
 }
@@ -273,6 +339,51 @@ mod tests {
     #[test]
     fn parse_codex_line_unrecognised_json_returns_none() {
         assert!(parse_codex_line(r#"{"foo":"bar"}"#).is_none());
+    }
+
+    #[test]
+    fn parse_codex_line_function_call_returns_tool_call() {
+        let line = r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"cmd\":\"ls\"}"}}"#;
+        let delta = parse_codex_line(line);
+        match delta {
+            Some(Delta::ToolCall { name, input }) => {
+                assert_eq!(name, "shell");
+                assert_eq!(input["cmd"].as_str(), Some("ls"));
+            }
+            other => panic!("expected ToolCall; got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_codex_line_function_call_output_returns_tool_result() {
+        let line = r#"{"type":"response.output_item.done","item":{"type":"function_call_output","call_id":"c1","output":"exit 0"}}"#;
+        let delta = parse_codex_line(line);
+        match delta {
+            Some(Delta::ToolResult {
+                tool_use_id,
+                content,
+            }) => {
+                assert_eq!(tool_use_id, "c1");
+                assert_eq!(content, "exit 0");
+            }
+            other => panic!("expected ToolResult; got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_codex_line_response_completed_returns_usage() {
+        let line = r#"{"type":"response.completed","response":{"usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let delta = parse_codex_line(line);
+        match delta {
+            Some(Delta::Usage {
+                input_tokens,
+                output_tokens,
+            }) => {
+                assert_eq!(input_tokens, 100);
+                assert_eq!(output_tokens, 50);
+            }
+            other => panic!("expected Usage; got: {other:?}"),
+        }
     }
 
     // --- mock binary integration tests ---
@@ -389,6 +500,39 @@ mod tests {
         assert!(
             output.contains("resume") && output.contains("--last"),
             "expected 'resume --last' in args; got: {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_flag_forwarded_to_command() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "smedja-codex-model-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        make_mock_codex(&tmp, "#!/bin/sh\nprintf \"args: $*\\n\"\n");
+
+        let old = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old}", tmp.display()));
+
+        let mut opts = base_opts(None);
+        opts.model = "o3-mini".to_owned();
+        let provider = CodexCliProvider::Cli;
+        let mut stream = provider.stream_chat(&[user_msg("hi")], &opts);
+        let mut output = String::new();
+        while let Some(item) = stream.next().await {
+            if let Ok(Delta::Text(t)) = item {
+                output.push_str(&t);
+            }
+        }
+
+        std::env::set_var("PATH", old);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            output.contains("-m") && output.contains("o3-mini"),
+            "expected '-m o3-mini' in args; got: {output:?}"
         );
     }
 }
