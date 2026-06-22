@@ -178,6 +178,36 @@ pub enum TurnEvent {
     },
 }
 
+// ── Constructors ──────────────────────────────────────────────────────────────
+
+impl TurnEvent {
+    /// Construct a [`TurnEvent::Failed`] with all optional correlation fields set
+    /// to `None`.
+    ///
+    /// Use this instead of spelling out nine `field: None` entries at every call
+    /// site.  Correlation fields can be set via struct-update syntax or by
+    /// constructing the variant directly when they are needed.
+    #[must_use]
+    pub fn fail(
+        session_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        TurnEvent::Failed {
+            session_id: session_id.into(),
+            turn_id: turn_id.into(),
+            reason: reason.into(),
+            conversation_id: None,
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            operation_name: None,
+            agent_name: None,
+            status: None,
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -388,6 +418,37 @@ mod tests {
             assert_eq!(conversation_id.as_deref(), Some("c"));
         } else {
             panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn turn_event_fail_constructor_sets_required_fields() {
+        let ev = TurnEvent::fail("sess-fail", "turn-fail", "something went wrong");
+        if let TurnEvent::Failed {
+            session_id,
+            turn_id,
+            reason,
+            conversation_id,
+            trace_id,
+            span_id,
+            parent_span_id,
+            operation_name,
+            agent_name,
+            status,
+        } = ev
+        {
+            assert_eq!(session_id, "sess-fail");
+            assert_eq!(turn_id, "turn-fail");
+            assert_eq!(reason, "something went wrong");
+            assert!(conversation_id.is_none(), "conversation_id must be None");
+            assert!(trace_id.is_none(), "trace_id must be None");
+            assert!(span_id.is_none(), "span_id must be None");
+            assert!(parent_span_id.is_none(), "parent_span_id must be None");
+            assert!(operation_name.is_none(), "operation_name must be None");
+            assert!(agent_name.is_none(), "agent_name must be None");
+            assert!(status.is_none(), "status must be None");
+        } else {
+            panic!("TurnEvent::fail must produce TurnEvent::Failed");
         }
     }
 }

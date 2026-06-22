@@ -44,7 +44,10 @@ use crate::cowork::{ApprovalPrompt, CoworkGate, Decision};
 use crate::sandbox::SandboxExecutor;
 
 fn socket_path() -> PathBuf {
-    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
+        tracing::warn!("XDG_RUNTIME_DIR not set; using /tmp for socket — set XDG_RUNTIME_DIR for a secure socket location");
+        "/tmp".into()
+    });
     PathBuf::from(base).join("smdjad.sock")
 }
 
@@ -60,6 +63,10 @@ impl Drop for SocketGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 fn now_epoch() -> f64 {
@@ -345,18 +352,7 @@ async fn run_turn(
             Ok(Some(t)) => t,
             Ok(None) => {
                 warn!(turn_id = %turn_id, "task not found; dropping turn");
-                dispatcher.publish(TurnEvent::Failed {
-                    session_id,
-                    turn_id,
-                    reason: "task not found".to_owned(),
-                    conversation_id: None,
-                    trace_id: None,
-                    span_id: None,
-                    parent_span_id: None,
-                    operation_name: None,
-                    agent_name: None,
-                    status: None,
-                });
+                dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, "task not found"));
                 turn_span.set_status(SpanStatus::error("task not found"));
                 turn_span.end();
                 return;
@@ -364,18 +360,7 @@ async fn run_turn(
             Err(e) => {
                 warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to load task");
                 let reason = e.to_string();
-                dispatcher.publish(TurnEvent::Failed {
-                    session_id,
-                    turn_id,
-                    reason: reason.clone(),
-                    conversation_id: None,
-                    trace_id: None,
-                    span_id: None,
-                    parent_span_id: None,
-                    operation_name: None,
-                    agent_name: None,
-                    status: None,
-                });
+                dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
                 turn_span.set_status(SpanStatus::error(reason));
                 turn_span.end();
                 return;
@@ -429,18 +414,7 @@ async fn run_turn(
             let reason = "no LLM provider available; turn cannot execute".to_owned();
             warn!(session_id = %session_id, turn_id = %turn_id, "{reason}");
             let _ = ingot.lock().await.update_task_status(&turn_id, "failed");
-            dispatcher.publish(TurnEvent::Failed {
-                session_id,
-                turn_id,
-                reason: reason.clone(),
-                conversation_id: None,
-                trace_id: None,
-                span_id: None,
-                parent_span_id: None,
-                operation_name: None,
-                agent_name: None,
-                status: None,
-            });
+            dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
             turn_span.set_status(SpanStatus::error(reason));
             turn_span.end();
             return;
@@ -522,8 +496,8 @@ async fn run_turn(
                     match ig.get_task(task_id) {
                         Ok(Some(active_task)) => format!(
                             "\n\n<active_task>\n<title>{}</title>\n<description>{}</description>\n</active_task>",
-                            active_task.title,
-                            active_task.description.as_str(),
+                            xml_escape(&active_task.title),
+                            xml_escape(active_task.description.as_str()),
                         ),
                         _ => String::new(),
                     }
@@ -803,18 +777,7 @@ async fn run_turn(
                                 "rate limited by provider; retry limit exceeded".to_owned();
                             warn!(turn_id = %turn_id, "rate limit retry limit exceeded");
                             let _ = ingot.lock().await.update_task_status(&turn_id, "failed");
-                            dispatcher.publish(TurnEvent::Failed {
-                                session_id,
-                                turn_id,
-                                reason: reason.clone(),
-                                conversation_id: None,
-                                trace_id: None,
-                                span_id: None,
-                                parent_span_id: None,
-                                operation_name: None,
-                                agent_name: None,
-                                status: None,
-                            });
+                            dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
                             turn_span.set_status(SpanStatus::error(reason));
                             turn_span.end();
                             return;
@@ -832,18 +795,7 @@ async fn run_turn(
                     Ok(Err(DrainError::Other(reason))) => {
                         warn!(turn_id = %turn_id, error = %reason, "stream error during turn");
                         let _ = ingot.lock().await.update_task_status(&turn_id, "failed");
-                        dispatcher.publish(TurnEvent::Failed {
-                            session_id,
-                            turn_id,
-                            reason: reason.clone(),
-                            conversation_id: None,
-                            trace_id: None,
-                            span_id: None,
-                            parent_span_id: None,
-                            operation_name: None,
-                            agent_name: None,
-                            status: None,
-                        });
+                        dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
                         turn_span.set_status(SpanStatus::error(reason));
                         turn_span.end();
                         return;
@@ -852,18 +804,7 @@ async fn run_turn(
                         let reason = "stream timed out after 300s".to_owned();
                         warn!(turn_id = %turn_id, "provider stream timed out");
                         let _ = ingot.lock().await.update_task_status(&turn_id, "failed");
-                        dispatcher.publish(TurnEvent::Failed {
-                            session_id,
-                            turn_id,
-                            reason: reason.clone(),
-                            conversation_id: None,
-                            trace_id: None,
-                            span_id: None,
-                            parent_span_id: None,
-                            operation_name: None,
-                            agent_name: None,
-                            status: None,
-                        });
+                        dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
                         turn_span.set_status(SpanStatus::error(reason));
                         turn_span.end();
                         return;
@@ -887,7 +828,7 @@ async fn run_turn(
         // A tool call appears as a JSON object with a "tool" key in the response.
         let tool_call = parse_tool_call(&response_text);
 
-        if let Some((tool_name, tool_input)) = tool_call {
+        if let Some((tool_name, mut tool_input)) = tool_call {
             // Generate a per-invocation correlation ID so the ToolCalled event
             // and the corresponding AuditEvent can be joined in the audit log.
             let tool_call_id = Uuid::new_v4().to_string();
@@ -943,8 +884,8 @@ async fn run_turn(
                     match gate.intercept(ap, 300).await {
                         Decision::Approve => None,
                         Decision::Deny(reason) => Some(format!("denied: {reason}")),
-                        Decision::Modify(_new_cmd) => {
-                            // Modify path: fall through to execution with original input.
+                        Decision::Modify(new_input) => {
+                            tool_input = new_input;
                             None
                         }
                     }
@@ -1097,18 +1038,7 @@ async fn run_turn(
     {
         let reason = e.to_string();
         warn!(turn_id = %turn_id, error = %reason, "failed to store task response");
-        dispatcher.publish(TurnEvent::Failed {
-            session_id,
-            turn_id,
-            reason: reason.clone(),
-            conversation_id: None,
-            trace_id: None,
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
-        });
+        dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
         turn_span.set_status(SpanStatus::error(reason));
         turn_span.end();
         return;
@@ -1277,66 +1207,38 @@ async fn run_turn(
     });
 }
 
-/// Parses a tool call embedded in `text`, returning `(tool_name, input_json_string)`.
+/// Finds the first JSON object with a `"tool"` key anywhere in `text`.
 ///
-/// Looks for a JSON object with a `"tool"` key anywhere in the text.
-/// Returns `None` when no tool call is detected.
-fn parse_tool_call(text: &str) -> Option<(String, String)> {
-    for (start, c) in text.char_indices() {
-        if c != '{' {
-            continue;
-        }
-        let slice = &text[start..];
-
-        // Try balanced-brace extraction first so embedded JSON is handled correctly.
-        let candidate = if let Some(end) = find_json_end(slice) {
-            &slice[..end]
-        } else {
-            slice
-        };
-
-        if let Ok(v) = serde_json::from_str::<Value>(candidate) {
-            if let Some(tool_name) = v.get("tool").and_then(Value::as_str) {
-                let input = v
-                    .get("input")
-                    .map_or_else(|| "{}".to_owned(), std::string::ToString::to_string);
-                return Some((tool_name.to_owned(), input));
+/// Uses `serde_json` streaming deserialization: for each `{` byte position,
+/// a `Deserializer` is created so that valid JSON is consumed and trailing
+/// text is ignored, without a custom brace-counting scanner.
+fn find_tool_call_json(text: &str) -> Option<serde_json::Value> {
+    use serde::de::Deserialize as _;
+    let bytes = text.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'{' {
+            let mut de = serde_json::Deserializer::from_str(&text[i..]);
+            if let Ok(v) = serde_json::Value::deserialize(&mut de) {
+                if v.get("tool").is_some() {
+                    return Some(v);
+                }
             }
         }
     }
     None
 }
 
-/// Finds the index of the character after the balanced closing `}` for `s`, which
-/// must start with `{`.
-fn find_json_end(s: &str) -> Option<usize> {
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut prev_backslash = false;
-    for (i, c) in s.char_indices() {
-        if in_string {
-            if prev_backslash {
-                prev_backslash = false;
-            } else if c == '\\' {
-                prev_backslash = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-        } else {
-            match c {
-                '"' => in_string = true,
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(i + 1);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    None
+/// Parses a tool call embedded in `text`, returning `(tool_name, input_json_string)`.
+///
+/// Looks for a JSON object with a `"tool"` key anywhere in the text.
+/// Returns `None` when no tool call is detected.
+fn parse_tool_call(text: &str) -> Option<(String, String)> {
+    let v = find_tool_call_json(text)?;
+    let tool_name = v.get("tool").and_then(Value::as_str)?.to_owned();
+    let input = v
+        .get("input")
+        .map_or_else(|| "{}".to_owned(), std::string::ToString::to_string);
+    Some((tool_name, input))
 }
 
 /// Executes the named tool with the given JSON input string.
@@ -1368,16 +1270,36 @@ async fn execute_tool(
         }
     }
 
-    // Data access tracking: warn on absolute-path write attempts outside workspace.
+    // Path traversal guard: reject write_file / edit_file paths outside workspace.
     if matches!(tool_name, "write_file" | "edit_file") {
         if let Some(path_str) = input.get("path").and_then(Value::as_str) {
-            let path = std::path::Path::new(path_str);
-            if path.is_absolute() {
+            let raw_join = workspace.join(path_str);
+            let full = match raw_join.canonicalize() {
+                Ok(p) => p,
+                Err(_) => {
+                    let workspace_canon =
+                        workspace.canonicalize().unwrap_or_else(|_| workspace.to_owned());
+                    let tentative = workspace.join(path_str);
+                    if !tentative.starts_with(&workspace_canon) {
+                        tracing::warn!(
+                            tool = tool_name,
+                            path = path_str,
+                            "smedja.security.data_access_blocked: write outside workspace rejected"
+                        );
+                        return r#"{"error": "path outside workspace"}"#.to_owned();
+                    }
+                    tentative
+                }
+            };
+            let workspace_canon =
+                workspace.canonicalize().unwrap_or_else(|_| workspace.to_owned());
+            if !full.starts_with(&workspace_canon) {
                 tracing::warn!(
                     tool = tool_name,
                     path = path_str,
-                    "smedja.security.data_access_blocked: write outside workspace attempted"
+                    "smedja.security.data_access_blocked: write outside workspace rejected"
                 );
+                return r#"{"error": "path outside workspace"}"#.to_owned();
             }
         }
     }
@@ -1415,7 +1337,24 @@ async fn execute_tool(
                 .get("path")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let full = workspace.join(path_str);
+            let raw_join = workspace.join(path_str);
+            let full = match raw_join.canonicalize() {
+                Ok(p) => p,
+                Err(_) => {
+                    let workspace_canon =
+                        workspace.canonicalize().unwrap_or_else(|_| workspace.to_owned());
+                    let tentative = workspace.join(path_str);
+                    if !tentative.starts_with(&workspace_canon) {
+                        return r#"{"error": "path outside workspace"}"#.to_owned();
+                    }
+                    tentative
+                }
+            };
+            let workspace_canon =
+                workspace.canonicalize().unwrap_or_else(|_| workspace.to_owned());
+            if !full.starts_with(&workspace_canon) {
+                return r#"{"error": "path outside workspace"}"#.to_owned();
+            }
             match tokio::fs::read_to_string(&full).await {
                 Ok(contents) => contents,
                 Err(e) => format!("error reading {path_str}: {e}"),
@@ -1423,7 +1362,24 @@ async fn execute_tool(
         }
         "list_files" => {
             let dir_str = input.get("path").and_then(Value::as_str).unwrap_or(".");
-            let full = workspace.join(dir_str);
+            let raw_join = workspace.join(dir_str);
+            let full = match raw_join.canonicalize() {
+                Ok(p) => p,
+                Err(_) => {
+                    let workspace_canon =
+                        workspace.canonicalize().unwrap_or_else(|_| workspace.to_owned());
+                    let tentative = workspace.join(dir_str);
+                    if !tentative.starts_with(&workspace_canon) {
+                        return r#"{"error": "path outside workspace"}"#.to_owned();
+                    }
+                    tentative
+                }
+            };
+            let workspace_canon =
+                workspace.canonicalize().unwrap_or_else(|_| workspace.to_owned());
+            if !full.starts_with(&workspace_canon) {
+                return r#"{"error": "path outside workspace"}"#.to_owned();
+            }
             match tokio::fs::read_dir(&full).await {
                 Ok(mut rd) => {
                     let mut entries = Vec::new();
@@ -1745,6 +1701,37 @@ fn spawn_worker(
     handles
 }
 
+/// Returns `true` only for publicly routable HTTP/HTTPS URLs.
+/// Blocks RFC-1918 private ranges, loopback, the unspecified address, and the
+/// cloud IMDS endpoint (169.254.169.254).
+fn is_safe_mcp_url(url: &str) -> bool {
+    let Ok(parsed) = url.parse::<url::Url>() else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "https" | "http") {
+        return false;
+    }
+    let host = parsed.host_str().unwrap_or("");
+    if host == "localhost" || host == "169.254.169.254" {
+        return false;
+    }
+    if let Ok(addr) = host.parse::<std::net::IpAddr>() {
+        if addr.is_loopback() || addr.is_unspecified() {
+            return false;
+        }
+        if let std::net::IpAddr::V4(v4) = addr {
+            let o = v4.octets();
+            if o[0] == 10
+                || (o[0] == 172 && o[1] >= 16 && o[1] <= 31)
+                || (o[0] == 192 && o[1] == 168)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[allow(clippy::too_many_lines)] // all RPC methods live in one function per the spec
 fn build_router(
     ingot: &Arc<Mutex<Ingot>>,
@@ -1781,6 +1768,11 @@ fn build_router(
         async move {
             let title = params
                 .get("title")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+
+            let mode = params
+                .get("mode")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
 
@@ -1823,10 +1815,8 @@ fn build_router(
                 updated_at: now,
                 status: "active".to_owned(),
                 task_id: task_id.clone(),
-                // Store the caller-supplied title in the `mode` field — Session
-                // has no dedicated title column; this is the nearest optional
-                // text field available on the existing schema.
-                mode: title.clone(),
+                mode,
+                title: title.clone().unwrap_or_default(),
                 cowork_mode,
                 workspace_root: None,
                 model_override: None,
@@ -1938,7 +1928,8 @@ fn build_router(
                 .map(|s| {
                     json!({
                         "id": s.id,
-                        "title": s.mode,
+                        "title": s.title,
+                        "mode": s.mode,
                         "created_at": s.created_at,
                         "updated_at": s.updated_at,
                     })
@@ -1969,7 +1960,8 @@ fn build_router(
 
             Ok(json!({
                 "id": session.id,
-                "title": session.mode,
+                "title": session.title,
+                "mode": session.mode,
                 "created_at": session.created_at,
                 "updated_at": session.updated_at,
                 "status": session.status,
@@ -2045,6 +2037,7 @@ fn build_router(
                         status: "active".into(),
                         task_id: None,
                         mode: parent.mode.clone(),
+                        title: parent.title.clone(),
                         cowork_mode: parent.cowork_mode,
                         workspace_root: parent.workspace_root.clone(),
                         model_override: parent.model_override.clone(),
@@ -2137,7 +2130,9 @@ fn build_router(
                                 "turn.subscribe timed out after 60s",
                             ));
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        // TODO: replace polling with a per-turn tokio::sync::watch channel
+                        // so run_turn can signal completion without busy-wait overhead.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                 }
             }
@@ -2486,7 +2481,9 @@ fn build_router(
                     created_at: 0.0,
                 };
                 let mut guard = vt.blocking_lock();
-                let _ = guard.upsert(&entry);
+                if let Err(e) = guard.upsert(&entry) {
+                    tracing::warn!(error = %e, "session.compact: vault upsert failed, compaction data lost");
+                }
             });
 
             Ok(json!({
@@ -2679,6 +2676,7 @@ fn build_router(
                         status: "active".into(),
                         task_id: None,
                         mode: parent.mode.clone(),
+                        title: parent.title.clone(),
                         cowork_mode: parent.cowork_mode,
                         workspace_root: parent.workspace_root.clone(),
                         model_override: parent.model_override.clone(),
@@ -2852,6 +2850,20 @@ fn build_router(
                 .and_then(Value::as_str)
                 .ok_or_else(|| missing_param("mode"))?
                 .to_owned();
+            // Prevent escalation out of read-only review sessions.
+            let existing_session = ig
+                .lock()
+                .await
+                .get_session(&session_id)
+                .map_err(|e| ingot_err(&e))?;
+            if let Some(existing_session) = existing_session {
+                if existing_session.mode.as_deref() == Some("review") {
+                    return Err(RpcError::new(
+                        codes::INVALID_PARAMS,
+                        "review sessions are read-only",
+                    ));
+                }
+            }
             ig.lock()
                 .await
                 .update_session_mode(&session_id, &mode)
@@ -2875,6 +2887,9 @@ fn build_router(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_owned();
+            if !is_safe_mcp_url(&url) {
+                return Err(RpcError::new(codes::INVALID_PARAMS, "url not permitted"));
+            }
             let transport = params
                 .get("transport")
                 .and_then(Value::as_str)
@@ -3495,6 +3510,11 @@ fn build_router(
                 ));
             }
 
+            // Guard against path traversal via change_name.
+            if rec.change_name.contains("..") || rec.change_name.contains('/') {
+                return Err(RpcError::new(codes::INVALID_PARAMS, "invalid change_name"));
+            }
+
             // Spawn background task — caller gets an immediate response.
             let bg_ig = Arc::clone(&ig);
             let bg_dispatcher = Arc::clone(&dispatcher);
@@ -3549,6 +3569,7 @@ fn build_router(
                     status: "active".to_owned(),
                     task_id: None,
                     mode: Some("loop".to_owned()),
+                    title: String::new(),
                     cowork_mode: false,
                     workspace_root: Some(workspace),
                     model_override: None,
@@ -4296,6 +4317,7 @@ mod tests {
                     status: "active".into(),
                     task_id: None,
                     mode: None,
+                    title: String::new(),
                     cowork_mode: false,
                     workspace_root: None,
                     model_override: None,
@@ -4329,6 +4351,7 @@ mod tests {
                     status: "active".into(),
                     task_id: None,
                     mode: Some("impl".into()),
+                    title: String::new(),
                     cowork_mode: false,
                     workspace_root: None,
                     model_override: None,
@@ -4350,6 +4373,7 @@ mod tests {
                     status: "active".into(),
                     task_id: None,
                     mode: parent.mode.clone(),
+                    title: parent.title.clone(),
                     cowork_mode: parent.cowork_mode,
                     workspace_root: parent.workspace_root.clone(),
                     model_override: parent.model_override.clone(),
@@ -4643,5 +4667,104 @@ mod tests {
 
         assert_eq!(warm_count, 1);
         assert_eq!(cold_count, 2);
+    }
+
+    // ── parse_tool_call / find_tool_call_json ─────────────────────────────────
+
+    #[test]
+    fn parse_tool_call_returns_none_for_plain_text() {
+        let result = super::parse_tool_call("hello world, no JSON here");
+        assert!(result.is_none(), "plain text must yield None");
+    }
+
+    #[test]
+    fn parse_tool_call_returns_some_for_valid_tool_json() {
+        let json = r#"{"tool":"bash","input":{"command":"ls"}}"#;
+        let result = super::parse_tool_call(json);
+        assert!(result.is_some(), "valid tool JSON must yield Some");
+        let (tool_name, input_str) = result.unwrap();
+        assert_eq!(tool_name, "bash");
+        let input_val: serde_json::Value = serde_json::from_str(&input_str).unwrap();
+        assert_eq!(input_val["command"], "ls");
+    }
+
+    #[test]
+    fn parse_tool_call_returns_none_for_json_without_tool_key() {
+        let json = r#"{"action":"bash","input":{"command":"ls"}}"#;
+        let result = super::parse_tool_call(json);
+        assert!(result.is_none(), "JSON without 'tool' key must yield None");
+    }
+
+    #[test]
+    fn find_tool_call_json_handles_json_embedded_in_text() {
+        let text = r#"Here is the call: {"tool":"read_file","input":{"path":"foo.txt"}} done."#;
+        let result = super::find_tool_call_json(text);
+        assert!(result.is_some(), "embedded JSON must be found");
+        let v = result.unwrap();
+        assert_eq!(v["tool"], "read_file");
+        assert_eq!(v["input"]["path"], "foo.txt");
+    }
+
+    #[tokio::test]
+    async fn smedja_vault_search_returns_results_when_vault_has_matching_entries() {
+        use smedja_ingot::Ingot;
+        use smedja_vault::Vault;
+
+        let ingot = Arc::new(Mutex::new(Ingot::open_in_memory().unwrap()));
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+
+        // Insert a known entry via the store tool so the embedding path is exercised.
+        let store_result = super::execute_tool(
+            "smedja_vault_store",
+            r#"{"content":"Rust ownership model borrow checker lifetimes","namespace":"search-test"}"#,
+            std::path::Path::new("/tmp"),
+            None,
+            &ingot,
+            &vault,
+        )
+        .await;
+        let stored: serde_json::Value = serde_json::from_str(&store_result).unwrap();
+        assert_eq!(stored["stored"], true, "entry must be stored before searching");
+
+        // Query with text similar to the inserted entry.
+        let search_result = super::execute_tool(
+            "smedja_vault_search",
+            r#"{"query":"Rust ownership borrow checker","namespace":"search-test","k":5}"#,
+            std::path::Path::new("/tmp"),
+            None,
+            &ingot,
+            &vault,
+        )
+        .await;
+
+        let v: serde_json::Value = serde_json::from_str(&search_result).unwrap();
+        let results = v["results"].as_array().expect("results must be an array");
+        assert!(
+            !results.is_empty(),
+            "smedja_vault_search must return at least one result for a matching query"
+        );
+
+        // Verify the returned entry has a positive cosine similarity by checking
+        // that the vault itself scores the entry > 0 when searched directly.
+        let similarity = {
+            let guard = vault.lock().await;
+            let qv = crate::embedder::embed("Rust ownership borrow checker");
+            let entries = guard
+                .search(&qv, "Rust ownership borrow checker", "search-test", 1)
+                .unwrap();
+            if entries.is_empty() {
+                return;
+            }
+            // Re-score using the embedder to confirm similarity is positive.
+            let stored_vec = crate::embedder::embed("Rust ownership model borrow checker lifetimes");
+            qv.iter()
+                .zip(stored_vec.iter())
+                .map(|(a, b)| a * b)
+                .sum::<f32>()
+        };
+        assert!(
+            similarity > 0.0,
+            "cosine similarity between query and stored entry must be > 0, got {similarity}"
+        );
     }
 }

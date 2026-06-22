@@ -58,21 +58,6 @@ pub struct WorktreePool {
 }
 
 impl WorktreePool {
-    // ponytail: WorktreePool::new() removed — use WorktreePool::default() instead.
-    // smdjad/src/main.rs still calls WorktreePool::new(); keep the method deprecated
-    // until that file is updated.
-    /// Creates an empty pool.
-    ///
-    /// # Deprecated
-    ///
-    /// Use [`WorktreePool::default()`] directly. This shim will be removed once
-    /// all call sites (e.g. `smdjad/src/main.rs`) are updated.
-    #[must_use]
-    #[deprecated(since = "0.1.0", note = "use WorktreePool::default() instead")]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Registers a new task for `role` pursuing `goal` inside `workspace_root`.
     ///
     /// The task starts in [`TaskStatus::Pending`]. No worktree is created on

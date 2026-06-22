@@ -111,6 +111,7 @@ tree-sitter-rust       = "0.23"
 tree-sitter-typescript = "0.23"
 
 # ids / time
+url          = "2"
 uuid         = { version = "1", features = ["v4", "serde"] }
 vte          = "0.13"
 walkdir            = "2"

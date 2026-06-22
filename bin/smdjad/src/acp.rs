@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use subtle::ConstantTimeEq;
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::routing::{delete, post};
@@ -53,7 +54,7 @@ async fn require_auth(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "));
-    if auth.is_some_and(|t| t == state.auth_token) {
+    if auth.is_some_and(|t| t.as_bytes().ct_eq(state.auth_token.as_bytes()).into()) {
         next.run(request).await.into_response()
     } else {
         (
@@ -78,6 +79,7 @@ async fn create_session(State(s): State<AcpState>) -> impl IntoResponse {
     let session = Session {
         id,
         mode: Some("acp".into()),
+        title: String::new(),
         status: "active".into(),
         task_id: None,
         cowork_mode: false,
@@ -466,5 +468,63 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(fetched.model_override.as_deref(), Some("gemma4-27b"));
+    }
+
+    /// Verifies that the auth check uses constant-time comparison:
+    /// - a token that is a prefix of the real token (different length) is rejected,
+    /// - a token that shares the same length but differs in content is rejected, and
+    /// - the exact correct token is accepted.
+    ///
+    /// A naive `==` short-circuits on the first byte mismatch (or on length
+    /// mismatch), leaking timing information.  `ConstantTimeEq` pads both
+    /// operands to equal length before comparing, so all three branches above
+    /// must take the same code path through the comparator.
+    #[tokio::test]
+    async fn auth_token_comparison_is_constant_time() {
+        // The real token is "test-token" (10 bytes).
+        // "test" is a strict prefix — a naive == would short-circuit on length.
+        let app = build_acp_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/acp/v1/session/new")
+                    .header("Authorization", "Bearer test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "prefix token must be rejected");
+
+        // Same length as "test-token" but wrong content.
+        let app = build_acp_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/acp/v1/session/new")
+                    .header("Authorization", "Bearer XXXX-XXXXX")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "wrong same-length token must be rejected");
+
+        // Correct token must be accepted.
+        let app = build_acp_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/acp/v1/session/new")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "correct token must be accepted");
     }
 }

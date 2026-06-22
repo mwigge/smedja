@@ -37,6 +37,7 @@ pub mod provider;
 pub mod subprocess;
 pub mod types;
 
+pub(crate) mod otel;
 pub(crate) mod sse;
 
 pub use anthropic::AnthropicProvider;

@@ -267,6 +267,7 @@ mod tests {
             status: "active".to_string(),
             task_id: None,
             mode: None,
+            title: String::new(),
             cowork_mode: false,
             workspace_root: None,
             model_override: None,
