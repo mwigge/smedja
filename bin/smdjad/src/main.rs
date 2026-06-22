@@ -8,6 +8,7 @@ pub mod mcp_oauth;
 pub mod price_table;
 pub mod provider_pool;
 pub mod sandbox;
+pub mod stream_server;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -163,6 +164,7 @@ impl std::fmt::Display for DrainError {
 async fn drain_stream(
     mut stream: smedja_adapter::DeltaStream,
     dispatcher: &Dispatcher,
+    turn_id: Option<&str>,
 ) -> Result<(String, u32, u32, Option<String>), DrainError> {
     let mut full_response = String::new();
     let mut input_tokens = 0u32;
@@ -175,6 +177,7 @@ async fn drain_stream(
                 full_response.push_str(&t);
                 dispatcher.publish(TurnEvent::AssistantDelta {
                     content: t,
+                    turn_id: turn_id.map(str::to_owned),
                     conversation_id: None,
                     trace_id: None,
                     span_id: None,
@@ -199,6 +202,7 @@ async fn drain_stream(
                 dispatcher.publish(TurnEvent::ToolCalled {
                     tool_name: name,
                     input_summary,
+                    turn_id: turn_id.map(str::to_owned),
                     conversation_id: None,
                     trace_id: None,
                     span_id: None,
@@ -210,6 +214,7 @@ async fn drain_stream(
                 });
                 dispatcher.publish(TurnEvent::AssistantDelta {
                     content: line,
+                    turn_id: turn_id.map(str::to_owned),
                     conversation_id: None,
                     trace_id: None,
                     span_id: None,
@@ -228,6 +233,7 @@ async fn drain_stream(
                 full_response.push('\n');
                 dispatcher.publish(TurnEvent::AssistantDelta {
                     content: line,
+                    turn_id: turn_id.map(str::to_owned),
                     conversation_id: None,
                     trace_id: None,
                     span_id: None,
@@ -716,7 +722,7 @@ async fn run_turn(
                 let stream = provider.stream_chat(&messages, &opts);
                 let drain_result = tokio::time::timeout(
                     std::time::Duration::from_mins(5),
-                    drain_stream(stream, &dispatcher),
+                    drain_stream(stream, &dispatcher, Some(turn_id.as_str())),
                 )
                 .await;
                 match drain_result {
@@ -841,6 +847,7 @@ async fn run_turn(
             dispatcher.publish(TurnEvent::ToolCalled {
                 tool_name: tool_name.clone(),
                 input_summary: tool_input.chars().take(120).collect(),
+                turn_id: Some(turn_id.clone()),
                 conversation_id: Some(session_id.clone()),
                 trace_id: ev_trace_id,
                 span_id: ev_span_id,
@@ -2226,7 +2233,7 @@ fn build_router(
                 &opts,
             );
             let dispatcher = Dispatcher::new(1);
-            let (summary, _, _, _) = drain_stream(stream, &dispatcher).await.map_err(|e| {
+            let (summary, _, _, _) = drain_stream(stream, &dispatcher, None).await.map_err(|e| {
                 RpcError::new(codes::INTERNAL_ERROR, format!("compaction failed: {e}"))
             })?;
 
@@ -3402,6 +3409,33 @@ async fn main() -> anyhow::Result<()> {
                     tracing::error!(error = %e, "ACP server error");
                 }
             });
+        }
+    }
+
+    // Streaming NDJSON server — sibling socket for live turn events.
+    let delta_store = stream_server::spawn_delta_buffer(Arc::clone(&dispatcher));
+    let stream_sock_path = stream_server::stream_socket_path(&path);
+    let _ = std::fs::remove_file(&stream_sock_path);
+    let _stream_sock_guard = SocketGuard { path: stream_sock_path.clone() };
+    match UnixListener::bind(&stream_sock_path) {
+        Ok(stream_listener) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(
+                    &stream_sock_path,
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
+            info!(path = %stream_sock_path.display(), "turn stream server listening");
+            let ds = Arc::clone(&delta_store);
+            let dp = Arc::clone(&dispatcher);
+            tokio::spawn(async move {
+                stream_server::serve(stream_listener, ds, dp).await;
+            });
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to bind stream socket; live streaming unavailable");
         }
     }
 
