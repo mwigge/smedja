@@ -85,6 +85,7 @@ async fn create_session(State(s): State<AcpState>) -> impl IntoResponse {
         updated_at: now,
         workspace_root: None,
         model_override: None,
+        runner_override: None,
     };
     match s.ingot.lock().await.create_session(&session) {
         Ok(()) => Json(json!({ "session_id": id })).into_response(),
