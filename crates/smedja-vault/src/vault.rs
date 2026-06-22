@@ -576,6 +576,21 @@ impl Vault {
         Ok(usize::try_from(n).unwrap_or(0))
     }
 
+    /// Returns the number of entries in the given `namespace`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::Db`] if the count query fails.
+    #[must_use = "check the Result and use the returned count"]
+    pub fn count_by_namespace(&self, namespace: &str) -> Result<usize, VaultError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM vault_entries WHERE namespace = ?1",
+            rusqlite::params![namespace],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
     /// Applies the database schema (idempotent).
     ///
     /// Creates all tables and then attempts to add any columns that may be
@@ -852,5 +867,26 @@ mod tests {
         let stored = vault.get_embedder_identity().unwrap().unwrap();
         assert_eq!(stored.model, "text-embedding-3-small");
         assert_eq!(stored.dimensions, 1536);
+    }
+
+    #[test]
+    fn count_by_namespace_isolates_entries() {
+        let mut vault = Vault::open_in_memory().unwrap();
+
+        let mut e1 = entry("warm1", vec![1.0, 0.0]);
+        e1.namespace = "warm".to_string();
+        let mut e2 = entry("warm2", vec![0.5, 0.5]);
+        e2.namespace = "warm".to_string();
+        let mut e3 = entry("cold1", vec![0.0, 1.0]);
+        e3.namespace = "default".to_string();
+
+        vault.upsert(&e1).unwrap();
+        vault.upsert(&e2).unwrap();
+        vault.upsert(&e3).unwrap();
+
+        assert_eq!(vault.count_by_namespace("warm").unwrap(), 2);
+        assert_eq!(vault.count_by_namespace("default").unwrap(), 1);
+        assert_eq!(vault.count_by_namespace("missing").unwrap(), 0);
+        assert_eq!(vault.count().unwrap(), 3);
     }
 }
