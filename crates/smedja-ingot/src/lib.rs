@@ -32,7 +32,32 @@ pub use task::Task;
 pub use token_snapshot::TokenSnapshot;
 
 /// The current schema version applied by [`Ingot::migrate`].
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+
+/// Numbered migrations applied in sequence after the base DDL.
+///
+/// Each entry is `(version, sql)`. The `sql` may be a single statement or a
+/// semicolon-separated batch. Migrations are applied in ascending version order
+/// and recorded in `schema_migrations` so they are never applied twice.
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, "ALTER TABLE tasks ADD COLUMN response TEXT;"),
+    (2, "ALTER TABLE sessions ADD COLUMN cowork_mode INTEGER NOT NULL DEFAULT 0;"),
+    (3, "ALTER TABLE sessions ADD COLUMN workspace_root TEXT;"),
+    (4, "ALTER TABLE sessions ADD COLUMN model_override TEXT;"),
+    (5, "ALTER TABLE sessions ADD COLUMN runner_override TEXT;"),
+    (6, "ALTER TABLE audit_events ADD COLUMN role_id TEXT;"),
+    (7, "ALTER TABLE audit_events ADD COLUMN conversation_id TEXT;"),
+    (8, "ALTER TABLE audit_events ADD COLUMN trace_id TEXT;"),
+    (9, "ALTER TABLE audit_events ADD COLUMN span_id TEXT;"),
+    (10, "ALTER TABLE audit_events ADD COLUMN parent_span_id TEXT;"),
+    (11, "ALTER TABLE audit_events ADD COLUMN agent_name TEXT;"),
+    (12, "ALTER TABLE audit_events ADD COLUMN operation_name TEXT;"),
+    (13, "ALTER TABLE audit_events ADD COLUMN status TEXT;"),
+    (14, "ALTER TABLE audit_events ADD COLUMN error_kind TEXT;"),
+    (15, "ALTER TABLE audit_events ADD COLUMN error_count INTEGER;"),
+    (16, "ALTER TABLE audit_events ADD COLUMN tool_call_id TEXT;"),
+    (17, "ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT '';"),
+];
 
 /// Aggregated statistics for a single multi-agent conversation.
 #[derive(Debug, Clone, PartialEq)]
@@ -123,6 +148,11 @@ impl Ingot {
 
             CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER PRIMARY KEY
+            );
+
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version    INTEGER PRIMARY KEY,
+                applied_at REAL NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS audit_events (
@@ -224,72 +254,7 @@ impl Ingot {
             ",
         )?;
 
-        // Add response column to existing databases -- SQLite returns an error if the
-        // column already exists; we suppress it so migrate() stays idempotent.
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE tasks ADD COLUMN response TEXT;");
-
-        // Add cowork_mode column to existing sessions tables -- suppressed if already present.
-        let _ = self.conn.execute_batch(
-            "ALTER TABLE sessions ADD COLUMN cowork_mode INTEGER NOT NULL DEFAULT 0;",
-        );
-
-        // Add workspace_root column to existing sessions tables -- suppressed if already present.
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE sessions ADD COLUMN workspace_root TEXT;");
-
-        // Add model_override column to existing sessions tables -- suppressed if already present.
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE sessions ADD COLUMN model_override TEXT;");
-
-        // Add runner_override column to existing sessions tables -- suppressed if already present.
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE sessions ADD COLUMN runner_override TEXT;");
-
-        // Add role_id column to audit_events -- suppressed if already present.
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE audit_events ADD COLUMN role_id TEXT;");
-
-        // schema version 2: timeline columns on audit_events.
-        // Each ALTER TABLE is independent so a failure on one (column already
-        // exists) does not prevent the remaining columns from being added.
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE audit_events ADD COLUMN conversation_id TEXT;");
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE audit_events ADD COLUMN trace_id TEXT;");
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE audit_events ADD COLUMN span_id TEXT;");
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE audit_events ADD COLUMN parent_span_id TEXT;");
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE audit_events ADD COLUMN agent_name TEXT;");
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE audit_events ADD COLUMN operation_name TEXT;");
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE audit_events ADD COLUMN status TEXT;");
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE audit_events ADD COLUMN error_kind TEXT;");
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE audit_events ADD COLUMN error_count INTEGER;");
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE audit_events ADD COLUMN tool_call_id TEXT;");
-
-        // schema version 2: conversation_rollups table.
+        // conversation_rollups table (created unconditionally via IF NOT EXISTS).
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS conversation_rollups (
                 conversation_id    TEXT PRIMARY KEY,
@@ -304,7 +269,39 @@ impl Ingot {
             );",
         )?;
 
-        // Record (or ignore) the schema version marker.
+        // Version-gated incremental migrations.
+        //
+        // Read the highest version already applied, then run each entry in
+        // MIGRATIONS whose version number exceeds that high-water mark.  After
+        // each successful statement we record the version in schema_migrations so
+        // the migration is never applied again — even if migrate() is called a
+        // second time on the same connection (idempotency is preserved).
+        let applied: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        let now = now_epoch();
+        for &(version, sql) in MIGRATIONS {
+            if version <= applied {
+                continue;
+            }
+            // Each ALTER TABLE may fail on a fresh database where the column was
+            // already present in the base CREATE TABLE DDL above.  We suppress the
+            // error so migrate() stays idempotent across both fresh and pre-existing
+            // databases.
+            let _ = self.conn.execute_batch(sql);
+            self.conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                rusqlite::params![version, now],
+            )?;
+        }
+
+        // Record (or ignore) the legacy schema version marker.
         self.conn.execute(
             "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
             rusqlite::params![SCHEMA_VERSION],
@@ -1296,6 +1293,7 @@ mod tests {
             status: "active".to_owned(),
             task_id: None,
             mode: None,
+            title: String::new(),
             cowork_mode: false,
             workspace_root: None,
             model_override: None,

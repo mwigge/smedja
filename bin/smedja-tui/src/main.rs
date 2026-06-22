@@ -188,6 +188,8 @@ struct AppState {
     last_traceparent: Option<String>,
     /// Pending structured output type for generator commands (/drawio, /pptx).
     pending_output_type: Option<OutputType>,
+    /// True when `SMEDJA_OTLP_ENDPOINT` is set in the environment at startup.
+    otlp_configured: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1167,9 +1169,20 @@ async fn handle_key(
             }
             KeyCode::Char('t') => {
                 if let Some(tp) = state.last_traceparent.clone() {
-                    yank_to_clipboard(&[tp.clone()]);
+                    yank_to_clipboard(std::slice::from_ref(&tp));
                     state.clipboard = Some(tp.clone());
-                    push_system_message(state, format!("trace: {tp}  (copied)"));
+                    let hint = if state.otlp_configured {
+                        // Extract trace_id: field index 1 of the W3C traceparent
+                        // (format: version-trace_id-parent_id-flags), which is a
+                        // 32-hex-char trace ID.
+                        let trace_id = tp.split('-').nth(1).unwrap_or("");
+                        format!(
+                            " — open in Jaeger: http://localhost:16686/trace/{trace_id}"
+                        )
+                    } else {
+                        " — set SMEDJA_OTLP_ENDPOINT to export traces".to_owned()
+                    };
+                    push_system_message(state, format!("trace: {tp}  (copied){hint}"));
                 }
                 return Ok(());
             }
@@ -1836,6 +1849,7 @@ async fn main() -> Result<()> {
         .and_then(|v| v.as_str())
         .map(str::to_owned);
 
+    let otlp_configured = std::env::var("SMEDJA_OTLP_ENDPOINT").is_ok();
     let stream_sock_path = stream_socket_path(&sock);
     let mut state = AppState {
         session_id,
@@ -1882,6 +1896,7 @@ async fn main() -> Result<()> {
         stream_sock_path,
         last_traceparent: None,
         pending_output_type: None,
+        otlp_configured,
     };
 
     // Connect banner — shown on every startup so the user knows what's connected.
@@ -2009,7 +2024,13 @@ async fn main() -> Result<()> {
                         };
 
                         let footer = if let Some(ref tp_str) = tp {
-                            format!("↳ {input_tok}↑ {output_tok}↓ · trace: {tp_str}")
+                            if state.otlp_configured {
+                                format!("↳ {input_tok}↑ {output_tok}↓ · trace: {tp_str}")
+                            } else {
+                                format!(
+                                    "↳ {input_tok}↑ {output_tok}↓ · trace: {tp_str} · traces not exported (set SMEDJA_OTLP_ENDPOINT)"
+                                )
+                            }
                         } else {
                             format!("↳ {input_tok}↑ {output_tok}↓ tokens · {elapsed_ms}ms")
                         };
@@ -2649,6 +2670,7 @@ mod tests {
             stream_sock_path: PathBuf::from("/tmp/smdjad.sock.stream"),
             last_traceparent: None,
             pending_output_type: None,
+            otlp_configured: false,
         }
     }
 
@@ -3253,6 +3275,62 @@ mod tests {
             SLASH_COMPLETIONS.to_vec(),
             sorted,
             "SLASH_COMPLETIONS must be in alphabetical order"
+        );
+    }
+
+    // --- OTel footer guidance tests ---
+
+    /// Build the footer string the same way the streaming `done` handler does,
+    /// so the unit test does not depend on a live event loop.
+    fn build_turn_footer(
+        input_tok: u64,
+        output_tok: u64,
+        elapsed_ms: u64,
+        traceparent: Option<&str>,
+        otlp_configured: bool,
+    ) -> String {
+        if let Some(tp_str) = traceparent {
+            if otlp_configured {
+                format!("↳ {input_tok}↑ {output_tok}↓ · trace: {tp_str}")
+            } else {
+                format!(
+                    "↳ {input_tok}↑ {output_tok}↓ · trace: {tp_str} · traces not exported (set SMEDJA_OTLP_ENDPOINT)"
+                )
+            }
+        } else {
+            format!("↳ {input_tok}↑ {output_tok}↓ tokens · {elapsed_ms}ms")
+        }
+    }
+
+    #[test]
+    fn footer_shows_otlp_warning_when_not_configured() {
+        let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let footer = build_turn_footer(100, 50, 300, Some(tp), false);
+        assert!(
+            footer.contains(tp),
+            "footer must include the traceparent string"
+        );
+        assert!(
+            footer.contains("traces not exported"),
+            "footer must warn that traces are not exported when OTLP is not configured"
+        );
+        assert!(
+            footer.contains("SMEDJA_OTLP_ENDPOINT"),
+            "footer must mention SMEDJA_OTLP_ENDPOINT"
+        );
+    }
+
+    #[test]
+    fn footer_shows_no_otlp_warning_when_configured() {
+        let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let footer = build_turn_footer(100, 50, 300, Some(tp), true);
+        assert!(
+            footer.contains(tp),
+            "footer must include the traceparent string"
+        );
+        assert!(
+            !footer.contains("traces not exported"),
+            "footer must not show warning when OTLP is configured"
         );
     }
 }

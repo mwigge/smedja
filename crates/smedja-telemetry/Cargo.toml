@@ -12,5 +12,6 @@ sdk = ["dep:opentelemetry_sdk"]
 [dependencies]
 opentelemetry     = { workspace = true }
 opentelemetry_sdk = { workspace = true, optional = true }
+sha2              = { workspace = true }
 
 [dev-dependencies]
