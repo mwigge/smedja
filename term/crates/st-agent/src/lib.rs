@@ -11,7 +11,7 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -40,6 +40,19 @@ pub fn smdjad_socket_path() -> PathBuf {
 /// Returns `true` if the smdjad socket exists on the filesystem.
 pub async fn socket_exists() -> bool {
     tokio::fs::metadata(smdjad_socket_path()).await.is_ok()
+}
+
+/// Returns the agent-event push socket path: `<rpc_path>.agent`.
+#[must_use]
+pub fn agent_socket_path(rpc_path: &Path) -> PathBuf {
+    let name = rpc_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let mut p = rpc_path.to_path_buf();
+    p.set_file_name(format!("{name}.agent"));
+    p
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -95,6 +108,8 @@ pub enum PaneEvent {
         input_tokens: u64,
         output_tokens: u64,
         latency_ms: u64,
+        /// W3C `traceparent` header from the turn's root span, if available.
+        traceparent: Option<String>,
     },
     /// Incremental text from the model stream.
     StreamDelta { text: String },
@@ -113,8 +128,16 @@ impl PaneEvent {
                 Some(Self::TurnStart {
                     session_id: p.get("session_id")?.as_str()?.to_owned(),
                     turn_id: p.get("turn_id")?.as_str()?.to_owned(),
-                    tier: p.get("tier")?.as_str()?.to_owned(),
-                    model: p.get("model")?.as_str()?.to_owned(),
+                    tier: p
+                        .get("tier")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned(),
+                    model: p
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned(),
                     trace_id: p
                         .get("trace_id")
                         .and_then(|v| v.as_str())
@@ -159,6 +182,10 @@ impl PaneEvent {
                     input_tokens: p.get("input_tokens")?.as_u64()?,
                     output_tokens: p.get("output_tokens")?.as_u64()?,
                     latency_ms: p.get("latency_ms")?.as_u64()?,
+                    traceparent: p
+                        .get("traceparent")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned),
                 })
             }
             "stream_delta" => {
@@ -215,6 +242,24 @@ impl SmdjadClient {
         let (read_half, writer) = tokio::io::split(stream);
         let reader = BufReader::new(read_half);
         debug!("connected to smdjad socket");
+        Ok(Self { reader, writer })
+    }
+
+    /// Opens a connection to the smdjad agent-event socket.
+    ///
+    /// The agent socket path is derived from [`smdjad_socket_path`] via
+    /// [`agent_socket_path`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`] if the socket does not exist or the connection
+    /// is refused.
+    pub async fn connect_agent() -> Result<Self, io::Error> {
+        let path = agent_socket_path(&smdjad_socket_path());
+        let stream = UnixStream::connect(&path).await?;
+        let (read_half, writer) = tokio::io::split(stream);
+        let reader = BufReader::new(read_half);
+        debug!("connected to smdjad agent socket");
         Ok(Self { reader, writer })
     }
 
@@ -301,6 +346,14 @@ pub struct PaneAgentState {
     pub active_task: Option<String>,
     /// True while an agent turn is in progress.
     pub is_agent_turn: bool,
+    /// Input token count from the most recent `TurnEnd` event.
+    pub last_input_tokens: Option<u64>,
+    /// Output token count from the most recent `TurnEnd` event.
+    pub last_output_tokens: Option<u64>,
+    /// Turn latency in milliseconds from the most recent `TurnEnd` event.
+    pub last_latency_ms: Option<u64>,
+    /// W3C `traceparent` from the most recent `TurnEnd` event.
+    pub last_traceparent: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -747,6 +800,7 @@ mod tests {
             input_tokens,
             output_tokens,
             latency_ms,
+            ..
         } = event
         {
             assert_eq!(input_tokens, 100);
@@ -871,5 +925,74 @@ mod tests {
                 None => unsafe { std::env::remove_var(&self.key) },
             }
         }
+    }
+
+    #[test]
+    fn agent_socket_path_appends_dot_agent() {
+        let p = agent_socket_path(std::path::Path::new("/run/smdjad.sock"));
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/run/smdjad.sock.agent"),
+            "expected .agent suffix"
+        );
+    }
+
+    #[test]
+    fn turn_end_from_json_with_traceparent() {
+        let json = r#"{"type":"turn_end","params":{"input_tokens":412,"output_tokens":88,"latency_ms":4200,"traceparent":"00-abc-def-01"}}"#;
+        let ev = PaneEvent::from_json_line(json).expect("must parse");
+        if let PaneEvent::TurnEnd {
+            input_tokens,
+            output_tokens,
+            latency_ms,
+            traceparent,
+        } = ev
+        {
+            assert_eq!(input_tokens, 412);
+            assert_eq!(output_tokens, 88);
+            assert_eq!(latency_ms, 4200);
+            assert_eq!(traceparent.as_deref(), Some("00-abc-def-01"));
+        } else {
+            panic!("expected TurnEnd");
+        }
+    }
+
+    #[test]
+    fn turn_end_from_json_without_traceparent() {
+        let json =
+            r#"{"type":"turn_end","params":{"input_tokens":10,"output_tokens":5,"latency_ms":100}}"#;
+        let ev = PaneEvent::from_json_line(json).expect("must parse");
+        if let PaneEvent::TurnEnd { traceparent, .. } = ev {
+            assert!(traceparent.is_none(), "missing traceparent must be None");
+        } else {
+            panic!("expected TurnEnd");
+        }
+    }
+
+    #[test]
+    fn turn_start_from_json_missing_tier_model_uses_empty_strings() {
+        let json = r#"{"type":"turn_start","params":{"session_id":"s1","turn_id":"t1"}}"#;
+        let ev = PaneEvent::from_json_line(json).expect("must parse even without tier/model");
+        if let PaneEvent::TurnStart { tier, model, .. } = ev {
+            assert_eq!(tier, "", "missing tier must default to empty string");
+            assert_eq!(model, "", "missing model must default to empty string");
+        } else {
+            panic!("expected TurnStart");
+        }
+    }
+
+    #[test]
+    fn pane_agent_state_has_new_token_fields() {
+        let mut state = PaneAgentState::default();
+        assert!(state.last_input_tokens.is_none());
+        assert!(state.last_output_tokens.is_none());
+        assert!(state.last_latency_ms.is_none());
+        assert!(state.last_traceparent.is_none());
+        state.last_input_tokens = Some(412);
+        state.last_output_tokens = Some(88);
+        state.last_latency_ms = Some(4200);
+        state.last_traceparent = Some("00-abc-01".to_owned());
+        assert_eq!(state.last_input_tokens, Some(412));
+        assert_eq!(state.last_output_tokens, Some(88));
     }
 }

@@ -55,6 +55,14 @@ pub struct ModuleContext {
     pub active_task: Option<String>,
     /// Exit code of the last shell command (from OSC 133 D).
     pub last_exit_code: Option<i32>,
+    /// Input token count from the most recent completed turn.
+    pub input_tokens: Option<u64>,
+    /// Output token count from the most recent completed turn.
+    pub output_tokens: Option<u64>,
+    /// Turn latency in milliseconds from the most recent completed turn.
+    pub latency_ms: Option<u64>,
+    /// W3C `traceparent` from the most recent completed turn.
+    pub traceparent: Option<String>,
 }
 
 // ── StatusModule trait ────────────────────────────────────────────────────────
@@ -198,6 +206,7 @@ pub struct GitBranchModule {
 
 impl GitBranchModule {
     /// Creates a module that prefixes the branch name with `sym`.
+    #[must_use]
     pub fn with_symbol(sym: Option<String>) -> Self {
         Self { symbol: sym }
     }
@@ -207,6 +216,7 @@ impl GitBranchModule {
     }
 
     /// Evaluate in an explicit working directory (useful for testing).
+    #[must_use]
     pub fn evaluate_in(&self, _ctx: &ModuleContext, cwd: &Path) -> Option<Segment> {
         let output = std::process::Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -248,6 +258,7 @@ pub struct GitStatusModule;
 
 impl GitStatusModule {
     /// Evaluate in an explicit working directory (useful for testing).
+    #[must_use]
     pub fn evaluate_in(&self, _ctx: &ModuleContext, cwd: &Path) -> Option<Segment> {
         let output = std::process::Command::new("git")
             .args(["status", "--porcelain"])
@@ -302,6 +313,7 @@ pub struct LanguageModule;
 
 impl LanguageModule {
     /// Evaluate against an explicit directory (useful for testing).
+    #[must_use]
     pub fn evaluate_in(&self, _ctx: &ModuleContext, cwd: &Path) -> Option<Segment> {
         let checks: &[(&str, &str)] = &[
             ("Cargo.toml", "\u{1f980} Rust"),
@@ -403,6 +415,66 @@ impl StatusModule for ExitCodeModule {
     }
 }
 
+/// Displays the most recent turn's token counts: `"{input}↑ {output}↓"`.
+///
+/// Returns `None` when either token count is absent.
+pub struct TokensModule;
+
+impl StatusModule for TokensModule {
+    fn name(&self) -> &'static str {
+        "tokens"
+    }
+
+    fn evaluate(&self, ctx: &ModuleContext) -> Option<Segment> {
+        let input = ctx.input_tokens?;
+        let output = ctx.output_tokens?;
+        Some(plain_segment("tokens", format!("{input}\u{2191} {output}\u{2193}")))
+    }
+}
+
+/// Displays the most recent turn's latency.
+///
+/// Format: `"{n}ms"` for under 1 second, `"{n:.1}s"` otherwise.
+/// Returns `None` when latency is absent.
+pub struct LatencyModule;
+
+impl StatusModule for LatencyModule {
+    fn name(&self) -> &'static str {
+        "latency"
+    }
+
+    fn evaluate(&self, ctx: &ModuleContext) -> Option<Segment> {
+        let ms = ctx.latency_ms?;
+        let text = if ms < 1000 {
+            format!("{ms}ms")
+        } else {
+            #[allow(clippy::cast_precision_loss)] // ms ≤ u64::MAX; precision loss is acceptable for display
+            let secs = ms as f64 / 1000.0;
+            format!("{secs:.1}s")
+        };
+        Some(plain_segment("latency", text))
+    }
+}
+
+/// Displays the first 8 characters of the `trace_id` from the most recent turn.
+///
+/// Parses the W3C `traceparent` header (`version-trace_id-parent_id-flags`).
+/// Returns `None` when no traceparent is available.
+pub struct TraceModule;
+
+impl StatusModule for TraceModule {
+    fn name(&self) -> &'static str {
+        "trace"
+    }
+
+    fn evaluate(&self, ctx: &ModuleContext) -> Option<Segment> {
+        let tp = ctx.traceparent.as_deref()?;
+        let trace_id = tp.split('-').nth(1).unwrap_or(tp);
+        let short = &trace_id[..trace_id.len().min(8)];
+        Some(plain_segment("trace", format!("trace:{short}")))
+    }
+}
+
 // ── Parallel render ───────────────────────────────────────────────────────────
 
 /// Fat-pointer (data + vtable) to a `StatusModule` packed into two `usize` words.
@@ -433,6 +505,7 @@ struct ModulePtr {
 ///
 /// The `budget_ms` parameter is accepted for API compatibility; per-module
 /// timeouts are the primary enforcement mechanism.
+#[must_use]
 pub fn render_status_bar_parallel(
     modules: &[Box<dyn StatusModule>],
     ctx: &ModuleContext,
@@ -498,6 +571,7 @@ pub fn render_status_bar_parallel(
 ///
 /// Unresolved tokens (modules not present in `segments`) are removed. Pipe
 /// characters `|` are replaced with the box-drawing vertical `│` (U+2502).
+#[must_use]
 pub fn format_bar(segments: &[Segment], format: &str) -> String {
     let mut result = format.to_owned();
 
@@ -579,6 +653,10 @@ mod tests {
             context_window: 0,
             active_task: None,
             last_exit_code: None,
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: None,
+            traceparent: None,
         }
     }
 
@@ -825,6 +903,90 @@ mod tests {
                 seg.text
             );
         }
+    }
+
+    // 17
+    #[test]
+    fn tokens_module_formats_up_down_arrows() {
+        let ctx = ModuleContext {
+            input_tokens: Some(412),
+            output_tokens: Some(88),
+            ..make_ctx()
+        };
+        let seg = TokensModule.evaluate(&ctx).expect("should return Some");
+        assert!(
+            seg.text.contains("412"),
+            "expected input count in '{}'",
+            seg.text
+        );
+        assert!(
+            seg.text.contains("88"),
+            "expected output count in '{}'",
+            seg.text
+        );
+        assert!(seg.text.contains('\u{2191}'), "expected ↑ in '{}'", seg.text);
+        assert!(seg.text.contains('\u{2193}'), "expected ↓ in '{}'", seg.text);
+    }
+
+    // 18
+    #[test]
+    fn tokens_module_none_when_missing() {
+        assert!(TokensModule.evaluate(&make_ctx()).is_none());
+        let ctx = ModuleContext {
+            input_tokens: Some(10),
+            ..make_ctx()
+        };
+        assert!(
+            TokensModule.evaluate(&ctx).is_none(),
+            "missing output_tokens must return None"
+        );
+    }
+
+    // 19
+    #[test]
+    fn latency_module_sub_second_shows_ms() {
+        let ctx = ModuleContext {
+            latency_ms: Some(800),
+            ..make_ctx()
+        };
+        let seg = LatencyModule.evaluate(&ctx).expect("should return Some");
+        assert_eq!(seg.text, "800ms");
+    }
+
+    // 20
+    #[test]
+    fn latency_module_multi_second_shows_decimal_s() {
+        let ctx = ModuleContext {
+            latency_ms: Some(4200),
+            ..make_ctx()
+        };
+        let seg = LatencyModule.evaluate(&ctx).expect("should return Some");
+        assert_eq!(seg.text, "4.2s");
+    }
+
+    // 21
+    #[test]
+    fn latency_module_none_when_missing() {
+        assert!(LatencyModule.evaluate(&make_ctx()).is_none());
+    }
+
+    // 22
+    #[test]
+    fn trace_module_extracts_first_eight_chars_of_trace_id() {
+        let ctx = ModuleContext {
+            traceparent: Some(
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_owned(),
+            ),
+            ..make_ctx()
+        };
+        let seg = TraceModule.evaluate(&ctx).expect("should return Some");
+        assert_eq!(seg.text, "trace:4bf92f35");
+    }
+
+    // 23
+    #[test]
+    fn trace_module_none_when_missing() {
+        assert!(TraceModule.evaluate(&make_ctx()).is_none());
     }
 
     // 11

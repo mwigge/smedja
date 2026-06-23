@@ -11,6 +11,7 @@ pub mod orchestrator;
 pub mod price_table;
 pub mod provider_pool;
 pub mod sandbox;
+pub mod agent_server;
 pub mod stream_server;
 
 use std::collections::HashMap;
@@ -2595,6 +2596,31 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(e) => {
             warn!(error = %e, "failed to bind stream socket; live streaming unavailable");
+        }
+    }
+
+    // Agent-event push server — sibling socket for live pane telemetry.
+    let agent_sock_path = agent_server::agent_socket_path(&path);
+    let _ = std::fs::remove_file(&agent_sock_path);
+    let _agent_sock_guard = SocketGuard { path: agent_sock_path.clone() };
+    match UnixListener::bind(&agent_sock_path) {
+        Ok(agent_listener) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(
+                    &agent_sock_path,
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
+            info!(path = %agent_sock_path.display(), "agent event server listening");
+            let dp = Arc::clone(&dispatcher);
+            tokio::spawn(async move {
+                agent_server::serve(agent_listener, dp).await;
+            });
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to bind agent socket");
         }
     }
 
