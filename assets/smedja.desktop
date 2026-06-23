@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=smedja
+Comment=GPU-accelerated terminal emulator and AI orchestration forge
+Exec=smedja
+Icon=smedja
+Type=Application
+Categories=System;TerminalEmulator;
+StartupNotify=true
+Keywords=terminal;emulator;AI;agent;

@@ -1,0 +1,44 @@
+# Maintainer: Morgan Wigge <morgan@wigge.nu>
+pkgname=smedja
+pkgver=0.12.0
+pkgrel=1
+pkgdesc="GPU-accelerated terminal emulator and AI orchestration forge"
+arch=('x86_64' 'aarch64')
+url="https://github.com/mwigge/smedja"
+license=('Apache-2.0')
+depends=('libssl.so')
+optdepends=('ttf-jetbrains-mono: monospace font for the terminal')
+provides=('smedja')
+
+source_x86_64=("smedja-linux-x86_64.tar.gz::https://github.com/mwigge/smedja/releases/download/v${pkgver}/smedja-linux-x86_64.tar.gz")
+source_aarch64=("smedja-linux-aarch64.tar.gz::https://github.com/mwigge/smedja/releases/download/v${pkgver}/smedja-linux-aarch64.tar.gz")
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+  cd "smedja-linux-${CARCH}"
+
+  for bin in smdjad smj smedja smedja-tui; do
+    install -Dm755 "$bin" "$pkgdir/usr/bin/$bin"
+  done
+
+  install -Dm644 smdjad.service "$pkgdir/usr/lib/systemd/user/smdjad.service"
+  install -Dm644 smedja.desktop  "$pkgdir/usr/share/applications/smedja.desktop"
+  install -Dm644 smedja-256.png  "$pkgdir/usr/share/icons/hicolor/256x256/apps/smedja.png"
+}
+
+post_install() {
+  echo ""
+  echo "smedja installed."
+  echo ""
+  echo "  To start the AI orchestration daemon automatically on login:"
+  echo ""
+  echo "    systemctl --user enable --now smdjad"
+  echo ""
+  echo "  Then launch the terminal: smedja"
+  echo ""
+}
+
+post_upgrade() {
+  post_install
+}

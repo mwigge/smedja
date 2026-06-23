@@ -37,3 +37,18 @@ winit             = { workspace = true }
 [dev-dependencies]
 portable-pty = { workspace = true }
 vte          = { workspace = true }
+
+[package.metadata.bundle]
+name              = "smedja"
+identifier        = "nu.wigge.smedja"
+icon              = ["../../../assets/brand/smedja.icns"]
+version           = "0.12.0"
+copyright         = "© 2025 Morgan Wigge"
+category          = "developer-tools"
+short_description = "GPU-accelerated terminal emulator and AI orchestration forge"
+long_description  = """
+smedja is a Rust-native forge for multi-agent AI orchestration.
+Route across local models, cloud APIs, and specialist roles with
+a GPU terminal, full OTel traceability, and a wire protocol that
+keeps everything interoperable.
+"""
