@@ -360,6 +360,53 @@ mod tests {
             .exists());
     }
 
+    /// A role runner whose execution always fails (models a role that could not
+    /// run, e.g. a per-role timeout firing).
+    #[derive(Default)]
+    struct FailingRunner {
+        statuses: Mutex<Vec<String>>,
+    }
+    impl RoleRunner for FailingRunner {
+        async fn run_role(
+            &self,
+            _role: &LoopRole,
+            _slice_index: usize,
+            _slice: &str,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("role timed out")
+        }
+    }
+    impl StatusSink for FailingRunner {
+        async fn set_status(&self, state: &LoopState) {
+            self.statuses
+                .lock()
+                .unwrap()
+                .push(state.as_str().to_owned());
+        }
+        async fn set_slice(&self, _slice: i64) {}
+    }
+
+    #[tokio::test]
+    async fn role_execution_failure_fails_the_slice() {
+        let dir = TempDir::new().unwrap();
+        let (cfg, path) = config_with(&dir, "true", "[]");
+        let rec = FailingRunner::default();
+        let out = drive(
+            &cfg,
+            dir.path(),
+            &path,
+            "demo",
+            &["slice".to_owned()],
+            &rec,
+            &rec,
+        )
+        .await;
+        assert_eq!(out.final_state, LoopState::Failed);
+        assert_eq!(out.slices_completed, 0);
+        // The loop must reach the terminal Failed state.
+        assert!(rec.statuses.lock().unwrap().contains(&"failed".to_owned()));
+    }
+
     #[tokio::test]
     async fn evaluator_separation_violation_fails_before_any_role_runs() {
         let dir = TempDir::new().unwrap();

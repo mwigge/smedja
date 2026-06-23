@@ -56,6 +56,7 @@ mod tests {
 
     #[test]
     fn detect_returns_api_when_no_gh_but_token_set() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         if which::which("gh").is_ok() {
             // CLI wins; skip this case.
             return;
@@ -69,6 +70,7 @@ mod tests {
 
     #[test]
     fn detect_returns_none_when_no_gh_and_no_token() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         if which::which("gh").is_ok() {
             // CLI wins; can't test the None path.
             return;

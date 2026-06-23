@@ -1,12 +1,50 @@
 use anyhow::Result;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::UnixStream;
 
 use crate::{Request, Response};
 
 /// Maximum inbound frame size: 4 MiB. Prevents unbounded allocation from a
 /// malicious or runaway local process sending a giant JSON payload.
-const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
+/// Reads one newline-delimited frame from `reader`, bounding allocation to
+/// `MAX_FRAME_BYTES` so a giant payload with no newline cannot exhaust memory.
+///
+/// Returns `Ok(None)` on EOF. The read is capped via `take`, so the buffer never
+/// grows past the limit before the size guard fires.
+///
+/// # Errors
+/// Returns an error if the read fails, the frame exceeds `MAX_FRAME_BYTES`, or
+/// the bytes are not valid UTF-8.
+pub(crate) async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<String>> {
+    // Cap the bytes the reader can yield at MAX_FRAME_BYTES + 1: enough to tell a
+    // maximal valid frame from an oversized one without allocating beyond the cap.
+    let cap = MAX_FRAME_BYTES as u64 + 1;
+    let mut limited = reader.take(cap);
+    let mut buf: Vec<u8> = Vec::new();
+    let n = limited.read_until(b'\n', &mut buf).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.len() > MAX_FRAME_BYTES {
+        anyhow::bail!("incoming JSON-RPC frame too large: exceeds max {MAX_FRAME_BYTES} bytes");
+    }
+    let line = std::str::from_utf8(&buf)?;
+    Ok(Some(line.to_owned()))
+}
+
+/// Writes `s` as a newline-terminated frame to `writer`.
+///
+/// # Errors
+/// Returns an error if the socket write fails.
+pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, s: &str) -> Result<()> {
+    writer.write_all(s.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    Ok(())
+}
 
 /// Newline-delimited JSON framing over a Unix socket.
 pub struct Codec {
@@ -63,26 +101,14 @@ impl Codec {
     }
 
     async fn write_line(&mut self, s: &str) -> Result<()> {
-        let mut buf = s.to_owned();
-        buf.push('\n');
-        self.stream.get_mut().write_all(buf.as_bytes()).await?;
-        Ok(())
+        write_frame(self.stream.get_mut(), s).await
     }
 
     async fn read_line_as<T: serde::de::DeserializeOwned>(&mut self) -> Result<Option<T>> {
-        let mut line = String::new();
-        let n = self.stream.read_line(&mut line).await?;
-        if n == 0 {
-            return Ok(None);
+        match read_frame(&mut self.stream).await? {
+            None => Ok(None),
+            Some(line) => Ok(Some(serde_json::from_str(line.trim_end())?)),
         }
-        if line.len() > MAX_FRAME_BYTES {
-            anyhow::bail!(
-                "incoming JSON-RPC frame too large: {} bytes (max {})",
-                line.len(),
-                MAX_FRAME_BYTES
-            );
-        }
-        Ok(Some(serde_json::from_str(line.trim_end())?))
     }
 }
 
@@ -173,6 +199,31 @@ mod tests {
             msg.contains("too large"),
             "error must mention 'too large': {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn recv_rejects_oversized_frame_without_newline() {
+        // A payload larger than MAX_FRAME_BYTES with NO trailing newline must be
+        // rejected by the bounded reader rather than buffering it all.
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut server = Codec::new(a);
+        let mut client = Codec::new(b);
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            // Write the cap+1 bytes with no newline, then keep the stream open.
+            let giant = "x".repeat(MAX_FRAME_BYTES + 1);
+            let _ = client.stream.get_mut().write_all(giant.as_bytes()).await;
+            // Hold the connection so the reader does not see EOF.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        });
+
+        let result = server.recv_request().await;
+        assert!(
+            result.is_err(),
+            "an oversized frame with no newline must be rejected"
+        );
+        assert!(result.unwrap_err().to_string().contains("too large"));
     }
 
     #[tokio::test]

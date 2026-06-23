@@ -27,6 +27,7 @@ mod tests {
 
     #[test]
     fn detect_returns_none_when_key_absent() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         let saved = std::env::var("MINIMAX_API_KEY").ok();
         std::env::remove_var("MINIMAX_API_KEY");
         let provider = MinimaxProvider::detect();
@@ -38,6 +39,7 @@ mod tests {
 
     #[test]
     fn detect_returns_some_when_key_present() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         std::env::set_var("MINIMAX_API_KEY", "test-key");
         let provider = MinimaxProvider::detect();
         std::env::remove_var("MINIMAX_API_KEY");
