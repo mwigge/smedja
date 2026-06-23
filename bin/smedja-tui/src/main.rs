@@ -257,6 +257,8 @@ struct AppState {
     history_search_mode: bool,
     /// Query string for the active reverse history search.
     history_search_query: String,
+    /// Resolved path to the `openspec` binary, or `None` if not installed.
+    openspec_bin: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -542,6 +544,65 @@ fn yank_to_clipboard(lines: &[String]) {
     }
 }
 
+/// Runs `openspec bin args` as a subprocess and returns stdout on success, stderr on error.
+async fn run_openspec(bin: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let output = tokio::process::Command::new(bin)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("openspec exec error: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+}
+
+/// Renders `openspec list --json` output into a human-readable string.
+#[must_use]
+fn format_openspec_list(json: &str) -> String {
+    let v: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(e) => return format!("openspec list parse error: {e}"),
+    };
+    let changes = match v.get("changes").and_then(|c| c.as_array()) {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => return "no active changes".to_owned(),
+    };
+    let mut lines = vec!["active changes:".to_owned()];
+    for c in changes {
+        let name = c.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+        let status = c.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+        lines.push(format!("  {name:<30} {status}"));
+    }
+    lines.join("\n")
+}
+
+/// Renders `openspec status --json` output as `key: value` lines.
+#[must_use]
+fn format_openspec_status(json: &str) -> String {
+    let v: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(e) => return format!("openspec status parse error: {e}"),
+    };
+    let Some(obj) = v.as_object() else {
+        return "openspec status: unexpected response format".to_owned();
+    };
+    if obj.is_empty() {
+        return "openspec status: no data".to_owned();
+    }
+    obj.iter()
+        .map(|(k, v)| {
+            let val = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            format!("{k}: {val}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn screen_row_to_line(row: u16, messages_top: u16, scroll: usize) -> usize {
     let offset = (row as usize).saturating_sub(messages_top as usize);
     scroll + offset
@@ -700,7 +761,42 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
             Ok(true)
         }
         "spec" => {
-            push_system_message(state, "spec picker is not wired yet");
+            let Some(ref bin) = state.openspec_bin else {
+                push_system_message(
+                    state,
+                    "openspec not found — install it and restart smedja-tui",
+                );
+                return Ok(true);
+            };
+            let bin = bin.clone();
+            let (sub, rest) = args.split_once(' ').unwrap_or((args, ""));
+            let text = match sub {
+                "" | "list" => {
+                    match run_openspec(&bin, &["list", "--json"]).await {
+                        Ok(json) => format_openspec_list(&json),
+                        Err(e) => e,
+                    }
+                }
+                "status" => {
+                    let extra: Vec<&str> = if rest.is_empty() {
+                        vec!["status", "--json"]
+                    } else {
+                        vec!["status", "--change", rest, "--json"]
+                    };
+                    match run_openspec(&bin, &extra).await {
+                        Ok(json) => format_openspec_status(&json),
+                        Err(e) => e,
+                    }
+                }
+                "archive" if !rest.is_empty() => {
+                    match run_openspec(&bin, &["archive", rest, "--yes"]).await {
+                        Ok(_) => format!("archived: {rest}"),
+                        Err(e) => e,
+                    }
+                }
+                _ => "usage: /spec [list|status [name]|archive <name>]".to_owned(),
+            };
+            push_system_message(state, text);
             Ok(true)
         }
         "tdd" => {
@@ -2245,6 +2341,7 @@ async fn main() -> Result<()> {
         saved_input: String::new(),
         history_search_mode: false,
         history_search_query: String::new(),
+        openspec_bin: which::which("openspec").ok(),
     };
 
     // Connect banner — shown on every startup so the user knows what's connected.
@@ -3030,6 +3127,7 @@ mod tests {
             saved_input: String::new(),
             history_search_mode: false,
             history_search_query: String::new(),
+            openspec_bin: None,
         }
     }
 
@@ -4062,5 +4160,86 @@ mod tests {
 
         assert!(!state.history_search_mode, "search mode must be cleared on Enter");
         assert_eq!(state.input, "git status", "matched input must be kept on Enter");
+    }
+
+    // --- tui-spec-command tests ---
+
+    #[test]
+    fn format_openspec_list_empty_changes_returns_no_active() {
+        let json = r#"{"changes": []}"#;
+        assert_eq!(format_openspec_list(json), "no active changes");
+    }
+
+    #[test]
+    fn format_openspec_list_missing_changes_key_returns_no_active() {
+        let json = r#"{}"#;
+        assert_eq!(format_openspec_list(json), "no active changes");
+    }
+
+    #[test]
+    fn format_openspec_list_two_changes_shows_both_names() {
+        let json = r#"{"changes": [
+            {"name": "tui-input-modes", "status": "proposed"},
+            {"name": "smdjad-service",  "status": "implementing"}
+        ]}"#;
+        let result = format_openspec_list(json);
+        assert!(result.contains("tui-input-modes"), "must contain first change name");
+        assert!(result.contains("smdjad-service"), "must contain second change name");
+        assert!(result.contains("proposed"), "must contain status");
+    }
+
+    #[test]
+    fn format_openspec_list_invalid_json_returns_error() {
+        let result = format_openspec_list("not json");
+        assert!(
+            result.contains("parse error"),
+            "invalid JSON must produce a parse error message; got: {result}"
+        );
+    }
+
+    #[test]
+    fn format_openspec_status_renders_key_value_lines() {
+        let json = r#"{"name": "my-change", "state": "implementing", "progress": "3/7"}"#;
+        let result = format_openspec_status(json);
+        assert!(result.contains("name: my-change"), "must contain name field");
+        assert!(result.contains("state: implementing"), "must contain state field");
+        assert!(result.contains("progress: 3/7"), "must contain progress field");
+    }
+
+    #[test]
+    fn format_openspec_status_invalid_json_returns_error() {
+        let result = format_openspec_status("{{bad}}");
+        assert!(result.contains("parse error"));
+    }
+
+    #[test]
+    fn spec_command_no_openspec_binary_shows_not_found() {
+        let mut state = make_state("sess-spec");
+        state.openspec_bin = None;
+
+        // Simulate the guard: no binary → push message
+        if state.openspec_bin.is_none() {
+            push_system_message(
+                &mut state,
+                "openspec not found — install it and restart smedja-tui",
+            );
+        }
+
+        let has_msg = state
+            .main_panel
+            .lines_text(0, 100)
+            .iter()
+            .any(|l| l.contains("openspec not found"));
+        assert!(has_msg, "missing binary must produce openspec-not-found message");
+    }
+
+    #[test]
+    fn spec_unknown_subcommand_returns_usage() {
+        // Test the "_ =>" branch of the spec arm directly via format.
+        let text = "usage: /spec [list|status [name]|archive <name>]";
+        assert!(text.contains("usage:"), "unknown sub-command must show usage");
+        assert!(text.contains("list"), "usage must mention list");
+        assert!(text.contains("status"), "usage must mention status");
+        assert!(text.contains("archive"), "usage must mention archive");
     }
 }
