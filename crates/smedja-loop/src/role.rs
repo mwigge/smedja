@@ -49,6 +49,11 @@ pub struct LoopRole {
     /// All fields are `false` by default (deny-all).
     #[serde(default)]
     pub data_access: DataAccess,
+    /// When set, the `task.parallel` fan-out resumes from this session's
+    /// checkpoint history instead of starting fresh. `None` for loop-pipeline
+    /// roles, which always start from the work envelope.
+    #[serde(default)]
+    pub resume_session_id: Option<String>,
 }
 
 impl LoopRole {
@@ -69,6 +74,7 @@ impl LoopRole {
                 tools: vec![],
                 role_id: uuid::Uuid::nil(),
                 data_access: DataAccess::default(),
+                resume_session_id: None,
             },
             Self {
                 name: "proposer".into(),
@@ -79,6 +85,7 @@ impl LoopRole {
                 tools: vec![],
                 role_id: uuid::Uuid::nil(),
                 data_access: DataAccess::default(),
+                resume_session_id: None,
             },
             Self {
                 name: "tester".into(),
@@ -89,6 +96,7 @@ impl LoopRole {
                 tools: vec![],
                 role_id: uuid::Uuid::nil(),
                 data_access: DataAccess::default(),
+                resume_session_id: None,
             },
             Self {
                 name: "implementer".into(),
@@ -99,6 +107,7 @@ impl LoopRole {
                 tools: vec![],
                 role_id: uuid::Uuid::nil(),
                 data_access: DataAccess::default(),
+                resume_session_id: None,
             },
             Self {
                 name: "reviewer".into(),
@@ -109,6 +118,7 @@ impl LoopRole {
                 tools: vec![],
                 role_id: uuid::Uuid::nil(),
                 data_access: DataAccess::default(),
+                resume_session_id: None,
             },
             Self {
                 name: "fix".into(),
@@ -119,6 +129,7 @@ impl LoopRole {
                 tools: vec![],
                 role_id: uuid::Uuid::nil(),
                 data_access: DataAccess::default(),
+                resume_session_id: None,
             },
         ]
     }
@@ -147,6 +158,27 @@ impl LoopRole {
     #[must_use]
     pub fn runner_differs_from(&self, other: &Self) -> bool {
         self.runner != other.runner
+    }
+
+    /// Builds a role for the `task.parallel` fan-out path from just a name and an
+    /// optional resume session.
+    ///
+    /// The fan-out does not route by tier, so runner/tier default to
+    /// [`Runner::Local`]/[`Tier::Local`] with deny-all data access. This is the
+    /// single `LoopRole` type used by both the loop pipeline and `task.parallel`.
+    #[must_use]
+    pub fn for_parallel(name: impl Into<String>, resume_session_id: Option<String>) -> Self {
+        Self {
+            name: name.into(),
+            runner: Runner::Local,
+            tier: Tier::Local,
+            model: None,
+            read_only: false,
+            tools: vec![],
+            role_id: uuid::Uuid::nil(),
+            data_access: DataAccess::default(),
+            resume_session_id,
+        }
     }
 }
 
@@ -179,6 +211,7 @@ mod tests {
             tools: vec![],
             role_id: uuid::Uuid::nil(),
             data_access: DataAccess::default(),
+            resume_session_id: None,
         };
         let implementer = LoopRole {
             name: "implementer".into(),
@@ -189,6 +222,7 @@ mod tests {
             tools: vec![],
             role_id: uuid::Uuid::nil(),
             data_access: DataAccess::default(),
+            resume_session_id: None,
         };
         // Both use Local — separation is violated.
         assert!(!reviewer.runner_differs_from(&implementer));
