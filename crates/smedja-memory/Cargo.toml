@@ -10,6 +10,7 @@ repository.workspace = true
 anyhow     = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
+smedja-adapter = { path = "../smedja-adapter" }
 smedja-plugins = { path = "../smedja-plugins" }
 smedja-rpc = { path = "../smedja-rpc" }
 thiserror  = { workspace = true }
