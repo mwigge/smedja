@@ -37,6 +37,8 @@ pub struct MainPanel {
     lines: Vec<StyledLine>,
     /// First visible line index.
     pub scroll: usize,
+    /// Watermark set by `/clear`; lines before this index are not rendered.
+    pub display_start: usize,
     /// Whether the next pushed line should be treated as code.
     in_code_block: bool,
     /// Language tag from the opening fence (e.g. "rust"), empty if none.
@@ -50,9 +52,17 @@ impl MainPanel {
         Self {
             lines: Vec::new(),
             scroll: 0,
+            display_start: 0,
             in_code_block: false,
             code_lang: String::new(),
         }
+    }
+
+    /// Advances the display watermark to the current line count, hiding all
+    /// previously pushed lines without discarding them.  Used by `/clear`.
+    pub fn clear_display(&mut self) {
+        self.display_start = self.lines.len();
+        self.scroll = self.lines.len();
     }
 
     /// Pushes a line of text, classifying its style automatically.
@@ -130,7 +140,7 @@ impl MainPanel {
             .lines
             .iter()
             .enumerate()
-            .skip(self.scroll)
+            .skip(self.scroll.max(self.display_start))
             .take(height)
             .map(|(abs_line, sl)| {
                 let base = match sl.style {
@@ -167,7 +177,7 @@ impl MainPanel {
     }
 
     pub fn scroll_up(&mut self) {
-        self.scroll = self.scroll.saturating_sub(1);
+        self.scroll = self.scroll.saturating_sub(1).max(self.display_start);
     }
 
     pub fn scroll_down(&mut self) {
@@ -178,7 +188,7 @@ impl MainPanel {
     }
 
     pub fn scroll_to_top(&mut self) {
-        self.scroll = 0;
+        self.scroll = self.display_start;
     }
 
     pub fn scroll_to_bottom(&mut self) {
@@ -448,14 +458,51 @@ mod tests {
     }
 
     #[test]
-    fn scroll_to_top_sets_zero() {
+    fn scroll_to_top_sets_display_start() {
         let mut panel = MainPanel::new();
         for i in 0..5u32 {
             panel.push_line(format!("line {i}"));
         }
         panel.scroll = 4;
         panel.scroll_to_top();
-        assert_eq!(panel.scroll, 0);
+        assert_eq!(panel.scroll, panel.display_start);
+    }
+
+    #[test]
+    fn clear_display_advances_watermark_and_scroll() {
+        let mut panel = MainPanel::new();
+        for i in 0..5u32 {
+            panel.push_line(format!("line {i}"));
+        }
+        panel.clear_display();
+        assert_eq!(panel.display_start, 5);
+        assert_eq!(panel.scroll, 5);
+    }
+
+    #[test]
+    fn scroll_up_does_not_cross_display_start() {
+        let mut panel = MainPanel::new();
+        for i in 0..5u32 {
+            panel.push_line(format!("line {i}"));
+        }
+        panel.clear_display();
+        panel.push_line("after clear".into());
+        panel.scroll_up();
+        assert_eq!(panel.scroll, panel.display_start, "scroll must not cross the clear watermark");
+    }
+
+    #[test]
+    fn new_lines_after_clear_are_rendered() {
+        let mut panel = MainPanel::new();
+        for i in 0..3u32 {
+            panel.push_line(format!("old {i}"));
+        }
+        panel.clear_display();
+        panel.push_line("new line".into());
+        // scroll == display_start == 3; new line is at index 3 → visible
+        let vis: Vec<&StyledLine> = panel.lines.iter().skip(panel.scroll.max(panel.display_start)).collect();
+        assert_eq!(vis.len(), 1);
+        assert_eq!(vis[0].text, "new line");
     }
 
     #[test]
