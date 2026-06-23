@@ -63,6 +63,12 @@ pub struct ModuleContext {
     pub latency_ms: Option<u64>,
     /// W3C `traceparent` from the most recent completed turn.
     pub traceparent: Option<String>,
+    /// Session or pane UUID (short form, first 8 chars used in displays).
+    pub session_id: Option<String>,
+    /// Current working directory of the terminal process.
+    pub cwd: Option<String>,
+    /// Interface mode: `"cli"` or `"tui"`.
+    pub interface: Option<String>,
 }
 
 // ── StatusModule trait ────────────────────────────────────────────────────────
@@ -475,6 +481,63 @@ impl StatusModule for TraceModule {
     }
 }
 
+pub struct AppNameModule;
+
+impl StatusModule for AppNameModule {
+    fn name(&self) -> &'static str {
+        "app_name"
+    }
+
+    fn evaluate(&self, _ctx: &ModuleContext) -> Option<Segment> {
+        Some(plain_segment("app_name", "smedja"))
+    }
+}
+
+pub struct SessionIdModule;
+
+impl StatusModule for SessionIdModule {
+    fn name(&self) -> &'static str {
+        "session_id"
+    }
+
+    fn evaluate(&self, ctx: &ModuleContext) -> Option<Segment> {
+        let sid = ctx.session_id.as_deref()?;
+        let short = &sid[..sid.len().min(8)];
+        Some(plain_segment("session_id", short.to_owned()))
+    }
+}
+
+pub struct CwdModule;
+
+impl StatusModule for CwdModule {
+    fn name(&self) -> &'static str {
+        "cwd"
+    }
+
+    fn evaluate(&self, ctx: &ModuleContext) -> Option<Segment> {
+        let cwd = ctx.cwd.as_deref()?;
+        let short = if cwd.len() <= 40 {
+            cwd.to_owned()
+        } else {
+            format!("\u{2026}{}", &cwd[cwd.len() - 40..])
+        };
+        Some(plain_segment("cwd", short))
+    }
+}
+
+pub struct InterfaceModule;
+
+impl StatusModule for InterfaceModule {
+    fn name(&self) -> &'static str {
+        "interface"
+    }
+
+    fn evaluate(&self, ctx: &ModuleContext) -> Option<Segment> {
+        let iface = ctx.interface.as_deref()?;
+        Some(plain_segment("interface", iface.to_owned()))
+    }
+}
+
 // ── Parallel render ───────────────────────────────────────────────────────────
 
 /// Fat-pointer (data + vtable) to a `StatusModule` packed into two `usize` words.
@@ -657,6 +720,9 @@ mod tests {
             output_tokens: None,
             latency_ms: None,
             traceparent: None,
+            session_id: None,
+            cwd: None,
+            interface: None,
         }
     }
 
@@ -990,6 +1056,51 @@ mod tests {
     }
 
     // 11
+    #[test]
+    fn app_name_module_always_returns_smedja() {
+        let ctx = make_ctx();
+        let seg = AppNameModule.evaluate(&ctx).expect("AppNameModule must return Some");
+        assert_eq!(seg.text, "smedja");
+    }
+
+    #[test]
+    fn session_id_module_returns_first_eight_chars() {
+        let ctx = ModuleContext {
+            session_id: Some("abcdef1234567890".to_owned()),
+            ..make_ctx()
+        };
+        let seg = SessionIdModule.evaluate(&ctx).expect("SessionIdModule must return Some");
+        assert_eq!(seg.text, "abcdef12");
+    }
+
+    #[test]
+    fn session_id_module_returns_none_when_absent() {
+        let ctx = make_ctx();
+        assert!(SessionIdModule.evaluate(&ctx).is_none());
+    }
+
+    #[test]
+    fn cwd_module_truncates_long_path() {
+        let long = "/home/user/very/deep/path/that/exceeds/the/forty/char/limit";
+        let ctx = ModuleContext {
+            cwd: Some(long.to_owned()),
+            ..make_ctx()
+        };
+        let seg = CwdModule.evaluate(&ctx).expect("CwdModule must return Some");
+        assert!(seg.text.starts_with('\u{2026}'), "long cwd must start with ellipsis");
+        assert!(seg.text.chars().count() <= 41, "truncated cwd must be at most 41 chars (ellipsis + 40)");
+    }
+
+    #[test]
+    fn cwd_module_returns_full_short_path() {
+        let ctx = ModuleContext {
+            cwd: Some("/home/user".to_owned()),
+            ..make_ctx()
+        };
+        let seg = CwdModule.evaluate(&ctx).expect("CwdModule must return Some");
+        assert_eq!(seg.text, "/home/user");
+    }
+
     #[test]
     fn module_timeout_emits_question_mark() {
         struct SlowModule;

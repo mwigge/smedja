@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+echo ""
+echo "smedja installed."
+echo ""
+echo "  To start the AI orchestration daemon automatically on login:"
+echo ""
+echo "    systemctl --user enable --now smdjad"
+echo ""
+echo "  Then launch the terminal:"
+echo ""
+echo "    smedja"
+echo ""

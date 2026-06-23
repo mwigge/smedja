@@ -54,19 +54,87 @@ jobs:
           cargo build --release --target ${{ matrix.target }} \
             --bin smdjad --bin smj --bin smedja --bin smedja-tui
 
-      - name: package
+      - name: package tarball
         run: |
           OUT="smedja-${{ matrix.os }}-${{ matrix.arch }}"
           mkdir "$OUT"
           for bin in smdjad smj smedja smedja-tui; do
             cp "target/${{ matrix.target }}/release/$bin" "$OUT/"
           done
+          cp assets/smdjad.service "$OUT/"
+          cp assets/smedja.desktop "$OUT/"
+          cp assets/brand/smedja-256.png "$OUT/"
           tar -czf "$OUT.tar.gz" "$OUT"
 
-      - uses: actions/upload-artifact@v4
+      # ── Linux: .deb and .rpm ──────────────────────────────────────────────────
+      - name: install linux packaging tools
+        if: runner.os == 'Linux'
+        run: |
+          cargo install cargo-deb --locked
+          cargo install cargo-generate-rpm --locked
+
+      - name: build deb
+        if: runner.os == 'Linux'
+        run: |
+          cargo deb -p smdjad --target ${{ matrix.target }} --no-build --no-strip
+          DEB=$(find "target/${{ matrix.target }}/debian" -name "*.deb" | head -1)
+          cp "$DEB" "smedja-linux-${{ matrix.arch }}.deb"
+
+      - name: build rpm
+        if: runner.os == 'Linux'
+        run: |
+          cargo generate-rpm -p smdjad --target ${{ matrix.target }}
+          RPM=$(find "target/${{ matrix.target }}/generate-rpm" -name "*.rpm" | head -1)
+          cp "$RPM" "smedja-linux-${{ matrix.arch }}.rpm"
+
+      # ── macOS: .app bundle + DMG ──────────────────────────────────────────────
+      - name: install cargo-bundle
+        if: runner.os == 'macOS'
+        run: cargo install cargo-bundle --locked
+
+      - name: build app bundle and DMG
+        if: runner.os == 'macOS'
+        run: |
+          cargo bundle --release --target ${{ matrix.target }} --bin smedja
+          APP="target/${{ matrix.target }}/release/bundle/osx/smedja.app"
+          DMG="smedja-darwin-${{ matrix.arch }}.dmg"
+          mkdir -p /tmp/dmg-stage
+          cp -r "$APP" /tmp/dmg-stage/
+          ln -s /Applications /tmp/dmg-stage/Applications
+          hdiutil create \
+            -volname smedja \
+            -srcfolder /tmp/dmg-stage \
+            -ov \
+            -format UDZO \
+            "$DMG"
+
+      # ── Upload artifacts ──────────────────────────────────────────────────────
+      - name: upload tarball
+        uses: actions/upload-artifact@v4
         with:
-          name: smedja-${{ matrix.os }}-${{ matrix.arch }}
+          name: tarball-${{ matrix.os }}-${{ matrix.arch }}
           path: smedja-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+
+      - name: upload deb
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: smedja-linux-${{ matrix.arch }}.deb
+
+      - name: upload rpm
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.arch }}
+          path: smedja-linux-${{ matrix.arch }}.rpm
+
+      - name: upload dmg
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmg-${{ matrix.arch }}
+          path: smedja-darwin-${{ matrix.arch }}.dmg
 
   release:
     needs: build
@@ -90,6 +158,9 @@ jobs:
             --title "${{ github.ref_name }}" \
             --notes-file - \
             dist/*.tar.gz \
+            dist/*.deb \
+            dist/*.rpm \
+            dist/*.dmg \
             scripts/install.sh <<'EOF'
           See [README](https://github.com/mwigge/smedja#install) for installation instructions.
 
@@ -98,3 +169,37 @@ jobs:
           curl -fsSL https://github.com/mwigge/smedja/releases/latest/download/install.sh | sh
           ```
           EOF
+
+  aur-publish:
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: update PKGBUILD checksums
+        run: |
+          VERSION="${{ github.ref_name }}"
+          PKGVER="${VERSION#v}"
+          BASE="https://github.com/mwigge/smedja/releases/download/${VERSION}"
+
+          curl -fsSL "${BASE}/smedja-linux-x86_64.tar.gz" -o /tmp/x86_64.tar.gz
+          curl -fsSL "${BASE}/smedja-linux-aarch64.tar.gz" -o /tmp/aarch64.tar.gz
+
+          SHA_X86=$(sha256sum /tmp/x86_64.tar.gz | awk '{print $1}')
+          SHA_ARM=$(sha256sum /tmp/aarch64.tar.gz | awk '{print $1}')
+
+          cp assets/PKGBUILD /tmp/PKGBUILD
+          sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" /tmp/PKGBUILD
+          sed -i "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('${SHA_X86}')/" /tmp/PKGBUILD
+          sed -i "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('${SHA_ARM}')/" /tmp/PKGBUILD
+
+      - uses: KSXGitHub/github-actions-deploy-aur@v2.7.2
+        with:
+          pkgname: smedja
+          pkgbuild: /tmp/PKGBUILD
+          commit_username: "GitHub Actions"
+          commit_email: "41898282+github-actions[bot]@users.noreply.github.com"
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to ${{ github.ref_name }}"
+          force_push: "true"

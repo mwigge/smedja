@@ -44,3 +44,62 @@ which              = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+# ── Debian package ─────────────────────────────────────────────────────────────
+[package.metadata.deb]
+name             = "smedja"
+maintainer       = "Morgan Wigge <morgan@wigge.nu>"
+copyright        = "2025, Morgan Wigge"
+license-file     = ["LICENSE", "0"]
+extended-description = """\
+GPU-accelerated terminal emulator and AI orchestration forge.
+Routes across local models, cloud APIs, and specialist roles with
+full OTel traceability and a wire protocol that keeps everything
+interoperable."""
+depends          = "$auto"
+section          = "utils"
+priority         = "optional"
+maintainer-scripts = "../../assets/debian/"
+assets = [
+  # Binaries — paths starting with target/ resolve from the workspace root.
+  ["target/release/smdjad",     "usr/bin/smdjad",     "755"],
+  ["target/release/smj",        "usr/bin/smj",        "755"],
+  ["target/release/smedja",     "usr/bin/smedja",     "755"],
+  ["target/release/smedja-tui", "usr/bin/smedja-tui", "755"],
+  # systemd user unit
+  ["../../assets/smdjad.service",     "lib/systemd/user/smdjad.service",                        "644"],
+  # Desktop integration
+  ["../../assets/smedja.desktop",     "usr/share/applications/smedja.desktop",                  "644"],
+  ["../../assets/brand/smedja-256.png","usr/share/icons/hicolor/256x256/apps/smedja.png",        "644"],
+]
+
+# ── Fedora / RPM package ────────────────────────────────────────────────────────
+[package.metadata.generate-rpm]
+name        = "smedja"
+license     = "Apache-2.0"
+summary     = "GPU-accelerated terminal emulator and AI orchestration forge"
+description = """\
+smedja is a Rust-native forge for multi-agent AI orchestration.
+Route across local models, cloud APIs, and specialist roles with
+a GPU terminal, full OTel traceability, and a wire protocol that
+keeps everything interoperable."""
+post_install_script = """
+echo ""
+echo "smedja installed."
+echo ""
+echo "  To start the AI orchestration daemon automatically on login:"
+echo ""
+echo "    systemctl --user enable --now smdjad"
+echo ""
+echo "  Then launch the terminal: smedja"
+echo ""
+"""
+assets = [
+  { source = "target/release/smdjad",      dest = "/usr/bin/smdjad",                                          mode = "755" },
+  { source = "target/release/smj",         dest = "/usr/bin/smj",                                             mode = "755" },
+  { source = "target/release/smedja",      dest = "/usr/bin/smedja",                                          mode = "755" },
+  { source = "target/release/smedja-tui",  dest = "/usr/bin/smedja-tui",                                      mode = "755" },
+  { source = "assets/smdjad.service",            dest = "/usr/lib/systemd/user/smdjad.service",               mode = "644" },
+  { source = "assets/smedja.desktop",            dest = "/usr/share/applications/smedja.desktop",             mode = "644" },
+  { source = "assets/brand/smedja-256.png",      dest = "/usr/share/icons/hicolor/256x256/apps/smedja.png",  mode = "644" },
+]

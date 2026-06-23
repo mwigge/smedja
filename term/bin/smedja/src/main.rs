@@ -138,6 +138,10 @@ struct App {
     pane_state: SharedPaneState,
     /// Accumulated agent session text, fed by the bridge and read each frame.
     agent_manager: SharedAgentManager,
+    /// Current working directory, updated on startup and after each agent turn.
+    cwd: Option<String>,
+    /// Pane UUID string (used as `session_id` in statusbar / window title).
+    pane_id: String,
 }
 
 impl App {
@@ -166,6 +170,10 @@ impl App {
             launch_menu_selection: 0,
             pane_state: SharedPaneState::new(),
             agent_manager: SharedAgentManager::new(),
+            cwd: std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_owned)),
+            pane_id: String::new(),
         }
     }
 
@@ -341,6 +349,7 @@ impl ApplicationHandler<UserEvent> for App {
         // can route agent events back to the correct window.
         let pane_id = self.tab_bar.tabs[0].panes[0].id;
         let pane_id_str = pane_id.to_string();
+        self.pane_id.clone_from(&pane_id_str);
 
         // Spawn PTY session with the pane env var so the shell (and smdjad
         // child processes) inherit it.
@@ -495,6 +504,19 @@ impl ApplicationHandler<UserEvent> for App {
                         })
                     };
 
+                    // Read the most recent OSC 7 CWD marker from the PTY grid.
+                    let pty_cwd = {
+                        let grid = pty.grid.lock();
+                        grid.block_markers.iter().rev().find_map(|m| {
+                            if let st_pty::MarkerKind::Osc7Cwd { ref path } = m.kind {
+                                Some(path.clone())
+                            } else {
+                                None
+                            }
+                        })
+                    };
+                    let cwd = pty_cwd.or_else(|| self.cwd.clone());
+
                     let sb_ctx = st_statusbar::ModuleContext {
                         tier,
                         model,
@@ -506,6 +528,9 @@ impl ApplicationHandler<UserEvent> for App {
                         output_tokens,
                         latency_ms,
                         traceparent,
+                        session_id: Some(self.pane_id.clone()),
+                        cwd,
+                        interface: Some("tui".to_owned()),
                     };
 
                     let git_branch_disabled = self
@@ -534,6 +559,27 @@ impl ApplicationHandler<UserEvent> for App {
                     let segments =
                         st_statusbar::render_status_bar_parallel(&sb_modules, &sb_ctx, 8);
                     renderer.set_status_bar_segments(&segments);
+
+                    // Build top-bar segments and push them to the renderer.
+                    let top_modules: Vec<Box<dyn st_statusbar::StatusModule>> = vec![
+                        Box::new(st_statusbar::AppNameModule),
+                        Box::new(st_statusbar::SessionIdModule),
+                        Box::new(st_statusbar::CwdModule),
+                    ];
+                    let top_segments =
+                        st_statusbar::render_status_bar_parallel(&top_modules, &sb_ctx, 8);
+                    renderer.set_top_bar_segments(&top_segments);
+
+                    // Update window title.
+                    let title = build_window_title(
+                        sb_ctx.tier.as_deref(),
+                        sb_ctx.active_task.as_deref(),
+                        sb_ctx.session_id.as_deref(),
+                        sb_ctx.cwd.as_deref(),
+                    );
+                    for w in self.windows.values() {
+                        w.set_title(&title);
+                    }
 
                     // Snapshot agent session content and push to renderer.
                     if let Ok(mgr) = self.agent_manager.0.try_lock() {
@@ -716,6 +762,39 @@ fn status_bar_height_for_font(font_size: f32) -> u32 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let px = font_size.max(0.0) as u32;
     px.min(36)
+}
+
+// ── Window title helpers ───────────────────────────────────────────────────────
+
+#[must_use]
+fn build_window_title(
+    tier: Option<&str>,
+    mode: Option<&str>,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+) -> String {
+    let mut parts = vec!["smedja".to_owned()];
+    if let Some(t) = tier {
+        parts.push(format!("[{t}]"));
+    }
+    if let Some(m) = mode {
+        parts.push(format!("[{m}]"));
+    }
+    if let Some(s) = session_id {
+        parts.push(s[..s.len().min(8)].to_owned());
+    }
+    if let Some(c) = cwd {
+        parts.push(truncate_cwd(c, 40));
+    }
+    parts.join("  ")
+}
+
+#[must_use]
+fn truncate_cwd(cwd: &str, max: usize) -> String {
+    if cwd.len() <= max {
+        return cwd.to_owned();
+    }
+    format!("\u{2026}{}", &cwd[cwd.len() - max..])
 }
 
 // ── Subcommand handlers ────────────────────────────────────────────────────────
@@ -1050,5 +1129,45 @@ mod tests {
         let app = make_app();
         assert_eq!(app.tab_bar.tabs.len(), 1);
         assert_eq!(app.split_layouts.len(), 1);
+    }
+
+    #[test]
+    fn build_window_title_contains_required_parts() {
+        use super::build_window_title;
+        let title = build_window_title(
+            Some("fast"),
+            Some("impl"),
+            Some("abc12345xyz"),
+            Some("/home/u/proj"),
+        );
+        assert!(title.contains("smedja"), "must contain app name");
+        assert!(title.contains("[fast]"), "must contain tier");
+        assert!(title.contains("[impl]"), "must contain mode");
+        assert!(title.contains("abc12345"), "must contain first 8 chars of session_id");
+        assert!(title.contains("/home/u/proj"), "must contain cwd");
+    }
+
+    #[test]
+    fn build_window_title_all_none_returns_smedja() {
+        use super::build_window_title;
+        let title = build_window_title(None, None, None, None);
+        assert_eq!(title, "smedja");
+    }
+
+    #[test]
+    fn truncate_cwd_long_path_starts_with_ellipsis() {
+        use super::truncate_cwd;
+        let long = "/very/long/path/that/exceeds/limit";
+        let result = truncate_cwd(long, 10);
+        assert!(result.starts_with('\u{2026}'), "expected … prefix, got '{result}'");
+        assert!(result.chars().count() <= 11, "result must be at most max+1 chars");
+    }
+
+    #[test]
+    fn truncate_cwd_short_path_unchanged() {
+        use super::truncate_cwd;
+        let short = "/short";
+        let result = truncate_cwd(short, 40);
+        assert_eq!(result, "/short");
     }
 }

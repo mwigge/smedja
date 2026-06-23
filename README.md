@@ -217,20 +217,114 @@ Config is TOML. A migration tool converts existing WezTerm Lua config.
 
 ## Install
 
-No release binaries are published yet. Build from source:
+### macOS
+
+**One-line install (recommended)**
+
+```sh
+curl -fsSL https://github.com/mwigge/smedja/releases/latest/download/install.sh | sh
+```
+
+Installs `smdjad`, `smj`, `smedja`, and `smedja-tui` to `~/.local/bin/` and registers `smdjad` as a LaunchAgent so it starts at login.
+
+**DMG**
+
+Download `smedja-darwin-<arch>.dmg` from the [latest release](https://github.com/mwigge/smedja/releases/latest), open it, and drag `smedja.app` to `/Applications`.
+
+**Gatekeeper**
+
+macOS will block unsigned binaries downloaded from the internet. Run once after install to clear the quarantine flag:
+
+```sh
+# For the install.sh tarball install:
+xattr -dr com.apple.quarantine ~/.local/bin/smedja ~/.local/bin/smdjad ~/.local/bin/smj ~/.local/bin/smedja-tui
+
+# For the .app bundle:
+xattr -cr /Applications/smedja.app
+```
+
+Alternatively: right-click the binary or app in Finder → Open → Open anyway.
+
+---
+
+### Arch Linux / CachyOS
+
+```sh
+yay -S smedja
+```
+
+or with another AUR helper:
+
+```sh
+paru -S smedja
+```
+
+After install, enable the daemon for auto-start on login:
+
+```sh
+systemctl --user enable --now smdjad
+```
+
+---
+
+### Debian / Ubuntu
+
+Download the `.deb` from the [latest release](https://github.com/mwigge/smedja/releases/latest):
+
+```sh
+curl -fsSL -O https://github.com/mwigge/smedja/releases/latest/download/smedja-linux-x86_64.deb
+sudo dpkg -i smedja-linux-x86_64.deb
+```
+
+Enable the daemon:
+
+```sh
+systemctl --user enable --now smdjad
+```
+
+---
+
+### Fedora
+
+Download the `.rpm` from the [latest release](https://github.com/mwigge/smedja/releases/latest):
+
+```sh
+sudo dnf install https://github.com/mwigge/smedja/releases/latest/download/smedja-linux-x86_64.rpm
+```
+
+Enable the daemon:
+
+```sh
+systemctl --user enable --now smdjad
+```
+
+---
+
+### WSL2
+
+Install the Linux tarball as normal — smedja renders via WSLg. Ensure WSLg is enabled in your Windows setup (Windows 11 or Windows 10 with WSLg preview).
+
+```sh
+curl -fsSL https://github.com/mwigge/smedja/releases/latest/download/install.sh | sh
+```
+
+If systemd is not available in your WSL2 distro, add this to `~/.bashrc` or `~/.zshrc` to start the daemon automatically:
+
+```sh
+pgrep -u "$USER" smdjad >/dev/null || smdjad &
+```
+
+---
+
+### Build from source
+
+Requires Rust stable ≥ 1.82.
 
 ```bash
 git clone https://github.com/mwigge/smedja
 cd smedja
 cargo build --release --workspace
-```
-
-Requires Rust stable ≥ 1.82. On Linux, `lld` is recommended for link speed. Copy the produced binaries from `target/release/` to a directory on your `$PATH`:
-
-```bash
-cp target/release/{smdjad,smj,smedja-tui} ~/.local/bin/
-# optional: GPU terminal (requires wgpu-capable GPU or Mesa software renderer)
-cp target/release/smedja ~/.local/bin/
+cp target/release/{smdjad,smj,smedja-tui,smedja} ~/.local/bin/
 ```
 
 ## Getting Started

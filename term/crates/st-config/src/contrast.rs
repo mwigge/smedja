@@ -19,6 +19,7 @@ fn linearise(channel: u8) -> f64 {
 /// Returns the WCAG relative luminance of an sRGB colour `(r, g, b)`.
 ///
 /// The result is in the range `0.0` (black) to `1.0` (white).
+#[must_use]
 pub fn relative_luminance(r: u8, g: u8, b: u8) -> f64 {
     0.2126 * linearise(r) + 0.7152 * linearise(g) + 0.0722 * linearise(b)
 }
@@ -28,6 +29,7 @@ pub fn relative_luminance(r: u8, g: u8, b: u8) -> f64 {
 /// Returns the WCAG contrast ratio between two sRGB colours.
 ///
 /// The ratio is always ≥ 1.0 (same colour → 1.0, black vs white → 21.0).
+#[must_use]
 pub fn contrast_ratio(fg: (u8, u8, u8), bg: (u8, u8, u8)) -> f64 {
     let l1 = relative_luminance(fg.0, fg.1, fg.2);
     let l2 = relative_luminance(bg.0, bg.1, bg.2);
@@ -38,6 +40,7 @@ pub fn contrast_ratio(fg: (u8, u8, u8), bg: (u8, u8, u8)) -> f64 {
 // ── WCAG AA compliance ────────────────────────────────────────────────────────
 
 /// Returns `true` when the fg/bg pair meets WCAG AA (contrast ratio ≥ 4.5).
+#[must_use]
 pub fn meets_wcag_aa(fg: (u8, u8, u8), bg: (u8, u8, u8)) -> bool {
     contrast_ratio(fg, bg) >= 4.5
 }
@@ -53,6 +56,7 @@ pub fn meets_wcag_aa(fg: (u8, u8, u8), bg: (u8, u8, u8)) -> bool {
 ///
 /// The function is guaranteed to terminate because full white (255, 255, 255)
 /// and full black (0, 0, 0) both contrast well against any background.
+#[must_use]
 pub fn enforce_contrast(fg: (u8, u8, u8), bg: (u8, u8, u8)) -> (u8, u8, u8) {
     if meets_wcag_aa(fg, bg) {
         return fg;
