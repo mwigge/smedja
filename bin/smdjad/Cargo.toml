@@ -27,6 +27,7 @@ smedja-assayer     = { path = "../../crates/smedja-assayer" }
 smedja-bellows     = { path = "../../crates/smedja-bellows" }
 smedja-graph       = { path = "../../crates/smedja-graph" }
 smedja-ingot       = { path = "../../crates/smedja-ingot" }
+smedja-loop        = { path = "../../crates/smedja-loop", package = "smedja-loop-types" }
 smedja-memory      = { path = "../../crates/smedja-memory" }
 smedja-rpc         = { path = "../../crates/smedja-rpc" }
 smedja-sre         = { path = "../../crates/smedja-sre" }

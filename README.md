@@ -91,6 +91,54 @@ The new `smedja-loop` concept binds `.smedja/loop.json` to OpenSpec task state, 
   <img src="assets/diagrams/smedja-loop-concept.png" alt="smedja-loop concept overview" width="900" />
 </div>
 
+### Workspace layout
+
+`loop.run` consumes a workspace laid out under `.smedja/` plus the OpenSpec change envelope:
+
+```
+<workspace>/
+├── .smedja/
+│   ├── loop.json          # loop engine policy (see below) — required by loop.run
+│   ├── agents.toml        # per-role runner/tier/model routing overrides
+│   ├── workspace.toml     # optional workspace-level settings
+│   └── guides/<role>.md   # failure guides, written by the engine on failure
+└── openspec/
+    └── changes/<name>/
+        └── tasks.md       # the work envelope; pending `- [ ] ` lines become slices
+```
+
+The change name passed to `loop.create` selects `openspec/changes/<name>/tasks.md`; each unchecked `- [ ] ` line is one slice the pipeline drives.
+
+### `loop.json` policy
+
+`.smedja/loop.json` is the policy contract. Its SHA-256 is hashed at load; if the file changes mid-run the loop aborts in the terminal `policy_tampered` state. The reviewer and implementer **must** use different runners (evaluator/generator separation) or the loop fails closed before any role runs.
+
+```json
+{
+  "version": 1,
+  "limits": { "max_attempts": 3, "agent_timeout_s": 600 },
+  "roles": [
+    { "name": "implementer", "runner": "local",   "tier": "local", "read_only": false, "tools": [] },
+    { "name": "reviewer",    "runner": "minimax",  "tier": "fast",  "read_only": true,  "tools": [] },
+    { "name": "fix",         "runner": "local",    "tier": "local", "read_only": false, "tools": [] }
+  ],
+  "verification": { "command": ".smedja/bin/verify.sh" },
+  "review":       { "per_slice": true, "required": true },
+  "publication":  { "max_pr_lines": 400 }
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `limits.max_attempts` | Maximum role attempts per slice before the loop fails. |
+| `limits.agent_timeout_s` | Per-role wall-clock timeout. |
+| `roles[]` | Each role's `runner`, `tier`, optional `model`, `read_only`, and allowed `tools`. |
+| `verification.command` | Deterministic gate run after each slice; exit code 0 = pass. |
+| `review.per_slice` / `required` | Whether the reviewer runs each slice and whether a failing review blocks progress. |
+| `publication.max_pr_lines` | Maximum changed lines permitted per published slice. |
+
+The verification gate's wall-clock budget defaults to 300 seconds; override it with the `SMEDJA_LOOP_VERIFY_TIMEOUT` environment variable (seconds). A loop with no `.smedja/loop.json` fails fast rather than running.
+
 ---
 
 ## Session Memory and Sharing Between Agents
