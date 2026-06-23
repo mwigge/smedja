@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use serde_json::Value;
-use smedja_ingot::{Ingot, Session};
+use smedja_ingot::{IngotHandle, Session};
 use smedja_vault::{Vault, VaultEntry};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -96,7 +96,7 @@ pub(crate) async fn execute_tool(
     tool_input: &str,
     workspace: &std::path::Path,
     session: Option<&Session>,
-    ingot: &Arc<Mutex<Ingot>>,
+    ingot: &IngotHandle,
     vault: &Arc<Mutex<Vault>>,
 ) -> String {
     let input: Value = serde_json::from_str(tool_input).unwrap_or(Value::Null);
@@ -453,20 +453,17 @@ pub(crate) async fn execute_tool(
 pub(crate) async fn dispatch_mcp_tool(
     tool_name: &str,
     input: &serde_json::Value,
-    ingot: &Arc<Mutex<Ingot>>,
+    ingot: &IngotHandle,
 ) -> String {
-    let server = {
-        let ig = ingot.lock().await;
-        match ig.find_mcp_server_for_tool(tool_name) {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                tracing::debug!(tool = tool_name, "no MCP server registered for tool");
-                return format!("error: tool '{tool_name}' is not available");
-            }
-            Err(e) => {
-                tracing::warn!(tool = tool_name, error = %e, "ingot error looking up MCP tool");
-                return format!("error: tool '{tool_name}' is not available");
-            }
+    let server = match ingot.find_mcp_server_for_tool(tool_name).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            tracing::debug!(tool = tool_name, "no MCP server registered for tool");
+            return format!("error: tool '{tool_name}' is not available");
+        }
+        Err(e) => {
+            tracing::warn!(tool = tool_name, error = %e, "ingot error looking up MCP tool");
+            return format!("error: tool '{tool_name}' is not available");
         }
     };
 
@@ -491,8 +488,6 @@ pub(crate) async fn dispatch_mcp_tool(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-
-    use tokio::sync::Mutex;
 
     // ── find_tool_call_json / parse_tool_call ─────────────────────────────────
 
@@ -540,10 +535,11 @@ mod tests {
 
     #[tokio::test]
     async fn execute_tool_bash_returns_error_for_path_outside_workspace() {
-        use smedja_ingot::Ingot;
+        use smedja_ingot::{Ingot, IngotHandle};
         use smedja_vault::Vault;
+        use tokio::sync::Mutex;
 
-        let ingot = Arc::new(Mutex::new(Ingot::open_in_memory().unwrap()));
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
         let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
 
         // write_file with a path that tries to escape the workspace via ../
@@ -567,9 +563,9 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_mcp_tool_returns_error_when_no_server_registered() {
-        let ig = Arc::new(Mutex::new(
+        let ig = smedja_ingot::IngotHandle::new(
             smedja_ingot::Ingot::open_in_memory().expect("in-memory Ingot must open"),
-        ));
+        );
         let result =
             super::dispatch_mcp_tool("unknown_tool", &serde_json::json!({}), &ig).await;
         assert!(
@@ -611,22 +607,19 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         // Register the mock server in an in-memory Ingot.
-        let ig = Arc::new(Mutex::new(
+        let ig = smedja_ingot::IngotHandle::new(
             smedja_ingot::Ingot::open_in_memory().expect("in-memory Ingot must open"),
-        ));
-        {
-            let mut guard = ig.lock().await;
-            guard
-                .register_mcp_server(&smedja_ingot::McpServer {
-                    id: "mock-1".into(),
-                    name: "mock-server".into(),
-                    url: server_url,
-                    transport: "http".into(),
-                    tools_json: r#"[{"name":"greet","description":"Greet"}]"#.into(),
-                    last_refresh: 1.0,
-                })
-                .expect("register_mcp_server must succeed");
-        }
+        );
+        ig.register_mcp_server(smedja_ingot::McpServer {
+            id: "mock-1".into(),
+            name: "mock-server".into(),
+            url: server_url,
+            transport: "http".into(),
+            tools_json: r#"[{"name":"greet","description":"Greet"}]"#.into(),
+            last_refresh: 1.0,
+        })
+        .await
+        .expect("register_mcp_server must succeed");
 
         let result =
             super::dispatch_mcp_tool("greet", &serde_json::json!({"name": "world"}), &ig).await;
@@ -640,10 +633,11 @@ mod tests {
 
     #[tokio::test]
     async fn vault_search_returns_empty_when_no_entries() {
-        use smedja_ingot::Ingot;
+        use smedja_ingot::{Ingot, IngotHandle};
         use smedja_vault::Vault;
+        use tokio::sync::Mutex;
 
-        let ingot = Arc::new(Mutex::new(Ingot::open_in_memory().unwrap()));
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
         let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
 
         let result = super::execute_tool(
@@ -662,10 +656,11 @@ mod tests {
 
     #[tokio::test]
     async fn vault_store_then_search_finds_entry() {
-        use smedja_ingot::Ingot;
+        use smedja_ingot::{Ingot, IngotHandle};
         use smedja_vault::Vault;
+        use tokio::sync::Mutex;
 
-        let ingot = Arc::new(Mutex::new(Ingot::open_in_memory().unwrap()));
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
         let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
 
         let store_result = super::execute_tool(
@@ -697,10 +692,11 @@ mod tests {
 
     #[tokio::test]
     async fn vault_search_respects_k_limit() {
-        use smedja_ingot::Ingot;
+        use smedja_ingot::{Ingot, IngotHandle};
         use smedja_vault::Vault;
+        use tokio::sync::Mutex;
 
-        let ingot = Arc::new(Mutex::new(Ingot::open_in_memory().unwrap()));
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
         let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
 
         for i in 0..5_u8 {
@@ -733,10 +729,11 @@ mod tests {
 
     #[tokio::test]
     async fn smedja_vault_search_returns_results_when_vault_has_matching_entries() {
-        use smedja_ingot::Ingot;
+        use smedja_ingot::{Ingot, IngotHandle};
         use smedja_vault::Vault;
+        use tokio::sync::Mutex;
 
-        let ingot = Arc::new(Mutex::new(Ingot::open_in_memory().unwrap()));
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
         let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
 
         // Insert a known entry via the store tool so the embedding path is exercised.
