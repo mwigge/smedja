@@ -73,6 +73,25 @@ fn now_epoch() -> f64 {
         .as_secs_f64()
 }
 
+/// Assembles a conversation transcript for compaction from a checkpoint's
+/// `messages_json` blob, routing it through working-memory strata (deep tier) so
+/// the same windowing the live prompt path uses is applied. Invalid or empty JSON
+/// yields an empty transcript. The raw blob is preserved separately in the
+/// pre-compaction checkpoint, so this rendering is not lossy for rollback.
+fn assemble_compaction_transcript(messages_json: &str) -> String {
+    let parsed: Vec<AdapterMessage> = serde_json::from_str(messages_json).unwrap_or_default();
+    let mut mem = smedja_memory::WorkingMemory::new(100_000);
+    mem.set_strata(smedja_memory::StrataConfig::deep());
+    for m in parsed {
+        mem.push(m);
+    }
+    mem.build_prompt(100_000)
+        .iter()
+        .map(|m| format!("{}: {}", m.role.as_str(), m.content))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// In-memory map from smedja sessions to provider-native resume identifiers.
 fn provider_session_store() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
     static STORE: OnceLock<tokio::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -1090,10 +1109,15 @@ fn build_router(
                     .map_or_else(|| "[]".to_owned(), |cp| cp.messages_json)
             };
 
+            // Assemble the summarisation input through working-memory strata
+            // rather than feeding the raw checkpoint blob. The raw blob is still
+            // preserved in the pre-compaction checkpoint below for rollback.
+            let history_transcript = assemble_compaction_transcript(&messages_json);
+
             // Call provider to produce a summary.
             let compaction_prompt = format!(
                 "Summarise this conversation in 3–5 bullet points, then state the current goal. \
-                 Be concise.\n\nConversation history:\n{messages_json}"
+                 Be concise.\n\nConversation history:\n{history_transcript}"
             );
             let pool_entry = pool
                 .get(Runner::Claude, Tier::Fast)
@@ -3080,6 +3104,31 @@ mod tests {
 
         let count = vault.lock().await.count_by_namespace("handoff").unwrap();
         assert_eq!(count, 1, "one handoff entry must be written on takeover");
+    }
+
+    #[test]
+    fn compaction_transcript_renders_strata_messages_not_raw_json() {
+        let messages_json = r#"[
+            {"role":"user","content":"first request"},
+            {"role":"assistant","content":"first reply"},
+            {"role":"user","content":"second request"}
+        ]"#;
+        let transcript = super::assemble_compaction_transcript(messages_json);
+        // Rendered as role: content lines, not the raw JSON blob.
+        assert!(transcript.contains("user: first request"));
+        assert!(transcript.contains("assistant: first reply"));
+        assert!(transcript.contains("user: second request"));
+        assert!(
+            !transcript.contains("\"role\""),
+            "transcript must not contain raw JSON keys"
+        );
+    }
+
+    #[test]
+    fn compaction_transcript_empty_for_invalid_json() {
+        assert_eq!(super::assemble_compaction_transcript(""), "");
+        assert_eq!(super::assemble_compaction_transcript("not json"), "");
+        assert_eq!(super::assemble_compaction_transcript("[]"), "");
     }
 
     #[tokio::test]

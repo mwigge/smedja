@@ -15,7 +15,10 @@ use opentelemetry::{
 };
 use smedja_adapter::types::{Message as AdapterMessage, Role as AdapterRole};
 use smedja_adapter::CallOptions;
-use smedja_assayer::{Assayer, Complexity, Role as AgentRole, Route, Runner};
+use smedja_assayer::{Assayer, Complexity, Role as AgentRole, Route, Runner, Tier};
+use smedja_memory::{
+    estimate_messages_tokens, estimate_tokens, inject_conciseness, StrataConfig, WorkingMemory,
+};
 use smedja_bellows::{Dispatcher, TurnEvent};
 use smedja_ingot::{Checkpoint, CostEntry, IngotHandle, TokenSnapshot};
 use smedja_vault::Vault;
@@ -29,6 +32,32 @@ use crate::cowork::{ApprovalPrompt, CoworkGate, Decision};
 use crate::executor::execute_tool;
 use crate::price_table::PriceTable;
 use crate::provider_pool::ProviderPool;
+
+/// Maps a routed runner tier to its retention strata and warm-stratum token
+/// budget. `fast` keeps a shallow warm window and small budget; `deep` keeps the
+/// full warm window and a large budget; `local` sits between. The stable prefix
+/// and hot turns are always included verbatim regardless of budget.
+pub(crate) fn strata_for_tier(tier: Tier) -> (StrataConfig, usize) {
+    match tier {
+        Tier::Fast => (StrataConfig::fast(), 4_000),
+        Tier::Local => (StrataConfig::local(), 8_000),
+        Tier::Deep => (StrataConfig::deep(), 32_000),
+    }
+}
+
+/// Returns the approximate context-window size (in tokens) for a model.
+///
+/// Used to scale verbosity steering — the conciseness directive is appended once
+/// the assembled prompt exceeds 60% of this window. Unknown models fall back to a
+/// conservative 128k window.
+fn model_context_window(model: &str) -> usize {
+    if model.to_lowercase().contains("claude") {
+        200_000
+    } else {
+        // gpt-4o / o1 / o3 and unknown models share the conservative default.
+        128_000
+    }
+}
 
 /// Owns all the shared resources needed to execute a single agent turn.
 pub(crate) struct TurnOrchestrator {
@@ -231,7 +260,23 @@ impl TurnOrchestrator {
             }
         };
 
-        let system_prompt = format!("You are smedja, an AI coding assistant.{task_prefix}");
+        // Base system prompt, with workspace skills folded into the stable
+        // (cacheable) system block. `base_system` is kept unsteered so verbosity
+        // steering can be re-applied per tool-loop iteration without compounding.
+        let base_system = {
+            let base = format!("You are smedja, an AI coding assistant.{task_prefix}");
+            match smedja_memory::load_workspace_skills(&workspace_root) {
+                Ok(skills) if !skills.is_empty() => {
+                    let joined = skills.join("\n\n");
+                    format!("{base}\n\n<workspace_skills>\n{joined}\n</workspace_skills>")
+                }
+                Ok(_) => base,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to load workspace skills; continuing without");
+                    base
+                }
+            }
+        };
 
         let mcp_tools: Vec<serde_json::Value> = {
             ingot.list_mcp_servers()
@@ -371,35 +416,22 @@ impl TurnOrchestrator {
             None
         };
 
-        let opts = CallOptions {
-            model: model.clone(),
-            max_tokens: Some(2048),
-            temperature: Some(0.7),
-            system: Some(system_prompt),
-            tools: if all_tools.is_empty() {
-                None
-            } else {
-                Some(all_tools)
-            },
-            provider_session_id,
-            stable_prefix_len: if runner == "anthropic" { Some(0) } else { None },
-        };
+        // Per-runner-tier strata + token budget. `fast` keeps a shallow warm
+        // window and small budget; `deep` keeps the full warm window and a large
+        // budget; `local` sits between. The budget caps the warm stratum — the
+        // stable prefix and hot turns are always included verbatim.
+        let (strata, budget_tokens) = strata_for_tier(route.tier);
+        let context_window = model_context_window(&model);
 
-        // 4. Mark in_progress.
-        {
-            if let Err(e) = ingot.update_task_status(&turn_id, "in_progress").await {
-                warn!(turn_id = %turn_id, error = %e, "failed to mark task in_progress");
-            }
-        }
+        // 4. Assemble the stable prefix (the user turn plus auto-injected graph
+        //    symbols) into working memory, then seal it so the prefix survives
+        //    the tool loop unchanged and drives the provider KV-cache hint.
+        let mut mem = WorkingMemory::new(budget_tokens);
+        mem.set_strata(strata);
 
-        // 5. Tool-dispatch loop — up to MAX_TOOL_TURNS iterations.
-        let mut messages: Vec<AdapterMessage> = vec![AdapterMessage {
-            role: AdapterRole::User,
-            content: task.title.clone(),
-        }];
-
-        // Auto-inject top-3 graph symbols related to user message nouns.
-        {
+        let first_user_content = {
+            let mut content = task.title.clone();
+            // Auto-inject top-3 graph symbols related to user message nouns.
             let stop_words = [
                 "the", "and", "for", "with", "this", "that", "from", "into", "use", "are", "was",
                 "has", "not", "can", "its", "will",
@@ -433,13 +465,10 @@ impl TurnOrchestrator {
                                                 )
                                             })
                                             .collect();
-                                        let injection = format!(
+                                        content.push_str(&format!(
                                             "\n\n<graph_symbols>\n{}\n</graph_symbols>",
                                             snippets.join("\n\n")
-                                        );
-                                        if let Some(first) = messages.first_mut() {
-                                            first.content.push_str(&injection);
-                                        }
+                                        ));
                                         injected_count = symbols.len();
                                     }
                                 }
@@ -460,6 +489,37 @@ impl TurnOrchestrator {
                 smedja.turn.graph_symbols_injected = injected_count,
                 "graph symbol injection"
             );
+            content
+        };
+
+        mem.push(AdapterMessage::user(first_user_content));
+        mem.seal_prefix();
+
+        let mut opts = CallOptions {
+            model: model.clone(),
+            max_tokens: Some(2048),
+            temperature: Some(0.7),
+            system: Some(base_system.clone()),
+            tools: if all_tools.is_empty() {
+                None
+            } else {
+                Some(all_tools)
+            },
+            provider_session_id,
+            // F-21: cache through the real sealed prefix, not just the system
+            // block. `None` for providers without prompt caching.
+            stable_prefix_len: if runner == "anthropic" {
+                Some(mem.stable_prefix())
+            } else {
+                None
+            },
+        };
+
+        // 4b. Mark in_progress.
+        {
+            if let Err(e) = ingot.update_task_status(&turn_id, "in_progress").await {
+                warn!(turn_id = %turn_id, error = %e, "failed to mark task in_progress");
+            }
         }
 
         const MAX_RATE_LIMIT_RETRIES: u32 = 4;
@@ -474,8 +534,16 @@ impl TurnOrchestrator {
             let (response_text, input_tokens, output_tokens, native_session_id) = {
                 let mut backoff_secs = RATE_LIMIT_BACKOFF_BASE_SECS;
                 let mut attempt = 0u32;
+                // Assemble the budgeted prompt and apply verbosity steering for
+                // this iteration. The prompt always leads with the sealed prefix
+                // and all hot turns; warm turns are included until the budget is
+                // spent. The conciseness directive is appended above 60% fill.
+                let prompt = mem.build_prompt(budget_tokens);
+                let used = estimate_messages_tokens(&prompt)
+                    + estimate_tokens(opts.system.as_deref().unwrap_or(""));
+                opts.system = Some(inject_conciseness(&base_system, used, context_window));
                 loop {
-                    let stream = provider.stream_chat(&messages, &opts);
+                    let stream = provider.stream_chat(&prompt, &opts);
                     let drain_result = tokio::time::timeout(
                         std::time::Duration::from_mins(5),
                         crate::drain_stream(stream, dispatcher, Some(turn_id.as_str())),
@@ -548,10 +616,7 @@ impl TurnOrchestrator {
             if let Some((tool_name, mut tool_input)) = tool_call {
                 let tool_call_id = Uuid::new_v4().to_string();
 
-                messages.push(AdapterMessage {
-                    role: AdapterRole::Assistant,
-                    content: response_text.clone(),
-                });
+                mem.push(AdapterMessage::assistant(response_text.clone()));
 
                 let (ev_trace_id, ev_span_id) = {
                     use opentelemetry::trace::TraceContextExt as _;
@@ -726,14 +791,15 @@ impl TurnOrchestrator {
                     }
                 }
 
-                // 5e. Append tool result as a user message and continue the loop.
-                let escaped_result = tool_result.replace('<', "&lt;").replace('>', "&gt;");
-                messages.push(AdapterMessage {
-                    role: AdapterRole::User,
-                    content: format!(
-                        "<tool_result tool=\"{tool_name}\">{escaped_result}</tool_result>"
-                    ),
-                });
+                // 5e. Compress the tool result (SmartCrusher strips JSON nulls,
+                // bypassed by SMEDJA_NO_TOOL_COMPRESS=1), then append it as a user
+                // message and continue the loop. Compression runs before the push
+                // so token budgeting reflects the crushed size.
+                let crushed = smedja_adapter::crush::compress_tool_result(&tool_result);
+                let escaped_result = crushed.replace('<', "&lt;").replace('>', "&gt;");
+                mem.push(AdapterMessage::user(format!(
+                    "<tool_result tool=\"{tool_name}\">{escaped_result}</tool_result>"
+                )));
 
                 full_response = response_text;
                 continue 'tool_loop;
@@ -782,7 +848,8 @@ impl TurnOrchestrator {
 
         // 8. Save checkpoint.
         {
-            let messages_json_value: Vec<serde_json::Value> = messages
+            let messages_json_value: Vec<serde_json::Value> = mem
+                .messages()
                 .iter()
                 .map(|m| {
                     serde_json::json!({
@@ -923,6 +990,53 @@ mod tests {
 
     use crate::price_table::PriceTable;
     use crate::provider_pool::build_provider_pool;
+
+    #[test]
+    fn fast_tier_prompt_no_larger_than_deep_with_hot_present() {
+        use smedja_adapter::types::Message;
+        use smedja_assayer::Tier;
+        use smedja_memory::WorkingMemory;
+
+        let build = |tier: Tier| {
+            let (strata, budget) = super::strata_for_tier(tier);
+            let mut m = WorkingMemory::new(budget);
+            m.set_strata(strata);
+            m.push(Message::user("stable context")); // prefix
+            m.seal_prefix();
+            for i in 0..40 {
+                m.push(Message::user(format!(
+                    "turn {i} with enough content to cost a few tokens each"
+                )));
+            }
+            m.build_prompt(budget)
+        };
+
+        let fast = build(Tier::Fast);
+        let deep = build(Tier::Deep);
+
+        // A shallower/cheaper tier must never assemble more messages than deep.
+        assert!(
+            fast.len() <= deep.len(),
+            "fast prompt ({}) must be ≤ deep prompt ({})",
+            fast.len(),
+            deep.len()
+        );
+        // The most recent hot turn must be present in both regardless of tier.
+        assert!(
+            fast.iter().any(|m| m.content.contains("turn 39")),
+            "fast must retain the latest hot turn"
+        );
+        assert!(
+            deep.iter().any(|m| m.content.contains("turn 39")),
+            "deep must retain the latest hot turn"
+        );
+    }
+
+    #[test]
+    fn model_context_window_known_and_default() {
+        assert_eq!(super::model_context_window("claude-sonnet-4-6"), 200_000);
+        assert_eq!(super::model_context_window("some-unknown-model"), 128_000);
+    }
 
     #[tokio::test]
     async fn orchestrator_returns_error_for_unknown_session() {
