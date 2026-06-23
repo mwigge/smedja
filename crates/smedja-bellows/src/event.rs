@@ -178,6 +178,307 @@ pub enum TurnEvent {
     },
 }
 
+// ── ControlEvent ──────────────────────────────────────────────────────────────
+
+/// Low-frequency lifecycle events for an agent turn.
+///
+/// Subscribers that only care about turn lifecycle (started, completed, failed,
+/// tool calls) should receive [`ControlEvent`] rather than [`TurnEvent`] to
+/// avoid filtering thousands of high-frequency [`DeltaEvent`]s.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ControlEvent {
+    /// The turn has started.
+    Started {
+        /// Identifier for the session this turn belongs to.
+        session_id: String,
+        /// Unique identifier for this turn within the session.
+        turn_id: String,
+        /// Conversation grouping identifier across multiple turns or agents.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+        /// W3C trace-id for distributed tracing correlation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trace_id: Option<String>,
+        /// W3C span-id for the span that produced this event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        span_id: Option<String>,
+        /// Parent span identifier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_span_id: Option<String>,
+        /// High-level operation label (e.g. `"chat"`, `"invoke_agent"`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_name: Option<String>,
+        /// Name of the agent that emitted this event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_name: Option<String>,
+        /// Terminal status of the operation: `"ok"` or `"error"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+
+    /// A tool was invoked during this turn.
+    ToolCalled {
+        /// The name of the tool that was called.
+        tool_name: String,
+        /// A short, human-readable description of the tool's input.
+        input_summary: String,
+        /// Turn identifier; correlates this event with the enclosing turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        /// Conversation grouping identifier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+        /// W3C trace-id for distributed tracing correlation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trace_id: Option<String>,
+        /// W3C span-id for the span that produced this event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        span_id: Option<String>,
+        /// Parent span identifier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_span_id: Option<String>,
+        /// High-level operation label.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_name: Option<String>,
+        /// Name of the agent that emitted this event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_name: Option<String>,
+        /// Terminal status of the operation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        /// Tool-call identifier for correlating the call with its result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
+    },
+
+    /// The turn completed successfully.
+    Completed {
+        /// Identifier for the session this turn belongs to.
+        session_id: String,
+        /// Unique identifier for the turn that completed.
+        turn_id: String,
+        /// Number of output tokens generated during this turn.
+        output_tokens: u32,
+        /// Number of input tokens consumed during this turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_tokens: Option<u32>,
+        /// W3C `traceparent` string for this turn's root span.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traceparent: Option<String>,
+        /// Conversation grouping identifier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+        /// W3C trace-id for distributed tracing correlation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trace_id: Option<String>,
+        /// W3C span-id for the span that produced this event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        span_id: Option<String>,
+        /// Parent span identifier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_span_id: Option<String>,
+        /// High-level operation label.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_name: Option<String>,
+        /// Name of the agent that emitted this event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_name: Option<String>,
+        /// Terminal status of the operation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+
+    /// The turn failed.
+    Failed {
+        /// Identifier for the session this turn belongs to.
+        session_id: String,
+        /// Unique identifier for the turn that failed.
+        turn_id: String,
+        /// Human-readable description of why the turn failed.
+        reason: String,
+        /// Conversation grouping identifier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+        /// W3C trace-id for distributed tracing correlation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trace_id: Option<String>,
+        /// W3C span-id for the span that produced this event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        span_id: Option<String>,
+        /// Parent span identifier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_span_id: Option<String>,
+        /// High-level operation label.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_name: Option<String>,
+        /// Name of the agent that emitted this event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_name: Option<String>,
+        /// Terminal status of the operation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+}
+
+// ── DeltaEvent ────────────────────────────────────────────────────────────────
+
+/// A high-frequency streaming text token emitted by the assistant.
+///
+/// Subscribers interested only in token-streaming should subscribe to a
+/// [`DeltaEvent`] channel rather than [`TurnEvent`] to avoid receiving
+/// low-frequency lifecycle overhead.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DeltaEvent {
+    /// Identifier for the session this delta belongs to.
+    pub session_id: Option<String>,
+    /// Turn identifier; correlates this delta with the enclosing turn.
+    pub turn_id: Option<String>,
+    /// The incremental text content emitted by the assistant.
+    pub delta: String,
+}
+
+// ── TryFrom<TurnEvent> for ControlEvent ───────────────────────────────────────
+
+/// Converts a [`TurnEvent`] into a [`ControlEvent`].
+///
+/// Returns `Err(TurnEvent::AssistantDelta { .. })` when the source event is an
+/// `AssistantDelta`, since that variant has no [`ControlEvent`] counterpart.
+impl TryFrom<TurnEvent> for ControlEvent {
+    type Error = TurnEvent;
+
+    fn try_from(event: TurnEvent) -> Result<Self, Self::Error> {
+        match event {
+            TurnEvent::Started {
+                session_id,
+                turn_id,
+                conversation_id,
+                trace_id,
+                span_id,
+                parent_span_id,
+                operation_name,
+                agent_name,
+                status,
+            } => Ok(ControlEvent::Started {
+                session_id,
+                turn_id,
+                conversation_id,
+                trace_id,
+                span_id,
+                parent_span_id,
+                operation_name,
+                agent_name,
+                status,
+            }),
+            TurnEvent::ToolCalled {
+                tool_name,
+                input_summary,
+                turn_id,
+                conversation_id,
+                trace_id,
+                span_id,
+                parent_span_id,
+                operation_name,
+                agent_name,
+                status,
+                tool_call_id,
+            } => Ok(ControlEvent::ToolCalled {
+                tool_name,
+                input_summary,
+                turn_id,
+                conversation_id,
+                trace_id,
+                span_id,
+                parent_span_id,
+                operation_name,
+                agent_name,
+                status,
+                tool_call_id,
+            }),
+            TurnEvent::Completed {
+                session_id,
+                turn_id,
+                output_tokens,
+                input_tokens,
+                traceparent,
+                conversation_id,
+                trace_id,
+                span_id,
+                parent_span_id,
+                operation_name,
+                agent_name,
+                status,
+            } => Ok(ControlEvent::Completed {
+                session_id,
+                turn_id,
+                output_tokens,
+                input_tokens,
+                traceparent,
+                conversation_id,
+                trace_id,
+                span_id,
+                parent_span_id,
+                operation_name,
+                agent_name,
+                status,
+            }),
+            TurnEvent::Failed {
+                session_id,
+                turn_id,
+                reason,
+                conversation_id,
+                trace_id,
+                span_id,
+                parent_span_id,
+                operation_name,
+                agent_name,
+                status,
+            } => Ok(ControlEvent::Failed {
+                session_id,
+                turn_id,
+                reason,
+                conversation_id,
+                trace_id,
+                span_id,
+                parent_span_id,
+                operation_name,
+                agent_name,
+                status,
+            }),
+            delta @ TurnEvent::AssistantDelta { .. } => Err(delta),
+        }
+    }
+}
+
+// ── From<TurnEvent> for Option<DeltaEvent> ────────────────────────────────────
+
+/// Converts a [`TurnEvent`] into an `Option<DeltaEvent>`.
+///
+/// Returns `Some` only when the source event is `AssistantDelta`.
+/// All other variants produce `None`.
+impl From<TurnEvent> for Option<DeltaEvent> {
+    fn from(event: TurnEvent) -> Self {
+        match event {
+            TurnEvent::AssistantDelta {
+                content,
+                turn_id,
+                conversation_id: _,
+                trace_id: _,
+                span_id: _,
+                parent_span_id: _,
+                operation_name: _,
+                agent_name: _,
+                status: _,
+            } => Some(DeltaEvent {
+                session_id: None,
+                turn_id,
+                delta: content,
+            }),
+            _ => None,
+        }
+    }
+}
+
 // ── Constructors ──────────────────────────────────────────────────────────────
 
 impl TurnEvent {
@@ -450,5 +751,103 @@ mod tests {
         } else {
             panic!("TurnEvent::fail must produce TurnEvent::Failed");
         }
+    }
+
+    // ── ControlEvent / DeltaEvent conversion tests ────────────────────────
+
+    #[test]
+    fn control_event_try_from_started_succeeds() {
+        let turn_event = TurnEvent::Started {
+            session_id: "sess-ctrl".into(),
+            turn_id: "turn-ctrl".into(),
+            conversation_id: Some("conv-1".into()),
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            operation_name: None,
+            agent_name: None,
+            status: None,
+        };
+        let result = ControlEvent::try_from(turn_event);
+        assert!(result.is_ok(), "TurnEvent::Started must convert to ControlEvent");
+        if let Ok(ControlEvent::Started {
+            session_id,
+            turn_id,
+            conversation_id,
+            ..
+        }) = result
+        {
+            assert_eq!(session_id, "sess-ctrl");
+            assert_eq!(turn_id, "turn-ctrl");
+            assert_eq!(conversation_id.as_deref(), Some("conv-1"));
+        } else {
+            panic!("expected ControlEvent::Started");
+        }
+    }
+
+    #[test]
+    fn control_event_try_from_assistant_delta_fails() {
+        let turn_event = TurnEvent::AssistantDelta {
+            content: "token".into(),
+            turn_id: None,
+            conversation_id: None,
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            operation_name: None,
+            agent_name: None,
+            status: None,
+        };
+        let result = ControlEvent::try_from(turn_event);
+        assert!(
+            result.is_err(),
+            "TurnEvent::AssistantDelta must not convert to ControlEvent"
+        );
+        // The original event is returned as the error value.
+        if let Err(TurnEvent::AssistantDelta { content, .. }) = result {
+            assert_eq!(content, "token");
+        } else {
+            panic!("expected Err(TurnEvent::AssistantDelta)");
+        }
+    }
+
+    #[test]
+    fn delta_event_from_turn_event_assistant_delta_succeeds() {
+        let turn_event = TurnEvent::AssistantDelta {
+            content: "hello delta".into(),
+            turn_id: Some("turn-delta".into()),
+            conversation_id: None,
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            operation_name: None,
+            agent_name: None,
+            status: None,
+        };
+        let result: Option<DeltaEvent> = turn_event.into();
+        assert!(result.is_some(), "AssistantDelta must produce Some(DeltaEvent)");
+        let delta = result.unwrap();
+        assert_eq!(delta.delta, "hello delta");
+        assert_eq!(delta.turn_id.as_deref(), Some("turn-delta"));
+    }
+
+    #[test]
+    fn delta_event_from_turn_event_started_returns_none() {
+        let turn_event = TurnEvent::Started {
+            session_id: "s".into(),
+            turn_id: "t".into(),
+            conversation_id: None,
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            operation_name: None,
+            agent_name: None,
+            status: None,
+        };
+        let result: Option<DeltaEvent> = turn_event.into();
+        assert!(
+            result.is_none(),
+            "TurnEvent::Started must produce None for DeltaEvent"
+        );
     }
 }

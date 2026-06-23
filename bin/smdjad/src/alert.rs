@@ -6,7 +6,7 @@
 //! is set to a non-empty value in the environment.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -14,7 +14,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use smedja_ingot::{AuditEvent, Ingot};
+use smedja_ingot::{AuditEvent, IngotHandle};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -67,7 +67,7 @@ pub(crate) struct AlertManagerAlert {
 #[derive(Clone)]
 pub struct AlertState {
     /// Shared ingot for writing audit events.
-    pub ingot: Arc<Mutex<Ingot>>,
+    pub ingot: IngotHandle,
 }
 
 // ── Route builder ─────────────────────────────────────────────────────────────
@@ -161,19 +161,15 @@ async fn webhook_alert(
         // Lock dropped here — before any await.
     }
 
-    // Phase 3 — write audit events; ingot lock is independent of queue lock.
-    {
-        let ig = state.ingot.lock().await;
-        for (alert, event) in &normalised {
-            if let Err(e) = ig.insert_audit_event(event) {
-                tracing::warn!(
-                    alert = %alert.title,
-                    error = %e,
-                    "failed to write alert audit event"
-                );
-            }
+    // Phase 3 — write audit events; each call goes through spawn_blocking.
+    for (alert, event) in normalised.clone() {
+        if let Err(e) = state.ingot.insert_audit_event(event).await {
+            tracing::warn!(
+                alert = %alert.title,
+                error = %e,
+                "failed to write alert audit event"
+            );
         }
-        // Lock dropped here.
     }
 
     let accepted = normalised.len();
@@ -195,11 +191,9 @@ pub async fn drain_alerts(max: usize) -> Vec<Alert> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
-    use smedja_ingot::Ingot;
+    use smedja_ingot::{Ingot, IngotHandle};
     use tokio::sync::Mutex;
     use tower::ServiceExt as _;
 
@@ -216,7 +210,7 @@ mod tests {
     fn test_state() -> AlertState {
         let ingot = Ingot::open_in_memory().expect("in-memory ingot");
         AlertState {
-            ingot: Arc::new(Mutex::new(ingot)),
+            ingot: IngotHandle::new(ingot),
         }
     }
 
