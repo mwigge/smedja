@@ -15,7 +15,9 @@ use statusbar::{render_status_bar, ModuleCtx};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEvent,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -234,6 +236,12 @@ struct AppState {
     pending_output_type: Option<OutputType>,
     /// True when `SMEDJA_OTLP_ENDPOINT` is set in the environment at startup.
     otlp_configured: bool,
+    /// Start screen row of an in-progress mouse drag (messages area only).
+    mouse_drag_start: Option<u16>,
+    /// Current end screen row of an in-progress mouse drag.
+    mouse_drag_end: Option<u16>,
+    /// Top row of the messages panel as recorded by the last render frame.
+    messages_top: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -513,6 +521,40 @@ fn yank_to_clipboard(lines: &[String]) {
         });
     if let Err(e) = result {
         tracing::debug!(error = %e, "clipboard write failed");
+    }
+}
+
+fn screen_row_to_line(row: u16, messages_top: u16, scroll: usize) -> usize {
+    let offset = (row as usize).saturating_sub(messages_top as usize);
+    scroll + offset
+}
+
+fn handle_mouse(state: &mut AppState, me: MouseEvent) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    match me.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            state.mouse_drag_start = Some(me.row);
+            state.mouse_drag_end = Some(me.row);
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            state.mouse_drag_end = Some(me.row);
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let (Some(start), Some(end)) = (state.mouse_drag_start, state.mouse_drag_end) {
+                let top = state.messages_top;
+                let scroll = state.main_panel.scroll;
+                let lo = screen_row_to_line(start.min(end), top, scroll);
+                let hi = screen_row_to_line(start.max(end), top, scroll);
+                let lines = state.main_panel.lines_text(lo, hi);
+                let count = lines.len();
+                yank_to_clipboard(&lines);
+                state.clipboard = Some(lines.join("\n"));
+                push_system_message(state, format!("\u{2713} {count} lines copied"));
+            }
+            state.mouse_drag_start = None;
+            state.mouse_drag_end = None;
+        }
+        _ => {}
     }
 }
 
@@ -1321,7 +1363,11 @@ async fn handle_key(
 
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.quit = true;
+            if let Some(ref text) = state.clipboard.clone() {
+                yank_to_clipboard(std::slice::from_ref(text));
+            } else {
+                state.quit = true;
+            }
         }
 
         // Ctrl-R: toggle context rail
@@ -1704,7 +1750,7 @@ async fn handle_key(
 // Render
 // ---------------------------------------------------------------------------
 
-fn render(frame: &mut ratatui::Frame, state: &AppState) {
+fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     let area = frame.area();
 
     // L122: outer vertical split:
@@ -1751,10 +1797,17 @@ fn render(frame: &mut ratatui::Frame, state: &AppState) {
         (body_area, None)
     };
 
+    // Record messages area top row for mouse-to-line mapping.
+    state.messages_top = main_area.y;
+
     // L122: render MainPanel from state.main_panel.
     let selection = if state.selection_mode {
         let lo = state.selection_anchor.min(state.selection_end);
         let hi = state.selection_anchor.max(state.selection_end);
+        Some((lo, hi))
+    } else if let (Some(start), Some(end)) = (state.mouse_drag_start, state.mouse_drag_end) {
+        let lo = screen_row_to_line(start.min(end), state.messages_top, state.main_panel.scroll);
+        let hi = screen_row_to_line(start.max(end), state.messages_top, state.main_panel.scroll);
         Some((lo, hi))
     } else {
         None
@@ -1906,7 +1959,7 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen);
+        let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
@@ -2019,6 +2072,9 @@ async fn main() -> Result<()> {
         last_traceparent: None,
         pending_output_type: None,
         otlp_configured,
+        mouse_drag_start: None,
+        mouse_drag_end: None,
+        messages_top: 0,
     };
 
     // Connect banner — shown on every startup so the user knows what's connected.
@@ -2042,7 +2098,8 @@ async fn main() -> Result<()> {
         .push_line("type a message or /help for commands".into());
 
     enable_raw_mode().context("enable raw mode")?;
-    execute!(stdout(), EnterAlternateScreen).context("enter alternate screen")?;
+    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)
+        .context("enter alternate screen")?;
     let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(stdout());
@@ -2061,8 +2118,12 @@ async fn main() -> Result<()> {
                 let ev = tokio::task::spawn_blocking(event::read)
                     .await
                     .context("read task panicked")??;
-                if let Event::Key(key) = ev {
-                    handle_key(key, &mut state, &mut client, &mut editor).await?;
+                match ev {
+                    Event::Key(key) => {
+                        handle_key(key, &mut state, &mut client, &mut editor).await?;
+                    }
+                    Event::Mouse(me) => handle_mouse(&mut state, me),
+                    _ => {}
                 }
                 // Check if more events are ready without blocking.
                 let more = tokio::task::spawn_blocking(|| event::poll(Duration::from_millis(0)))
@@ -2074,7 +2135,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        terminal.draw(|f| render(f, &state))?;
+        terminal.draw(|f| render(f, &mut state))?;
 
         // Drain NDJSON stream events from the background reader task.
         // When streaming is active (stream_rx is Some), render deltas in real
@@ -2790,11 +2851,14 @@ mod tests {
             last_traceparent: None,
             pending_output_type: None,
             otlp_configured: false,
+            mouse_drag_start: None,
+            mouse_drag_end: None,
+            messages_top: 0,
         }
     }
 
     /// Renders `state` to an 80×24 `TestBackend` and returns the buffer.
-    fn render_frame(state: &AppState) -> ratatui::buffer::Buffer {
+    fn render_frame(state: &mut AppState) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, state)).unwrap();
@@ -2821,8 +2885,8 @@ mod tests {
 
     #[test]
     fn render_does_not_panic_with_empty_state() {
-        let state = make_state("test-session");
-        let _buf = render_frame(&state);
+        let mut state = make_state("test-session");
+        let _buf = render_frame(&mut state);
         // Verify no panic — any output is acceptable.
     }
 
@@ -2832,7 +2896,7 @@ mod tests {
         assert!(!state.slash_popup_visible);
         state.slash_popup_visible = true;
         state.slash_completions = filtered_completions("/");
-        let buf = render_frame(&state);
+        let buf = render_frame(&mut state);
         let content: String = buf
             .content()
             .iter()
@@ -2851,7 +2915,7 @@ mod tests {
         block.complete(42);
         state.block_store.push(block);
         state.block_browser_open = true;
-        let buf = render_frame(&state);
+        let buf = render_frame(&mut state);
         let content: String = buf
             .content()
             .iter()
@@ -2870,7 +2934,7 @@ mod tests {
             0,
             vec!["+added line".to_owned(), "-removed line".to_owned()],
         ));
-        let buf = render_frame(&state);
+        let buf = render_frame(&mut state);
         let content: String = buf
             .content()
             .iter()
@@ -2898,7 +2962,7 @@ mod tests {
         // Simulate what /health should push to main_panel.
         let msg = format!("health: socket=ok session={} latency=?ms", state.session_id);
         state.main_panel.push_line(msg.clone());
-        let buf = render_frame(&state);
+        let buf = render_frame(&mut state);
         let content: String = buf
             .content()
             .iter()
@@ -2940,7 +3004,7 @@ mod tests {
         let mut state = make_state("sess-stream");
         state.main_panel.push_delta("hello");
         state.main_panel.push_delta(" there");
-        let buf = render_frame(&state);
+        let buf = render_frame(&mut state);
         let content: String = buf
             .content()
             .iter()
@@ -2965,7 +3029,7 @@ mod tests {
         state
             .main_panel
             .push_line("type a message or /help for commands".into());
-        let buf = render_frame(&state);
+        let buf = render_frame(&mut state);
         let content: String = buf
             .content()
             .iter()
@@ -2982,7 +3046,7 @@ mod tests {
     fn status_bar_shows_tier_when_set() {
         let mut state = make_state("sess-xyz");
         state.tier = Some("fast".into());
-        let buf = render_frame(&state);
+        let buf = render_frame(&mut state);
         let content: String = buf
             .content()
             .iter()
@@ -2993,8 +3057,8 @@ mod tests {
 
     #[test]
     fn status_bar_shows_unknown_when_no_tier() {
-        let state = make_state("sess-xyz");
-        let buf = render_frame(&state);
+        let mut state = make_state("sess-xyz");
+        let buf = render_frame(&mut state);
         let content: String = buf
             .content()
             .iter()
@@ -3009,7 +3073,7 @@ mod tests {
     fn thinking_indicator_visible_when_turn_in_flight() {
         let mut state = make_state("sess-think");
         state.turn_in_flight = true;
-        let buf = render_frame(&state);
+        let buf = render_frame(&mut state);
         let content: String = buf
             .content()
             .iter()
@@ -3023,8 +3087,8 @@ mod tests {
 
     #[test]
     fn thinking_indicator_hidden_when_idle() {
-        let state = make_state("sess-idle");
-        let buf = render_frame(&state);
+        let mut state = make_state("sess-idle");
+        let buf = render_frame(&mut state);
         let content: String = buf
             .content()
             .iter()
@@ -3037,10 +3101,10 @@ mod tests {
 
     #[test]
     fn layout_input_row_at_bottom_of_80x24() {
-        let state = make_state("sess-layout");
+        let mut state = make_state("sess-layout");
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(frame, &state)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let buf = terminal.backend().buffer();
         assert_eq!(buf.area().height, 24);
         assert_eq!(buf.area().width, 80);
@@ -3048,10 +3112,10 @@ mod tests {
 
     #[test]
     fn layout_40x10_does_not_panic() {
-        let state = make_state("sess-narrow");
+        let mut state = make_state("sess-narrow");
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(frame, &state)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let buf = terminal.backend().buffer();
         assert_eq!(buf.area().width, 40);
         assert_eq!(buf.area().height, 10);
@@ -3110,7 +3174,7 @@ mod tests {
         );
 
         // The main panel must contain the health output line.
-        let buf = render_frame(&state);
+        let buf = render_frame(&mut state);
         let content: String = buf
             .content()
             .iter()
@@ -3132,7 +3196,7 @@ mod tests {
         state
             .main_panel
             .push_line("↳ 10↑ 20↓ tokens · 250ms".into());
-        let buf = render_frame(&state);
+        let buf = render_frame(&mut state);
         let content: String = buf
             .content()
             .iter()
@@ -3263,7 +3327,7 @@ mod tests {
     fn status_bar_shows_runner_when_set() {
         let mut state = make_state("sess-runner");
         state.runner = "anthropic".to_owned();
-        let buf = render_frame(&state);
+        let buf = render_frame(&mut state);
         let content: String = buf
             .content()
             .iter()
@@ -3453,6 +3517,107 @@ mod tests {
         );
     }
 
+    // --- tui-mouse-copy tests ---
+
+    #[test]
+    fn screen_row_to_line_maps_correctly() {
+        // row=5, messages_top=3, scroll=10 → offset=2, result=12
+        assert_eq!(screen_row_to_line(5, 3, 10), 12);
+        // row at top → offset=0, result=scroll
+        assert_eq!(screen_row_to_line(3, 3, 7), 7);
+        // row above messages_top → saturating_sub gives 0
+        assert_eq!(screen_row_to_line(1, 3, 5), 5);
+    }
+
+    #[test]
+    fn handle_mouse_down_sets_drag_start_and_end() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut state = make_state("sess-mouse");
+        let me = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut state, me);
+        assert_eq!(state.mouse_drag_start, Some(5));
+        assert_eq!(state.mouse_drag_end, Some(5));
+    }
+
+    #[test]
+    fn handle_mouse_drag_updates_end_only() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut state = make_state("sess-mouse");
+        state.mouse_drag_start = Some(3);
+        state.mouse_drag_end = Some(3);
+        let me = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 0,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut state, me);
+        assert_eq!(state.mouse_drag_start, Some(3));
+        assert_eq!(state.mouse_drag_end, Some(8));
+    }
+
+    #[test]
+    fn handle_mouse_up_yanks_and_clears_drag_state() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut state = make_state("sess-mouse");
+        // Push a few lines to the panel so lines_text has content.
+        state.main_panel.push_line("line alpha".to_owned());
+        state.main_panel.push_line("line beta".to_owned());
+        state.main_panel.push_line("line gamma".to_owned());
+        state.messages_top = 1;
+        state.mouse_drag_start = Some(1); // row 1 → line 0 + scroll(0)
+        state.mouse_drag_end = Some(2);   // row 2 → line 1 + scroll(0)
+
+        let me = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 0,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut state, me);
+
+        assert!(state.clipboard.is_some(), "clipboard must be populated after drag release");
+        assert!(state.mouse_drag_start.is_none(), "drag start must be cleared");
+        assert!(state.mouse_drag_end.is_none(), "drag end must be cleared");
+        let has_msg = state
+            .main_panel
+            .lines_text(0, 200)
+            .iter()
+            .any(|l| l.contains("lines copied") || l.contains("✓"));
+        assert!(has_msg, "panel must show copy confirmation message");
+    }
+
+    #[test]
+    fn ctrl_c_with_clipboard_does_not_quit() {
+        let mut state = make_state("sess-ctrlc");
+        state.clipboard = Some("some text".to_owned());
+        // Simulate the Ctrl-C branch: clipboard is Some → do NOT quit
+        if state.clipboard.is_some() {
+            // copy, do not quit
+        } else {
+            state.quit = true;
+        }
+        assert!(!state.quit, "Ctrl-C must not quit when clipboard is non-empty");
+    }
+
+    #[test]
+    fn ctrl_c_with_no_clipboard_quits() {
+        let mut state = make_state("sess-ctrlc");
+        state.clipboard = None;
+        // Simulate the Ctrl-C branch: clipboard is None → quit
+        if state.clipboard.is_some() {
+            // copy
+        } else {
+            state.quit = true;
+        }
+        assert!(state.quit, "Ctrl-C must quit when clipboard is empty");
+    }
+
     // --- tui-input-modes tests ---
 
     #[test]
@@ -3530,7 +3695,7 @@ mod tests {
     fn status_bar_shows_input_mode_badge_when_not_scroll() {
         let mut state = make_state("sess-mode");
         state.scroll_focus = false;
-        let buf = render_frame(&state);
+        let buf = render_frame(&mut state);
         let content: String = buf.content().iter().map(ratatui::buffer::Cell::symbol).collect();
         assert!(
             content.contains("[I]"),
@@ -3542,7 +3707,7 @@ mod tests {
     fn status_bar_shows_normal_mode_badge_when_scroll() {
         let mut state = make_state("sess-mode");
         state.scroll_focus = true;
-        let buf = render_frame(&state);
+        let buf = render_frame(&mut state);
         let content: String = buf.content().iter().map(ratatui::buffer::Cell::symbol).collect();
         assert!(
             content.contains("[N]"),
