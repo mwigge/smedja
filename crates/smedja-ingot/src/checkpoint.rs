@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use smedja_types::Timestamp;
 use uuid::Uuid;
 
 use crate::error::IngotError;
@@ -11,18 +12,31 @@ pub struct Checkpoint {
     /// Session this checkpoint belongs to.
     pub session_id: String,
     /// Monotonically increasing turn index within the session.
+    ///
+    /// Compaction checkpoints historically used `-1` as a sentinel; they are now
+    /// distinguished by a non-`None` [`Checkpoint::compaction_id`] instead, so
+    /// multiple compactions per session are retained rather than overwritten.
     pub turn_n: i64,
     /// JSON-serialised array of message objects.
     pub messages_json: String,
-    /// Unix epoch timestamp when the checkpoint was saved.
-    pub created_at: f64,
+    /// Timestamp when the checkpoint was saved (micros since the Unix epoch).
+    pub created_at: Timestamp,
+    /// Compaction discriminator.
+    ///
+    /// `None` for ordinary per-turn checkpoints (one row per `(session_id,
+    /// turn_n)`). `Some(id)` for compaction checkpoints, where `id` is a unique
+    /// string (e.g. a UUID) that keeps every compaction distinct so a session
+    /// can retain its full compaction history.
+    #[serde(default)]
+    pub compaction_id: Option<String>,
 }
 
 /// Inserts or replaces a [`Checkpoint`].
 ///
-/// The `UNIQUE(session_id, turn_n)` constraint means saving the same turn a second
-/// time will fail unless using `INSERT OR REPLACE`. This method uses `INSERT OR REPLACE`
-/// to allow idempotent saves.
+/// Ordinary per-turn checkpoints (`compaction_id == None`) replace any existing
+/// row for the same `(session_id, turn_n)` via the partial unique index, keeping
+/// saves idempotent. Compaction checkpoints (`compaction_id == Some(_)`) carry no
+/// turn-based uniqueness, so every compaction is retained as a distinct row.
 ///
 /// # Errors
 ///
@@ -30,14 +44,15 @@ pub struct Checkpoint {
 pub(crate) fn save(conn: &rusqlite::Connection, cp: &Checkpoint) -> Result<(), IngotError> {
     conn.execute(
         "INSERT OR REPLACE INTO checkpoints \
-         (id, session_id, turn_n, messages_json, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+         (id, session_id, turn_n, messages_json, created_at, compaction_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         rusqlite::params![
             cp.id.to_string(),
             cp.session_id,
             cp.turn_n,
             cp.messages_json,
-            cp.created_at,
+            cp.created_at.as_micros(),
+            cp.compaction_id,
         ],
     )?;
     Ok(())
@@ -57,7 +72,11 @@ fn optional_result(r: rusqlite::Result<Checkpoint>) -> Result<Option<Checkpoint>
     }
 }
 
-/// Retrieves a [`Checkpoint`] by `session_id` and `turn_n`, returning `None` if not found.
+/// Column list shared by all SELECT statements in this module.
+const SELECT_COLS: &str = "id, session_id, turn_n, messages_json, created_at, compaction_id";
+
+/// Retrieves an ordinary [`Checkpoint`] by `session_id` and `turn_n`, returning
+/// `None` if not found. Compaction checkpoints are excluded from this lookup.
 ///
 /// # Errors
 ///
@@ -68,15 +87,17 @@ pub(crate) fn load(
     turn_n: u32,
 ) -> Result<Option<Checkpoint>, IngotError> {
     optional_result(conn.query_row(
-        "SELECT id, session_id, turn_n, messages_json, created_at \
-         FROM checkpoints WHERE session_id = ?1 AND turn_n = ?2",
+        &format!(
+            "SELECT {SELECT_COLS} FROM checkpoints \
+             WHERE session_id = ?1 AND turn_n = ?2 AND compaction_id IS NULL"
+        ),
         rusqlite::params![session_id, i64::from(turn_n)],
         row_to_checkpoint,
     ))
 }
 
-/// Returns the checkpoint with the highest `turn_n` for `session_id`, or `None` if
-/// no checkpoints exist.
+/// Returns the ordinary checkpoint with the highest `turn_n` for `session_id`,
+/// or `None` if no checkpoints exist. Compaction checkpoints are excluded.
 ///
 /// # Errors
 ///
@@ -86,9 +107,11 @@ pub(crate) fn latest(
     session_id: &str,
 ) -> Result<Option<Checkpoint>, IngotError> {
     optional_result(conn.query_row(
-        "SELECT id, session_id, turn_n, messages_json, created_at \
-         FROM checkpoints WHERE session_id = ?1 \
-         ORDER BY turn_n DESC LIMIT 1",
+        &format!(
+            "SELECT {SELECT_COLS} FROM checkpoints \
+             WHERE session_id = ?1 AND compaction_id IS NULL \
+             ORDER BY turn_n DESC LIMIT 1"
+        ),
         rusqlite::params![session_id],
         row_to_checkpoint,
     ))
@@ -97,8 +120,10 @@ pub(crate) fn latest(
 /// Atomically rolls back a session to `turn_n`.
 ///
 /// Within a single `SQLite` transaction:
-/// 1. Loads the checkpoint at `turn_n`.
-/// 2. Deletes all checkpoints with `turn_n > N`.
+/// 1. Loads the ordinary checkpoint at `turn_n`.
+/// 2. Deletes all ordinary checkpoints with `turn_n > N`.
+///
+/// Compaction checkpoints are never loaded or deleted by this operation.
 ///
 /// Returns `Ok(Some(checkpoint))` on success, `Ok(None)` when the target turn
 /// does not exist (no changes are made in that case), or `Err` if the database
@@ -115,8 +140,10 @@ pub fn rollback_session(
     let tx = conn.unchecked_transaction()?;
 
     let cp_result: rusqlite::Result<Checkpoint> = tx.query_row(
-        "SELECT id, session_id, turn_n, messages_json, created_at \
-         FROM checkpoints WHERE session_id = ?1 AND turn_n = ?2",
+        &format!(
+            "SELECT {SELECT_COLS} FROM checkpoints \
+             WHERE session_id = ?1 AND turn_n = ?2 AND compaction_id IS NULL"
+        ),
         rusqlite::params![session_id, i64::from(turn_n)],
         row_to_checkpoint,
     );
@@ -132,7 +159,8 @@ pub fn rollback_session(
     };
 
     tx.execute(
-        "DELETE FROM checkpoints WHERE session_id = ?1 AND turn_n > ?2",
+        "DELETE FROM checkpoints \
+         WHERE session_id = ?1 AND turn_n > ?2 AND compaction_id IS NULL",
         rusqlite::params![session_id, i64::from(turn_n)],
     )?;
 
@@ -140,7 +168,8 @@ pub fn rollback_session(
     Ok(Some(checkpoint))
 }
 
-/// Returns all checkpoints for `session_id` ordered by `turn_n` ascending.
+/// Returns all ordinary checkpoints for `session_id` ordered by `turn_n`
+/// ascending. Compaction checkpoints are excluded.
 ///
 /// # Errors
 ///
@@ -149,10 +178,30 @@ pub(crate) fn list(
     conn: &rusqlite::Connection,
     session_id: &str,
 ) -> Result<Vec<Checkpoint>, IngotError> {
-    let mut stmt = conn.prepare(
-        "SELECT id, session_id, turn_n, messages_json, created_at \
-         FROM checkpoints WHERE session_id = ?1 ORDER BY turn_n ASC",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECT_COLS} FROM checkpoints \
+         WHERE session_id = ?1 AND compaction_id IS NULL ORDER BY turn_n ASC"
+    ))?;
+    let rows: Result<Vec<Checkpoint>, _> = stmt
+        .query_map(rusqlite::params![session_id], row_to_checkpoint)?
+        .collect();
+    Ok(rows?)
+}
+
+/// Returns all compaction checkpoints for `session_id` ordered by `created_at`
+/// ascending. Ordinary per-turn checkpoints are excluded.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the query fails.
+pub(crate) fn list_compactions(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Vec<Checkpoint>, IngotError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECT_COLS} FROM checkpoints \
+         WHERE session_id = ?1 AND compaction_id IS NOT NULL ORDER BY created_at ASC"
+    ))?;
     let rows: Result<Vec<Checkpoint>, _> = stmt
         .query_map(rusqlite::params![session_id], row_to_checkpoint)?
         .collect();
@@ -169,7 +218,8 @@ fn row_to_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<Checkpoint> {
         session_id: row.get(1)?,
         turn_n: row.get(2)?,
         messages_json: row.get(3)?,
-        created_at: row.get(4)?,
+        created_at: Timestamp::from_micros(crate::read_micros(row, 4)?),
+        compaction_id: row.get(5)?,
     })
 }
 
@@ -184,13 +234,27 @@ mod tests {
             session_id: session_id.to_string(),
             turn_n,
             messages_json: r#"[{"role":"user","content":"hello"}]"#.to_string(),
-            created_at: 1_700_000_000.0 + f64::from(u32::try_from(turn_n).unwrap_or(0)),
+            created_at: Timestamp::from_secs_f64(
+                1_700_000_000.0 + f64::from(u32::try_from(turn_n).unwrap_or(0)),
+            ),
+            compaction_id: None,
+        }
+    }
+
+    fn make_compaction(session_id: &str, compaction_id: &str, created_secs: f64) -> Checkpoint {
+        Checkpoint {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            turn_n: -1,
+            messages_json: r#"[{"role":"system","content":"compacted"}]"#.to_string(),
+            created_at: Timestamp::from_secs_f64(created_secs),
+            compaction_id: Some(compaction_id.to_string()),
         }
     }
 
     #[test]
     fn save_then_load_returns_checkpoint() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let cp = make_checkpoint("sess-1", 0);
         ingot.save_checkpoint(&cp).unwrap();
 
@@ -200,6 +264,7 @@ mod tests {
         assert_eq!(loaded.id, cp.id);
         assert_eq!(loaded.turn_n, 0);
         assert_eq!(loaded.messages_json, cp.messages_json);
+        assert!(loaded.compaction_id.is_none());
     }
 
     #[test]
@@ -211,7 +276,7 @@ mod tests {
 
     #[test]
     fn latest_checkpoint_returns_highest_turn() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         ingot.save_checkpoint(&make_checkpoint("s", 0)).unwrap();
         ingot.save_checkpoint(&make_checkpoint("s", 2)).unwrap();
         ingot.save_checkpoint(&make_checkpoint("s", 1)).unwrap();
@@ -230,7 +295,7 @@ mod tests {
 
     #[test]
     fn save_is_idempotent_for_same_turn() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let cp1 = make_checkpoint("s", 0);
         let mut cp2 = make_checkpoint("s", 0);
         cp2.messages_json = r#"[{"role":"assistant","content":"updated"}]"#.to_string();
@@ -243,11 +308,13 @@ mod tests {
             loaded.messages_json,
             r#"[{"role":"assistant","content":"updated"}]"#
         );
+        // Only one ordinary row remains for the turn.
+        assert_eq!(ingot.list_checkpoints("s").unwrap().len(), 1);
     }
 
     #[test]
     fn latest_checkpoint_scoped_to_session() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         ingot
             .save_checkpoint(&make_checkpoint("session-a", 5))
             .unwrap();
@@ -264,7 +331,7 @@ mod tests {
 
     #[test]
     fn list_checkpoints_returns_ordered() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         ig.save_checkpoint(&make_checkpoint("s1", 2)).unwrap();
         ig.save_checkpoint(&make_checkpoint("s1", 1)).unwrap();
         let cps = ig.list_checkpoints("s1").unwrap();
@@ -282,14 +349,15 @@ mod tests {
 
     #[test]
     fn save_and_load_checkpoint_round_trip() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let messages_json = r#"[{"role":"user","content":"round-trip"}]"#;
         let cp = Checkpoint {
             id: Uuid::new_v4(),
             session_id: "rt-session".to_string(),
             turn_n: 7,
             messages_json: messages_json.to_string(),
-            created_at: 1_700_001_000.0,
+            created_at: Timestamp::from_secs_f64(1_700_001_000.0),
+            compaction_id: None,
         };
         ingot.save_checkpoint(&cp).unwrap();
 
@@ -298,34 +366,49 @@ mod tests {
         assert_eq!(loaded.turn_n, 7);
         assert_eq!(loaded.messages_json, messages_json);
         assert_eq!(loaded.session_id, "rt-session");
+        assert_eq!(loaded.created_at, Timestamp::from_secs_f64(1_700_001_000.0));
     }
 
     #[test]
-    fn rollback_discards_later_turns() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+    fn two_compactions_for_one_session_are_both_retained() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let first = make_compaction("compact-sess", "compaction-1", 1_700_000_000.0);
+        let second = make_compaction("compact-sess", "compaction-2", 1_700_000_100.0);
+
+        ingot.save_checkpoint(&first).unwrap();
+        ingot.save_checkpoint(&second).unwrap();
+
+        let compactions = ingot.list_compaction_checkpoints("compact-sess").unwrap();
+        assert_eq!(compactions.len(), 2, "both compactions must be retained");
+
+        let ids: Vec<&str> = compactions
+            .iter()
+            .filter_map(|c| c.compaction_id.as_deref())
+            .collect();
+        assert!(ids.contains(&"compaction-1"));
+        assert!(ids.contains(&"compaction-2"));
+    }
+
+    #[test]
+    fn compaction_checkpoints_do_not_collide_with_turns() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        // A normal turn 0 alongside two compactions.
+        ingot.save_checkpoint(&make_checkpoint("mixed", 0)).unwrap();
         ingot
-            .save_checkpoint(&make_checkpoint("rollback-sess", 1))
+            .save_checkpoint(&make_compaction("mixed", "c-a", 1.0))
             .unwrap();
         ingot
-            .save_checkpoint(&make_checkpoint("rollback-sess", 2))
-            .unwrap();
-        ingot
-            .save_checkpoint(&make_checkpoint("rollback-sess", 3))
+            .save_checkpoint(&make_compaction("mixed", "c-b", 2.0))
             .unwrap();
 
-        // Load the turn-1 checkpoint — simulates rolling back before turns 2 and 3.
-        let rolled_back = ingot.load_checkpoint("rollback-sess", 1).unwrap().unwrap();
-        assert_eq!(rolled_back.turn_n, 1);
+        // Ordinary listing excludes compactions.
+        let turns = ingot.list_checkpoints("mixed").unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].turn_n, 0);
 
-        // Turns 2 and 3 still exist in the store; the caller is responsible for
-        // discarding them.  Verify they are independently accessible.
-        let turn2 = ingot.load_checkpoint("rollback-sess", 2).unwrap().unwrap();
-        assert_eq!(turn2.turn_n, 2);
-
-        let cps = ingot.list_checkpoints("rollback-sess").unwrap();
-        assert_eq!(cps.len(), 3);
-        // Confirm the roll-back point is the first in the ordered list.
-        assert_eq!(cps[0].turn_n, 1);
+        // Compaction listing excludes ordinary turns.
+        let compactions = ingot.list_compaction_checkpoints("mixed").unwrap();
+        assert_eq!(compactions.len(), 2);
     }
 
     /// Builds an in-memory connection with the checkpoints table for direct
@@ -334,15 +417,16 @@ mod tests {
     fn in_memory_conn() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "PRAGMA foreign_keys = ON;
-             CREATE TABLE IF NOT EXISTS checkpoints (
+            "CREATE TABLE IF NOT EXISTS checkpoints (
                  id            TEXT PRIMARY KEY,
                  session_id    TEXT NOT NULL,
                  turn_n        INTEGER NOT NULL,
                  messages_json TEXT NOT NULL,
-                 created_at    REAL NOT NULL,
-                 UNIQUE(session_id, turn_n)
-             );",
+                 created_at    INTEGER NOT NULL,
+                 compaction_id TEXT
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_turn \
+                 ON checkpoints(session_id, turn_n) WHERE compaction_id IS NULL;",
         )
         .unwrap();
         conn
@@ -356,14 +440,16 @@ mod tests {
         for turn in 1i64..=3 {
             let cp = make_checkpoint("sess", turn);
             conn.execute(
-                "INSERT INTO checkpoints (id, session_id, turn_n, messages_json, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO checkpoints \
+                 (id, session_id, turn_n, messages_json, created_at, compaction_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
                     cp.id.to_string(),
                     cp.session_id,
                     cp.turn_n,
                     cp.messages_json,
-                    cp.created_at,
+                    cp.created_at.as_micros(),
+                    cp.compaction_id,
                 ],
             )
             .unwrap();
@@ -400,14 +486,16 @@ mod tests {
         // Insert turn 1 but request rollback to non-existent turn 99.
         let cp = make_checkpoint("sess2", 1);
         conn.execute(
-            "INSERT INTO checkpoints (id, session_id, turn_n, messages_json, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO checkpoints \
+             (id, session_id, turn_n, messages_json, created_at, compaction_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![
                 cp.id.to_string(),
                 cp.session_id,
                 cp.turn_n,
                 cp.messages_json,
-                cp.created_at,
+                cp.created_at.as_micros(),
+                cp.compaction_id,
             ],
         )
         .unwrap();

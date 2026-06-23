@@ -35,8 +35,11 @@ pub use session::Session;
 pub use task::Task;
 pub use token_snapshot::TokenSnapshot;
 
-/// The current schema version applied by [`Ingot::migrate`].
-const SCHEMA_VERSION: i64 = 3;
+/// The current schema version recorded in the legacy `schema_version` marker
+/// table. Derived from the number of numbered [`MIGRATIONS`] so it can never
+/// drift from the migrations actually defined.
+#[allow(clippy::cast_possible_wrap)] // MIGRATIONS.len() is a small compile-time constant
+const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
 /// Numbered migrations applied in sequence after the base DDL.
 ///
@@ -87,6 +90,58 @@ const MIGRATIONS: &[(i64, &str)] = &[
             approval_recorded INTEGER NOT NULL DEFAULT 0, \
             no_spec_gate INTEGER NOT NULL DEFAULT 0 \
          );",
+    ),
+    // Timestamp backfill: convert legacy REAL-seconds columns to INTEGER
+    // microseconds. SQLite columns have dynamic type affinity, so the same
+    // column can hold both before and after this one-time, version-gated
+    // conversion. On fresh databases every table is empty (or already stores
+    // micros), so these UPDATEs are no-ops and stay idempotent.
+    (
+        19,
+        "UPDATE audit_events          SET ts         = CAST(round(ts * 1000000) AS INTEGER); \
+         UPDATE sessions              SET created_at = CAST(round(created_at * 1000000) AS INTEGER), \
+                                          updated_at = CAST(round(updated_at * 1000000) AS INTEGER); \
+         UPDATE tasks                 SET created_at = CAST(round(created_at * 1000000) AS INTEGER); \
+         UPDATE checkpoints           SET created_at = CAST(round(created_at * 1000000) AS INTEGER); \
+         UPDATE cost_ledger           SET created_at = CAST(round(created_at * 1000000) AS INTEGER); \
+         UPDATE loops                 SET created_at = CAST(round(created_at * 1000000) AS INTEGER), \
+                                          updated_at = CAST(round(updated_at * 1000000) AS INTEGER); \
+         UPDATE turn_token_snapshots  SET created_at = CAST(round(created_at * 1000000) AS INTEGER);",
+    ),
+    // Money backfill: convert legacy REAL-dollar cost_ledger.cost_usd to
+    // INTEGER microdollars. Version-gated so it runs exactly once.
+    (
+        20,
+        "UPDATE cost_ledger SET cost_usd = CAST(round(cost_usd * 1000000) AS INTEGER);",
+    ),
+    // Compaction redesign: add an explicit compaction_id discriminator and a
+    // partial unique index, and migrate legacy turn_n = -1 sentinel rows onto a
+    // generated compaction_id so multiple compactions per session are retained.
+    //
+    // Pre-existing databases declared a table-level UNIQUE(session_id, turn_n)
+    // that would still collide on the -1 sentinel, so the table is rebuilt to
+    // drop that constraint. The leading DROP clears any partially-rebuilt table
+    // from an interrupted prior attempt, keeping this re-runnable.
+    (
+        21,
+        "DROP TABLE IF EXISTS checkpoints_old; \
+         ALTER TABLE checkpoints RENAME TO checkpoints_old; \
+         DROP INDEX IF EXISTS idx_checkpoints_turn; \
+         CREATE TABLE checkpoints ( \
+             id            TEXT PRIMARY KEY, \
+             session_id    TEXT NOT NULL, \
+             turn_n        INTEGER NOT NULL, \
+             messages_json TEXT NOT NULL, \
+             created_at    INTEGER NOT NULL, \
+             compaction_id TEXT \
+         ); \
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_turn \
+             ON checkpoints(session_id, turn_n) WHERE compaction_id IS NULL; \
+         INSERT INTO checkpoints (id, session_id, turn_n, messages_json, created_at, compaction_id) \
+             SELECT id, session_id, turn_n, messages_json, created_at, \
+                    CASE WHEN turn_n = -1 THEN 'legacy-compaction-' || id ELSE NULL END \
+             FROM checkpoints_old; \
+         DROP TABLE checkpoints_old;",
     ),
 ];
 
@@ -175,7 +230,11 @@ impl Ingot {
         self.conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
-            PRAGMA foreign_keys = ON;
+            -- NOTE: foreign_keys is intentionally left at its default (OFF).
+            -- This schema declares no REFERENCES clauses; referential integrity
+            -- between sessions/tasks/checkpoints/cost_ledger is enforced in
+            -- application code, not by SQLite. The previous `PRAGMA foreign_keys
+            -- = ON` was misleading (no FKs to enforce) and has been removed.
 
             CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER PRIMARY KEY
@@ -186,9 +245,14 @@ impl Ingot {
                 applied_at REAL NOT NULL
             );
 
+            -- Timestamp columns store INTEGER microseconds since the Unix epoch
+            -- (smedja_types::Timestamp). Monetary columns store INTEGER
+            -- microdollars (smedja_types::Microdollars). Pre-existing databases
+            -- that stored REAL seconds / REAL dollars are converted by the
+            -- version-gated backfill migrations below.
             CREATE TABLE IF NOT EXISTS audit_events (
                 id          TEXT PRIMARY KEY,
-                ts          REAL NOT NULL,
+                ts          INTEGER NOT NULL,
                 session_id  TEXT NOT NULL,
                 turn_id     TEXT,
                 action_type TEXT NOT NULL,
@@ -203,8 +267,8 @@ impl Ingot {
 
             CREATE TABLE IF NOT EXISTS sessions (
                 id             TEXT PRIMARY KEY,
-                created_at     REAL NOT NULL,
-                updated_at     REAL NOT NULL,
+                created_at     INTEGER NOT NULL,
+                updated_at     INTEGER NOT NULL,
                 status         TEXT NOT NULL DEFAULT 'active',
                 task_id        TEXT,
                 mode           TEXT,
@@ -227,18 +291,24 @@ impl Ingot {
                 title       TEXT NOT NULL,
                 description TEXT NOT NULL DEFAULT '',
                 status      TEXT NOT NULL DEFAULT 'planned',
-                created_at  REAL NOT NULL,
+                created_at  INTEGER NOT NULL,
                 session_id  TEXT,
                 response    TEXT
             );
 
+            -- Fresh databases get the new checkpoints shape here; the partial
+            -- unique index (and, for pre-existing databases, the rebuild that
+            -- drops the legacy table-level UNIQUE(session_id, turn_n)) is applied
+            -- by the version-gated compaction migration below. Defining the index
+            -- here would fail on old databases whose checkpoints table predates
+            -- the compaction_id column.
             CREATE TABLE IF NOT EXISTS checkpoints (
                 id            TEXT PRIMARY KEY,
                 session_id    TEXT NOT NULL,
                 turn_n        INTEGER NOT NULL,
                 messages_json TEXT NOT NULL,
-                created_at    REAL NOT NULL,
-                UNIQUE(session_id, turn_n)
+                created_at    INTEGER NOT NULL,
+                compaction_id TEXT
             );
 
             CREATE TABLE IF NOT EXISTS cost_ledger (
@@ -249,8 +319,8 @@ impl Ingot {
                 model       TEXT NOT NULL,
                 input_tok   INTEGER NOT NULL DEFAULT 0,
                 output_tok  INTEGER NOT NULL DEFAULT 0,
-                cost_usd    REAL NOT NULL DEFAULT 0.0,
-                created_at  REAL NOT NULL
+                cost_usd    INTEGER NOT NULL DEFAULT 0,
+                created_at  INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS loops (
@@ -259,8 +329,8 @@ impl Ingot {
                 status        TEXT NOT NULL DEFAULT 'planning',
                 current_slice INTEGER NOT NULL DEFAULT 0,
                 attempt       INTEGER NOT NULL DEFAULT 1,
-                created_at    REAL NOT NULL,
-                updated_at    REAL NOT NULL
+                created_at    INTEGER NOT NULL,
+                updated_at    INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS turn_token_snapshots (
@@ -271,7 +341,7 @@ impl Ingot {
                 output_tok       INTEGER NOT NULL DEFAULT 0,
                 cumulative_input INTEGER NOT NULL DEFAULT 0,
                 cumulative_output INTEGER NOT NULL DEFAULT 0,
-                created_at       REAL NOT NULL,
+                created_at       INTEGER NOT NULL,
                 UNIQUE(session_id, turn_n)
             );
 
@@ -478,7 +548,7 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the INSERT fails.
     #[must_use = "check the Result to confirm the session was created"]
-    pub fn create_session(&mut self, session: &Session) -> Result<(), IngotError> {
+    pub fn create_session(&self, session: &Session) -> Result<(), IngotError> {
         session::create(&self.conn, session)
     }
 
@@ -511,7 +581,7 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the DELETE fails.
     #[must_use = "check the Result to confirm the session was deleted"]
-    pub fn delete_session(&mut self, id: &str) -> Result<bool, IngotError> {
+    pub fn delete_session(&self, id: &str) -> Result<bool, IngotError> {
         session::delete(&self.conn, id)
     }
 
@@ -522,23 +592,8 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the UPDATE fails.
     #[must_use = "check the Result to confirm the status was updated"]
-    pub fn update_session_status(&mut self, id: &str, status: &str) -> Result<(), IngotError> {
-        let now = now_epoch();
-        session::update_status(&self.conn, id, status, now)
-    }
-
-    /// Sets the `cowork_mode` flag for the session identified by `session_id`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IngotError::Db`] if the UPDATE fails.
-    #[must_use = "check the Result to confirm the cowork mode was updated"]
-    pub fn set_cowork_mode(&mut self, session_id: &str, enabled: bool) -> Result<(), IngotError> {
-        self.conn.execute(
-            "UPDATE sessions SET cowork_mode = ?1, updated_at = ?2 WHERE id = ?3",
-            rusqlite::params![i64::from(enabled), now_epoch(), session_id],
-        )?;
-        Ok(())
+    pub fn update_session_status(&self, id: &str, status: &str) -> Result<(), IngotError> {
+        session::update_status(&self.conn, id, status, smedja_types::Timestamp::now())
     }
 
     /// Sets the `workspace_root` filesystem path for the session identified by `session_id`.
@@ -548,7 +603,7 @@ impl Ingot {
     /// Returns [`IngotError::Db`] if the UPDATE fails.
     #[must_use = "check the Result to confirm the workspace root was updated"]
     pub fn update_session_workspace_root(
-        &mut self,
+        &self,
         session_id: &str,
         workspace_root: &str,
     ) -> Result<(), IngotError> {
@@ -561,7 +616,7 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the UPDATE fails.
     #[must_use = "check the Result to confirm the mode was updated"]
-    pub fn update_session_mode(&mut self, session_id: &str, mode: &str) -> Result<(), IngotError> {
+    pub fn update_session_mode(&self, session_id: &str, mode: &str) -> Result<(), IngotError> {
         session::update_mode(&self.conn, session_id, mode)
     }
 
@@ -575,7 +630,7 @@ impl Ingot {
     /// Returns [`IngotError::Db`] if the UPDATE fails.
     #[must_use = "check the Result to confirm the model override was updated"]
     pub fn update_session_model_override(
-        &mut self,
+        &self,
         session_id: &str,
         model: &str,
     ) -> Result<(), IngotError> {
@@ -592,7 +647,7 @@ impl Ingot {
     /// Returns [`IngotError::Db`] if the UPDATE fails.
     #[must_use = "check the Result to confirm the runner override was updated"]
     pub fn update_session_runner_override(
-        &mut self,
+        &self,
         session_id: &str,
         runner: &str,
     ) -> Result<(), IngotError> {
@@ -606,7 +661,7 @@ impl Ingot {
     /// Returns [`IngotError::Db`] if the UPDATE fails.
     #[must_use = "check the Result to confirm the task id was linked"]
     pub fn update_session_task_id(
-        &mut self,
+        &self,
         session_id: &str,
         task_id: &str,
     ) -> Result<(), IngotError> {
@@ -620,7 +675,7 @@ impl Ingot {
     /// Returns [`IngotError::Db`] if the UPDATE fails.
     #[must_use = "check the Result to confirm the cowork mode was updated"]
     pub fn update_session_cowork_mode(
-        &mut self,
+        &self,
         session_id: &str,
         enabled: bool,
     ) -> Result<(), IngotError> {
@@ -635,7 +690,7 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the INSERT OR REPLACE fails.
     #[must_use = "check the Result to confirm the MCP server was registered"]
-    pub fn register_mcp_server(&mut self, server: &McpServer) -> Result<(), IngotError> {
+    pub fn register_mcp_server(&self, server: &McpServer) -> Result<(), IngotError> {
         mcp::insert(&self.conn, server)
     }
 
@@ -655,7 +710,7 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the DELETE fails.
     #[must_use = "check the Result to confirm the MCP server was removed"]
-    pub fn remove_mcp_server(&mut self, id: &str) -> Result<(), IngotError> {
+    pub fn remove_mcp_server(&self, id: &str) -> Result<(), IngotError> {
         mcp::remove(&self.conn, id)
     }
 
@@ -666,7 +721,7 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the UPDATE fails.
     #[must_use = "check the Result to confirm the tool list was updated"]
-    pub fn update_mcp_tools(&mut self, name: &str, tools_json: &str) -> Result<(), IngotError> {
+    pub fn update_mcp_tools(&self, name: &str, tools_json: &str) -> Result<(), IngotError> {
         mcp::update_tools(&self.conn, name, tools_json)
     }
 
@@ -738,7 +793,7 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the INSERT fails.
     #[must_use = "check the Result to confirm the task was created"]
-    pub fn create_task(&mut self, task: &Task) -> Result<(), IngotError> {
+    pub fn create_task(&self, task: &Task) -> Result<(), IngotError> {
         task::create(&self.conn, task)
     }
 
@@ -761,7 +816,7 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the UPDATE fails.
     #[must_use = "check the Result to confirm the status was updated"]
-    pub fn update_task_status(&mut self, id: &str, status: &str) -> Result<(), IngotError> {
+    pub fn update_task_status(&self, id: &str, status: &str) -> Result<(), IngotError> {
         task::update_status(&self.conn, id, status)
     }
 
@@ -782,7 +837,7 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the UPDATE fails.
     #[must_use = "check the Result to confirm the response was stored"]
-    pub fn set_task_response(&mut self, id: &str, response: &str) -> Result<(), IngotError> {
+    pub fn set_task_response(&self, id: &str, response: &str) -> Result<(), IngotError> {
         task::update_response(&self.conn, id, response)
     }
 
@@ -795,7 +850,7 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the upsert fails.
     #[must_use = "check the Result to confirm the checkpoint was saved"]
-    pub fn save_checkpoint(&mut self, cp: &Checkpoint) -> Result<(), IngotError> {
+    pub fn save_checkpoint(&self, cp: &Checkpoint) -> Result<(), IngotError> {
         checkpoint::save(&self.conn, cp)
     }
 
@@ -824,7 +879,8 @@ impl Ingot {
         checkpoint::latest(&self.conn, session_id)
     }
 
-    /// Returns all checkpoints for `session_id`, ordered by turn number ascending.
+    /// Returns all ordinary (non-compaction) checkpoints for `session_id`,
+    /// ordered by turn number ascending.
     ///
     /// # Errors
     ///
@@ -832,6 +888,21 @@ impl Ingot {
     #[must_use = "check the Result and inspect the returned checkpoints"]
     pub fn list_checkpoints(&self, session_id: &str) -> Result<Vec<Checkpoint>, IngotError> {
         checkpoint::list(&self.conn, session_id)
+    }
+
+    /// Returns all compaction checkpoints for `session_id`, ordered by
+    /// `created_at` ascending. Each carries a distinct `compaction_id`, so a
+    /// session retains every compaction rather than overwriting the previous one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned compaction checkpoints"]
+    pub fn list_compaction_checkpoints(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<Checkpoint>, IngotError> {
+        checkpoint::list_compactions(&self.conn, session_id)
     }
 
     /// Atomically rolls back a session to `turn_n`, pruning all later checkpoints.
@@ -846,7 +917,7 @@ impl Ingot {
     /// Returns [`IngotError::Db`] if any SQL operation fails.
     #[must_use = "check the Result to confirm the rollback succeeded"]
     pub fn rollback_session(
-        &mut self,
+        &self,
         session_id: &str,
         turn_n: u32,
     ) -> Result<Option<Checkpoint>, IngotError> {
@@ -861,19 +932,20 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the INSERT fails.
     #[must_use = "check the Result to confirm the cost entry was recorded"]
-    pub fn insert_cost(&mut self, entry: &CostEntry) -> Result<(), IngotError> {
+    pub fn insert_cost(&self, entry: &CostEntry) -> Result<(), IngotError> {
         cost::insert(&self.conn, entry)
     }
 
-    /// Returns the total `cost_usd` for all entries in `session_id`.
+    /// Returns the exact total cost (microdollars) for all entries in
+    /// `session_id`.
     ///
-    /// Returns `0.0` when no entries exist.
+    /// Returns `Microdollars::from_micros(0)` when no entries exist.
     ///
     /// # Errors
     ///
     /// Returns [`IngotError::Db`] if the query fails.
     #[must_use = "check the Result and inspect the returned sum"]
-    pub fn session_cost(&self, session_id: &str) -> Result<f64, IngotError> {
+    pub fn session_cost(&self, session_id: &str) -> Result<smedja_types::Microdollars, IngotError> {
         cost::session_total(&self.conn, session_id)
     }
 
@@ -960,7 +1032,7 @@ impl Ingot {
     /// Returns [`IngotError::Json`] if an object cannot be deserialised, or
     /// [`IngotError::Db`] if a database INSERT fails.
     #[must_use = "check the Result and inspect the returned import count"]
-    pub fn import_jsonl(&mut self, records: &[serde_json::Value]) -> Result<usize, IngotError> {
+    pub fn import_jsonl(&self, records: &[serde_json::Value]) -> Result<usize, IngotError> {
         let mut imported = 0usize;
         for rec in records {
             match rec["type"].as_str() {
@@ -975,7 +1047,7 @@ impl Ingot {
                             t.title,
                             t.description,
                             t.status,
-                            t.created_at,
+                            t.created_at.as_micros(),
                             t.session_id,
                             t.response,
                         ],
@@ -995,7 +1067,7 @@ impl Ingot {
                                  ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
                         rusqlite::params![
                             ev.id.to_string(),
-                            ev.ts,
+                            ev.ts.as_micros(),
                             ev.session_id,
                             ev.turn_id,
                             ev.action_type,
@@ -1041,7 +1113,7 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the upsert fails.
     #[must_use = "check the Result to confirm the snapshot was saved"]
-    pub fn save_token_snapshot(&mut self, snap: &TokenSnapshot) -> Result<(), IngotError> {
+    pub fn save_token_snapshot(&self, snap: &TokenSnapshot) -> Result<(), IngotError> {
         token_snapshot::save(&self.conn, snap)
     }
 
@@ -1066,7 +1138,7 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the INSERT fails (e.g. duplicate `id`).
     #[must_use = "check the Result to confirm the loop record was created"]
-    pub fn create_loop(&mut self, rec: &LoopRecord) -> Result<(), IngotError> {
+    pub fn create_loop(&self, rec: &LoopRecord) -> Result<(), IngotError> {
         loop_state::insert(&self.conn, rec)
     }
 
@@ -1087,7 +1159,7 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the UPSERT fails.
     #[must_use = "check the Result to confirm the flag was set"]
-    pub fn set_spec_recorded(&mut self, session_id: &str, value: bool) -> Result<(), IngotError> {
+    pub fn set_spec_recorded(&self, session_id: &str, value: bool) -> Result<(), IngotError> {
         methodology::set_spec_recorded(&self.conn, session_id, value)
     }
 
@@ -1097,11 +1169,7 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the UPSERT fails.
     #[must_use = "check the Result to confirm the flag was set"]
-    pub fn set_approval_recorded(
-        &mut self,
-        session_id: &str,
-        value: bool,
-    ) -> Result<(), IngotError> {
+    pub fn set_approval_recorded(&self, session_id: &str, value: bool) -> Result<(), IngotError> {
         methodology::set_approval_recorded(&self.conn, session_id, value)
     }
 
@@ -1111,7 +1179,7 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the UPSERT fails.
     #[must_use = "check the Result to confirm the flag was set"]
-    pub fn set_no_spec_gate(&mut self, session_id: &str, value: bool) -> Result<(), IngotError> {
+    pub fn set_no_spec_gate(&self, session_id: &str, value: bool) -> Result<(), IngotError> {
         methodology::set_no_spec_gate(&self.conn, session_id, value)
     }
 
@@ -1132,10 +1200,10 @@ impl Ingot {
     /// Returns [`IngotError::Db`] if the UPDATE fails.
     #[must_use = "check the Result to confirm the loop status was updated"]
     pub fn update_loop_status(
-        &mut self,
+        &self,
         id: &str,
         status: &str,
-        updated_at: f64,
+        updated_at: smedja_types::Timestamp,
     ) -> Result<(), IngotError> {
         loop_state::update_status(&self.conn, id, status, updated_at)
     }
@@ -1157,10 +1225,10 @@ impl Ingot {
     /// Returns [`IngotError::Db`] if the UPDATE fails.
     #[must_use = "check the Result to confirm the slice was updated"]
     pub fn update_loop_slice(
-        &mut self,
+        &self,
         id: &str,
         current_slice: i64,
-        updated_at: f64,
+        updated_at: smedja_types::Timestamp,
     ) -> Result<(), IngotError> {
         loop_state::update_slice(&self.conn, id, current_slice, updated_at)
     }
@@ -1190,12 +1258,7 @@ impl Ingot {
     ///
     /// Returns [`IngotError::Db`] if the INSERT fails.
     #[must_use = "check the Result to confirm the hash was saved"]
-    pub fn save_prompt_hash(
-        &mut self,
-        change: &str,
-        role: &str,
-        hash: &str,
-    ) -> Result<(), IngotError> {
+    pub fn save_prompt_hash(&self, change: &str, role: &str, hash: &str) -> Result<(), IngotError> {
         prompt_hash::save(&self.conn, change, role, hash, now_epoch())
     }
 
@@ -1230,6 +1293,34 @@ impl Ingot {
     #[must_use = "check the Result and inspect the returned events"]
     pub fn list_all_audit_events(&self) -> Result<Vec<AuditEvent>, IngotError> {
         audit::list_all(&self.conn)
+    }
+}
+
+/// Reads a microsecond-count column tolerant of `SQLite` storage class.
+///
+/// Fresh databases store these columns with `INTEGER` affinity, but databases
+/// migrated from the legacy `REAL`-seconds schema retain `REAL` affinity, so a
+/// backfilled `CAST(... AS INTEGER)` value is coerced back to a float on write.
+/// This helper reads either representation: an integer cell directly, or a real
+/// cell rounded to the nearest integer (lossless for realistic micro counts,
+/// which stay well below `2^53`).
+///
+/// # Errors
+///
+/// Returns the underlying `rusqlite` error if the column holds neither an
+/// integer nor a real value.
+pub(crate) fn read_micros(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<i64> {
+    use rusqlite::types::ValueRef;
+    match row.get_ref(idx)? {
+        ValueRef::Integer(v) => Ok(v),
+        #[allow(clippy::cast_possible_truncation)]
+        // rounded micros stay below 2^53 for realistic timestamps/costs
+        ValueRef::Real(v) => Ok(v.round() as i64),
+        other => Err(rusqlite::Error::InvalidColumnType(
+            idx,
+            format!("{other:?}"),
+            other.data_type(),
+        )),
     }
 }
 
@@ -1281,7 +1372,7 @@ mod tests {
             title: title.to_owned(),
             description: String::new(),
             status: "planned".to_owned(),
-            created_at: 1_700_000_000.0,
+            created_at: smedja_types::Timestamp::from_secs_f64(1_700_000_000.0),
             session_id: None,
             response: None,
         }
@@ -1290,7 +1381,7 @@ mod tests {
     fn make_audit_event(session_id: &str) -> AuditEvent {
         AuditEvent {
             id: uuid::Uuid::new_v4(),
-            ts: 1_700_000_001.0,
+            ts: smedja_types::Timestamp::from_secs_f64(1_700_000_001.0),
             session_id: session_id.to_owned(),
             action_type: "tool_exec".to_owned(),
             actor: "coder".to_owned(),
@@ -1304,7 +1395,7 @@ mod tests {
 
     #[test]
     fn export_jsonl_returns_task_rows() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let t = make_task("fix the bug");
         ingot.create_task(&t).unwrap();
 
@@ -1316,7 +1407,7 @@ mod tests {
 
     #[test]
     fn export_jsonl_filters_by_change_name() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         ingot.create_task(&make_task("fix alpha")).unwrap();
         ingot.create_task(&make_task("fix beta")).unwrap();
 
@@ -1327,14 +1418,14 @@ mod tests {
 
     #[test]
     fn export_import_round_trip_restores_same_rows() {
-        let mut source = Ingot::open_in_memory().unwrap();
+        let source = Ingot::open_in_memory().unwrap();
         let task = make_task("round trip task");
         source.create_task(&task).unwrap();
 
         let records = source.export_jsonl(None).unwrap();
         assert!(!records.is_empty());
 
-        let mut dest = Ingot::open_in_memory().unwrap();
+        let dest = Ingot::open_in_memory().unwrap();
         let imported = dest.import_jsonl(&records).unwrap();
         assert_eq!(imported, 1);
 
@@ -1346,7 +1437,7 @@ mod tests {
 
     #[test]
     fn import_jsonl_is_idempotent_on_duplicate_ids() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let task = make_task("idempotent task");
         ingot.create_task(&task).unwrap();
 
@@ -1360,12 +1451,12 @@ mod tests {
 
     #[test]
     fn export_jsonl_includes_audit_events_for_session_tasks() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
 
         let session = crate::session::Session {
             id: uuid::Uuid::new_v4(),
-            created_at: 1_700_000_000.0,
-            updated_at: 1_700_000_000.0,
+            created_at: smedja_types::Timestamp::from_secs_f64(1_700_000_000.0),
+            updated_at: smedja_types::Timestamp::from_secs_f64(1_700_000_000.0),
             status: "active".to_owned(),
             task_id: None,
             mode: None,
@@ -1393,7 +1484,7 @@ mod tests {
 
     #[test]
     fn import_jsonl_skips_unknown_types() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let unknown = serde_json::json!({ "type": "unknown_record", "data": 42 });
         let imported = ingot.import_jsonl(&[unknown]).unwrap();
         assert_eq!(imported, 0);
@@ -1465,6 +1556,87 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn migrate_backfills_real_seconds_to_integer_micros_idempotently() {
+        // Seed an OLD-schema database: REAL seconds timestamps and REAL dollars,
+        // table-level UNIQUE(session_id, turn_n) on checkpoints, and a
+        // schema_migrations high-water mark below the new backfill versions.
+        let sid = uuid::Uuid::new_v4().to_string();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at REAL NOT NULL);
+             INSERT INTO schema_migrations (version, applied_at) VALUES (18, 0.0);
+             CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'active', task_id TEXT, mode TEXT,
+                 cowork_mode INTEGER NOT NULL DEFAULT 0, workspace_root TEXT, model_override TEXT,
+                 runner_override TEXT, title TEXT NOT NULL DEFAULT ''
+             );
+             CREATE TABLE cost_ledger (
+                 id TEXT PRIMARY KEY, session_id TEXT NOT NULL, turn_n INTEGER NOT NULL,
+                 runner TEXT NOT NULL, model TEXT NOT NULL, input_tok INTEGER NOT NULL DEFAULT 0,
+                 output_tok INTEGER NOT NULL DEFAULT 0, cost_usd REAL NOT NULL DEFAULT 0.0,
+                 created_at REAL NOT NULL
+             );
+             CREATE TABLE checkpoints (
+                 id TEXT PRIMARY KEY, session_id TEXT NOT NULL, turn_n INTEGER NOT NULL,
+                 messages_json TEXT NOT NULL, created_at REAL NOT NULL,
+                 UNIQUE(session_id, turn_n)
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, created_at, updated_at, status) \
+             VALUES (?1, 1700000000.5, 1700000000.5, 'active')",
+            rusqlite::params![sid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cost_ledger (id, session_id, turn_n, runner, model, cost_usd, created_at) \
+             VALUES ('c-old', ?1, 0, 'claude', 'claude-sonnet-4-6', 0.042, 1700000000.0)",
+            rusqlite::params![sid],
+        )
+        .unwrap();
+        let ck_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO checkpoints (id, session_id, turn_n, messages_json, created_at) \
+             VALUES (?1, ?2, -1, '[]', 1700000000.0)",
+            rusqlite::params![ck_id, sid],
+        )
+        .unwrap();
+
+        let ingot = Ingot { conn };
+        ingot.migrate().unwrap();
+
+        // Timestamps converted from REAL seconds to INTEGER micros.
+        let session = ingot.get_session(&sid).unwrap().unwrap();
+        assert_eq!(
+            session.created_at,
+            smedja_types::Timestamp::from_micros(1_700_000_000_500_000)
+        );
+
+        // Money converted from REAL dollars to INTEGER microdollars.
+        let total = ingot.session_cost(&sid).unwrap();
+        assert_eq!(total, smedja_types::Microdollars::from_micros(42_000));
+
+        // Legacy turn_n = -1 compaction row carries a generated compaction_id and
+        // is retrievable as a compaction checkpoint.
+        let compactions = ingot.list_compaction_checkpoints(&sid).unwrap();
+        assert_eq!(compactions.len(), 1);
+        assert!(compactions[0].compaction_id.is_some());
+
+        // Re-running migrate() must NOT double-convert (version-gated idempotency).
+        ingot.migrate().unwrap();
+        let session_again = ingot.get_session(&sid).unwrap().unwrap();
+        assert_eq!(
+            session_again.created_at,
+            smedja_types::Timestamp::from_micros(1_700_000_000_500_000)
+        );
+        let total_again = ingot.session_cost(&sid).unwrap();
+        assert_eq!(total_again, smedja_types::Microdollars::from_micros(42_000));
+        assert_eq!(ingot.list_compaction_checkpoints(&sid).unwrap().len(), 1);
     }
 
     #[test]
@@ -1628,7 +1800,7 @@ mod tests {
         let ingot = Ingot::open_in_memory().unwrap();
         let make_ev = |action: &str, ts: f64| AuditEvent {
             id: uuid::Uuid::new_v4(),
-            ts,
+            ts: smedja_types::Timestamp::from_secs_f64(ts),
             session_id: "s".into(),
             action_type: action.to_string(),
             actor: "smdjad".into(),
@@ -1655,7 +1827,7 @@ mod tests {
         let ingot = Ingot::open_in_memory().unwrap();
         let ok_ev = AuditEvent {
             id: uuid::Uuid::new_v4(),
-            ts: 1.0,
+            ts: smedja_types::Timestamp::from_secs_f64(1.0),
             session_id: "s".into(),
             action_type: "tool_exec".into(),
             actor: "smdjad".into(),
@@ -1665,7 +1837,7 @@ mod tests {
         };
         let err_ev = AuditEvent {
             id: uuid::Uuid::new_v4(),
-            ts: 2.0,
+            ts: smedja_types::Timestamp::from_secs_f64(2.0),
             status: Some("error".into()),
             action_type: "tool_exec".into(),
             actor: "smdjad".into(),

@@ -1,13 +1,51 @@
+/// Correlation context shared across every event variant.
+///
+/// These seven optional fields tie an event back to a conversation, a
+/// distributed trace, and the emitting agent.  They are embedded once per
+/// event variant via `#[serde(flatten)]`, so on the wire they appear as
+/// top-level fields of the event object — identical to the historical layout
+/// where each variant spelled them out individually.
+///
+/// Every field is omitted from serialised JSON when `None`, which keeps the
+/// wire format compact and preserves backward compatibility with older
+/// daemons that never emitted them.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CorrelationCtx {
+    /// Conversation grouping identifier across multiple turns or agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    /// W3C trace-id for distributed tracing correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    /// W3C span-id for the span that produced this event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_id: Option<String>,
+    /// Parent span identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_span_id: Option<String>,
+    /// High-level operation label (e.g. `"chat"`, `"invoke_agent"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_name: Option<String>,
+    /// Name of the agent that emitted this event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    /// Terminal status of the operation: `"ok"` or `"error"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
 /// Events emitted during the lifecycle of an agent turn.
 ///
 /// Each variant corresponds to a distinct point in the turn's progression —
 /// from initiation through tool use and streaming deltas to final resolution.
 ///
-/// All variants carry optional correlation fields (`conversation_id`,
-/// `trace_id`, `span_id`, `parent_span_id`, `operation_name`, `agent_name`,
-/// `status`).  Tool-related variants additionally carry `tool_call_id`.
-/// These fields are omitted from serialised JSON when `None`, which keeps the
-/// wire format compact and preserves backward compatibility with older daemons.
+/// All variants embed a [`CorrelationCtx`] (`conversation_id`, `trace_id`,
+/// `span_id`, `parent_span_id`, `operation_name`, `agent_name`, `status`) via
+/// `#[serde(flatten)]`, so those fields appear at the top level of the
+/// serialised event object.  Tool-related variants additionally carry
+/// `tool_call_id`.  Correlation fields are omitted from serialised JSON when
+/// `None`, which keeps the wire format compact and preserves backward
+/// compatibility with older daemons.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TurnEvent {
     /// The turn has started.
@@ -19,27 +57,9 @@ pub enum TurnEvent {
         session_id: String,
         /// Unique identifier for this turn within the session.
         turn_id: String,
-        /// Conversation grouping identifier across multiple turns or agents.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        conversation_id: Option<String>,
-        /// W3C trace-id for distributed tracing correlation.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        trace_id: Option<String>,
-        /// W3C span-id for the span that produced this event.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        span_id: Option<String>,
-        /// Parent span identifier.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_span_id: Option<String>,
-        /// High-level operation label (e.g. `"chat"`, `"invoke_agent"`).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        operation_name: Option<String>,
-        /// Name of the agent that emitted this event.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        agent_name: Option<String>,
-        /// Terminal status of the operation: `"ok"` or `"error"`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        status: Option<String>,
+        /// Correlation context (trace, conversation, agent, status).
+        #[serde(flatten)]
+        correlation: CorrelationCtx,
     },
 
     /// A tool was invoked during this turn.
@@ -51,27 +71,9 @@ pub enum TurnEvent {
         /// Turn identifier; correlates this event with the enclosing turn.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
-        /// Conversation grouping identifier.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        conversation_id: Option<String>,
-        /// W3C trace-id for distributed tracing correlation.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        trace_id: Option<String>,
-        /// W3C span-id for the span that produced this event.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        span_id: Option<String>,
-        /// Parent span identifier.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_span_id: Option<String>,
-        /// High-level operation label.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        operation_name: Option<String>,
-        /// Name of the agent that emitted this event.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        agent_name: Option<String>,
-        /// Terminal status of the operation.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        status: Option<String>,
+        /// Correlation context (trace, conversation, agent, status).
+        #[serde(flatten)]
+        correlation: CorrelationCtx,
         /// Tool-call identifier for correlating the call with its result.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
@@ -84,27 +86,9 @@ pub enum TurnEvent {
         /// Turn identifier; correlates this delta with the enclosing turn.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
-        /// Conversation grouping identifier.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        conversation_id: Option<String>,
-        /// W3C trace-id for distributed tracing correlation.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        trace_id: Option<String>,
-        /// W3C span-id for the span that produced this event.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        span_id: Option<String>,
-        /// Parent span identifier.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_span_id: Option<String>,
-        /// High-level operation label.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        operation_name: Option<String>,
-        /// Name of the agent that emitted this event.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        agent_name: Option<String>,
-        /// Terminal status of the operation.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        status: Option<String>,
+        /// Correlation context (trace, conversation, agent, status).
+        #[serde(flatten)]
+        correlation: CorrelationCtx,
     },
 
     /// The turn completed successfully.
@@ -123,27 +107,9 @@ pub enum TurnEvent {
         /// Format: `"00-<trace_id_hex32>-<span_id_hex16>-01"`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         traceparent: Option<String>,
-        /// Conversation grouping identifier.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        conversation_id: Option<String>,
-        /// W3C trace-id for distributed tracing correlation.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        trace_id: Option<String>,
-        /// W3C span-id for the span that produced this event.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        span_id: Option<String>,
-        /// Parent span identifier.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_span_id: Option<String>,
-        /// High-level operation label.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        operation_name: Option<String>,
-        /// Name of the agent that emitted this event.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        agent_name: Option<String>,
-        /// Terminal status of the operation.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        status: Option<String>,
+        /// Correlation context (trace, conversation, agent, status).
+        #[serde(flatten)]
+        correlation: CorrelationCtx,
     },
 
     /// The turn failed.
@@ -154,27 +120,9 @@ pub enum TurnEvent {
         turn_id: String,
         /// Human-readable description of why the turn failed.
         reason: String,
-        /// Conversation grouping identifier.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        conversation_id: Option<String>,
-        /// W3C trace-id for distributed tracing correlation.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        trace_id: Option<String>,
-        /// W3C span-id for the span that produced this event.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        span_id: Option<String>,
-        /// Parent span identifier.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_span_id: Option<String>,
-        /// High-level operation label.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        operation_name: Option<String>,
-        /// Name of the agent that emitted this event.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        agent_name: Option<String>,
-        /// Terminal status of the operation.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        status: Option<String>,
+        /// Correlation context (trace, conversation, agent, status).
+        #[serde(flatten)]
+        correlation: CorrelationCtx,
     },
 }
 
@@ -194,27 +142,9 @@ pub enum ControlEvent {
         session_id: String,
         /// Unique identifier for this turn within the session.
         turn_id: String,
-        /// Conversation grouping identifier across multiple turns or agents.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        conversation_id: Option<String>,
-        /// W3C trace-id for distributed tracing correlation.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        trace_id: Option<String>,
-        /// W3C span-id for the span that produced this event.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        span_id: Option<String>,
-        /// Parent span identifier.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_span_id: Option<String>,
-        /// High-level operation label (e.g. `"chat"`, `"invoke_agent"`).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        operation_name: Option<String>,
-        /// Name of the agent that emitted this event.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        agent_name: Option<String>,
-        /// Terminal status of the operation: `"ok"` or `"error"`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        status: Option<String>,
+        /// Correlation context (trace, conversation, agent, status).
+        #[serde(flatten)]
+        correlation: CorrelationCtx,
     },
 
     /// A tool was invoked during this turn.
@@ -226,27 +156,9 @@ pub enum ControlEvent {
         /// Turn identifier; correlates this event with the enclosing turn.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
-        /// Conversation grouping identifier.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        conversation_id: Option<String>,
-        /// W3C trace-id for distributed tracing correlation.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        trace_id: Option<String>,
-        /// W3C span-id for the span that produced this event.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        span_id: Option<String>,
-        /// Parent span identifier.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_span_id: Option<String>,
-        /// High-level operation label.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        operation_name: Option<String>,
-        /// Name of the agent that emitted this event.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        agent_name: Option<String>,
-        /// Terminal status of the operation.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        status: Option<String>,
+        /// Correlation context (trace, conversation, agent, status).
+        #[serde(flatten)]
+        correlation: CorrelationCtx,
         /// Tool-call identifier for correlating the call with its result.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
@@ -266,27 +178,9 @@ pub enum ControlEvent {
         /// W3C `traceparent` string for this turn's root span.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         traceparent: Option<String>,
-        /// Conversation grouping identifier.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        conversation_id: Option<String>,
-        /// W3C trace-id for distributed tracing correlation.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        trace_id: Option<String>,
-        /// W3C span-id for the span that produced this event.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        span_id: Option<String>,
-        /// Parent span identifier.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_span_id: Option<String>,
-        /// High-level operation label.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        operation_name: Option<String>,
-        /// Name of the agent that emitted this event.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        agent_name: Option<String>,
-        /// Terminal status of the operation.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        status: Option<String>,
+        /// Correlation context (trace, conversation, agent, status).
+        #[serde(flatten)]
+        correlation: CorrelationCtx,
     },
 
     /// The turn failed.
@@ -297,27 +191,9 @@ pub enum ControlEvent {
         turn_id: String,
         /// Human-readable description of why the turn failed.
         reason: String,
-        /// Conversation grouping identifier.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        conversation_id: Option<String>,
-        /// W3C trace-id for distributed tracing correlation.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        trace_id: Option<String>,
-        /// W3C span-id for the span that produced this event.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        span_id: Option<String>,
-        /// Parent span identifier.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_span_id: Option<String>,
-        /// High-level operation label.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        operation_name: Option<String>,
-        /// Name of the agent that emitted this event.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        agent_name: Option<String>,
-        /// Terminal status of the operation.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        status: Option<String>,
+        /// Correlation context (trace, conversation, agent, status).
+        #[serde(flatten)]
+        correlation: CorrelationCtx,
     },
 }
 
@@ -352,47 +228,23 @@ impl TryFrom<TurnEvent> for ControlEvent {
             TurnEvent::Started {
                 session_id,
                 turn_id,
-                conversation_id,
-                trace_id,
-                span_id,
-                parent_span_id,
-                operation_name,
-                agent_name,
-                status,
+                correlation,
             } => Ok(ControlEvent::Started {
                 session_id,
                 turn_id,
-                conversation_id,
-                trace_id,
-                span_id,
-                parent_span_id,
-                operation_name,
-                agent_name,
-                status,
+                correlation,
             }),
             TurnEvent::ToolCalled {
                 tool_name,
                 input_summary,
                 turn_id,
-                conversation_id,
-                trace_id,
-                span_id,
-                parent_span_id,
-                operation_name,
-                agent_name,
-                status,
+                correlation,
                 tool_call_id,
             } => Ok(ControlEvent::ToolCalled {
                 tool_name,
                 input_summary,
                 turn_id,
-                conversation_id,
-                trace_id,
-                span_id,
-                parent_span_id,
-                operation_name,
-                agent_name,
-                status,
+                correlation,
                 tool_call_id,
             }),
             TurnEvent::Completed {
@@ -401,49 +253,25 @@ impl TryFrom<TurnEvent> for ControlEvent {
                 output_tokens,
                 input_tokens,
                 traceparent,
-                conversation_id,
-                trace_id,
-                span_id,
-                parent_span_id,
-                operation_name,
-                agent_name,
-                status,
+                correlation,
             } => Ok(ControlEvent::Completed {
                 session_id,
                 turn_id,
                 output_tokens,
                 input_tokens,
                 traceparent,
-                conversation_id,
-                trace_id,
-                span_id,
-                parent_span_id,
-                operation_name,
-                agent_name,
-                status,
+                correlation,
             }),
             TurnEvent::Failed {
                 session_id,
                 turn_id,
                 reason,
-                conversation_id,
-                trace_id,
-                span_id,
-                parent_span_id,
-                operation_name,
-                agent_name,
-                status,
+                correlation,
             } => Ok(ControlEvent::Failed {
                 session_id,
                 turn_id,
                 reason,
-                conversation_id,
-                trace_id,
-                span_id,
-                parent_span_id,
-                operation_name,
-                agent_name,
-                status,
+                correlation,
             }),
             delta @ TurnEvent::AssistantDelta { .. } => Err(delta),
         }
@@ -462,13 +290,7 @@ impl From<TurnEvent> for Option<DeltaEvent> {
             TurnEvent::AssistantDelta {
                 content,
                 turn_id,
-                conversation_id: _,
-                trace_id: _,
-                span_id: _,
-                parent_span_id: _,
-                operation_name: _,
-                agent_name: _,
-                status: _,
+                correlation: _,
             } => Some(DeltaEvent {
                 session_id: None,
                 turn_id,
@@ -482,12 +304,12 @@ impl From<TurnEvent> for Option<DeltaEvent> {
 // ── Constructors ──────────────────────────────────────────────────────────────
 
 impl TurnEvent {
-    /// Construct a [`TurnEvent::Failed`] with all optional correlation fields set
-    /// to `None`.
+    /// Construct a [`TurnEvent::Failed`] with a default (all-`None`)
+    /// [`CorrelationCtx`].
     ///
-    /// Use this instead of spelling out nine `field: None` entries at every call
-    /// site.  Correlation fields can be set via struct-update syntax or by
-    /// constructing the variant directly when they are needed.
+    /// Use this instead of spelling out the correlation context at every call
+    /// site.  Correlation fields can be set afterwards via struct-update syntax
+    /// or by constructing the variant directly when they are needed.
     #[must_use]
     pub fn fail(
         session_id: impl Into<String>,
@@ -498,13 +320,7 @@ impl TurnEvent {
             session_id: session_id.into(),
             turn_id: turn_id.into(),
             reason: reason.into(),
-            conversation_id: None,
-            trace_id: None,
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx::default(),
         }
     }
 }
@@ -522,13 +338,7 @@ mod tests {
         let ev = TurnEvent::Started {
             session_id: "sess-1".into(),
             turn_id: "t-1".into(),
-            conversation_id: None,
-            trace_id: None,
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx::default(),
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(
@@ -550,32 +360,24 @@ mod tests {
         let ev = TurnEvent::Started {
             session_id: "sess-2".into(),
             turn_id: "t-2".into(),
-            conversation_id: Some("conv-abc".into()),
-            trace_id: Some("trace-xyz".into()),
-            span_id: Some("span-123".into()),
-            parent_span_id: None,
-            operation_name: Some("invoke_agent".into()),
-            agent_name: Some("tester".into()),
-            status: None,
+            correlation: CorrelationCtx {
+                conversation_id: Some("conv-abc".into()),
+                trace_id: Some("trace-xyz".into()),
+                span_id: Some("span-123".into()),
+                operation_name: Some("invoke_agent".into()),
+                agent_name: Some("tester".into()),
+                ..CorrelationCtx::default()
+            },
         };
         let json = serde_json::to_string(&ev).unwrap();
         let decoded: TurnEvent = serde_json::from_str(&json).unwrap();
-        if let TurnEvent::Started {
-            conversation_id,
-            agent_name,
-            trace_id,
-            span_id,
-            parent_span_id,
-            status,
-            ..
-        } = decoded
-        {
-            assert_eq!(conversation_id.as_deref(), Some("conv-abc"));
-            assert_eq!(agent_name.as_deref(), Some("tester"));
-            assert_eq!(trace_id.as_deref(), Some("trace-xyz"));
-            assert_eq!(span_id.as_deref(), Some("span-123"));
-            assert!(parent_span_id.is_none());
-            assert!(status.is_none());
+        if let TurnEvent::Started { correlation, .. } = decoded {
+            assert_eq!(correlation.conversation_id.as_deref(), Some("conv-abc"));
+            assert_eq!(correlation.agent_name.as_deref(), Some("tester"));
+            assert_eq!(correlation.trace_id.as_deref(), Some("trace-xyz"));
+            assert_eq!(correlation.span_id.as_deref(), Some("span-123"));
+            assert!(correlation.parent_span_id.is_none());
+            assert!(correlation.status.is_none());
         } else {
             panic!("wrong variant after roundtrip");
         }
@@ -587,19 +389,82 @@ mod tests {
         // The new fields must default to None without error.
         let old_json = r#"{"Started":{"session_id":"sess-old","turn_id":"t-old"}}"#;
         let ev: TurnEvent = serde_json::from_str(old_json).unwrap();
-        if let TurnEvent::Started {
-            conversation_id,
-            trace_id,
-            agent_name,
-            ..
-        } = ev
-        {
-            assert!(conversation_id.is_none());
-            assert!(trace_id.is_none());
-            assert!(agent_name.is_none());
+        if let TurnEvent::Started { correlation, .. } = ev {
+            assert!(correlation.conversation_id.is_none());
+            assert!(correlation.trace_id.is_none());
+            assert!(correlation.agent_name.is_none());
         } else {
             panic!("wrong variant");
         }
+    }
+
+    #[test]
+    fn legacy_fieldless_event_decodes_to_all_none_correlation() {
+        // Task 8.4 (b): legacy JSON without any correlation fields must decode
+        // with every CorrelationCtx field set to None.
+        let legacy = r#"{"Completed":{"session_id":"s","turn_id":"t","output_tokens":3}}"#;
+        let ev: TurnEvent = serde_json::from_str(legacy).unwrap();
+        if let TurnEvent::Completed {
+            correlation,
+            input_tokens,
+            traceparent,
+            ..
+        } = ev
+        {
+            assert_eq!(correlation, CorrelationCtx::default());
+            assert!(correlation.conversation_id.is_none());
+            assert!(correlation.trace_id.is_none());
+            assert!(correlation.span_id.is_none());
+            assert!(correlation.parent_span_id.is_none());
+            assert!(correlation.operation_name.is_none());
+            assert!(correlation.agent_name.is_none());
+            assert!(correlation.status.is_none());
+            assert!(input_tokens.is_none());
+            assert!(traceparent.is_none());
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn fully_populated_event_serializes_correlation_fields_at_top_level() {
+        // Task 8.4 (a): a fully-populated event must serialise with the seven
+        // correlation fields flattened to the top level of the event object —
+        // the same wire shape as the historical per-variant layout.
+        let ev = TurnEvent::Started {
+            session_id: "s".into(),
+            turn_id: "t".into(),
+            correlation: CorrelationCtx {
+                conversation_id: Some("conv".into()),
+                trace_id: Some("tr".into()),
+                span_id: Some("sp".into()),
+                parent_span_id: Some("psp".into()),
+                operation_name: Some("op".into()),
+                agent_name: Some("agent".into()),
+                status: Some("ok".into()),
+            },
+        };
+        let value: serde_json::Value = serde_json::to_value(&ev).unwrap();
+        let inner = value.get("Started").expect("Started object must exist");
+        for field in [
+            "conversation_id",
+            "trace_id",
+            "span_id",
+            "parent_span_id",
+            "operation_name",
+            "agent_name",
+            "status",
+        ] {
+            assert!(
+                inner.get(field).is_some(),
+                "{field} must appear at the top level of the event object; got: {value}"
+            );
+        }
+        // There must be no nested `correlation` key — the context is flattened.
+        assert!(
+            inner.get("correlation").is_none(),
+            "correlation must be flattened, not nested; got: {value}"
+        );
     }
 
     #[test]
@@ -608,13 +473,10 @@ mod tests {
             tool_name: "bash".into(),
             input_summary: "ls".into(),
             turn_id: None,
-            conversation_id: None,
-            trace_id: Some("t".into()),
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx {
+                trace_id: Some("t".into()),
+                ..CorrelationCtx::default()
+            },
             tool_call_id: Some("call-42".into()),
         };
         let json = serde_json::to_string(&ev).unwrap();
@@ -638,28 +500,25 @@ mod tests {
             output_tokens: 7,
             input_tokens: Some(42),
             traceparent: Some("00-abc-def-01".into()),
-            conversation_id: Some("conv-1".into()),
-            trace_id: None,
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: Some("orchestrator".into()),
-            status: Some("ok".into()),
+            correlation: CorrelationCtx {
+                conversation_id: Some("conv-1".into()),
+                agent_name: Some("orchestrator".into()),
+                status: Some("ok".into()),
+                ..CorrelationCtx::default()
+            },
         };
         let json = serde_json::to_string(&ev).unwrap();
         let decoded: TurnEvent = serde_json::from_str(&json).unwrap();
         if let TurnEvent::Completed {
-            conversation_id,
-            agent_name,
-            status,
+            correlation,
             input_tokens,
             traceparent,
             ..
         } = decoded
         {
-            assert_eq!(conversation_id.as_deref(), Some("conv-1"));
-            assert_eq!(agent_name.as_deref(), Some("orchestrator"));
-            assert_eq!(status.as_deref(), Some("ok"));
+            assert_eq!(correlation.conversation_id.as_deref(), Some("conv-1"));
+            assert_eq!(correlation.agent_name.as_deref(), Some("orchestrator"));
+            assert_eq!(correlation.status.as_deref(), Some("ok"));
             assert_eq!(input_tokens, Some(42));
             assert_eq!(traceparent.as_deref(), Some("00-abc-def-01"));
         } else {
@@ -673,22 +532,18 @@ mod tests {
             session_id: "s".into(),
             turn_id: "t".into(),
             reason: "timeout".into(),
-            conversation_id: None,
-            trace_id: Some("tr".into()),
-            span_id: Some("sp".into()),
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: Some("error".into()),
+            correlation: CorrelationCtx {
+                trace_id: Some("tr".into()),
+                span_id: Some("sp".into()),
+                status: Some("error".into()),
+                ..CorrelationCtx::default()
+            },
         };
         let json = serde_json::to_string(&ev).unwrap();
         let decoded: TurnEvent = serde_json::from_str(&json).unwrap();
-        if let TurnEvent::Failed {
-            status, trace_id, ..
-        } = decoded
-        {
-            assert_eq!(status.as_deref(), Some("error"));
-            assert_eq!(trace_id.as_deref(), Some("tr"));
+        if let TurnEvent::Failed { correlation, .. } = decoded {
+            assert_eq!(correlation.status.as_deref(), Some("error"));
+            assert_eq!(correlation.trace_id.as_deref(), Some("tr"));
         } else {
             panic!("wrong variant");
         }
@@ -699,24 +554,21 @@ mod tests {
         let ev = TurnEvent::AssistantDelta {
             content: "hello".into(),
             turn_id: None,
-            conversation_id: Some("c".into()),
-            trace_id: None,
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx {
+                conversation_id: Some("c".into()),
+                ..CorrelationCtx::default()
+            },
         };
         let json = serde_json::to_string(&ev).unwrap();
         let decoded: TurnEvent = serde_json::from_str(&json).unwrap();
         if let TurnEvent::AssistantDelta {
             content,
-            conversation_id,
+            correlation,
             ..
         } = decoded
         {
             assert_eq!(content, "hello");
-            assert_eq!(conversation_id.as_deref(), Some("c"));
+            assert_eq!(correlation.conversation_id.as_deref(), Some("c"));
         } else {
             panic!("wrong variant");
         }
@@ -729,25 +581,17 @@ mod tests {
             session_id,
             turn_id,
             reason,
-            conversation_id,
-            trace_id,
-            span_id,
-            parent_span_id,
-            operation_name,
-            agent_name,
-            status,
+            correlation,
         } = ev
         {
             assert_eq!(session_id, "sess-fail");
             assert_eq!(turn_id, "turn-fail");
             assert_eq!(reason, "something went wrong");
-            assert!(conversation_id.is_none(), "conversation_id must be None");
-            assert!(trace_id.is_none(), "trace_id must be None");
-            assert!(span_id.is_none(), "span_id must be None");
-            assert!(parent_span_id.is_none(), "parent_span_id must be None");
-            assert!(operation_name.is_none(), "operation_name must be None");
-            assert!(agent_name.is_none(), "agent_name must be None");
-            assert!(status.is_none(), "status must be None");
+            assert_eq!(
+                correlation,
+                CorrelationCtx::default(),
+                "correlation must default to all-None"
+            );
         } else {
             panic!("TurnEvent::fail must produce TurnEvent::Failed");
         }
@@ -760,13 +604,10 @@ mod tests {
         let turn_event = TurnEvent::Started {
             session_id: "sess-ctrl".into(),
             turn_id: "turn-ctrl".into(),
-            conversation_id: Some("conv-1".into()),
-            trace_id: None,
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx {
+                conversation_id: Some("conv-1".into()),
+                ..CorrelationCtx::default()
+            },
         };
         let result = ControlEvent::try_from(turn_event);
         assert!(
@@ -776,13 +617,12 @@ mod tests {
         if let Ok(ControlEvent::Started {
             session_id,
             turn_id,
-            conversation_id,
-            ..
+            correlation,
         }) = result
         {
             assert_eq!(session_id, "sess-ctrl");
             assert_eq!(turn_id, "turn-ctrl");
-            assert_eq!(conversation_id.as_deref(), Some("conv-1"));
+            assert_eq!(correlation.conversation_id.as_deref(), Some("conv-1"));
         } else {
             panic!("expected ControlEvent::Started");
         }
@@ -793,13 +633,7 @@ mod tests {
         let turn_event = TurnEvent::AssistantDelta {
             content: "token".into(),
             turn_id: None,
-            conversation_id: None,
-            trace_id: None,
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx::default(),
         };
         let result = ControlEvent::try_from(turn_event);
         assert!(
@@ -819,13 +653,7 @@ mod tests {
         let turn_event = TurnEvent::AssistantDelta {
             content: "hello delta".into(),
             turn_id: Some("turn-delta".into()),
-            conversation_id: None,
-            trace_id: None,
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx::default(),
         };
         let result: Option<DeltaEvent> = turn_event.into();
         assert!(
@@ -842,13 +670,7 @@ mod tests {
         let turn_event = TurnEvent::Started {
             session_id: "s".into(),
             turn_id: "t".into(),
-            conversation_id: None,
-            trace_id: None,
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx::default(),
         };
         let result: Option<DeltaEvent> = turn_event.into();
         assert!(

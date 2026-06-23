@@ -16,12 +16,14 @@ use opentelemetry::{
 };
 use smedja_adapter::types::{Message as AdapterMessage, Role as AdapterRole};
 use smedja_adapter::CallOptions;
-use smedja_assayer::{Assayer, Complexity, Role as AgentRole, Route, Runner, Tier};
+use smedja_assayer::{AgentRole, Assayer, Complexity, Route, Runner, Tier};
+use smedja_bellows::event::CorrelationCtx;
 use smedja_bellows::{Dispatcher, TurnEvent};
 use smedja_ingot::{Checkpoint, CostEntry, IngotHandle, TokenSnapshot};
 use smedja_memory::{
     estimate_messages_tokens, estimate_tokens, inject_conciseness, StrataConfig, WorkingMemory,
 };
+use smedja_types::{Microdollars, Timestamp, ToolOutcome};
 use smedja_vault::Vault;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -57,6 +59,29 @@ fn model_context_window(model: &str) -> usize {
     } else {
         // gpt-4o / o1 / o3 and unknown models share the conservative default.
         128_000
+    }
+}
+
+/// Classifies an `execute_tool` result string into a [`ToolOutcome`].
+///
+/// The tool layer signals failures through textual prefixes rather than a typed
+/// error, so this bridges that convention onto the typed outcome: an
+/// `"error:"`-prefixed result that mentions a timeout becomes
+/// [`ToolOutcome::Timeout`], other `"error:"` results become
+/// [`ToolOutcome::Failure`], `"permission denied"` becomes
+/// [`ToolOutcome::ApprovalDenied`], and everything else is
+/// [`ToolOutcome::Success`].  The text fed back to the agent is unchanged.
+fn classify_tool_outcome(result: &str) -> ToolOutcome {
+    if result.starts_with("permission denied") {
+        ToolOutcome::ApprovalDenied(result.to_owned())
+    } else if result.starts_with("error:") {
+        if result.contains("timed out") || result.contains("timeout") {
+            ToolOutcome::Timeout
+        } else {
+            ToolOutcome::Failure(result.to_owned())
+        }
+    } else {
+        ToolOutcome::Success(result.to_owned())
     }
 }
 
@@ -153,13 +178,19 @@ impl TurnOrchestrator {
                 .and_then(crate::parse_session_mode_to_role)
                 .unwrap_or(AgentRole::Orchestrator);
             let complexity = Complexity::Coding;
+            let decision = assayer.route_decision(role, complexity);
             tracing::debug!(
                 turn_id = %turn_id,
                 role = ?role,
-                complexity = ?complexity,
+                complexity = ?decision.complexity(),
+                rationale = %decision.rationale(),
                 "routing turn"
             );
-            assayer.route(role, complexity)
+            Route {
+                runner: decision.runner(),
+                tier: decision.tier(),
+                model: decision.model().map(str::to_owned),
+            }
         };
 
         // Apply session runner override.
@@ -638,16 +669,18 @@ impl TurnOrchestrator {
                     tool_name: tool_name.clone(),
                     input_summary: tool_input.chars().take(120).collect(),
                     turn_id: Some(turn_id.clone()),
-                    conversation_id: Some(session_id.clone()),
-                    trace_id: ev_trace_id,
-                    span_id: ev_span_id,
-                    parent_span_id: None,
-                    operation_name: Some(tel::OPERATION_EXECUTE_TOOL.to_owned()),
-                    agent_name: session
-                        .as_ref()
-                        .and_then(|s| s.mode.as_deref())
-                        .map(str::to_owned),
-                    status: None,
+                    correlation: CorrelationCtx {
+                        conversation_id: Some(session_id.clone()),
+                        trace_id: ev_trace_id,
+                        span_id: ev_span_id,
+                        parent_span_id: None,
+                        operation_name: Some(tel::OPERATION_EXECUTE_TOOL.to_owned()),
+                        agent_name: session
+                            .as_ref()
+                            .and_then(|s| s.mode.as_deref())
+                            .map(str::to_owned),
+                        status: None,
+                    },
                     tool_call_id: Some(tool_call_id.clone()),
                 });
 
@@ -737,14 +770,15 @@ impl TurnOrchestrator {
                         tel::TOOL_RESULT_TOKENS,
                         i64::try_from(result.split_whitespace().count()).unwrap_or(0),
                     ));
-                    if result.starts_with("error:") || result.starts_with("permission denied") {
+                    let outcome = classify_tool_outcome(&result);
+                    if outcome.is_success() {
+                        use opentelemetry::trace::Span as _;
+                        tool_span.set_status(opentelemetry::trace::Status::Ok);
+                    } else {
                         use opentelemetry::trace::Span as _;
                         tool_span.set_status(opentelemetry::trace::Status::error(
                             result.chars().take(120).collect::<String>(),
                         ));
-                    } else {
-                        use opentelemetry::trace::Span as _;
-                        tool_span.set_status(opentelemetry::trace::Status::Ok);
                     }
                     tool_span.end();
                     result
@@ -767,7 +801,7 @@ impl TurnOrchestrator {
                     };
                     let tool_audit = smedja_ingot::AuditEvent {
                         id: Uuid::new_v4(),
-                        ts: crate::now_epoch(),
+                        ts: Timestamp::now(),
                         session_id: session_id.clone(),
                         turn_id: Some(turn_id.clone()),
                         action_type: "tool_exec".into(),
@@ -841,8 +875,8 @@ impl TurnOrchestrator {
                 model,
                 input_tok: i64::from(total_input_tokens),
                 output_tok: i64::from(total_output_tokens),
-                cost_usd,
-                created_at: crate::now_epoch(),
+                cost_usd: Microdollars::from_usd_f64(cost_usd),
+                created_at: Timestamp::now(),
             };
             if let Err(e) = ingot.insert_cost(entry).await {
                 warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to record cost entry");
@@ -872,7 +906,8 @@ impl TurnOrchestrator {
                 turn_n,
                 messages_json: serde_json::to_string(&messages_json_value)
                     .unwrap_or_else(|_| "[]".to_owned()),
-                created_at: crate::now_epoch(),
+                created_at: Timestamp::now(),
+                compaction_id: None,
             };
             if let Err(e) = ingot.save_checkpoint(cp).await {
                 warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to save checkpoint");
@@ -900,7 +935,7 @@ impl TurnOrchestrator {
                 output_tok,
                 cumulative_input: prior_in + input_tok,
                 cumulative_output: prior_out + output_tok,
-                created_at: crate::now_epoch(),
+                created_at: Timestamp::now(),
             };
             if let Err(e) = ingot.save_token_snapshot(snap).await {
                 warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to save token snapshot");
@@ -941,7 +976,7 @@ impl TurnOrchestrator {
                 .to_owned();
             let audit_ev = smedja_ingot::AuditEvent {
                 id: Uuid::new_v4(),
-                ts: crate::now_epoch(),
+                ts: Timestamp::now(),
                 session_id: session_id.clone(),
                 turn_id: Some(turn_id.clone()),
                 action_type: "turn_end".into(),
@@ -968,16 +1003,18 @@ impl TurnOrchestrator {
             output_tokens: total_output_tokens,
             input_tokens: Some(total_input_tokens),
             traceparent: Some(traceparent),
-            conversation_id: Some(session_id.clone()),
-            trace_id: None,
-            span_id: None,
-            parent_span_id: None,
-            operation_name: Some(tel::OPERATION_INVOKE_AGENT.to_owned()),
-            agent_name: session
-                .as_ref()
-                .and_then(|s| s.mode.as_deref())
-                .map(str::to_owned),
-            status: Some("ok".to_owned()),
+            correlation: CorrelationCtx {
+                conversation_id: Some(session_id.clone()),
+                trace_id: None,
+                span_id: None,
+                parent_span_id: None,
+                operation_name: Some(tel::OPERATION_INVOKE_AGENT.to_owned()),
+                agent_name: session
+                    .as_ref()
+                    .and_then(|s| s.mode.as_deref())
+                    .map(str::to_owned),
+                status: Some("ok".to_owned()),
+            },
         });
     }
 }

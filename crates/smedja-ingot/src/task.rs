@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use smedja_types::Timestamp;
 use uuid::Uuid;
 
 use crate::error::IngotError;
@@ -14,8 +15,8 @@ pub struct Task {
     pub description: String,
     /// Lifecycle status: `"planned"`, `"in_progress"`, `"complete"`, or `"failed"`.
     pub status: String,
-    /// Unix epoch timestamp when the task was created.
-    pub created_at: f64,
+    /// Timestamp when the task was created (micros since the Unix epoch).
+    pub created_at: Timestamp,
     /// Optional session that owns this task.
     pub session_id: Option<String>,
     /// Full response text stored once the turn completes.
@@ -36,7 +37,7 @@ pub(crate) fn create(conn: &rusqlite::Connection, task: &Task) -> Result<(), Ing
             task.title,
             task.description,
             task.status,
-            task.created_at,
+            task.created_at.as_micros(),
             task.session_id,
         ],
     )?;
@@ -135,7 +136,7 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         title: row.get(1)?,
         description: row.get(2)?,
         status: row.get(3)?,
-        created_at: row.get(4)?,
+        created_at: Timestamp::from_micros(crate::read_micros(row, 4)?),
         session_id: row.get(5)?,
         response: row.get(6)?,
     })
@@ -152,7 +153,7 @@ mod tests {
             title: "Write tests".to_string(),
             description: "TDD red phase".to_string(),
             status: status.to_string(),
-            created_at: 1_700_000_000.0,
+            created_at: Timestamp::from_secs_f64(1_700_000_000.0),
             session_id: None,
             response: None,
         }
@@ -160,7 +161,7 @@ mod tests {
 
     #[test]
     fn create_then_list_all_returns_task() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let t = sample_task("planned");
         ingot.create_task(&t).unwrap();
 
@@ -172,7 +173,7 @@ mod tests {
 
     #[test]
     fn list_tasks_filters_by_status() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         ingot.create_task(&sample_task("planned")).unwrap();
         ingot.create_task(&sample_task("in_progress")).unwrap();
         ingot.create_task(&sample_task("planned")).unwrap();
@@ -187,7 +188,7 @@ mod tests {
 
     #[test]
     fn update_task_status_changes_status() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let t = sample_task("planned");
         ingot.create_task(&t).unwrap();
 
@@ -208,7 +209,7 @@ mod tests {
 
     #[test]
     fn list_tasks_no_match_status_returns_empty() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         ingot.create_task(&sample_task("planned")).unwrap();
 
         let results = ingot.list_tasks(Some("complete")).unwrap();
@@ -217,7 +218,7 @@ mod tests {
 
     #[test]
     fn get_task_returns_task_by_id() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let t = sample_task("planned");
         ingot.create_task(&t).unwrap();
 
@@ -240,7 +241,7 @@ mod tests {
 
     #[test]
     fn set_task_response_stores_response_and_marks_complete() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let t = sample_task("in_progress");
         ingot.create_task(&t).unwrap();
 
@@ -257,13 +258,13 @@ mod tests {
     fn task_lifecycle_create_update_get() {
         use crate::session::Session;
 
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
 
         // Create a session so the task carries a meaningful session_id.
         let session = Session {
             id: Uuid::new_v4(),
-            created_at: 1_700_000_000.0,
-            updated_at: 1_700_000_000.0,
+            created_at: Timestamp::from_secs_f64(1_700_000_000.0),
+            updated_at: Timestamp::from_secs_f64(1_700_000_000.0),
             status: "active".to_string(),
             task_id: None,
             mode: None,
@@ -281,7 +282,7 @@ mod tests {
             title: "Fix the softcap".to_string(),
             description: String::new(),
             status: "planned".to_string(),
-            created_at: 1_700_000_001.0,
+            created_at: Timestamp::from_secs_f64(1_700_000_001.0),
             session_id: Some(session.id.to_string()),
             response: None,
         };

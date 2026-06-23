@@ -1,15 +1,16 @@
 use serde::{Deserialize, Serialize};
+use smedja_types::Timestamp;
 use uuid::Uuid;
 
 use crate::error::IngotError;
 
 /// An immutable audit record capturing a single agent action.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
     /// Unique event identifier (UUID v4 stored as TEXT).
     pub id: Uuid,
-    /// Unix epoch timestamp as `f64`.
-    pub ts: f64,
+    /// Event timestamp (microseconds since the Unix epoch).
+    pub ts: Timestamp,
     /// Owning session identifier.
     pub session_id: String,
     /// Optional turn identifier within the session.
@@ -68,6 +69,36 @@ pub struct AuditEvent {
     pub tool_call_id: Option<String>,
 }
 
+impl Default for AuditEvent {
+    fn default() -> Self {
+        Self {
+            id: Uuid::default(),
+            ts: Timestamp::from_micros(0),
+            session_id: String::new(),
+            turn_id: None,
+            action_type: String::new(),
+            actor: String::new(),
+            tool_name: None,
+            input_tok: 0,
+            output_tok: 0,
+            latency_ms: 0,
+            traceparent: None,
+            tier: None,
+            role_id: None,
+            conversation_id: None,
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            agent_name: None,
+            operation_name: None,
+            status: None,
+            error_kind: None,
+            error_count: None,
+            tool_call_id: None,
+        }
+    }
+}
+
 /// Inserts an [`AuditEvent`] into the `audit_events` table.
 ///
 /// # Errors
@@ -85,7 +116,7 @@ pub(crate) fn insert(conn: &rusqlite::Connection, event: &AuditEvent) -> Result<
                  ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
         rusqlite::params![
             event.id.to_string(),
-            event.ts,
+            event.ts.as_micros(),
             event.session_id,
             event.turn_id,
             event.action_type,
@@ -120,7 +151,7 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEvent> {
     })?;
     Ok(AuditEvent {
         id,
-        ts: row.get(1)?,
+        ts: Timestamp::from_micros(crate::read_micros(row, 1)?),
         session_id: row.get(2)?,
         turn_id: row.get(3)?,
         action_type: row.get(4)?,
@@ -223,7 +254,7 @@ mod tests {
     fn sample_event(session_id: &str) -> AuditEvent {
         AuditEvent {
             id: Uuid::new_v4(),
-            ts: 1_700_000_000.0,
+            ts: Timestamp::from_secs_f64(1_700_000_000.0),
             session_id: session_id.to_string(),
             turn_id: Some("turn-1".to_string()),
             action_type: "tool_exec".to_string(),
@@ -289,7 +320,7 @@ mod tests {
         let ingot = Ingot::open_in_memory().unwrap();
         let ev = AuditEvent {
             id: Uuid::new_v4(),
-            ts: 1_700_000_001.0,
+            ts: Timestamp::from_secs_f64(1_700_000_001.0),
             session_id: "s".to_string(),
             turn_id: None,
             action_type: "turn_start".to_string(),

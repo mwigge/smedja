@@ -15,6 +15,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use smedja_ingot::{AuditEvent, IngotHandle};
+use smedja_types::Timestamp;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -87,10 +88,7 @@ async fn webhook_alert(
     axum::extract::State(state): axum::extract::State<AlertState>,
     Json(payload): Json<AlertManagerPayload>,
 ) -> impl IntoResponse {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
+    let now = Timestamp::now();
 
     // Phase 1 — normalise AlertManager alerts into `Alert` structs, building
     // the audit events simultaneously (no locking required here).

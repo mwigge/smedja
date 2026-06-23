@@ -1,6 +1,7 @@
 //! Loop engine persistence — `loops` table tracking multi-role pipeline runs.
 
 use serde::{Deserialize, Serialize};
+use smedja_types::Timestamp;
 
 /// Persisted state for a single loop run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,10 +17,10 @@ pub struct LoopRecord {
     pub current_slice: i64,
     /// Attempt number for the current slice (1-based).
     pub attempt: i64,
-    /// Unix epoch timestamp (seconds) when this record was created.
-    pub created_at: f64,
-    /// Unix epoch timestamp (seconds) when this record was last updated.
-    pub updated_at: f64,
+    /// Timestamp when this record was created (micros since the Unix epoch).
+    pub created_at: Timestamp,
+    /// Timestamp when this record was last updated (micros since the Unix epoch).
+    pub updated_at: Timestamp,
 }
 
 pub(crate) fn insert(
@@ -36,8 +37,8 @@ pub(crate) fn insert(
             rec.status,
             rec.current_slice,
             rec.attempt,
-            rec.created_at,
-            rec.updated_at,
+            rec.created_at.as_micros(),
+            rec.updated_at.as_micros(),
         ],
     )?;
     Ok(())
@@ -47,11 +48,11 @@ pub(crate) fn update_status(
     conn: &rusqlite::Connection,
     id: &str,
     status: &str,
-    updated_at: f64,
+    updated_at: Timestamp,
 ) -> Result<(), crate::error::IngotError> {
     conn.execute(
         "UPDATE loops SET status = ?1, updated_at = ?2 WHERE id = ?3",
-        rusqlite::params![status, updated_at, id],
+        rusqlite::params![status, updated_at.as_micros(), id],
     )?;
     Ok(())
 }
@@ -60,11 +61,11 @@ pub(crate) fn update_slice(
     conn: &rusqlite::Connection,
     id: &str,
     current_slice: i64,
-    updated_at: f64,
+    updated_at: Timestamp,
 ) -> Result<(), crate::error::IngotError> {
     conn.execute(
         "UPDATE loops SET current_slice = ?1, updated_at = ?2 WHERE id = ?3",
-        rusqlite::params![current_slice, updated_at, id],
+        rusqlite::params![current_slice, updated_at.as_micros(), id],
     )?;
     Ok(())
 }
@@ -84,8 +85,8 @@ pub(crate) fn get(
             status: row.get(2)?,
             current_slice: row.get(3)?,
             attempt: row.get(4)?,
-            created_at: row.get(5)?,
-            updated_at: row.get(6)?,
+            created_at: Timestamp::from_micros(crate::read_micros(row, 5)?),
+            updated_at: Timestamp::from_micros(crate::read_micros(row, 6)?),
         })
     })?;
     match rows.next() {
@@ -110,8 +111,8 @@ pub(crate) fn list_by_change(
                 status: row.get(2)?,
                 current_slice: row.get(3)?,
                 attempt: row.get(4)?,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
+                created_at: Timestamp::from_micros(crate::read_micros(row, 5)?),
+                updated_at: Timestamp::from_micros(crate::read_micros(row, 6)?),
             })
         })?
         .collect();
@@ -130,8 +131,8 @@ pub(crate) fn list_by_status(
             status: row.get(2)?,
             current_slice: row.get(3)?,
             attempt: row.get(4)?,
-            created_at: row.get(5)?,
-            updated_at: row.get(6)?,
+            created_at: Timestamp::from_micros(crate::read_micros(row, 5)?),
+            updated_at: Timestamp::from_micros(crate::read_micros(row, 6)?),
         })
     };
     if let Some(s) = status {
@@ -163,14 +164,14 @@ mod tests {
             status: "planning".into(),
             current_slice: 0,
             attempt: 1,
-            created_at: 1_000.0,
-            updated_at: 1_000.0,
+            created_at: Timestamp::from_secs_f64(1_000.0),
+            updated_at: Timestamp::from_secs_f64(1_000.0),
         }
     }
 
     #[test]
     fn insert_and_get_loop_record() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         ig.create_loop(&sample("loop-1")).unwrap();
         let got = ig.get_loop("loop-1").unwrap().unwrap();
         assert_eq!(got.status, "planning");
@@ -179,12 +180,13 @@ mod tests {
 
     #[test]
     fn update_loop_status() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         ig.create_loop(&sample("l2")).unwrap();
-        ig.update_loop_status("l2", "complete", 2_000.0).unwrap();
+        ig.update_loop_status("l2", "complete", Timestamp::from_secs_f64(2_000.0))
+            .unwrap();
         let got = ig.get_loop("l2").unwrap().unwrap();
         assert_eq!(got.status, "complete");
-        assert!((got.updated_at - 2_000.0).abs() < f64::EPSILON);
+        assert_eq!(got.updated_at, Timestamp::from_secs_f64(2_000.0));
     }
 
     #[test]
@@ -195,13 +197,13 @@ mod tests {
 
     #[test]
     fn list_by_change_returns_in_descending_order() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         let mut early = sample("early");
-        early.created_at = 100.0;
-        early.updated_at = 100.0;
+        early.created_at = Timestamp::from_secs_f64(100.0);
+        early.updated_at = Timestamp::from_secs_f64(100.0);
         let mut late = sample("late");
-        late.created_at = 200.0;
-        late.updated_at = 200.0;
+        late.created_at = Timestamp::from_secs_f64(200.0);
+        late.updated_at = Timestamp::from_secs_f64(200.0);
         ig.create_loop(&early).unwrap();
         ig.create_loop(&late).unwrap();
         let list = ig.list_loops("smedja").unwrap();
@@ -212,7 +214,7 @@ mod tests {
 
     #[test]
     fn list_by_change_filters_by_change_name() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         ig.create_loop(&sample("a")).unwrap();
         let mut other = sample("b");
         other.change_name = "other-change".into();
