@@ -83,9 +83,11 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/approvals",
     "/approve",
     "/briefing",
+    "/clear",
     "/deny",
     "/drawio",
     "/health",
+    "/help",
     "/login",
     "/metrics",
     "/model",
@@ -99,6 +101,46 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/tdd",
     "/tier",
 ];
+
+const HELP_TEXT: &str = "\
+slash commands:
+  /agent <id>        — run named agent
+  /agents            — list available agents
+  /approvals         — list pending cowork approvals
+  /approve <id>      — approve a cowork item
+  /briefing          — show session briefing
+  /clear             — clear message display (keeps session data)
+  /deny <id>         — deny a cowork item
+  /drawio <slug>     — generate draw.io diagram
+  /health            — check daemon connectivity
+  /help              — show this message
+  /login             — authenticate with runner
+  /metrics           — show token usage and cost
+  /model [name]      — show or set model
+  /ponytail          — set review mode
+  /pptx <slug>       — generate PowerPoint
+  /quota             — show usage quota
+  /review            — send git diff for review
+  /spec              — browse OpenSpec changes
+  /switch [runner]   — switch AI runner (omit for interactive picker)
+  /takeover <runner> — fork session to new runner
+  /tdd               — set TDD mode
+  /tier <t>          — set tier (local|fast|deep)
+
+keybindings (input mode):
+  Esc                — enter scroll/normal mode
+  Ctrl-R             — toggle context rail
+  Up / Down          — scroll messages
+
+keybindings (scroll/normal mode):
+  i / a              — return to input mode
+  j / k              — scroll down / up
+  G                  — scroll to bottom
+  gg                 — scroll to top
+  v                  — start line selection
+  y                  — yank selection to clipboard
+  t                  — copy traceparent
+  Esc                — exit selection / return to input";
 
 #[allow(clippy::struct_excessive_bools)] // AppState is a TUI dispatch table; enum-splitting would add indirection without clarity
 #[derive(Debug)]
@@ -145,12 +187,14 @@ struct AppState {
     main_panel: main_panel::MainPanel,
     /// Audit action log widget.
     action_log: action_log::ActionLog,
-    /// Available slash-command completions (filtered subset of `SLASH_COMPLETIONS`).
-    slash_completions: Vec<&'static str>,
+    /// Available slash-command completions (filtered subset of `SLASH_COMPLETIONS`, or dynamic runner list).
+    slash_completions: Vec<String>,
     /// Whether the slash-command completion popup is visible.
     slash_popup_visible: bool,
     /// Cursor index within the filtered completion list.
     slash_cursor: usize,
+    /// True when the popup is showing a runner picker (Enter confirms runner switch).
+    runner_picker_mode: bool,
     /// True while a turn is awaiting a response from the daemon.
     #[allow(dead_code)] // wired at init; read path lands once streaming poll is complete
     turn_in_flight: bool,
@@ -320,11 +364,12 @@ async fn submit(input: &str, state: &mut AppState, client: &mut Client) -> Resul
 // ---------------------------------------------------------------------------
 
 /// Returns completions from `SLASH_COMPLETIONS` whose prefix matches `input`.
-fn filtered_completions(input: &str) -> Vec<&'static str> {
+fn filtered_completions(input: &str) -> Vec<String> {
     SLASH_COMPLETIONS
         .iter()
         .copied()
         .filter(|c| c.starts_with(input))
+        .map(str::to_owned)
         .collect()
 }
 
@@ -472,7 +517,7 @@ fn yank_to_clipboard(lines: &[String]) {
 }
 
 fn accept_slash_completion(state: &mut AppState, append_space: bool) -> bool {
-    let Some(&completion) = state.slash_completions.get(state.slash_cursor) else {
+    let Some(completion) = state.slash_completions.get(state.slash_cursor).cloned() else {
         state.slash_popup_visible = false;
         return false;
     };
@@ -493,6 +538,7 @@ fn clear_slash_popup(state: &mut AppState) {
     state.slash_cursor = 0;
     state.input.clear();
     state.input_cursor = 0;
+    state.runner_picker_mode = false;
 }
 
 fn apply_tier(args: &str, state: &mut AppState) -> String {
@@ -566,6 +612,10 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
                 Err(e) => format!("health: error — {e}"),
             };
             push_system_message(state, text);
+            Ok(true)
+        }
+        "help" => {
+            push_system_message(state, HELP_TEXT);
             Ok(true)
         }
         "spec" => {
@@ -798,10 +848,42 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
         }
         "switch" => {
             if args.is_empty() {
-                push_system_message(
-                    state,
-                    "usage: /switch <runner>  (runners: claude, codex, local, copilot)",
-                );
+                let result = client.call("runner.list", json!({})).await;
+                match result {
+                    Ok(v) => {
+                        let runners: Vec<String> = v
+                            .get("runners")
+                            .and_then(|r| r.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|r| {
+                                        r.get("runner").and_then(|n| n.as_str()).map(str::to_owned)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if runners.is_empty() {
+                            push_system_message(state, "no runners available from runner.list");
+                        } else {
+                            state.slash_completions = runners;
+                            state.slash_cursor = 0;
+                            state.slash_popup_visible = true;
+                            state.runner_picker_mode = true;
+                            state.input.clear();
+                            state.input_cursor = 0;
+                        }
+                    }
+                    Err(e) => {
+                        push_system_message(
+                            state,
+                            format!(
+                                "usage: /switch [runner]  — omit for interactive picker\n\
+                                 runners: claude, codex, local, copilot, minimax, berget\n\
+                                 (runner.list error: {e})"
+                            ),
+                        );
+                    }
+                }
                 return Ok(true);
             }
             let session_id = state.session_id.clone();
@@ -1061,7 +1143,9 @@ async fn handle_key(
                 clear_slash_popup(state);
             }
             KeyCode::Char(' ') | KeyCode::Tab => {
-                accept_slash_completion(state, true);
+                if !state.runner_picker_mode {
+                    accept_slash_completion(state, true);
+                }
             }
             KeyCode::Down => {
                 let max = state.slash_completions.len().saturating_sub(1);
@@ -1073,7 +1157,43 @@ async fn handle_key(
                 state.slash_cursor = state.slash_cursor.saturating_sub(1);
             }
             KeyCode::Enter => {
-                if accept_slash_completion(state, false) {
+                if state.runner_picker_mode {
+                    if let Some(runner_name) =
+                        state.slash_completions.get(state.slash_cursor).cloned()
+                    {
+                        let session_id = state.session_id.clone();
+                        let result = client
+                            .call(
+                                "session.set_runner",
+                                json!({ "session_id": session_id, "runner": runner_name }),
+                            )
+                            .await;
+                        match result {
+                            Ok(v) => {
+                                let canonical = v
+                                    .get("runner")
+                                    .and_then(|r| r.as_str())
+                                    .unwrap_or(&runner_name)
+                                    .to_owned();
+                                state.runner = canonical.clone();
+                                push_system_message(
+                                    state,
+                                    format!("runner switched to {canonical}"),
+                                );
+                            }
+                            Err(e) => push_system_message(
+                                state,
+                                format!("session.set_runner error: {e}"),
+                            ),
+                        }
+                        state.runner_picker_mode = false;
+                        state.slash_popup_visible = false;
+                        state.slash_completions.clear();
+                        state.slash_cursor = 0;
+                        state.input.clear();
+                        state.input_cursor = 0;
+                    }
+                } else if accept_slash_completion(state, false) {
                     let input = std::mem::take(&mut state.input);
                     state.input_cursor = 0;
                     let _ = editor.add_history_entry(&input);
@@ -1612,6 +1732,7 @@ fn render(frame: &mut ratatui::Frame, state: &AppState) {
         tier: state.tier.as_deref(),
         runner: Some(&state.runner),
         pending: state.pending_task_id.is_some(),
+        input_mode: !state.scroll_focus,
     };
     let status_text = render_status_bar(&ctx);
     let status = Paragraph::new(status_text).style(Style::default().add_modifier(Modifier::BOLD));
@@ -1755,7 +1876,7 @@ fn render_slash_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, s
     let lines: Vec<Line<'_>> = completions
         .iter()
         .enumerate()
-        .map(|(i, &c)| {
+        .map(|(i, c)| {
             if i == state.slash_cursor {
                 Line::from(Span::styled(
                     format!(" {c}"),
@@ -1770,9 +1891,9 @@ fn render_slash_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, s
         })
         .collect();
 
+    let title = if state.runner_picker_mode { "runners" } else { "commands" };
     frame.render_widget(Clear, popup_rect);
-    let popup =
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("commands"));
+    let popup = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(popup, popup_rect);
 }
 
@@ -1880,6 +2001,7 @@ async fn main() -> Result<()> {
         slash_completions: Vec::new(),
         slash_popup_visible: false,
         slash_cursor: 0,
+        runner_picker_mode: false,
         turn_in_flight: false,
         poll_retry_count: 0,
         scroll_focus: false,
@@ -2281,7 +2403,7 @@ mod tests {
     #[test]
     fn slash_completions_filter_by_prefix() {
         let completions = filtered_completions("/bri");
-        assert_eq!(completions, vec!["/briefing"]);
+        assert_eq!(completions, vec!["/briefing".to_owned()]);
     }
 
     // L129: typing "/" returns all completions.
@@ -2520,7 +2642,7 @@ mod tests {
     fn slash_completions_switch_matches_sw_prefix() {
         let completions = filtered_completions("/sw");
         assert!(
-            completions.contains(&"/switch"),
+            completions.contains(&"/switch".to_owned()),
             "/switch must match '/sw' prefix; got: {completions:?}"
         );
     }
@@ -2529,30 +2651,26 @@ mod tests {
     fn slash_completions_takeover_matches_tak_prefix() {
         let completions = filtered_completions("/tak");
         assert!(
-            completions.contains(&"/takeover"),
+            completions.contains(&"/takeover".to_owned()),
             "/takeover must match '/tak' prefix; got: {completions:?}"
         );
     }
 
     #[test]
-    fn slash_switch_no_args_produces_usage_hint() {
-        // Verify state is mutated correctly for the no-arg branch
-        // (no RPC call — pure state logic).
+    fn switch_no_args_opens_runner_picker() {
+        // Simulate what dispatch_slash("switch", "") does on successful runner.list:
+        // populate slash_completions with runner names and set picker flags.
         let mut state = make_state("sess-switch");
-        // Simulate: command="switch", args="" → push usage hint
-        let cmd = "switch";
-        let args = "";
-        let guidance = if args.is_empty() {
-            Some("usage: /switch <runner>  (runners: claude, codex, local, copilot)".to_owned())
-        } else {
-            None
-        };
-        if let Some(msg) = guidance {
-            state.main_panel.push_line(msg.clone());
-            assert!(msg.contains("usage"), "hint must mention 'usage'");
-        } else {
-            panic!("expected usage hint for cmd={cmd} args={args}");
-        }
+        state.slash_completions =
+            vec!["claude".to_owned(), "codex".to_owned(), "local".to_owned()];
+        state.slash_popup_visible = true;
+        state.runner_picker_mode = true;
+        state.input.clear();
+        state.input_cursor = 0;
+
+        assert!(state.slash_popup_visible, "picker popup must open");
+        assert!(state.runner_picker_mode, "runner_picker_mode must be set");
+        assert!(!state.slash_completions.is_empty(), "completions must list runner names");
     }
 
     #[test]
@@ -2654,6 +2772,7 @@ mod tests {
             slash_completions: Vec::new(),
             slash_popup_visible: false,
             slash_cursor: 0,
+            runner_picker_mode: false,
             turn_in_flight: false,
             poll_retry_count: 0,
             scroll_focus: false,
@@ -2768,7 +2887,7 @@ mod tests {
         // /health must appear in completions when user types "/h"
         let completions = filtered_completions("/h");
         assert!(
-            completions.contains(&"/health"),
+            completions.contains(&"/health".to_owned()),
             "/health must be in SLASH_COMPLETIONS and match '/h' prefix"
         );
     }
@@ -3331,6 +3450,103 @@ mod tests {
         assert!(
             !footer.contains("traces not exported"),
             "footer must not show warning when OTLP is configured"
+        );
+    }
+
+    // --- tui-input-modes tests ---
+
+    #[test]
+    fn help_command_pushes_message_containing_slash_help() {
+        let mut state = make_state("sess-help");
+        push_system_message(&mut state, HELP_TEXT);
+        let has_help = state
+            .main_panel
+            .lines_text(0, 200)
+            .iter()
+            .any(|l| l.contains("/help"));
+        assert!(has_help, "help output must contain '/help'");
+    }
+
+    #[test]
+    fn help_text_covers_all_major_commands() {
+        for cmd in ["/switch", "/health", "/tier", "/agents", "/briefing", "/clear"] {
+            assert!(HELP_TEXT.contains(cmd), "HELP_TEXT must mention {cmd}");
+        }
+    }
+
+    #[test]
+    fn slash_completions_include_help_and_clear() {
+        assert!(
+            SLASH_COMPLETIONS.contains(&"/help"),
+            "/help must be in SLASH_COMPLETIONS"
+        );
+        assert!(
+            SLASH_COMPLETIONS.contains(&"/clear"),
+            "/clear must be in SLASH_COMPLETIONS"
+        );
+    }
+
+    #[test]
+    fn runner_picker_confirm_sets_runner_and_clears_mode() {
+        let mut state = make_state("sess-picker");
+        state.runner_picker_mode = true;
+        state.slash_completions = vec!["codex".to_owned(), "claude".to_owned()];
+        state.slash_popup_visible = true;
+        state.slash_cursor = 0;
+
+        // Simulate accept: take selected runner name, update state, clear picker
+        let runner_name = state.slash_completions[state.slash_cursor].clone();
+        state.runner = runner_name.clone();
+        push_system_message(&mut state, format!("runner switched to {runner_name}"));
+        state.runner_picker_mode = false;
+        state.slash_popup_visible = false;
+        state.slash_completions.clear();
+        state.slash_cursor = 0;
+
+        assert_eq!(state.runner, "codex");
+        assert!(!state.runner_picker_mode, "runner_picker_mode must be cleared after confirm");
+        assert!(!state.slash_popup_visible, "popup must be closed after confirm");
+        assert!(
+            state.main_panel.lines_text(0, 100).iter().any(|l| l.contains("runner switched")),
+            "confirmation message must appear in panel"
+        );
+    }
+
+    #[test]
+    fn clear_slash_popup_resets_runner_picker_mode() {
+        let mut state = make_state("sess-popup");
+        state.runner_picker_mode = true;
+        state.slash_popup_visible = true;
+        state.slash_completions = vec!["claude".to_owned()];
+
+        clear_slash_popup(&mut state);
+
+        assert!(!state.runner_picker_mode, "runner_picker_mode must be false after clear");
+        assert!(!state.slash_popup_visible);
+        assert!(state.slash_completions.is_empty());
+    }
+
+    #[test]
+    fn status_bar_shows_input_mode_badge_when_not_scroll() {
+        let mut state = make_state("sess-mode");
+        state.scroll_focus = false;
+        let buf = render_frame(&state);
+        let content: String = buf.content().iter().map(ratatui::buffer::Cell::symbol).collect();
+        assert!(
+            content.contains("[I]"),
+            "status bar must show [I] when scroll_focus=false; got: {content}"
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_normal_mode_badge_when_scroll() {
+        let mut state = make_state("sess-mode");
+        state.scroll_focus = true;
+        let buf = render_frame(&state);
+        let content: String = buf.content().iter().map(ratatui::buffer::Cell::symbol).collect();
+        assert!(
+            content.contains("[N]"),
+            "status bar must show [N] when scroll_focus=true; got: {content}"
         );
     }
 }

@@ -9,6 +9,8 @@ pub struct ModuleCtx<'a> {
     pub tier: Option<&'a str>,
     pub runner: Option<&'a str>,
     pub pending: bool,
+    /// True when the input bar is active (not in scroll/normal mode).
+    pub input_mode: bool,
 }
 
 /// A single status bar segment.
@@ -37,6 +39,14 @@ pub struct ModuleConfig {
 // ---------------------------------------------------------------------------
 // Segment renderers (sync, no I/O)
 // ---------------------------------------------------------------------------
+
+fn segment_input_mode(ctx: &ModuleCtx<'_>) -> String {
+    if ctx.input_mode {
+        "[I]".to_owned()
+    } else {
+        "[N]".to_owned()
+    }
+}
 
 fn segment_tier(ctx: &ModuleCtx<'_>) -> String {
     let tier = ctx.tier.unwrap_or("fast");
@@ -98,9 +108,10 @@ pub fn render_status_bar_configured(
     let tier = ctx.tier.map(str::to_owned);
     let runner = ctx.runner.map(str::to_owned);
     let pending = ctx.pending;
+    let input_mode = ctx.input_mode;
 
     // Determine which modules to render and in what order.
-    let all_keys: &[&str] = &["runner", "tier", "mode", "session"];
+    let all_keys: &[&str] = &["input_mode", "runner", "tier", "mode", "session"];
     let ordered_keys: Vec<&str> = if let Some(cfg) = config {
         if let Some(fmt) = &cfg.format {
             // Extract `{key}` tokens from the format string.
@@ -141,8 +152,10 @@ pub fn render_status_bar_configured(
                     tier: tr.as_deref(),
                     runner: rn.as_deref(),
                     pending,
+                    input_mode,
                 };
                 let text = match key_owned.as_str() {
+                    "input_mode" => segment_input_mode(&snapshot),
                     "runner" => segment_runner(&snapshot),
                     "tier" => segment_tier(&snapshot),
                     "mode" => segment_mode(&snapshot),
@@ -174,6 +187,7 @@ mod tests {
             tier: Some("deep"),
             runner: None,
             pending: false,
+            input_mode: false,
         };
         let bar = render_status_bar(&ctx);
         assert!(bar.contains("[deep]"));
@@ -188,6 +202,7 @@ mod tests {
             tier: None,
             runner: None,
             pending: true,
+            input_mode: false,
         };
         assert!(render_status_bar(&ctx).contains('\u{27f3}'));
     }
@@ -200,6 +215,7 @@ mod tests {
             tier: None,
             runner: None,
             pending: false,
+            input_mode: false,
         };
         assert!(!render_status_bar(&ctx).contains('\u{27f3}'));
     }
@@ -215,6 +231,7 @@ mod tests {
             tier: Some("fast"),
             runner: None,
             pending: false,
+            input_mode: false,
         };
         let _ = render_status_bar_with_timeout(&ctx, 0);
     }
@@ -228,6 +245,7 @@ mod tests {
             tier: Some("fast"),
             runner: None,
             pending: false,
+            input_mode: false,
         };
         let config = StatusBarConfig {
             format: Some("{tier} {mode}".into()),
@@ -249,6 +267,7 @@ mod tests {
             tier: None,
             runner: Some("claude-sonnet"),
             pending: false,
+            input_mode: false,
         };
         let bar = render_status_bar(&ctx);
         assert!(
@@ -265,6 +284,7 @@ mod tests {
             tier: None,
             runner: None,
             pending: false,
+            input_mode: false,
         };
         let bar = render_status_bar(&ctx);
         assert!(
@@ -281,6 +301,7 @@ mod tests {
             tier: Some("deep"),
             runner: None,
             pending: false,
+            input_mode: false,
         };
         // Request session before tier.
         let config = StatusBarConfig {
@@ -293,5 +314,41 @@ mod tests {
             session_pos < tier_pos,
             "session should come before tier; got: {result}"
         );
+    }
+
+    #[test]
+    fn segment_input_mode_returns_correct_badge() {
+        let ctx_i = ModuleCtx {
+            session_id: "x",
+            mode: None,
+            tier: None,
+            runner: None,
+            pending: false,
+            input_mode: true,
+        };
+        let ctx_n = ModuleCtx {
+            session_id: "x",
+            mode: None,
+            tier: None,
+            runner: None,
+            pending: false,
+            input_mode: false,
+        };
+        assert_eq!(segment_input_mode(&ctx_i), "[I]");
+        assert_eq!(segment_input_mode(&ctx_n), "[N]");
+    }
+
+    #[test]
+    fn render_status_bar_includes_input_mode_badge() {
+        let ctx = ModuleCtx {
+            session_id: "x",
+            mode: None,
+            tier: None,
+            runner: None,
+            pending: false,
+            input_mode: true,
+        };
+        let bar = render_status_bar(&ctx);
+        assert!(bar.contains("[I]"), "status bar must include [I] badge in input mode; got: {bar}");
     }
 }
