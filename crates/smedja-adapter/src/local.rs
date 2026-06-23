@@ -156,7 +156,11 @@ mod tests {
     /// When no server is listening the health check must complete (not hang)
     /// and report `healthy = false`.
     #[tokio::test]
+    // Holds the env lock across the connect await on purpose: the env mutation
+    // must stay serialized for the whole call so a sibling test cannot change it.
+    #[allow(clippy::await_holding_lock)]
     async fn connect_reports_unhealthy_when_no_server() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         // Port 19999 is chosen to be very unlikely to have anything listening.
         std::env::set_var("SMEDJA_LOCAL_ENDPOINT", "http://127.0.0.1:19999");
         let provider = LocalProvider::connect().await;
@@ -173,7 +177,11 @@ mod tests {
     /// The endpoint default must fall back to `http://127.0.0.1:9090` when
     /// `SMEDJA_LOCAL_ENDPOINT` is not set.
     #[tokio::test]
+    // Holds the env lock across the connect await on purpose: the env mutation
+    // must stay serialized for the whole call so a sibling test cannot change it.
+    #[allow(clippy::await_holding_lock)]
     async fn connect_uses_default_endpoint_when_env_not_set() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         // Remove the env var so the default kicks in.
         std::env::remove_var("SMEDJA_LOCAL_ENDPOINT");
         // We don't assert the result of the health check (port 9090 may or may

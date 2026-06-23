@@ -43,6 +43,7 @@ mod tests {
 
     #[test]
     fn detect_returns_none_when_key_absent() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         let saved = std::env::var("OPENCODE_API_KEY").ok();
         std::env::remove_var("OPENCODE_API_KEY");
         let provider = OpenCodeProvider::detect();
@@ -54,6 +55,7 @@ mod tests {
 
     #[test]
     fn detect_returns_some_when_key_present() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         let provider = OpenCodeProvider::detect();
         std::env::remove_var("OPENCODE_API_KEY");
@@ -62,6 +64,7 @@ mod tests {
 
     #[test]
     fn detect_uses_default_base_url_when_env_not_set() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::remove_var("OPENCODE_BASE_URL");
         // Verify detect() doesn't panic and returns Some; the URL is tested
@@ -74,6 +77,7 @@ mod tests {
 
     #[test]
     fn detect_uses_custom_base_url_from_env() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("OPENCODE_BASE_URL", "https://custom.opencode.example/v1");
         let provider = OpenCodeProvider::detect();

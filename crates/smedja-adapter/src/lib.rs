@@ -40,6 +40,13 @@ pub mod types;
 pub(crate) mod otel;
 pub(crate) mod sse;
 
+/// A single process-wide lock serialising tests that mutate global process
+/// state (e.g. `PATH`). Per-module locks do not serialise across modules, so
+/// CLI-provider tests in different modules raced on `PATH` under the parallel
+/// test harness; sharing one lock removes that race.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub use anthropic::AnthropicProvider;
 pub use berget::BergetProvider;
 pub use claude_cli::ClaudeCliProvider;

@@ -346,6 +346,108 @@ fn effective_max_tool_turns() -> usize {
         .map_or(MAX_TOOL_TURNS, |n| n.min(50))
 }
 
+/// Builds the `turn.subscribe` response envelope from a task's current state.
+///
+/// Returns `Err` when the task does not exist, `Ok(Some(env))` when the task has
+/// reached a terminal state (`complete` / `failed`), and `Ok(None)` when it is
+/// still in progress.
+async fn terminal_envelope(ingot: &IngotHandle, task_id: &str) -> Result<Option<Value>, RpcError> {
+    match ingot.get_task(task_id).await.map_err(|e| ingot_err(&e))? {
+        None => Err(RpcError::new(
+            codes::INTERNAL_ERROR,
+            format!("task not found: {task_id}"),
+        )),
+        Some(t) if t.status == "complete" => {
+            // Best-effort token counts from the latest snapshot for the session.
+            let (input_tok, output_tok) = if let Some(ref sid) = t.session_id {
+                ingot
+                    .session_token_snapshots(sid)
+                    .await
+                    .map_or((0i64, 0i64), |snaps| {
+                        snaps
+                            .last()
+                            .map_or((0i64, 0i64), |s| (s.input_tok, s.output_tok))
+                    })
+            } else {
+                (0i64, 0i64)
+            };
+            Ok(Some(json!({
+                "done": true,
+                "response": t.response.unwrap_or_default(),
+                "input_tok": input_tok,
+                "output_tok": output_tok,
+            })))
+        }
+        Some(t) if t.status == "failed" => Ok(Some(json!({
+            "done": true,
+            "error": t.response.unwrap_or_else(|| "turn failed".into()),
+        }))),
+        Some(_) => Ok(None),
+    }
+}
+
+/// Waits for `task_id` to reach a terminal state and returns the
+/// `turn.subscribe` response envelope.
+///
+/// Subscribes to the dispatcher *before* the initial state read so no terminal
+/// event published after subscription is missed; on subscriber lag it falls back
+/// to a direct state read; the wait is bounded by `timeout`.
+async fn await_turn_terminal(
+    ingot: &IngotHandle,
+    dispatcher: &Dispatcher,
+    task_id: &str,
+    timeout: std::time::Duration,
+) -> Result<Value, RpcError> {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let mut rx = dispatcher.subscribe();
+
+    // Resolve immediately if the task is already terminal (or absent).
+    if let Some(env) = terminal_envelope(ingot, task_id).await? {
+        return Ok(env);
+    }
+
+    let wait = async {
+        loop {
+            match rx.recv().await {
+                Ok(ev) => {
+                    let event_turn = match &ev {
+                        TurnEvent::Completed { turn_id, .. }
+                        | TurnEvent::Failed { turn_id, .. } => Some(turn_id.as_str()),
+                        _ => None,
+                    };
+                    if event_turn == Some(task_id) {
+                        return;
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {
+                    // A burst dropped events: check state directly so the terminal
+                    // signal cannot be silently lost.
+                    if let Ok(Some(t)) = ingot.get_task(task_id).await {
+                        if t.status == "complete" || t.status == "failed" {
+                            return;
+                        }
+                    }
+                }
+                Err(RecvError::Closed) => return,
+            }
+        }
+    };
+
+    tokio::time::timeout(timeout, wait)
+        .await
+        .map_err(|_| RpcError::new(codes::TIMEOUT, "turn.subscribe timed out after 60s"))?;
+
+    // Build the envelope from the now-terminal state.
+    match terminal_envelope(ingot, task_id).await? {
+        Some(env) => Ok(env),
+        None => Err(RpcError::new(
+            codes::TIMEOUT,
+            "turn ended without a terminal status",
+        )),
+    }
+}
+
 /// Executes a single turn: loads the task, calls the LLM, handles tool calls,
 /// stores the final response.
 #[allow(clippy::too_many_arguments)] // forwarded directly to TurnOrchestrator
@@ -373,10 +475,13 @@ async fn run_turn(
     .await;
 }
 
-/// Subscribes to [`TurnEvent::Started`] and spawns a [`run_turn`] task for each.
+/// Subscribes to [`TurnEvent::Started`] and spawns a [`run_turn`] task for each
+/// into the shared `task_set`.
 ///
-/// Returns a shared handle store so that the caller can drain in-flight tasks
-/// before exiting (graceful shutdown).
+/// Completed tasks are reaped from the set as they finish (via `try_join_next`)
+/// so the set is bounded by the number of *in-flight* tasks rather than every
+/// task ever spawned. The same set is drained at shutdown.
+#[allow(clippy::too_many_arguments)] // forwarded directly to TurnOrchestrator
 fn spawn_worker(
     ingot: IngotHandle,
     dispatcher: Arc<Dispatcher>,
@@ -385,9 +490,8 @@ fn spawn_worker(
     assayer: Arc<Assayer>,
     price_table: Arc<PriceTable>,
     vault: Arc<Mutex<Vault>>,
-) -> Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> {
-    let handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
-    let handles_inner = Arc::clone(&handles);
+    task_set: Arc<Mutex<tokio::task::JoinSet<()>>>,
+) {
     tokio::spawn(async move {
         let mut rx = dispatcher.subscribe();
         loop {
@@ -420,15 +524,15 @@ fn spawn_worker(
                     let as_ = Arc::clone(&assayer);
                     let pt = Arc::clone(&price_table);
                     let vt = Arc::clone(&vault);
-                    let handle =
-                        tokio::spawn(run_turn(ig, dp, session_id, turn_id, g, pl, as_, pt, vt));
-                    handles_inner.lock().await.push(handle);
+                    let mut set = task_set.lock().await;
+                    set.spawn(run_turn(ig, dp, session_id, turn_id, g, pl, as_, pt, vt));
+                    // Reap finished tasks so the set tracks only in-flight work.
+                    while set.try_join_next().is_some() {}
                 }
                 // ignore non-Started events
             }
         }
     });
-    handles
 }
 
 /// Returns `true` only for publicly routable HTTP/HTTPS URLs.
@@ -473,6 +577,7 @@ fn build_router(
     startup_model: &'static str,
     price_table: &Arc<PriceTable>,
     vault: &Arc<Mutex<Vault>>,
+    task_set: &Arc<Mutex<tokio::task::JoinSet<()>>>,
 ) -> Router {
     let mut router = Router::new();
 
@@ -794,65 +899,25 @@ fn build_router(
     // or a 60-second deadline expires.  Returns a single response envelope so
     // callers do not need to poll task.get in a loop.
     let ig = ingot.clone();
+    let dispatcher_subscribe = Arc::clone(&dispatcher);
     router.register("turn.subscribe", move |params: Value| {
         let ig = ig.clone();
+        let dispatcher = Arc::clone(&dispatcher_subscribe);
         async move {
             let task_id = params
                 .get("task_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| missing_param("task_id"))?
                 .to_owned();
-
-            let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
-            loop {
-                let task = { ig.get_task(&task_id).await.map_err(|e| ingot_err(&e))? };
-                match task {
-                    None => {
-                        return Err(RpcError::new(
-                            codes::INTERNAL_ERROR,
-                            format!("task not found: {task_id}"),
-                        ))
-                    }
-                    Some(t) if t.status == "complete" => {
-                        // Best-effort: look up the latest token snapshot for
-                        // this task's session so the TUI can display counts.
-                        let (input_tok, output_tok) = if let Some(ref sid) = t.session_id {
-                            ig.session_token_snapshots(sid)
-                                .await
-                                .map_or((0i64, 0i64), |snaps| {
-                                    snaps
-                                        .last()
-                                        .map_or((0i64, 0i64), |s| (s.input_tok, s.output_tok))
-                                })
-                        } else {
-                            (0i64, 0i64)
-                        };
-                        return Ok(json!({
-                            "done": true,
-                            "response": t.response.unwrap_or_default(),
-                            "input_tok": input_tok,
-                            "output_tok": output_tok,
-                        }));
-                    }
-                    Some(t) if t.status == "failed" => {
-                        return Ok(json!({
-                            "done": true,
-                            "error": t.response.unwrap_or_else(|| "turn failed".into()),
-                        }));
-                    }
-                    Some(_) => {
-                        if std::time::Instant::now() >= deadline {
-                            return Err(RpcError::new(
-                                codes::TIMEOUT,
-                                "turn.subscribe timed out after 60s",
-                            ));
-                        }
-                        // TODO: replace polling with a per-turn tokio::sync::watch channel
-                        // so run_turn can signal completion without busy-wait overhead.
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                }
-            }
+            // Event-driven: resolve on the terminal TurnEvent for this turn,
+            // bounded by a 60s deadline. No fixed-interval polling.
+            await_turn_terminal(
+                &ig,
+                &dispatcher,
+                &task_id,
+                std::time::Duration::from_mins(1),
+            )
+            .await
         }
     });
 
@@ -2172,6 +2237,7 @@ fn build_router(
     let loop_run_assayer = Arc::clone(assayer);
     let loop_run_price = Arc::clone(price_table);
     let loop_run_vault = Arc::clone(&vault);
+    let loop_run_tasks = Arc::clone(task_set);
     router.register("loop.run", move |params: Value| {
         let ig = loop_run_ingot.clone();
         let dispatcher = Arc::clone(&loop_run_dispatcher);
@@ -2180,6 +2246,7 @@ fn build_router(
         let assayer = Arc::clone(&loop_run_assayer);
         let price_table = Arc::clone(&loop_run_price);
         let vault = Arc::clone(&loop_run_vault);
+        let task_set = Arc::clone(&loop_run_tasks);
         async move {
             let loop_id = params["loop_id"]
                 .as_str()
@@ -2214,22 +2281,20 @@ fn build_router(
             let change_name = rec.change_name.clone();
             let bg_loop_id = loop_id.clone();
 
-            // Spawn the engine-backed runner — caller gets an immediate response.
-            tokio::spawn(async move {
-                crate::loop_runner::run(
-                    ig,
-                    dispatcher,
-                    gates,
-                    pool,
-                    assayer,
-                    price_table,
-                    vault,
-                    bg_loop_id,
-                    change_name,
-                    workspace_root,
-                )
-                .await;
-            });
+            // Spawn the engine-backed runner into the shared task set so it is
+            // drained at shutdown; the caller gets an immediate response.
+            task_set.lock().await.spawn(crate::loop_runner::run(
+                ig,
+                dispatcher,
+                gates,
+                pool,
+                assayer,
+                price_table,
+                vault,
+                bg_loop_id,
+                change_name,
+                workspace_root,
+            ));
 
             Ok(json!({ "loop_id": loop_id, "status": "slicing" }))
         }
@@ -2439,6 +2504,11 @@ async fn main() -> anyhow::Result<()> {
 
     let vault = Arc::new(Mutex::new(open_vault()));
 
+    // Shared set tracking in-flight turn tasks and loop.run background tasks, so
+    // both are drained together at shutdown and completed tasks are reaped.
+    let task_set: Arc<Mutex<tokio::task::JoinSet<()>>> =
+        Arc::new(Mutex::new(tokio::task::JoinSet::new()));
+
     let router = build_router(
         &ingot,
         Arc::clone(&dispatcher),
@@ -2449,9 +2519,10 @@ async fn main() -> anyhow::Result<()> {
         startup_model,
         &price_table,
         &vault,
+        &task_set,
     );
 
-    let turn_handles = spawn_worker(
+    spawn_worker(
         ingot.clone(),
         Arc::clone(&dispatcher),
         Arc::clone(&gates),
@@ -2459,6 +2530,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&assayer),
         Arc::clone(&price_table),
         Arc::clone(&vault),
+        Arc::clone(&task_set),
     );
 
     // ACP HTTP server — activated by SMEDJA_ACP_PORT.
@@ -2562,21 +2634,20 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Drain any in-flight run_turn tasks before cleaning up, so that turns that
-    // are mid-stream can complete (or fail cleanly) rather than being silently
-    // abandoned.  A 30 s deadline prevents indefinite blocking on a stuck task.
+    // Drain in-flight turn tasks and loop.run background tasks before cleaning
+    // up, so mid-stream work can complete (or fail cleanly) rather than being
+    // silently abandoned. A 30 s deadline prevents indefinite blocking; tasks
+    // still running at the deadline are dropped (aborted) when the set is.
     {
-        let handles: Vec<tokio::task::JoinHandle<()>> =
-            std::mem::take(&mut *turn_handles.lock().await);
-        if !handles.is_empty() {
+        let mut set = std::mem::take(&mut *task_set.lock().await);
+        if !set.is_empty() {
             info!(
-                count = handles.len(),
-                "waiting for in-flight turns to finish (up to 30 s)"
+                count = set.len(),
+                "waiting for in-flight turns and loops to finish (up to 30 s)"
             );
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                futures_util::future::join_all(handles),
-            )
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while set.join_next().await.is_some() {}
+            })
             .await;
         }
     }
@@ -2593,6 +2664,155 @@ mod tests {
     use std::sync::Arc;
 
     use tokio::sync::Mutex;
+
+    // ── turn.subscribe event-driven wait ──────────────────────────────────────
+
+    use smedja_bellows::{Dispatcher, TurnEvent};
+    use smedja_ingot::{Ingot, IngotHandle, Task};
+
+    fn task(id: uuid::Uuid, status: &str, response: Option<&str>) -> Task {
+        Task {
+            id,
+            title: "t".to_owned(),
+            description: String::new(),
+            status: status.to_owned(),
+            created_at: 0.0,
+            session_id: None,
+            response: response.map(str::to_owned),
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_not_found_errors() {
+        let ig = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let dispatcher = Dispatcher::new(16);
+        let r = super::await_turn_terminal(
+            &ig,
+            &dispatcher,
+            "missing",
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        assert!(r.is_err());
+        assert!(r.unwrap_err().message.contains("task not found"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_already_complete_returns_envelope() {
+        let ig = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let dispatcher = Dispatcher::new(16);
+        let id = uuid::Uuid::new_v4();
+        ig.create_task(task(id, "complete", None)).await.unwrap();
+        let env = super::await_turn_terminal(
+            &ig,
+            &dispatcher,
+            &id.to_string(),
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+        assert_eq!(env["done"], true);
+        assert!(
+            env.get("response").is_some(),
+            "complete envelope carries a response field"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_already_failed_returns_error_envelope() {
+        let ig = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let dispatcher = Dispatcher::new(16);
+        let id = uuid::Uuid::new_v4();
+        ig.create_task(task(id, "failed", None)).await.unwrap();
+        let env = super::await_turn_terminal(
+            &ig,
+            &dispatcher,
+            &id.to_string(),
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+        assert_eq!(env["done"], true);
+        assert_eq!(env["error"], "turn failed");
+    }
+
+    #[tokio::test]
+    async fn subscribe_times_out_for_in_progress_with_no_event() {
+        let ig = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let dispatcher = Dispatcher::new(16);
+        let id = uuid::Uuid::new_v4();
+        ig.create_task(task(id, "planned", None)).await.unwrap();
+        let r = super::await_turn_terminal(
+            &ig,
+            &dispatcher,
+            &id.to_string(),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(r.is_err());
+        assert_eq!(r.unwrap_err().code, super::codes::TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn subscribe_resolves_on_completed_event() {
+        let ig = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let dispatcher = Arc::new(Dispatcher::new(16));
+        let id = uuid::Uuid::new_v4();
+        let id_str = id.to_string();
+        ig.create_task(task(id, "planned", None)).await.unwrap();
+
+        // After a short delay, mark complete and publish the terminal event.
+        let ig2 = ig.clone();
+        let id2 = id_str.clone();
+        let dispatcher2 = Arc::clone(&dispatcher);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            ig2.set_task_response(&id2, "done-now").await.unwrap();
+            dispatcher2.publish(TurnEvent::Completed {
+                session_id: "s".to_owned(),
+                turn_id: id2.clone(),
+                output_tokens: 0,
+                input_tokens: Some(0),
+                traceparent: None,
+                conversation_id: None,
+                trace_id: None,
+                span_id: None,
+                parent_span_id: None,
+                operation_name: None,
+                agent_name: None,
+                status: Some("ok".to_owned()),
+            });
+        });
+
+        let env = super::await_turn_terminal(
+            &ig,
+            &dispatcher,
+            &id_str,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(env["done"], true);
+        assert_eq!(env["response"], "done-now");
+    }
+
+    #[tokio::test]
+    async fn joinset_reaps_completed_tasks() {
+        // A JoinSet drains finished tasks via try_join_next, so it tracks only
+        // in-flight work rather than retaining every handle forever.
+        let mut set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        for _ in 0..5 {
+            set.spawn(async {});
+        }
+        // Let them finish.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let mut reaped = 0;
+        while set.try_join_next().is_some() {
+            reaped += 1;
+        }
+        assert_eq!(reaped, 5);
+        assert!(set.is_empty(), "set must be empty after reaping");
+    }
 
     #[test]
     fn read_only_role_blocks_write_tools() {

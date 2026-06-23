@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
+use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 
-use crate::{codec::Codec, router::Router, Response};
+use crate::codec::{read_frame, write_frame};
+use crate::{router::Router, Request, Response};
 
 /// Maximum number of concurrently-handled connections.
 ///
@@ -56,23 +58,104 @@ impl Server {
     }
 }
 
+/// Handles one connection: reads framed requests, dispatches each on its own
+/// task so a slow handler does not block siblings, and funnels every response
+/// through a single writer task so framing stays intact.
 async fn handle_connection(stream: UnixStream, router: Arc<Router>) {
-    let mut codec = Codec::new(stream);
-    loop {
-        let Ok(Some(req)) = codec.recv_request().await else {
-            break;
-        };
-        let is_notification = req.is_notification();
-        let id = req.id.clone();
-        let result = router.dispatch(&req.method, req.params).await;
-        if !is_notification {
-            let resp = match result {
-                Ok(v) => Response::ok(id, v),
-                Err(e) => Response::err(id, e),
+    let (read_half, write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // The single writer owns the write half; all responses are sent through it.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Response>(64);
+    let writer = tokio::spawn(async move {
+        let mut write_half = write_half;
+        while let Some(resp) = rx.recv().await {
+            let Ok(line) = serde_json::to_string(&resp) else {
+                continue;
             };
-            if codec.send_response(&resp).await.is_err() {
+            if write_frame(&mut write_half, &line).await.is_err() {
                 break;
             }
         }
+    });
+
+    loop {
+        // EOF, read error, or oversized frame: stop reading this connection.
+        let Ok(Some(frame)) = read_frame(&mut reader).await else {
+            break;
+        };
+        let Ok(req) = serde_json::from_str::<Request>(frame.trim_end()) else {
+            // Malformed frame — no reliable id to correlate an error to; skip it.
+            continue;
+        };
+        let is_notification = req.is_notification();
+        let id = req.id.clone();
+        let router = Arc::clone(&router);
+        let tx = tx.clone();
+        // Spawn the handler so a slow request never blocks sibling requests.
+        tokio::spawn(async move {
+            let result = router.dispatch(&req.method, req.params).await;
+            if !is_notification {
+                let resp = match result {
+                    Ok(v) => Response::ok(id, v),
+                    Err(e) => Response::err(id, e),
+                };
+                let _ = tx.send(resp).await;
+            }
+        });
+    }
+
+    // Close the channel so the writer task finishes once in-flight responses drain.
+    drop(tx);
+    let _ = writer.await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::Codec;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn slow_handler_does_not_block_fast_sibling() {
+        // A "slow" method sleeps; a "fast" method returns immediately. Sent on
+        // one connection slow-then-fast, the fast response must arrive first.
+        let mut router = Router::new();
+        router.register("slow", |_| async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            Ok(json!("slow-done"))
+        });
+        router.register("fast", |_| async { Ok(json!("fast-done")) });
+
+        let sock =
+            std::env::temp_dir().join(format!("smedja-rpc-slowfast-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        tokio::spawn(Server::new(router).serve(listener));
+
+        let client = UnixStream::connect(&sock).await.unwrap();
+        let mut codec = Codec::new(client);
+
+        // Fire slow (id 1) then fast (id 2) back-to-back.
+        codec
+            .send_request(&Request::new(1_i64, "slow", json!({})))
+            .await
+            .unwrap();
+        codec
+            .send_request(&Request::new(2_i64, "fast", json!({})))
+            .await
+            .unwrap();
+
+        // The first response received must be the fast one (id 2).
+        let first = codec.recv_response().await.unwrap().unwrap();
+        assert_eq!(
+            first.id,
+            Some(json!(2)),
+            "fast handler must respond before the slow one"
+        );
+        assert_eq!(first.result, Some(json!("fast-done")));
+
+        let second = codec.recv_response().await.unwrap().unwrap();
+        assert_eq!(second.id, Some(json!(1)));
     }
 }
