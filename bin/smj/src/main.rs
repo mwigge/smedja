@@ -489,7 +489,7 @@ fn xdg_config_dir() -> PathBuf {
 #[allow(clippy::too_many_lines)] // all CLI command arms live in one function per the spec
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    init_tracing();
     let cli = Cli::parse();
     let sock = cli.sock.unwrap_or_else(default_socket_path);
 
@@ -517,7 +517,8 @@ async fn main() -> Result<()> {
                     let _ = std::process::Command::new("kill")
                         .args(["-TERM", &pid])
                         .status();
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    wait_for_daemon_exit(&pid, &sock)
+                        .context("old smdjad did not shut down cleanly")?;
                 }
                 cmd_daemon_start()?;
                 println!("smdjad restarted");
@@ -1417,6 +1418,83 @@ async fn cmd_daemon_status(sock: &std::path::Path) -> Result<()> {
     }
 }
 
+/// Initialises tracing, honouring `SMEDJA_LOG_FORMAT`.
+///
+/// Accepts `text` (default) or `json`. Any unrecognised value falls back to
+/// `text` and logs a warning once the subscriber is installed.
+fn init_tracing() {
+    let raw = std::env::var("SMEDJA_LOG_FORMAT").unwrap_or_default();
+    let format = raw.trim().to_ascii_lowercase();
+    let unrecognised = !matches!(format.as_str(), "" | "text" | "json");
+
+    if format == "json" {
+        tracing_subscriber::fmt().json().init();
+    } else {
+        tracing_subscriber::fmt::init();
+    }
+
+    if unrecognised {
+        tracing::warn!(
+            value = %raw,
+            "unrecognised SMEDJA_LOG_FORMAT; falling back to 'text' (valid values: text, json)"
+        );
+    }
+}
+
+/// Returns `true` if a process with the given PID is still alive.
+///
+/// Uses `kill -0`, which sends no signal but reports whether the PID exists
+/// and is signal-able by the caller.
+fn process_alive(pid: &str) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", pid])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Polls until the old daemon has exited and released its socket path.
+///
+/// Bounded to roughly five seconds; returns an error if the process is still
+/// alive or the socket still exists after the deadline so the caller does not
+/// race a fresh daemon against the dying one.
+fn wait_for_daemon_exit(pid: &str, sock: &std::path::Path) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if !process_alive(pid) && !sock.exists() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "smdjad (pid {pid}) still running or socket {} still present after 5s",
+                sock.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Returns the path to the smdjad log file, creating its parent directory.
+///
+/// Resolves to `$XDG_STATE_HOME/smedja/smdjad.log`, falling back to
+/// `$HOME/.local/state/smedja/smdjad.log`.
+fn smdjad_log_path() -> PathBuf {
+    let state_home = std::env::var("XDG_STATE_HOME").map_or_else(
+        |_| {
+            std::env::var("HOME").map_or_else(
+                |_| PathBuf::from(".local/state"),
+                |h| PathBuf::from(h).join(".local/state"),
+            )
+        },
+        PathBuf::from,
+    );
+    let dir = state_home.join("smedja");
+    // Best-effort: if creation fails, File::create below surfaces the error.
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("smdjad.log")
+}
+
 fn cmd_daemon_start() -> Result<()> {
     // Locate smdjad relative to this binary.
     let exe = std::env::current_exe().context("cannot determine own path")?;
@@ -1426,14 +1504,26 @@ fn cmd_daemon_start() -> Result<()> {
         .filter(|p| p.exists())
         .unwrap_or_else(|| PathBuf::from("smdjad"));
 
+    // Redirect stdout/stderr to a log file so daemon output is not lost.
+    let log_path = smdjad_log_path();
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("cannot open log file {}", log_path.display()))?;
+    let stderr_file = log_file
+        .try_clone()
+        .context("cannot duplicate log file handle for stderr")?;
+
     std::process::Command::new(&smdjad)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log_file))
+        .stderr(std::process::Stdio::from(stderr_file))
         .spawn()
         .with_context(|| format!("failed to spawn {}", smdjad.display()))?;
 
     println!("smdjad started");
+    println!("logs: {}", log_path.display());
     Ok(())
 }
 

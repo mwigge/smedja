@@ -9,7 +9,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::IntoResponse;
-use axum::routing::{delete, post};
+use axum::routing::{delete, get, post};
 use axum::Json;
 use axum::Router;
 use serde::Deserialize;
@@ -40,7 +40,16 @@ pub fn build_acp_router(state: AcpState) -> Router {
             state.clone(),
             require_auth,
         ))
+        // /health is added after the auth layer so it is unauthenticated: a
+        // supervisor or load balancer probes readiness without a token. It is
+        // reachable only once the daemon is serving, so it returns 200.
+        .route("/health", get(health))
         .with_state(state)
+}
+
+/// Liveness/readiness probe: returns `200 OK` whenever the daemon is serving.
+async fn health() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
 }
 
 /// Rejects requests that do not carry a valid `Authorization: Bearer <token>` header.

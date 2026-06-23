@@ -1,10 +1,20 @@
 #!/bin/sh
 set -e
 
+# DECISION: smdjad runs as a systemd *user* service (smdjad.service is a
+# --user unit keyed on %h/%U/%t). dpkg postinst executes as root with no
+# target user, no per-user session bus, and no XDG_RUNTIME_DIR, so
+# `systemctl --user enable` cannot be run reliably here — there is no single
+# correct user to enable it for, and `--global` would force it on for every
+# account on the machine. We therefore DEFER enablement to the logged-in user
+# and print explicit, copy-pasteable guidance instead. This is intentional,
+# not a TODO.
+
 echo ""
 echo "smedja installed."
 echo ""
-echo "  To start the AI orchestration daemon automatically on login:"
+echo "  smdjad runs as a systemd --user service. Enable it for your account"
+echo "  (run as your normal user, NOT as root) to start it now and on login:"
 echo ""
 echo "    systemctl --user enable --now smdjad"
 echo ""
@@ -12,3 +22,5 @@ echo "  Then launch the terminal:"
 echo ""
 echo "    smedja"
 echo ""
+
+exit 0

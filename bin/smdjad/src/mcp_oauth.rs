@@ -34,6 +34,8 @@ pub enum PkceError {
     Storage(String),
     /// Flow cancelled or timed out.
     Cancelled,
+    /// The PKCE flow has not yet been implemented.
+    NotImplemented,
 }
 
 impl std::fmt::Display for PkceError {
@@ -42,9 +44,12 @@ impl std::fmt::Display for PkceError {
             Self::Http(e) => write!(f, "HTTP error: {e}"),
             Self::Storage(e) => write!(f, "storage error: {e}"),
             Self::Cancelled => write!(f, "OAuth flow cancelled"),
+            Self::NotImplemented => write!(f, "MCP OAuth PKCE is not yet implemented"),
         }
     }
 }
+
+impl std::error::Error for PkceError {}
 
 /// Starts an OAuth 2.0 Authorization Code + PKCE flow for `server_url`.
 ///
@@ -69,7 +74,7 @@ pub async fn start_pkce(server_url: &str) -> Result<Token, PkceError> {
         server_url,
         "PKCE flow not yet implemented; set MCP_TOKEN env var for static auth"
     );
-    Err(PkceError::Cancelled)
+    Err(PkceError::NotImplemented)
 }
 
 /// Persistent token store using the XDG config directory.
@@ -199,9 +204,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_pkce_returns_cancelled() {
+    async fn start_pkce_returns_not_implemented() {
         let result = start_pkce("https://mcp.example.com").await;
-        assert!(matches!(result, Err(PkceError::Cancelled)));
+        assert!(matches!(result, Err(PkceError::NotImplemented)));
+    }
+
+    #[test]
+    #[ignore = "MCP OAuth flow not yet implemented"]
+    fn token_store_round_trips_access_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TokenStore::new(tmp.path().to_path_buf());
+        let token = Token {
+            access_token: "round-trip-token".into(),
+            token_type: "Bearer".into(),
+            refresh_token: Some("refresh".into()),
+            expires_in: Some(3600),
+        };
+        store.save("https://mcp.example.com", &token).unwrap();
+        let loaded = store
+            .load("https://mcp.example.com")
+            .unwrap()
+            .expect("token should be present after save");
+        assert_eq!(loaded.access_token, "round-trip-token");
     }
 
     #[test]

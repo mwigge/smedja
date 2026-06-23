@@ -568,6 +568,25 @@ impl TurnOrchestrator {
         let mut total_input_tokens = 0u32;
         let mut total_output_tokens = 0u32;
 
+        // Correlation for streamed events: carry the turn span's trace/span ids
+        // so deltas and tool events are linkable to the turn, not just Started.
+        let turn_correlation = {
+            let sc = turn_span.span_context();
+            if sc.is_valid() {
+                CorrelationCtx {
+                    trace_id: Some(sc.trace_id().to_string()),
+                    span_id: Some(sc.span_id().to_string()),
+                    conversation_id: Some(session_id.clone()),
+                    ..CorrelationCtx::default()
+                }
+            } else {
+                CorrelationCtx {
+                    conversation_id: Some(session_id.clone()),
+                    ..CorrelationCtx::default()
+                }
+            }
+        };
+
         'tool_loop: for _iteration in 0..crate::effective_max_tool_turns() {
             // 5a. Stream LLM response with rate-limit retry.
             let (response_text, input_tokens, output_tokens, native_session_id) = {
@@ -585,7 +604,12 @@ impl TurnOrchestrator {
                     let stream = provider.stream_chat(&prompt, &opts);
                     let drain_result = tokio::time::timeout(
                         std::time::Duration::from_mins(5),
-                        crate::drain_stream(stream, dispatcher, Some(turn_id.as_str())),
+                        crate::drain_stream(
+                            stream,
+                            dispatcher,
+                            Some(turn_id.as_str()),
+                            &turn_correlation,
+                        ),
                     )
                     .await;
                     match drain_result {
