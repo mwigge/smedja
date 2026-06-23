@@ -627,6 +627,8 @@ pub struct Renderer {
     pub size: winit::dpi::PhysicalSize<u32>,
     /// Status bar segments to overlay at the bottom of the window.
     status_bar_segments: Vec<Segment>,
+    /// Top bar segments to overlay at the top of the window.
+    top_bar_segments: Vec<Segment>,
     /// Device pixel ratio for this window (1.0 on non-HiDPI, 2.0 on 2× displays).
     pub scale_factor: f64,
 }
@@ -993,6 +995,7 @@ impl Renderer {
             background,
             size,
             status_bar_segments: Vec::new(),
+            top_bar_segments: Vec::new(),
             scale_factor,
         })
     }
@@ -1107,25 +1110,49 @@ impl Renderer {
         self.status_bar_segments = segments.to_vec();
     }
 
+    /// Updates the segments displayed in the top bar strip.
+    ///
+    /// Segments are laid out left-to-right separated by a single space.  Call
+    /// this before [`Self::render`] each frame.
+    pub fn set_top_bar_segments(&mut self, segments: &[Segment]) {
+        self.top_bar_segments = segments.to_vec();
+    }
+
     /// Returns the physical pixel height reserved for the status bar.
     ///
-    /// Scale factor is applied so the strip is the same logical size on HiDPI
-    /// displays, matching the formula used in the terminal binary when sizing
-    /// the PTY grid.
+    /// Scale factor is applied so the strip is the same logical size on
+    /// high-DPI displays, matching the formula used in the terminal binary when
+    /// sizing the PTY grid.
     #[must_use]
     pub fn status_bar_height_px(&self) -> u32 {
         let eff = (self.config.font.size * self.scale_factor as f32) as u32;
         eff.min(36)
     }
 
+    /// Returns the height of the top bar strip in pixels.
+    ///
+    /// The top bar uses the same cell metrics as the status bar so both strips
+    /// have consistent appearance.
+    #[must_use]
+    pub fn top_bar_height_px(&self) -> u32 {
+        if self.top_bar_segments.is_empty() {
+            0
+        } else {
+            self.status_bar_height_px()
+        }
+    }
+
     /// Returns the height of the usable grid area in pixels (window height
-    /// minus the status bar strip).
+    /// minus the status bar strip and top bar strip).
     ///
     /// Pass this value to PTY resize calculations so the terminal grid never
-    /// draws into the status bar row.
+    /// draws into the status bar or top bar rows.
     #[must_use]
     pub fn grid_height_px(&self) -> u32 {
-        self.size.height.saturating_sub(self.status_bar_height_px())
+        self.size
+            .height
+            .saturating_sub(self.status_bar_height_px())
+            .saturating_sub(self.top_bar_height_px())
     }
 
     /// Uploads `pixels` (RGBA8, row-major) as the terminal background image.
@@ -1283,8 +1310,9 @@ impl Renderer {
     fn cell_to_ndc(&self, col: u16, row: u16, cell_w: f32, cell_h: f32) -> (f32, f32, f32, f32) {
         let pw = self.size.width as f32;
         let ph = self.size.height as f32;
+        let top_off = self.top_bar_height_px() as f32;
         let x0 = (f32::from(col) * cell_w) / pw * 2.0 - 1.0;
-        let y0 = 1.0 - (f32::from(row) * cell_h) / ph * 2.0;
+        let y0 = 1.0 - (f32::from(row) * cell_h + top_off) / ph * 2.0;
         let x1 = x0 + cell_w / pw * 2.0;
         let y1 = y0 - cell_h / ph * 2.0;
         (x0, y0, x1, y1)
@@ -1468,6 +1496,42 @@ impl Renderer {
             ]);
         }
 
+        // ── Top bar background strip ──────────────────────────────────────────
+        {
+            let tb_h = self.top_bar_height_px() as f32;
+            if tb_h > 0.0 {
+                let pw = self.size.width as f32;
+                let tb_bg: [f32; 4] = [0.05, 0.05, 0.08, 1.0];
+                let (x0, y0, x1, y1) = self.px_to_ndc(0.0, 0.0, pw, tb_h);
+                verts.extend_from_slice(&[
+                    BgVertex {
+                        position: [x0, y0],
+                        color: tb_bg,
+                    },
+                    BgVertex {
+                        position: [x1, y0],
+                        color: tb_bg,
+                    },
+                    BgVertex {
+                        position: [x0, y1],
+                        color: tb_bg,
+                    },
+                    BgVertex {
+                        position: [x1, y0],
+                        color: tb_bg,
+                    },
+                    BgVertex {
+                        position: [x1, y1],
+                        color: tb_bg,
+                    },
+                    BgVertex {
+                        position: [x0, y1],
+                        color: tb_bg,
+                    },
+                ]);
+            }
+        }
+
         verts
     }
 
@@ -1506,7 +1570,8 @@ impl Renderer {
             let u1 = (entry.x + entry.w) as f32 / atlas_size_f;
             let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
 
-            let baseline_y = f32::from(cell.row) * ch + ch * (2.0 / 3.0);
+            let top_off = self.top_bar_height_px() as f32;
+            let baseline_y = f32::from(cell.row) * ch + ch * (2.0 / 3.0) + top_off;
             let glyph_top = baseline_y - entry.bearing_y as f32;
             let glyph_left = f32::from(cell.col) * cw + (cw - entry.w as f32) / 2.0;
             let (x0, y0, x1, y1) = self.px_to_ndc(
@@ -1649,6 +1714,101 @@ impl Renderer {
             }
             if col_px >= pw {
                 break;
+            }
+        }
+
+        // ── Top bar glyphs ────────────────────────────────────────────────────
+        {
+            let tb_h = self.top_bar_height_px() as f32;
+            if tb_h > 0.0 {
+                let pw = self.size.width as f32;
+                let tb_cw = 7.2_f32;
+                let mut tb_col_px = 4.0_f32;
+
+                for (seg_idx, seg) in self.top_bar_segments.iter().enumerate() {
+                    if seg_idx > 0 {
+                        tb_col_px += tb_cw;
+                    }
+                    let fg_color: [f32; 4] =
+                        seg.style.fg.as_ref().map_or([0.957, 0.843, 0.631, 1.0], |c| {
+                            [
+                                f32::from(c.r) / 255.0,
+                                f32::from(c.g) / 255.0,
+                                f32::from(c.b) / 255.0,
+                                1.0,
+                            ]
+                        });
+
+                    for ch in seg.text.chars() {
+                        if ch == ' ' {
+                            tb_col_px += tb_cw;
+                            continue;
+                        }
+                        let Some(&entry) =
+                            self.atlas.glyphs.get(&(ch, false, false, sb_font_key))
+                        else {
+                            tracing::warn!(ch = %ch, "glyph atlas miss — top-bar cell skipped");
+                            tb_col_px += tb_cw;
+                            continue;
+                        };
+                        let u0 = entry.x as f32 / atlas_size_f;
+                        let v0 = entry.y as f32 / atlas_size_f;
+                        let u1 = (entry.x + entry.w) as f32 / atlas_size_f;
+                        let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
+
+                        let glyph_w = entry.w as f32;
+                        let glyph_h = entry.h as f32;
+                        let glyph_left = tb_col_px + (tb_cw - glyph_w) / 2.0;
+                        let baseline = tb_h * (2.0 / 3.0);
+                        let glyph_top = baseline - entry.bearing_y as f32;
+                        let (x0, y0, x1, y1) = self.px_to_ndc(
+                            glyph_left,
+                            glyph_top,
+                            glyph_left + glyph_w,
+                            glyph_top + glyph_h,
+                        );
+                        let c = fg_color;
+                        verts.extend_from_slice(&[
+                            GlyphVertex {
+                                position: [x0, y0],
+                                tex_coords: [u0, v0],
+                                color: c,
+                            },
+                            GlyphVertex {
+                                position: [x1, y0],
+                                tex_coords: [u1, v0],
+                                color: c,
+                            },
+                            GlyphVertex {
+                                position: [x0, y1],
+                                tex_coords: [u0, v1],
+                                color: c,
+                            },
+                            GlyphVertex {
+                                position: [x1, y0],
+                                tex_coords: [u1, v0],
+                                color: c,
+                            },
+                            GlyphVertex {
+                                position: [x1, y1],
+                                tex_coords: [u1, v1],
+                                color: c,
+                            },
+                            GlyphVertex {
+                                position: [x0, y1],
+                                tex_coords: [u0, v1],
+                                color: c,
+                            },
+                        ]);
+                        tb_col_px += tb_cw;
+                        if tb_col_px >= pw {
+                            break;
+                        }
+                    }
+                    if tb_col_px >= pw {
+                        break;
+                    }
+                }
             }
         }
 
