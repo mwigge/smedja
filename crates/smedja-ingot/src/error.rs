@@ -12,4 +12,9 @@ pub enum IngotError {
     /// The schema version table contains an unexpected value.
     #[error("schema version mismatch: expected {expected}, found {found}")]
     SchemaMismatch { expected: i64, found: i64 },
+
+    /// A blocking database task panicked (e.g. inside `spawn_blocking`) or the
+    /// shared connection lock was poisoned by a prior panic.
+    #[error("database task panicked: {0}")]
+    TaskPanic(String),
 }

@@ -14,6 +14,7 @@ use smedja_assayer::Assayer;
 use smedja_bellows::Dispatcher;
 use smedja_ingot::{IngotHandle, Session, Task};
 use smedja_loop::{LoopConfig, LoopRole, LoopState, RoleRunner, StatusSink};
+use smedja_types::Timestamp;
 use smedja_vault::Vault;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -34,7 +35,7 @@ impl StatusSink for LoopStatusSink {
     async fn set_status(&self, state: &LoopState) {
         if let Err(e) = self
             .ingot
-            .update_loop_status(&self.loop_id, state.as_str(), crate::now_epoch())
+            .update_loop_status(&self.loop_id, state.as_str(), Timestamp::now())
             .await
         {
             warn!(loop_id = %self.loop_id, error = %e, "failed to persist loop status");
@@ -44,7 +45,7 @@ impl StatusSink for LoopStatusSink {
     async fn set_slice(&self, slice: i64) {
         if let Err(e) = self
             .ingot
-            .update_loop_slice(&self.loop_id, slice, crate::now_epoch())
+            .update_loop_slice(&self.loop_id, slice, Timestamp::now())
             .await
         {
             warn!(loop_id = %self.loop_id, error = %e, "failed to persist loop slice");
@@ -72,7 +73,7 @@ impl RoleRunner for LoopRoleRunner {
         _slice_index: usize,
         slice: &str,
     ) -> anyhow::Result<()> {
-        let now = crate::now_epoch();
+        let now = Timestamp::now();
         let session_id = Uuid::new_v4();
 
         // The role's configured runner becomes the session runner override so the
@@ -198,7 +199,7 @@ pub(crate) async fn run(
                 "loop.run: .smedja/loop.json missing or invalid; marking loop failed",
             );
             let _ = ingot
-                .update_loop_status(&loop_id, LoopState::Failed.as_str(), crate::now_epoch())
+                .update_loop_status(&loop_id, LoopState::Failed.as_str(), Timestamp::now())
                 .await;
             return;
         }
@@ -271,8 +272,8 @@ mod tests {
                 status: "planning".to_owned(),
                 current_slice: 0,
                 attempt: 1,
-                created_at: 1_000.0,
-                updated_at: 1_000.0,
+                created_at: Timestamp::from_secs_f64(1_000.0),
+                updated_at: Timestamp::from_secs_f64(1_000.0),
             })
             .await
             .unwrap();

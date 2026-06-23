@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::dispatcher::Dispatcher;
-use crate::event::TurnEvent;
+use crate::event::{CorrelationCtx, TurnEvent};
 use opentelemetry::trace::TraceContextExt as _;
 
 /// Extracts `(trace_id, span_id)` strings from the currently active `OTel` span.
@@ -41,6 +41,16 @@ pub struct TurnHandle {
 }
 
 impl TurnHandle {
+    /// Builds a [`CorrelationCtx`] carrying this handle's captured trace and
+    /// span identifiers, leaving the remaining fields at their `None` default.
+    fn correlation(&self) -> CorrelationCtx {
+        CorrelationCtx {
+            trace_id: self.trace_id.clone(),
+            span_id: self.span_id.clone(),
+            ..CorrelationCtx::default()
+        }
+    }
+
     /// Creates a new handle and immediately publishes [`TurnEvent::Started`].
     ///
     /// `session_id` and `turn_id` together uniquely identify the turn across
@@ -59,13 +69,11 @@ impl TurnHandle {
         dispatcher.publish(TurnEvent::Started {
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
-            conversation_id: None,
-            trace_id: trace_id.clone(),
-            span_id: span_id.clone(),
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx {
+                trace_id: trace_id.clone(),
+                span_id: span_id.clone(),
+                ..CorrelationCtx::default()
+            },
         });
 
         Self {
@@ -98,13 +106,7 @@ impl TurnHandle {
             tool_name: tool_name.into(),
             input_summary: input_summary.into(),
             turn_id: Some(self.turn_id.clone()),
-            conversation_id: None,
-            trace_id: self.trace_id.clone(),
-            span_id: self.span_id.clone(),
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: self.correlation(),
             tool_call_id,
         });
     }
@@ -117,13 +119,7 @@ impl TurnHandle {
         self.dispatcher.publish(TurnEvent::AssistantDelta {
             content: content.into(),
             turn_id: Some(self.turn_id.clone()),
-            conversation_id: None,
-            trace_id: self.trace_id.clone(),
-            span_id: self.span_id.clone(),
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: self.correlation(),
         });
     }
 
@@ -137,13 +133,11 @@ impl TurnHandle {
             output_tokens,
             input_tokens: None,
             traceparent: None,
-            conversation_id: None,
-            trace_id: self.trace_id,
-            span_id: self.span_id,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx {
+                trace_id: self.trace_id,
+                span_id: self.span_id,
+                ..CorrelationCtx::default()
+            },
         });
     }
 
@@ -155,13 +149,11 @@ impl TurnHandle {
             session_id: self.session_id,
             turn_id: self.turn_id,
             reason: reason.into(),
-            conversation_id: None,
-            trace_id: self.trace_id,
-            span_id: self.span_id,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx {
+                trace_id: self.trace_id,
+                span_id: self.span_id,
+                ..CorrelationCtx::default()
+            },
         });
     }
 }

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::types::Role;
+use crate::types::AgentRole;
 use crate::{Route, RoutingRule, Runner, Tier};
 
 #[derive(Debug, Deserialize)]
@@ -69,13 +69,13 @@ pub fn load_rules(workspace_dir: &Path) -> Result<Vec<RoutingRule>, String> {
     Ok(rules)
 }
 
-fn parse_role(s: &str) -> Option<Role> {
+fn parse_role(s: &str) -> Option<AgentRole> {
     match s {
-        "impl" => Some(Role::Impl),
-        "test" => Some(Role::Test),
-        "review" => Some(Role::Review),
-        "sre" => Some(Role::Sre),
-        "orchestrator" => Some(Role::Orchestrator),
+        "impl" => Some(AgentRole::Impl),
+        "test" => Some(AgentRole::Test),
+        "review" => Some(AgentRole::Review),
+        "sre" => Some(AgentRole::Sre),
+        "orchestrator" => Some(AgentRole::Orchestrator),
         _ => None,
     }
 }
@@ -128,7 +128,7 @@ mod tests {
         assert_eq!(rules.len(), 1);
         let mut default = Assayer::default_rules();
         default.prepend_rules(rules);
-        let route = default.route(Role::Review, Complexity::Coding);
+        let route = default.route(AgentRole::Review, Complexity::Coding);
         assert_eq!(route.tier, Tier::Deep);
         assert_eq!(route.runner, Runner::Claude);
     }
@@ -144,7 +144,7 @@ mod tests {
         let rules = load_rules(dir.path()).unwrap();
         let mut default = Assayer::default_rules();
         default.prepend_rules(rules);
-        let route = default.route(Role::Impl, Complexity::Simple);
+        let route = default.route(AgentRole::Impl, Complexity::Simple);
         assert_eq!(route.runner, Runner::Local);
     }
 
@@ -155,7 +155,7 @@ mod tests {
         let rules = load_rules(dir.path()).unwrap();
         let mut default = Assayer::default_rules();
         default.prepend_rules(rules);
-        let route = default.route(Role::Review, Complexity::Coding);
+        let route = default.route(AgentRole::Review, Complexity::Coding);
         // Default: Review → Claude/Deep
         assert_eq!(route.runner, Runner::Claude);
         assert_eq!(route.tier, Tier::Deep);
@@ -172,7 +172,7 @@ mod tests {
         let rules = load_rules(dir.path()).unwrap();
         let mut default = Assayer::default_rules();
         default.prepend_rules(rules);
-        let route = default.route(Role::Impl, Complexity::Simple);
+        let route = default.route(AgentRole::Impl, Complexity::Simple);
         assert_eq!(route.model.as_deref(), Some("gemma-3-27b"));
     }
 

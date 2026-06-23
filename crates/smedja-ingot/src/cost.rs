@@ -1,5 +1,6 @@
 use rusqlite::OptionalExtension as _;
 use serde::{Deserialize, Serialize};
+use smedja_types::{Microdollars, Timestamp};
 use uuid::Uuid;
 
 use crate::error::IngotError;
@@ -17,8 +18,8 @@ pub struct CostRow {
     pub input_tok: i64,
     /// Total output tokens across all turns.
     pub output_tok: i64,
-    /// Total monetary cost in USD.
-    pub cost_usd: f64,
+    /// Total monetary cost (microdollars; exact integer total).
+    pub cost_usd: Microdollars,
 }
 
 /// A per-turn token cost record.
@@ -38,10 +39,10 @@ pub struct CostEntry {
     pub input_tok: i64,
     /// Output token count.
     pub output_tok: i64,
-    /// Monetary cost in USD.
-    pub cost_usd: f64,
-    /// Unix epoch timestamp when the entry was recorded.
-    pub created_at: f64,
+    /// Monetary cost (microdollars).
+    pub cost_usd: Microdollars,
+    /// Timestamp when the entry was recorded (micros since the Unix epoch).
+    pub created_at: Timestamp,
 }
 
 /// Inserts a new [`CostEntry`] row.
@@ -62,16 +63,17 @@ pub(crate) fn insert(conn: &rusqlite::Connection, entry: &CostEntry) -> Result<(
             entry.model,
             entry.input_tok,
             entry.output_tok,
-            entry.cost_usd,
-            entry.created_at,
+            entry.cost_usd.as_micros(),
+            entry.created_at.as_micros(),
         ],
     )?;
     Ok(())
 }
 
-/// Returns the sum of `cost_usd` for all entries belonging to `session_id`.
+/// Returns the exact integer sum of `cost_usd` (microdollars) for all entries
+/// belonging to `session_id`.
 ///
-/// Returns `0.0` when no entries exist for the session.
+/// Returns `Microdollars::from_micros(0)` when no entries exist for the session.
 ///
 /// # Errors
 ///
@@ -79,13 +81,13 @@ pub(crate) fn insert(conn: &rusqlite::Connection, entry: &CostEntry) -> Result<(
 pub(crate) fn session_total(
     conn: &rusqlite::Connection,
     session_id: &str,
-) -> Result<f64, IngotError> {
-    let total: f64 = conn.query_row(
-        "SELECT COALESCE(SUM(cost_usd), 0.0) FROM cost_ledger WHERE session_id = ?1",
+) -> Result<Microdollars, IngotError> {
+    let total = conn.query_row(
+        "SELECT COALESCE(SUM(cost_usd), 0) FROM cost_ledger WHERE session_id = ?1",
         rusqlite::params![session_id],
-        |row| row.get(0),
+        |row| crate::read_micros(row, 0),
     )?;
-    Ok(total)
+    Ok(Microdollars::from_micros(total))
 }
 
 /// Returns the model name from the most recent cost entry for `session_id`.
@@ -134,7 +136,7 @@ pub(crate) fn session_cost_entries(
                 turns: row.get(2)?,
                 input_tok: row.get(3)?,
                 output_tok: row.get(4)?,
-                cost_usd: row.get(5)?,
+                cost_usd: Microdollars::from_micros(crate::read_micros(row, 5)?),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -155,45 +157,43 @@ mod tests {
             model: "claude-sonnet-4-6".to_string(),
             input_tok: 200,
             output_tok: 100,
-            cost_usd,
-            created_at: 1_700_000_000.0,
+            cost_usd: Microdollars::from_usd_f64(cost_usd),
+            created_at: Timestamp::from_secs_f64(1_700_000_000.0),
         }
     }
 
     #[test]
-    fn insert_then_session_cost_returns_sum() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+    fn insert_then_session_cost_returns_exact_micro_total() {
+        let ingot = Ingot::open_in_memory().unwrap();
         ingot.insert_cost(&make_entry("s1", 0.001, 0)).unwrap();
         ingot.insert_cost(&make_entry("s1", 0.002, 1)).unwrap();
         ingot.insert_cost(&make_entry("s1", 0.003, 2)).unwrap();
 
         let total = ingot.session_cost("s1").unwrap();
-        assert!(
-            (total - 0.006_f64).abs() < 1e-9,
-            "expected 0.006, got {total}"
-        );
+        // 1000 + 2000 + 3000 microdollars, exact.
+        assert_eq!(total, Microdollars::from_micros(6_000));
     }
 
     #[test]
     fn session_cost_with_no_entries_returns_zero() {
         let ingot = Ingot::open_in_memory().unwrap();
         let total = ingot.session_cost("no-session").unwrap();
-        assert!(total.abs() < f64::EPSILON);
+        assert_eq!(total, Microdollars::from_micros(0));
     }
 
     #[test]
     fn session_cost_scoped_to_session() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         ingot.insert_cost(&make_entry("s1", 0.010, 0)).unwrap();
         ingot.insert_cost(&make_entry("s2", 0.100, 0)).unwrap();
 
         let total_s1 = ingot.session_cost("s1").unwrap();
-        assert!((total_s1 - 0.010_f64).abs() < 1e-9);
+        assert_eq!(total_s1, Microdollars::from_micros(10_000));
     }
 
     #[test]
     fn insert_cost_round_trips_all_fields() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let entry = CostEntry {
             id: Uuid::new_v4(),
             session_id: "s-rt".to_string(),
@@ -202,12 +202,12 @@ mod tests {
             model: "gemini-2.5-pro".to_string(),
             input_tok: 500,
             output_tok: 250,
-            cost_usd: 0.042,
-            created_at: 1_720_000_000.0,
+            cost_usd: Microdollars::from_usd_f64(0.042),
+            created_at: Timestamp::from_secs_f64(1_720_000_000.0),
         };
         ingot.insert_cost(&entry).unwrap();
         let total = ingot.session_cost("s-rt").unwrap();
-        assert!((total - 0.042_f64).abs() < 1e-9);
+        assert_eq!(total, Microdollars::from_micros(42_000));
     }
 
     fn make_entry_with(
@@ -225,8 +225,8 @@ mod tests {
             model: model.to_string(),
             input_tok: 200,
             output_tok: 100,
-            cost_usd,
-            created_at: 1_700_000_000.0,
+            cost_usd: Microdollars::from_usd_f64(cost_usd),
+            created_at: Timestamp::from_secs_f64(1_700_000_000.0),
         }
     }
 
@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn session_cost_entries_single_model_aggregates() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         ingot
             .insert_cost(&make_entry_with(
                 "s1",
@@ -261,16 +261,13 @@ mod tests {
         let rows = ingot.session_cost_entries("s1").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].turns, 2);
-        assert!(
-            (rows[0].cost_usd - 0.030_f64).abs() < 1e-9,
-            "expected 0.030; got {}",
-            rows[0].cost_usd
-        );
+        // 10_000 + 20_000 microdollars, exact.
+        assert_eq!(rows[0].cost_usd, Microdollars::from_micros(30_000));
     }
 
     #[test]
     fn session_cost_entries_multiple_models_sorted_descending() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         ingot
             .insert_cost(&make_entry_with("s2", "gpt-4o-mini", "codex-cli", 0.001, 0))
             .unwrap();
@@ -293,7 +290,7 @@ mod tests {
 
     #[test]
     fn session_cost_entries_scoped_to_session() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         ingot
             .insert_cost(&make_entry_with("s3", "gpt-4o", "openai", 0.050, 0))
             .unwrap();
@@ -302,6 +299,6 @@ mod tests {
             .unwrap();
         let rows = ingot.session_cost_entries("s3").unwrap();
         assert_eq!(rows.len(), 1);
-        assert!((rows[0].cost_usd - 0.050_f64).abs() < 1e-9);
+        assert_eq!(rows[0].cost_usd, Microdollars::from_micros(50_000));
     }
 }

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use smedja_types::Timestamp;
 use uuid::Uuid;
 
 use crate::error::IngotError;
@@ -8,10 +9,10 @@ use crate::error::IngotError;
 pub struct Session {
     /// Unique session identifier (UUID v4 stored as TEXT).
     pub id: Uuid,
-    /// Unix epoch timestamp when the session was created.
-    pub created_at: f64,
-    /// Unix epoch timestamp of the last status change.
-    pub updated_at: f64,
+    /// Timestamp when the session was created (micros since the Unix epoch).
+    pub created_at: Timestamp,
+    /// Timestamp of the last status change (micros since the Unix epoch).
+    pub updated_at: Timestamp,
     /// Lifecycle status: `"active"`, `"complete"`, or `"failed"`.
     pub status: String,
     /// Optional associated task identifier.
@@ -45,8 +46,8 @@ pub(crate) fn create(conn: &rusqlite::Connection, session: &Session) -> Result<(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         rusqlite::params![
             session.id.to_string(),
-            session.created_at,
-            session.updated_at,
+            session.created_at.as_micros(),
+            session.updated_at.as_micros(),
             session.status,
             session.task_id,
             session.mode,
@@ -82,8 +83,8 @@ pub(crate) fn get(conn: &rusqlite::Connection, id: &str) -> Result<Option<Sessio
             let cowork_raw: i64 = row.get(7).unwrap_or(0);
             Ok(Session {
                 id,
-                created_at: row.get(1)?,
-                updated_at: row.get(2)?,
+                created_at: Timestamp::from_micros(crate::read_micros(row, 1)?),
+                updated_at: Timestamp::from_micros(crate::read_micros(row, 2)?),
                 status: row.get(3)?,
                 task_id: row.get(4)?,
                 mode: row.get(5)?,
@@ -121,8 +122,8 @@ pub(crate) fn list(conn: &rusqlite::Connection) -> Result<Vec<Session>, IngotErr
         let cowork_raw: i64 = row.get(7).unwrap_or(0);
         Ok(Session {
             id,
-            created_at: row.get(1)?,
-            updated_at: row.get(2)?,
+            created_at: Timestamp::from_micros(crate::read_micros(row, 1)?),
+            updated_at: Timestamp::from_micros(crate::read_micros(row, 2)?),
             status: row.get(3)?,
             task_id: row.get(4)?,
             mode: row.get(5)?,
@@ -158,11 +159,11 @@ pub(crate) fn update_status(
     conn: &rusqlite::Connection,
     id: &str,
     status: &str,
-    updated_at: f64,
+    updated_at: Timestamp,
 ) -> Result<(), IngotError> {
     conn.execute(
         "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE id = ?3",
-        rusqlite::params![status, updated_at, id],
+        rusqlite::params![status, updated_at.as_micros(), id],
     )?;
     Ok(())
 }
@@ -212,8 +213,8 @@ pub(crate) fn update_cowork_mode(
     enabled: bool,
 ) -> Result<(), IngotError> {
     conn.execute(
-        "UPDATE sessions SET cowork_mode = ?1 WHERE id = ?2",
-        rusqlite::params![i64::from(enabled), id],
+        "UPDATE sessions SET cowork_mode = ?1, updated_at = ?2 WHERE id = ?3",
+        rusqlite::params![i64::from(enabled), Timestamp::now().as_micros(), id],
     )?;
     Ok(())
 }
@@ -247,7 +248,7 @@ pub(crate) fn update_model_override(
 ) -> Result<(), rusqlite::Error> {
     conn.execute(
         "UPDATE sessions SET model_override = ?1, updated_at = ?2 WHERE id = ?3",
-        rusqlite::params![model, crate::now_epoch(), id],
+        rusqlite::params![model, Timestamp::now().as_micros(), id],
     )?;
     Ok(())
 }
@@ -266,7 +267,7 @@ pub(crate) fn update_runner_override(
 ) -> Result<(), rusqlite::Error> {
     conn.execute(
         "UPDATE sessions SET runner_override = ?1, updated_at = ?2 WHERE id = ?3",
-        rusqlite::params![runner, crate::now_epoch(), id],
+        rusqlite::params![runner, Timestamp::now().as_micros(), id],
     )?;
     Ok(())
 }
@@ -279,8 +280,8 @@ mod tests {
     fn sample_session() -> Session {
         Session {
             id: Uuid::new_v4(),
-            created_at: 1_700_000_000.0,
-            updated_at: 1_700_000_000.0,
+            created_at: Timestamp::from_secs_f64(1_700_000_000.0),
+            updated_at: Timestamp::from_secs_f64(1_700_000_000.0),
             status: "active".to_string(),
             task_id: None,
             mode: Some("tdd".to_string()),
@@ -294,7 +295,7 @@ mod tests {
 
     #[test]
     fn create_then_get_returns_session() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let s = sample_session();
         ingot.create_session(&s).unwrap();
 
@@ -315,7 +316,7 @@ mod tests {
 
     #[test]
     fn update_session_status_changes_status() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let s = sample_session();
         ingot.create_session(&s).unwrap();
 
@@ -329,7 +330,7 @@ mod tests {
 
     #[test]
     fn update_status_changes_updated_at() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let s = sample_session();
         ingot.create_session(&s).unwrap();
 
@@ -344,11 +345,11 @@ mod tests {
 
     #[test]
     fn nullable_task_id_and_mode_round_trip() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let s = Session {
             id: Uuid::new_v4(),
-            created_at: 1_700_000_002.0,
-            updated_at: 1_700_000_002.0,
+            created_at: Timestamp::from_secs_f64(1_700_000_002.0),
+            updated_at: Timestamp::from_secs_f64(1_700_000_002.0),
             status: "active".to_string(),
             task_id: Some("task-xyz".to_string()),
             mode: None,
@@ -367,7 +368,7 @@ mod tests {
 
     #[test]
     fn workspace_root_round_trip() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let s = sample_session();
         ingot.create_session(&s).unwrap();
 
@@ -384,7 +385,7 @@ mod tests {
 
     #[test]
     fn update_mode_round_trip() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let s = sample_session();
         ingot.create_session(&s).unwrap();
 
@@ -398,7 +399,7 @@ mod tests {
 
     #[test]
     fn model_override_round_trip() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let s = sample_session();
         ingot.create_session(&s).unwrap();
 
@@ -412,7 +413,7 @@ mod tests {
 
     #[test]
     fn model_override_defaults_to_none() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let s = sample_session();
         ingot.create_session(&s).unwrap();
 
@@ -423,7 +424,7 @@ mod tests {
     #[test]
     fn task_id_link_round_trip() {
         use crate::Task;
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let s = sample_session();
         ingot.create_session(&s).unwrap();
 
@@ -433,7 +434,7 @@ mod tests {
             title: "Test task".to_string(),
             description: String::new(),
             status: "planned".to_string(),
-            created_at: 1_700_000_010.0,
+            created_at: Timestamp::from_secs_f64(1_700_000_010.0),
             session_id: Some(s.id.to_string()),
             response: None,
         };
@@ -452,7 +453,7 @@ mod tests {
 
     #[test]
     fn runner_override_round_trip() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let s = sample_session();
         ingot.create_session(&s).unwrap();
 
@@ -466,7 +467,7 @@ mod tests {
 
     #[test]
     fn runner_override_defaults_to_none() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
         let s = sample_session();
         ingot.create_session(&s).unwrap();
 

@@ -5,6 +5,7 @@
 //! determine how close a session is to its context-window limit without
 //! re-scanning all audit events.
 
+use smedja_types::Timestamp;
 use uuid::Uuid;
 
 use crate::error::IngotError;
@@ -28,8 +29,8 @@ pub struct TokenSnapshot {
     /// Cumulative output tokens across all turns in the session up to and
     /// including this one.
     pub cumulative_output: i64,
-    /// Unix epoch timestamp when the snapshot was recorded.
-    pub created_at: f64,
+    /// Timestamp when the snapshot was recorded (micros since the Unix epoch).
+    pub created_at: Timestamp,
 }
 
 /// Inserts a [`TokenSnapshot`] into the `turn_token_snapshots` table.
@@ -51,7 +52,7 @@ pub(crate) fn save(conn: &rusqlite::Connection, snap: &TokenSnapshot) -> Result<
             snap.output_tok,
             snap.cumulative_input,
             snap.cumulative_output,
-            snap.created_at,
+            snap.created_at.as_micros(),
         ],
     )?;
     Ok(())
@@ -114,7 +115,7 @@ fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenSnapshot> {
         output_tok: row.get(4)?,
         cumulative_input: row.get(5)?,
         cumulative_output: row.get(6)?,
-        created_at: row.get(7)?,
+        created_at: Timestamp::from_micros(crate::read_micros(row, 7)?),
     })
 }
 
@@ -133,13 +134,13 @@ mod tests {
             cumulative_input: input,   // set properly per test
             cumulative_output: output, // set properly per test
             #[allow(clippy::cast_precision_loss)] // test-only; turn_n is small
-            created_at: 1_700_000_000.0 + turn_n as f64,
+            created_at: Timestamp::from_secs_f64(1_700_000_000.0 + turn_n as f64),
         }
     }
 
     #[test]
     fn save_and_list_returns_ordered_snapshots() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
 
         let s1 = make_snap("sess", 2, 100, 50);
         let s2 = make_snap("sess", 0, 10, 5);
@@ -158,7 +159,7 @@ mod tests {
 
     #[test]
     fn cumulative_totals_accumulate_correctly() {
-        let mut ingot = Ingot::open_in_memory().unwrap();
+        let ingot = Ingot::open_in_memory().unwrap();
 
         let mut snap1 = make_snap("acc", 0, 100, 50);
         snap1.cumulative_input = 100;

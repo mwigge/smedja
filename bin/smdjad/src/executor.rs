@@ -652,8 +652,8 @@ mod tests {
     fn session_with_mode(mode: Option<&str>) -> smedja_ingot::Session {
         smedja_ingot::Session {
             id: uuid::Uuid::new_v4(),
-            created_at: 0.0,
-            updated_at: 0.0,
+            created_at: smedja_types::Timestamp::from_micros(0),
+            updated_at: smedja_types::Timestamp::from_micros(0),
             status: "active".to_owned(),
             task_id: None,
             mode: mode.map(str::to_owned),

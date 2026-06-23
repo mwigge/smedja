@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn register_and_list() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         ig.register_mcp_server(&server("fs")).unwrap();
         ig.register_mcp_server(&server("gh")).unwrap();
         let list = ig.list_mcp_servers().unwrap();
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn list_is_sorted_by_name() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         ig.register_mcp_server(&server("zebra")).unwrap();
         ig.register_mcp_server(&server("alpha")).unwrap();
         let list = ig.list_mcp_servers().unwrap();
@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn remove_server() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         ig.register_mcp_server(&server("x")).unwrap();
         ig.remove_mcp_server("x").unwrap();
         assert!(ig.list_mcp_servers().unwrap().is_empty());
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn replace_on_duplicate_id() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         let mut s = server("tool");
         ig.register_mcp_server(&s).unwrap();
         s.url = "http://updated".into();
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn update_mcp_tools_sets_tools_json_and_refresh() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         ig.register_mcp_server(&server("svc")).unwrap();
         ig.update_mcp_tools("svc", r#"[{"name":"tool1"}]"#).unwrap();
         let list = ig.list_mcp_servers().unwrap();
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn get_stale_servers_returns_old_entries() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
 
         // Stale server: last_refresh = 0 (epoch start, always older than threshold).
         ig.register_mcp_server(&server("stale")).unwrap();
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn get_all_mcp_tools_filters_empty() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
 
         // Empty tools_json — must be excluded.
         ig.register_mcp_server(&server("empty")).unwrap();
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn get_mcp_server_by_name_returns_server() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         ig.register_mcp_server(&server("target")).unwrap();
         let found = ig.get_mcp_server_by_name("target").unwrap();
         assert!(found.is_some());
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn find_mcp_server_for_tool_returns_owning_server() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         let s = McpServer {
             tools_json: r#"[{"name":"echo","description":"Echo input","input_schema":{}}]"#.into(),
             ..server("echo-server")
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn find_mcp_server_for_tool_returns_none_when_tool_not_registered() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         let s = McpServer {
             tools_json: r#"[{"name":"echo","description":"Echo"}]"#.into(),
             ..server("echo-server")
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn find_mcp_server_for_tool_matches_across_multiple_servers() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         ig.register_mcp_server(&McpServer {
             tools_json: r#"[{"name":"tool_a"}]"#.into(),
             ..server("server-a")

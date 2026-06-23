@@ -553,7 +553,7 @@ async fn main() -> Result<()> {
                 TaskCmd::Import => {
                     use std::io::BufRead as _;
                     let db_path = default_ingot_path();
-                    let mut ingot = Ingot::open(&db_path).with_context(|| {
+                    let ingot = Ingot::open(&db_path).with_context(|| {
                         format!("failed to open ingot at {}", db_path.display())
                     })?;
                     let stdin = std::io::stdin();
@@ -946,12 +946,17 @@ async fn main() -> Result<()> {
                                 let ph = prompt_hashes.get(role_id).map_or("", String::as_str);
                                 println!(
                                     "{role_id},{},{tool},,{},{tp},{},{}",
-                                    ev.session_id, ev.output_tok, ev.ts, ph
+                                    ev.session_id,
+                                    ev.output_tok,
+                                    ev.ts.as_micros(),
+                                    ph
                                 );
                             } else {
                                 println!(
                                     "{role_id},{},{tool},,{},{tp},{}",
-                                    ev.session_id, ev.output_tok, ev.ts
+                                    ev.session_id,
+                                    ev.output_tok,
+                                    ev.ts.as_micros()
                                 );
                             }
                         }
@@ -1278,7 +1283,7 @@ async fn main() -> Result<()> {
                         for ev in &events {
                             println!(
                                 "{:.0} {:12} {:8} {:<30} trace:{} span:{}",
-                                ev.ts,
+                                ev.ts.as_secs_f64(),
                                 ev.action_type,
                                 ev.status.as_deref().unwrap_or("-"),
                                 ev.tool_name.as_deref().unwrap_or(ev.actor.as_str()),
@@ -1354,7 +1359,7 @@ async fn main() -> Result<()> {
 }
 
 fn cmd_workspace_agents() -> Result<()> {
-    use smedja_assayer::{Complexity, Role, Runner, Tier};
+    use smedja_assayer::{AgentRole, Complexity, Runner, Tier};
 
     let workspace_dir = std::env::current_dir().context("cannot determine working directory")?;
     let file_rules = smedja_assayer::load_rules(&workspace_dir).map_err(|e| anyhow::anyhow!(e))?;
@@ -1365,11 +1370,11 @@ fn cmd_workspace_agents() -> Result<()> {
     println!("{}", "-".repeat(55));
 
     for (role_name, role) in &[
-        ("orchestrator", Role::Orchestrator),
-        ("impl", Role::Impl),
-        ("test", Role::Test),
-        ("review", Role::Review),
-        ("sre", Role::Sre),
+        ("orchestrator", AgentRole::Orchestrator),
+        ("impl", AgentRole::Impl),
+        ("test", AgentRole::Test),
+        ("review", AgentRole::Review),
+        ("sre", AgentRole::Sre),
     ] {
         let route = assayer.route(*role, Complexity::Coding);
         let runner = match route.runner {

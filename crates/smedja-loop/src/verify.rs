@@ -86,6 +86,12 @@ pub fn verification_timeout() -> Duration {
 mod tests {
     use super::*;
 
+    /// Serialises tests that mutate the process-global
+    /// `SMEDJA_LOOP_VERIFY_TIMEOUT` env var so they cannot race each other.
+    static VERIFY_TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const VERIFY_TIMEOUT_ENV: &str = "SMEDJA_LOOP_VERIFY_TIMEOUT";
+
     #[tokio::test]
     async fn verification_timeout_recorded() {
         // `sleep 999` will exceed the 100 ms budget.
@@ -124,14 +130,30 @@ mod tests {
     }
 
     #[test]
-    fn verification_timeout_defaults_to_300s() {
-        // Only valid when the env var is unset.  We can't unset env vars safely
-        // in parallel tests, so just verify the fallback arithmetic.
-        let secs = std::env::var("SMEDJA_LOOP_VERIFY_TIMEOUT")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(300);
-        assert_eq!(Duration::from_secs(secs), verification_timeout());
+    fn verification_timeout_reads_env_var() {
+        let _guard = VERIFY_TIMEOUT_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var(VERIFY_TIMEOUT_ENV).ok();
+
+        std::env::set_var(VERIFY_TIMEOUT_ENV, "42");
+        assert_eq!(verification_timeout(), Duration::from_secs(42));
+
+        match previous {
+            Some(value) => std::env::set_var(VERIFY_TIMEOUT_ENV, value),
+            None => std::env::remove_var(VERIFY_TIMEOUT_ENV),
+        }
+    }
+
+    #[test]
+    fn verification_timeout_defaults_to_300s_when_unset() {
+        let _guard = VERIFY_TIMEOUT_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var(VERIFY_TIMEOUT_ENV).ok();
+
+        std::env::remove_var(VERIFY_TIMEOUT_ENV);
+        assert_eq!(verification_timeout(), Duration::from_mins(5));
+
+        if let Some(value) = previous {
+            std::env::set_var(VERIFY_TIMEOUT_ENV, value);
+        }
     }
 
     #[test]

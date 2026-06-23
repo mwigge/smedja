@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde_json::json;
 use smedja_bellows::{Dispatcher, TurnHandle};
 use smedja_ingot::{IngotHandle, Session, Task};
+use smedja_types::Timestamp;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
@@ -71,10 +72,7 @@ struct PromptRequest {
 
 async fn create_session(State(s): State<AcpState>) -> impl IntoResponse {
     let id = Uuid::new_v4();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
+    let now = Timestamp::now();
     let session = Session {
         id,
         mode: Some("acp".into()),
@@ -105,10 +103,7 @@ async fn submit_prompt(
 ) -> impl IntoResponse {
     // ponytail: full SSE streaming deferred; return turn_id for polling
     let turn_id = Uuid::new_v4();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
+    let now = Timestamp::now();
     let session_id = id.clone();
     let task = Task {
         id: turn_id,

@@ -345,6 +345,7 @@ async fn write_line(writer: &mut (impl AsyncWriteExt + Unpin), line: &str) -> st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smedja_bellows::event::CorrelationCtx;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -355,24 +356,12 @@ mod tests {
         dispatcher.publish(TurnEvent::Started {
             session_id: "sess".into(),
             turn_id: "t1".into(),
-            conversation_id: None,
-            trace_id: None,
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx::default(),
         });
         dispatcher.publish(TurnEvent::AssistantDelta {
             content: "hello".into(),
             turn_id: Some("t1".into()),
-            conversation_id: None,
-            trace_id: None,
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx::default(),
         });
 
         // Give the background task a moment to process.
@@ -396,26 +385,14 @@ mod tests {
         dispatcher.publish(TurnEvent::Started {
             session_id: "sess".into(),
             turn_id: "t2".into(),
-            conversation_id: None,
-            trace_id: None,
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx::default(),
         });
 
         for i in 0..=MAX_BUFFER_PER_TURN {
             dispatcher.publish(TurnEvent::AssistantDelta {
                 content: format!("chunk-{i}"),
                 turn_id: Some("t2".into()),
-                conversation_id: None,
-                trace_id: None,
-                span_id: None,
-                parent_span_id: None,
-                operation_name: None,
-                agent_name: None,
-                status: None,
+                correlation: CorrelationCtx::default(),
             });
         }
 
@@ -435,13 +412,7 @@ mod tests {
         let event = TurnEvent::AssistantDelta {
             content: "hello world".into(),
             turn_id: Some("t3".into()),
-            conversation_id: None,
-            trace_id: None,
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx::default(),
         };
         let (tid, line, terminal) = turn_event_to_ndjson(&event, "t3");
         assert_eq!(tid.as_deref(), Some("t3"));
@@ -458,13 +429,7 @@ mod tests {
             output_tokens: 42,
             input_tokens: None,
             traceparent: None,
-            conversation_id: None,
-            trace_id: None,
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx::default(),
         };
         let (tid, line, terminal) = turn_event_to_ndjson(&event, "t4");
         assert_eq!(tid.as_deref(), Some("t4"));
@@ -480,13 +445,7 @@ mod tests {
             output_tokens: 88,
             input_tokens: Some(412),
             traceparent: Some("00-abc123-def456-01".into()),
-            conversation_id: None,
-            trace_id: None,
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx::default(),
         };
         let (tid, line, terminal) = turn_event_to_ndjson(&event, "t5");
         assert_eq!(tid.as_deref(), Some("t5"));

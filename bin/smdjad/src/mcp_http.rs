@@ -313,7 +313,7 @@ mod tests {
 
         // --- Step 2: create an in-memory Ingot and register the server entry ---
         let server_name = "test-echo-server";
-        let mut ig = smedja_ingot::Ingot::open_in_memory().expect("in-memory Ingot must open");
+        let ig = smedja_ingot::Ingot::open_in_memory().expect("in-memory Ingot must open");
 
         let mcp_entry = smedja_ingot::McpServer {
             id: "test-echo-server-id".into(),
