@@ -349,6 +349,9 @@ mod tests {
             input_mode: true,
         };
         let bar = render_status_bar(&ctx);
-        assert!(bar.contains("[I]"), "status bar must include [I] badge in input mode; got: {bar}");
+        assert!(
+            bar.contains("[I]"),
+            "status bar must include [I] badge in input mode; got: {bar}"
+        );
     }
 }

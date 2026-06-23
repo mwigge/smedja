@@ -12,6 +12,7 @@ pub enum CopilotProvider {
 
 impl CopilotProvider {
     /// Returns `Some(Self)` if either `gh` binary is on `$PATH` or `GITHUB_TOKEN` is set.
+    #[must_use]
     pub fn detect() -> Option<Self> {
         if which::which("gh").is_ok() {
             return Some(Self::Cli(SubprocessProvider::new(

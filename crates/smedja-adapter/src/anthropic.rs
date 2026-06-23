@@ -5,9 +5,8 @@ use serde_json::json;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt as _};
 
 use crate::{
-    otel::inject_traceparent,
-    sse::parse_anthropic_event,
-    AdapterError, CallOptions, Delta, DeltaStream, Message, Provider, Role,
+    otel::inject_traceparent, sse::parse_anthropic_event, AdapterError, CallOptions, Delta,
+    DeltaStream, Message, Provider, Role,
 };
 
 /// Anthropic streaming chat-completion provider.
@@ -62,10 +61,7 @@ fn build_body(messages: &[Message], opts: &CallOptions) -> serde_json::Value {
 
     // Filter non-system messages and apply cache_control to the stable-prefix boundary.
     let prefix_len = opts.stable_prefix_len.unwrap_or(0);
-    let non_system: Vec<&Message> = messages
-        .iter()
-        .filter(|m| m.role != Role::System)
-        .collect();
+    let non_system: Vec<&Message> = messages.iter().filter(|m| m.role != Role::System).collect();
 
     let msg_array: Vec<serde_json::Value> = non_system
         .iter()
@@ -96,7 +92,8 @@ fn build_body(messages: &[Message], opts: &CallOptions) -> serde_json::Value {
     // System prompt: content-block array with cache_control when caching is enabled.
     if let Some(sys) = system_content {
         if cache {
-            body["system"] = json!([{"type": "text", "text": sys, "cache_control": {"type": "ephemeral"}}]);
+            body["system"] =
+                json!([{"type": "text", "text": sys, "cache_control": {"type": "ephemeral"}}]);
         } else {
             body["system"] = json!(sys);
         }
@@ -109,10 +106,7 @@ fn build_body(messages: &[Message], opts: &CallOptions) -> serde_json::Value {
                 let mut tools_with_cache: Vec<serde_json::Value> = tools.clone();
                 let last = tools_with_cache.len() - 1;
                 if let Some(obj) = tools_with_cache[last].as_object_mut() {
-                    obj.insert(
-                        "cache_control".to_owned(),
-                        json!({"type": "ephemeral"}),
-                    );
+                    obj.insert("cache_control".to_owned(), json!({"type": "ephemeral"}));
                 }
                 body["tools"] = serde_json::Value::Array(tools_with_cache);
             } else {
@@ -485,7 +479,9 @@ mod tests {
     fn build_body_with_cache_hint_formats_system_as_content_block() {
         let opts = cache_opts();
         let body = build_body(&[], &opts);
-        let sys = body["system"].as_array().expect("system must be an array when caching");
+        let sys = body["system"]
+            .as_array()
+            .expect("system must be an array when caching");
         assert_eq!(sys.len(), 1);
         assert_eq!(sys[0]["type"], "text");
         assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
@@ -500,8 +496,14 @@ mod tests {
         let body = build_body(&[], &opts);
         let arr = body["tools"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
-        assert!(arr[0].get("cache_control").is_none(), "first tool must not be marked");
-        assert_eq!(arr[1]["cache_control"]["type"], "ephemeral", "last tool must be marked");
+        assert!(
+            arr[0].get("cache_control").is_none(),
+            "first tool must not be marked"
+        );
+        assert_eq!(
+            arr[1]["cache_control"]["type"], "ephemeral",
+            "last tool must be marked"
+        );
     }
 
     #[test]
@@ -509,8 +511,14 @@ mod tests {
         let mut opts = cache_opts();
         opts.stable_prefix_len = Some(1); // cache message at index 0
         let messages = vec![
-            Message { role: Role::User, content: "initial context".to_owned() },
-            Message { role: Role::Assistant, content: "ok".to_owned() },
+            Message {
+                role: Role::User,
+                content: "initial context".to_owned(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "ok".to_owned(),
+            },
         ];
         let body = build_body(&messages, &opts);
         let arr = body["messages"].as_array().unwrap();
@@ -521,18 +529,25 @@ mod tests {
         );
         assert_eq!(arr[0]["content"][0]["cache_control"]["type"], "ephemeral");
         // Message at index 1 should be a plain string.
-        assert!(arr[1]["content"].is_string(), "message after prefix boundary must be a plain string");
+        assert!(
+            arr[1]["content"].is_string(),
+            "message after prefix boundary must be a plain string"
+        );
     }
 
     #[test]
     fn build_body_with_prefix_zero_does_not_mark_any_message() {
         let mut opts = cache_opts();
         opts.stable_prefix_len = Some(0); // only system/tools cached
-        let messages = vec![
-            Message { role: Role::User, content: "hello".to_owned() },
-        ];
+        let messages = vec![Message {
+            role: Role::User,
+            content: "hello".to_owned(),
+        }];
         let body = build_body(&messages, &opts);
         let arr = body["messages"].as_array().unwrap();
-        assert!(arr[0]["content"].is_string(), "no message should be marked when prefix_len == 0");
+        assert!(
+            arr[0]["content"].is_string(),
+            "no message should be marked when prefix_len == 0"
+        );
     }
 }

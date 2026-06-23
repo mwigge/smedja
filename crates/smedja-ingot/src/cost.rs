@@ -210,7 +210,13 @@ mod tests {
         assert!((total - 0.042_f64).abs() < 1e-9);
     }
 
-    fn make_entry_with(session_id: &str, model: &str, runner: &str, cost_usd: f64, turn_n: i64) -> CostEntry {
+    fn make_entry_with(
+        session_id: &str,
+        model: &str,
+        runner: &str,
+        cost_usd: f64,
+        turn_n: i64,
+    ) -> CostEntry {
         CostEntry {
             id: Uuid::new_v4(),
             session_id: session_id.to_string(),
@@ -234,29 +240,66 @@ mod tests {
     #[test]
     fn session_cost_entries_single_model_aggregates() {
         let mut ingot = Ingot::open_in_memory().unwrap();
-        ingot.insert_cost(&make_entry_with("s1", "claude-sonnet-4-6", "claude-cli", 0.010, 0)).unwrap();
-        ingot.insert_cost(&make_entry_with("s1", "claude-sonnet-4-6", "claude-cli", 0.020, 1)).unwrap();
+        ingot
+            .insert_cost(&make_entry_with(
+                "s1",
+                "claude-sonnet-4-6",
+                "claude-cli",
+                0.010,
+                0,
+            ))
+            .unwrap();
+        ingot
+            .insert_cost(&make_entry_with(
+                "s1",
+                "claude-sonnet-4-6",
+                "claude-cli",
+                0.020,
+                1,
+            ))
+            .unwrap();
         let rows = ingot.session_cost_entries("s1").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].turns, 2);
-        assert!((rows[0].cost_usd - 0.030_f64).abs() < 1e-9, "expected 0.030; got {}", rows[0].cost_usd);
+        assert!(
+            (rows[0].cost_usd - 0.030_f64).abs() < 1e-9,
+            "expected 0.030; got {}",
+            rows[0].cost_usd
+        );
     }
 
     #[test]
     fn session_cost_entries_multiple_models_sorted_descending() {
         let mut ingot = Ingot::open_in_memory().unwrap();
-        ingot.insert_cost(&make_entry_with("s2", "gpt-4o-mini", "codex-cli", 0.001, 0)).unwrap();
-        ingot.insert_cost(&make_entry_with("s2", "claude-sonnet-4-6", "claude-cli", 0.100, 1)).unwrap();
+        ingot
+            .insert_cost(&make_entry_with("s2", "gpt-4o-mini", "codex-cli", 0.001, 0))
+            .unwrap();
+        ingot
+            .insert_cost(&make_entry_with(
+                "s2",
+                "claude-sonnet-4-6",
+                "claude-cli",
+                0.100,
+                1,
+            ))
+            .unwrap();
         let rows = ingot.session_cost_entries("s2").unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].model, "claude-sonnet-4-6", "most expensive model should be first");
+        assert_eq!(
+            rows[0].model, "claude-sonnet-4-6",
+            "most expensive model should be first"
+        );
     }
 
     #[test]
     fn session_cost_entries_scoped_to_session() {
         let mut ingot = Ingot::open_in_memory().unwrap();
-        ingot.insert_cost(&make_entry_with("s3", "gpt-4o", "openai", 0.050, 0)).unwrap();
-        ingot.insert_cost(&make_entry_with("s4", "gpt-4o", "openai", 0.999, 0)).unwrap();
+        ingot
+            .insert_cost(&make_entry_with("s3", "gpt-4o", "openai", 0.050, 0))
+            .unwrap();
+        ingot
+            .insert_cost(&make_entry_with("s4", "gpt-4o", "openai", 0.999, 0))
+            .unwrap();
         let rows = ingot.session_cost_entries("s3").unwrap();
         assert_eq!(rows.len(), 1);
         assert!((rows[0].cost_usd - 0.050_f64).abs() < 1e-9);

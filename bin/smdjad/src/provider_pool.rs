@@ -105,6 +105,13 @@ impl ProviderPool {
 /// The priority order matches the original `build_provider()` function so that
 /// the pool default is the highest-priority available provider.  An empty pool
 /// (all probes failed) is valid; callers handle `None` from `get()`.
+///
+/// # Panics
+///
+/// Panics if a provider binary that was just confirmed available via its
+/// `available()` probe fails to re-detect immediately afterwards, which would
+/// indicate the binary vanished mid-probe.
+#[allow(clippy::too_many_lines)] // sequential provider probes kept inline; each branch logs a distinct readiness signal
 pub async fn build_provider_pool() -> ProviderPool {
     let mut entries: HashMap<(Runner, Tier), ProviderEntry> = HashMap::new();
     let mut default: Option<(Runner, Tier)> = None;
@@ -170,20 +177,32 @@ pub async fn build_provider_pool() -> ProviderPool {
         );
         info!(runner = "anthropic", "provider ready");
     } else {
-        warn!(runner = "claude", "UNAVAILABLE — no claude binary and no ANTHROPIC_API_KEY");
+        warn!(
+            runner = "claude",
+            "UNAVAILABLE — no claude binary and no ANTHROPIC_API_KEY"
+        );
     }
 
     // 2. Codex CLI
     if SubprocessProvider::available("codex") {
         let p_fast = CodexCliProvider::detect(None).expect("codex binary just checked");
-        add!(Runner::Codex, Tier::Fast, p_fast, "codex-cli", "gpt-4o-mini");
+        add!(
+            Runner::Codex,
+            Tier::Fast,
+            p_fast,
+            "codex-cli",
+            "gpt-4o-mini"
+        );
         info!(runner = "codex-cli", "provider ready");
     } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         let p = OpenAiProvider::new("https://api.openai.com", key);
         add!(Runner::Codex, Tier::Fast, p, "openai", "gpt-4o-mini");
         info!(runner = "openai", "provider ready");
     } else {
-        warn!(runner = "codex", "UNAVAILABLE — no codex binary and no OPENAI_API_KEY");
+        warn!(
+            runner = "codex",
+            "UNAVAILABLE — no codex binary and no OPENAI_API_KEY"
+        );
     }
 
     // 3. Copilot
@@ -281,11 +300,7 @@ mod tests {
                 "claude-cli",
                 "claude-haiku-4-5-20251001",
             ),
-            (
-                (Runner::Local, Tier::Local),
-                "local",
-                "local",
-            ),
+            ((Runner::Local, Tier::Local), "local", "local"),
         ]);
         let entry = pool.get(Runner::Local, Tier::Local).unwrap();
         assert_eq!(entry.runner_name, "local");
@@ -315,7 +330,11 @@ mod tests {
     #[test]
     fn default_runner_name_returns_first_inserted() {
         let pool = pool_with(vec![
-            ((Runner::Claude, Tier::Fast), "claude-cli", "claude-haiku-4-5-20251001"),
+            (
+                (Runner::Claude, Tier::Fast),
+                "claude-cli",
+                "claude-haiku-4-5-20251001",
+            ),
             ((Runner::Local, Tier::Local), "local", "local"),
         ]);
         assert_eq!(pool.default_runner_name(), "claude-cli");
@@ -324,8 +343,16 @@ mod tests {
     #[test]
     fn available_runners_lists_unique_names() {
         let pool = pool_with(vec![
-            ((Runner::Claude, Tier::Fast), "claude-cli", "claude-haiku-4-5-20251001"),
-            ((Runner::Claude, Tier::Deep), "claude-cli", "claude-sonnet-4-6"),
+            (
+                (Runner::Claude, Tier::Fast),
+                "claude-cli",
+                "claude-haiku-4-5-20251001",
+            ),
+            (
+                (Runner::Claude, Tier::Deep),
+                "claude-cli",
+                "claude-sonnet-4-6",
+            ),
             ((Runner::Local, Tier::Local), "local", "local"),
         ]);
         let mut runners = pool.available_runners();

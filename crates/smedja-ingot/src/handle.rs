@@ -3,7 +3,7 @@
 //! [`IngotHandle`] wraps a [`std::sync::Mutex`]-guarded [`Ingot`] in an
 //! [`Arc`] so it is cheaply [`Clone`]-able across task boundaries. Every
 //! method delegates to the corresponding [`Ingot`] method inside
-//! [`tokio::task::spawn_blocking`], keeping SQLite I/O off the Tokio
+//! [`tokio::task::spawn_blocking`], keeping `SQLite` I/O off the Tokio
 //! executor thread-pool.
 
 use std::sync::Arc;
@@ -15,6 +15,7 @@ use crate::{
 
 /// Converts a [`tokio::task::JoinError`] (i.e. a panic inside `spawn_blocking`)
 /// into an [`IngotError`] so callers see a uniform error type.
+#[allow(clippy::needless_pass_by_value)] // used as `.map_err(join_err)`, which requires taking the error by value
 fn join_err(e: tokio::task::JoinError) -> IngotError {
     IngotError::Db(rusqlite::Error::InvalidParameterName(format!(
         "spawn_blocking panic: {e}"
@@ -23,7 +24,7 @@ fn join_err(e: tokio::task::JoinError) -> IngotError {
 
 /// Async facade over [`Ingot`].
 ///
-/// All methods route through [`tokio::task::spawn_blocking`] so SQLite
+/// All methods route through [`tokio::task::spawn_blocking`] so `SQLite`
 /// operations do not block Tokio executor threads. The handle is
 /// cheaply [`Clone`]able — all clones share the same underlying database
 /// connection.
@@ -45,6 +46,11 @@ impl IngotHandle {
 
     /// Appends an [`AuditEvent`] to the audit log.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying INSERT.
@@ -61,6 +67,11 @@ impl IngotHandle {
     }
 
     /// Returns all [`AuditEvent`]s for `session_id`, ordered by `ts` ascending.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -80,6 +91,11 @@ impl IngotHandle {
 
     /// Persists a timeline event and upserts the matching [`ConversationRollup`].
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from either the INSERT or the upsert.
@@ -96,6 +112,11 @@ impl IngotHandle {
     }
 
     /// Returns the most recent `limit` [`ConversationRollup`]s by `last_seen_at` descending.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -116,6 +137,11 @@ impl IngotHandle {
     }
 
     /// Returns timeline events for `conversation_id`, ordered by `rowid` ascending.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -138,6 +164,11 @@ impl IngotHandle {
 
     /// Returns timeline events with `status = 'error'` for `conversation_id`.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
@@ -159,6 +190,11 @@ impl IngotHandle {
 
     /// Returns all [`AuditEvent`]s, ordered by `ts` ascending.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
@@ -178,6 +214,11 @@ impl IngotHandle {
 
     /// Inserts a new [`Session`].
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying INSERT.
@@ -195,6 +236,11 @@ impl IngotHandle {
 
     /// Retrieves a [`Session`] by `id`, returning `None` when not found.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
@@ -209,6 +255,11 @@ impl IngotHandle {
     }
 
     /// Returns all [`Session`]s ordered by `created_at` ascending.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -225,6 +276,11 @@ impl IngotHandle {
     /// Deletes the session with the given `id`.
     ///
     /// Returns `true` if a row was deleted, `false` if none existed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -243,6 +299,11 @@ impl IngotHandle {
     }
 
     /// Updates the `status` of a session.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -263,6 +324,11 @@ impl IngotHandle {
 
     /// Sets the `cowork_mode` flag for the session identified by `session_id`.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying UPDATE.
@@ -280,6 +346,11 @@ impl IngotHandle {
     }
 
     /// Sets the `workspace_root` path for a session.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -304,6 +375,11 @@ impl IngotHandle {
 
     /// Sets the `mode` field for a session.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying UPDATE.
@@ -326,6 +402,11 @@ impl IngotHandle {
     }
 
     /// Sets the `model_override` for a session.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -350,6 +431,11 @@ impl IngotHandle {
 
     /// Sets the `runner_override` for a session.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying UPDATE.
@@ -373,6 +459,11 @@ impl IngotHandle {
 
     /// Links a session to a task.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying UPDATE.
@@ -395,6 +486,11 @@ impl IngotHandle {
     }
 
     /// Enables or disables the cowork gate for a session.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -420,6 +516,11 @@ impl IngotHandle {
 
     /// Registers (or replaces) an [`McpServer`].
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying INSERT OR REPLACE.
@@ -437,6 +538,11 @@ impl IngotHandle {
 
     /// Returns all registered [`McpServer`]s ordered by `name` ascending.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
@@ -453,6 +559,11 @@ impl IngotHandle {
     }
 
     /// Removes the [`McpServer`] with the given `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -472,6 +583,11 @@ impl IngotHandle {
 
     /// Updates the cached tool list for a server.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying UPDATE.
@@ -490,6 +606,11 @@ impl IngotHandle {
     }
 
     /// Returns stale [`McpServer`]s whose `last_refresh` is older than `older_than_secs`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -511,6 +632,11 @@ impl IngotHandle {
 
     /// Returns all `(server_name, tools_json)` pairs for servers with non-empty tool lists.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
@@ -527,6 +653,11 @@ impl IngotHandle {
     }
 
     /// Looks up a single [`McpServer`] by its registered name.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -548,6 +679,11 @@ impl IngotHandle {
     }
 
     /// Finds the MCP server that exposes a tool with the given `tool_name`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -572,6 +708,11 @@ impl IngotHandle {
 
     /// Inserts a new [`Task`].
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying INSERT.
@@ -589,6 +730,11 @@ impl IngotHandle {
 
     /// Returns tasks, optionally filtered by `status`.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
@@ -605,6 +751,11 @@ impl IngotHandle {
     }
 
     /// Updates the `status` field for a task.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -625,6 +776,11 @@ impl IngotHandle {
 
     /// Retrieves a [`Task`] by `id`, returning `None` when not found.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
@@ -639,6 +795,11 @@ impl IngotHandle {
     }
 
     /// Stores `response` text for a task and sets `status = "complete"`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -662,6 +823,11 @@ impl IngotHandle {
     /// Saves a [`Checkpoint`], replacing any existing one for the same
     /// `(session_id, turn_n)` pair.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying upsert.
@@ -678,6 +844,11 @@ impl IngotHandle {
     }
 
     /// Loads the [`Checkpoint`] for `(session_id, turn_n)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -701,6 +872,11 @@ impl IngotHandle {
 
     /// Returns the checkpoint with the highest `turn_n` for `session_id`.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
@@ -722,6 +898,11 @@ impl IngotHandle {
 
     /// Returns all checkpoints for `session_id`, ordered by turn number ascending.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
@@ -739,6 +920,11 @@ impl IngotHandle {
     }
 
     /// Atomically rolls back a session to `turn_n`, pruning later checkpoints.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -764,6 +950,11 @@ impl IngotHandle {
 
     /// Appends a [`CostEntry`] to the cost ledger.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying INSERT.
@@ -780,6 +971,11 @@ impl IngotHandle {
     }
 
     /// Returns the total `cost_usd` for all entries in `session_id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -799,6 +995,11 @@ impl IngotHandle {
 
     /// Returns per-model/runner aggregate cost rows for `session_id`.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
@@ -816,6 +1017,11 @@ impl IngotHandle {
     }
 
     /// Returns the model name from the most recent cost entry for `session_id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -837,6 +1043,11 @@ impl IngotHandle {
 
     /// Saves a [`TokenSnapshot`].
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying upsert.
@@ -853,6 +1064,11 @@ impl IngotHandle {
     }
 
     /// Returns all [`TokenSnapshot`]s for `session_id`, ordered by `turn_n` ascending.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -877,6 +1093,11 @@ impl IngotHandle {
 
     /// Inserts a new [`LoopRecord`].
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying INSERT.
@@ -894,6 +1115,11 @@ impl IngotHandle {
 
     /// Returns the spec-first methodology state for `session_id`, or the
     /// all-false default when no row exists.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -916,6 +1142,11 @@ impl IngotHandle {
 
     /// Sets the `spec_recorded` flag for `session_id`.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying UPSERT.
@@ -933,6 +1164,11 @@ impl IngotHandle {
     }
 
     /// Sets the `approval_recorded` flag for `session_id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -956,6 +1192,11 @@ impl IngotHandle {
 
     /// Sets the per-session `no_spec_gate` escape-hatch flag for `session_id`.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying UPSERT.
@@ -974,6 +1215,11 @@ impl IngotHandle {
 
     /// Retrieves a [`LoopRecord`] by `id`, returning `None` when not found.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
@@ -988,6 +1234,11 @@ impl IngotHandle {
     }
 
     /// Updates `status` and `updated_at` for a loop.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -1013,6 +1264,11 @@ impl IngotHandle {
 
     /// Returns all [`LoopRecord`]s for `change_name`, ordered by `created_at` descending.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
@@ -1030,6 +1286,11 @@ impl IngotHandle {
     }
 
     /// Updates `current_slice` and `updated_at` for a loop.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -1054,6 +1315,11 @@ impl IngotHandle {
 
     /// Returns all [`LoopRecord`]s, optionally filtered by `status`.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
@@ -1075,6 +1341,11 @@ impl IngotHandle {
     // ── prompt_hashes ─────────────────────────────────────────────────────────
 
     /// Records a prompt content hash for `(change, role)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -1101,6 +1372,11 @@ impl IngotHandle {
 
     /// Returns the most recent prompt hash for `(change, role)`.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
@@ -1123,6 +1399,11 @@ impl IngotHandle {
     }
 
     /// Returns all prompt hash records for `change`, ordered by `ts` ascending.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///
@@ -1147,6 +1428,11 @@ impl IngotHandle {
 
     /// Exports tasks and their associated audit events as a JSONL stream.
     ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
+    ///
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] or [`IngotError::Json`] from the underlying
@@ -1167,6 +1453,11 @@ impl IngotHandle {
     }
 
     /// Imports tasks and audit events from a JSONL stream.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ingot mutex is poisoned (a prior holder panicked while
+    /// holding the lock).
     ///
     /// # Errors
     ///

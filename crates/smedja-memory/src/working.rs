@@ -37,6 +37,7 @@
 /// * `prompt` — the assembled prompt string.
 /// * `used` — number of tokens currently used in the context window.
 /// * `window` — total context window size in tokens.
+#[must_use]
 pub fn inject_conciseness(prompt: &str, used: usize, window: usize) -> String {
     if std::env::var("SMEDJA_NO_VERBOSITY_STEER").as_deref() == Ok("1") {
         return prompt.to_owned();

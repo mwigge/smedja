@@ -7,6 +7,7 @@ pub struct MinimaxProvider(OpenAiProvider);
 
 impl MinimaxProvider {
     /// Returns `Some(Self)` if `MINIMAX_API_KEY` is set in the environment.
+    #[must_use]
     pub fn detect() -> Option<Self> {
         std::env::var("MINIMAX_API_KEY")
             .ok()

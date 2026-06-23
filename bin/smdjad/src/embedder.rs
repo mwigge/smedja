@@ -15,6 +15,7 @@ pub const DIM: usize = 128;
 /// normalised. Two texts that share many words will have a high cosine score.
 ///
 /// Returns a zero vector for empty input.
+#[must_use]
 pub fn embed(text: &str) -> Vec<f32> {
     let mut vec = vec![0.0_f32; DIM];
     for word in text.split_whitespace() {

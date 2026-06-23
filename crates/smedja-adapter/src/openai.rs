@@ -5,9 +5,8 @@ use serde_json::json;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt as _};
 
 use crate::{
-    otel::inject_traceparent,
-    sse::parse_openai_line,
-    AdapterError, CallOptions, Delta, DeltaStream, Message, Provider, Role,
+    otel::inject_traceparent, sse::parse_openai_line, AdapterError, CallOptions, Delta,
+    DeltaStream, Message, Provider, Role,
 };
 
 /// `OpenAI`-compatible streaming chat-completion provider.

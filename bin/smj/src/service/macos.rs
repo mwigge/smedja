@@ -1,5 +1,6 @@
 //! macOS launchd service management for smdjad.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
@@ -8,7 +9,7 @@ use super::ServiceAction;
 
 const LABEL: &str = "nu.wigge.smdjad";
 
-pub fn dispatch(action: ServiceAction) -> Result<()> {
+pub fn dispatch(action: &ServiceAction) -> Result<()> {
     match action {
         ServiceAction::Install => install(),
         ServiceAction::Uninstall => uninstall(),
@@ -28,7 +29,10 @@ fn plist_path() -> Result<PathBuf> {
 
 fn log_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join("Library").join("Logs").join("smdjad"))
+    Ok(PathBuf::from(home)
+        .join("Library")
+        .join("Logs")
+        .join("smdjad"))
 }
 
 fn current_uid() -> Result<String> {
@@ -50,7 +54,13 @@ fn write_plist(smdjad_bin: &Path) -> Result<()> {
 
     let xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_owned());
     let otlp_endpoint = std::env::var("SMEDJA_OTLP_ENDPOINT").ok();
-    write_plist_inner(smdjad_bin, &plist, &log, &xdg_runtime_dir, otlp_endpoint.as_deref())
+    write_plist_inner(
+        smdjad_bin,
+        &plist,
+        &log,
+        &xdg_runtime_dir,
+        otlp_endpoint.as_deref(),
+    )
 }
 
 fn write_plist_inner(
@@ -67,9 +77,10 @@ fn write_plist_inner(
     let mut env_entries =
         format!("        <key>XDG_RUNTIME_DIR</key> <string>{xdg_runtime_dir}</string>\n");
     if let Some(ep) = otlp_endpoint {
-        env_entries.push_str(&format!(
-            "        <key>SMEDJA_OTLP_ENDPOINT</key> <string>{ep}</string>\n"
-        ));
+        let _ = writeln!(
+            env_entries,
+            "        <key>SMEDJA_OTLP_ENDPOINT</key> <string>{ep}</string>"
+        );
     }
 
     let content = format!(

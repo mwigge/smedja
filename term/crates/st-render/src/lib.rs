@@ -890,47 +890,45 @@ impl Renderer {
                 push_constant_ranges: &[],
             });
 
-        let bg_image_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("bg_image_pipeline"),
-                layout: Some(&bg_image_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &bg_image_shader,
-                    entry_point: "vs_bg_img",
-                    buffers: &[BgImageVertex::layout()],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &bg_image_shader,
-                    entry_point: "fs_bg_img",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: surface_format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            });
+        let bg_image_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("bg_image_pipeline"),
+            layout: Some(&bg_image_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &bg_image_shader,
+                entry_point: "vs_bg_img",
+                buffers: &[BgImageVertex::layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &bg_image_shader,
+                entry_point: "fs_bg_img",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
 
         // Params uniform buffer (initial opacity from config).
         let initial_params = BgImageParams {
             opacity: config.window.background_opacity,
             _pad: [0.0; 3],
         };
-        let bg_image_params_buf =
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("bg_image_params_buf"),
-                contents: bytemuck::bytes_of(&initial_params),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
+        let bg_image_params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("bg_image_params_buf"),
+            contents: bytemuck::bytes_of(&initial_params),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
         let bg_image_params_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bg_image_params_bind_group"),
             layout: &bg_img_params_layout,
@@ -1161,28 +1159,37 @@ impl Renderer {
     /// renderer is constructed to install a background image at runtime (e.g.
     /// when the user changes the setting via a hot-reload mechanism).
     pub fn upload_background_image(&mut self, pixels: &[u8], width: u32, height: u32) {
-        let tex_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("bg_img_tex_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+        let tex_layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("bg_img_tex_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let (tex, bg) = upload_bg_image(&self.device, &self.queue, pixels, width, height, &tex_layout);
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let (tex, bg) = upload_bg_image(
+            &self.device,
+            &self.queue,
+            pixels,
+            width,
+            height,
+            &tex_layout,
+        );
         self.bg_image_texture = Some(tex);
         self.bg_image_bind_group = Some(bg);
     }
@@ -1236,12 +1243,30 @@ impl Renderer {
             // that cell backgrounds at opacity < 1.0 blend with it).
             if let Some(bg_img_group) = &self.bg_image_bind_group {
                 let verts = [
-                    BgImageVertex { position: [-1.0,  1.0], tex_coords: [0.0, 0.0] },
-                    BgImageVertex { position: [ 1.0,  1.0], tex_coords: [1.0, 0.0] },
-                    BgImageVertex { position: [-1.0, -1.0], tex_coords: [0.0, 1.0] },
-                    BgImageVertex { position: [ 1.0,  1.0], tex_coords: [1.0, 0.0] },
-                    BgImageVertex { position: [ 1.0, -1.0], tex_coords: [1.0, 1.0] },
-                    BgImageVertex { position: [-1.0, -1.0], tex_coords: [0.0, 1.0] },
+                    BgImageVertex {
+                        position: [-1.0, 1.0],
+                        tex_coords: [0.0, 0.0],
+                    },
+                    BgImageVertex {
+                        position: [1.0, 1.0],
+                        tex_coords: [1.0, 0.0],
+                    },
+                    BgImageVertex {
+                        position: [-1.0, -1.0],
+                        tex_coords: [0.0, 1.0],
+                    },
+                    BgImageVertex {
+                        position: [1.0, 1.0],
+                        tex_coords: [1.0, 0.0],
+                    },
+                    BgImageVertex {
+                        position: [1.0, -1.0],
+                        tex_coords: [1.0, 1.0],
+                    },
+                    BgImageVertex {
+                        position: [-1.0, -1.0],
+                        tex_coords: [0.0, 1.0],
+                    },
                 ];
                 let buf = self
                     .device
@@ -1730,22 +1755,24 @@ impl Renderer {
                         tb_col_px += tb_cw;
                     }
                     let fg_color: [f32; 4] =
-                        seg.style.fg.as_ref().map_or([0.957, 0.843, 0.631, 1.0], |c| {
-                            [
-                                f32::from(c.r) / 255.0,
-                                f32::from(c.g) / 255.0,
-                                f32::from(c.b) / 255.0,
-                                1.0,
-                            ]
-                        });
+                        seg.style
+                            .fg
+                            .as_ref()
+                            .map_or([0.957, 0.843, 0.631, 1.0], |c| {
+                                [
+                                    f32::from(c.r) / 255.0,
+                                    f32::from(c.g) / 255.0,
+                                    f32::from(c.b) / 255.0,
+                                    1.0,
+                                ]
+                            });
 
                     for ch in seg.text.chars() {
                         if ch == ' ' {
                             tb_col_px += tb_cw;
                             continue;
                         }
-                        let Some(&entry) =
-                            self.atlas.glyphs.get(&(ch, false, false, sb_font_key))
+                        let Some(&entry) = self.atlas.glyphs.get(&(ch, false, false, sb_font_key))
                         else {
                             tracing::warn!(ch = %ch, "glyph atlas miss — top-bar cell skipped");
                             tb_col_px += tb_cw;
@@ -2071,7 +2098,10 @@ mod tests {
 
     // ── GPU-gated smoke tests ─────────────────────────────────────────────────
 
-    #[cfg_attr(not(feature = "gpu-tests"), ignore)]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires a GPU device; enable the gpu-tests feature to run"
+    )]
     #[test]
     fn renderer_scale_factor_change_clears_atlas() {
         // Verifies that creating a new ShelfPacker (what update_scale_factor does)
@@ -2087,7 +2117,10 @@ mod tests {
         );
     }
 
-    #[cfg_attr(not(feature = "gpu-tests"), ignore)]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires a GPU device; enable the gpu-tests feature to run"
+    )]
     #[test]
     fn renderer_glyph_atlas_key_stores_bold_and_regular_separately() {
         use std::collections::HashMap;
@@ -2111,7 +2144,10 @@ mod tests {
         );
     }
 
-    #[cfg_attr(not(feature = "gpu-tests"), ignore)]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires a GPU device; enable the gpu-tests feature to run"
+    )]
     #[test]
     fn renderer_status_bar_quads_placeholder() {
         // Documents expected behaviour: status-bar segments produce non-empty
@@ -2287,7 +2323,10 @@ mod tests {
     /// GPU-gated placeholder: the glyph miss warn! path requires a live atlas
     /// backed by a real wgpu device.  The warn! call is verified by code inspection
     /// on the non-GPU path.
-    #[cfg_attr(not(feature = "gpu-tests"), ignore)]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires a GPU device; enable the gpu-tests feature to run"
+    )]
     #[test]
     fn glyph_miss_emits_warn() {
         // Without GPU this is hard to test directly.
@@ -2310,7 +2349,10 @@ mod tests {
 
     /// GPU-gated placeholder: full status-bar glyph warmup and render verification
     /// require a live wgpu device and surface.
-    #[cfg_attr(not(feature = "gpu-tests"), ignore)]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires a GPU device; enable the gpu-tests feature to run"
+    )]
     #[test]
     fn status_bar_glyphs_render() {
         // Run with: LIBGL_ALWAYS_SOFTWARE=1 cargo test -p st-render --features gpu-tests

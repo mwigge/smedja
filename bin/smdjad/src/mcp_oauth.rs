@@ -215,6 +215,9 @@ mod tests {
         assert_eq!(path_a, path_b, "same URL must produce same path");
 
         let path_other = store.token_path("https://other.example.com");
-        assert_ne!(path_a, path_other, "different URLs must produce different paths");
+        assert_ne!(
+            path_a, path_other,
+            "different URLs must produce different paths"
+        );
     }
 }

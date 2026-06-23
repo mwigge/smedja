@@ -7,6 +7,7 @@ pub struct PoolsideProvider(SubprocessProvider);
 
 impl PoolsideProvider {
     /// Returns `Some(Self)` only if the `poolside` binary is on `$PATH`.
+    #[must_use]
     pub fn detect() -> Option<Self> {
         if which::which("poolside").is_ok() {
             Some(Self(SubprocessProvider::new("poolside", vec![])))

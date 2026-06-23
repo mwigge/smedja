@@ -434,7 +434,10 @@ impl StatusModule for TokensModule {
     fn evaluate(&self, ctx: &ModuleContext) -> Option<Segment> {
         let input = ctx.input_tokens?;
         let output = ctx.output_tokens?;
-        Some(plain_segment("tokens", format!("{input}\u{2191} {output}\u{2193}")))
+        Some(plain_segment(
+            "tokens",
+            format!("{input}\u{2191} {output}\u{2193}"),
+        ))
     }
 }
 
@@ -454,7 +457,8 @@ impl StatusModule for LatencyModule {
         let text = if ms < 1000 {
             format!("{ms}ms")
         } else {
-            #[allow(clippy::cast_precision_loss)] // ms ≤ u64::MAX; precision loss is acceptable for display
+            #[allow(clippy::cast_precision_loss)]
+            // ms ≤ u64::MAX; precision loss is acceptable for display
             let secs = ms as f64 / 1000.0;
             format!("{secs:.1}s")
         };
@@ -915,7 +919,9 @@ mod tests {
             last_exit_code: Some(1),
             ..make_ctx()
         };
-        let seg = ExitCodeModule.evaluate(&ctx).expect("should return Some for exit 1");
+        let seg = ExitCodeModule
+            .evaluate(&ctx)
+            .expect("should return Some for exit 1");
         assert!(seg.text.contains('1'), "text should include exit code");
         assert!(seg.text.contains('\u{2718}'), "text should contain ✘");
         let fg = seg.style.fg.as_ref().expect("should have fg colour");
@@ -990,8 +996,16 @@ mod tests {
             "expected output count in '{}'",
             seg.text
         );
-        assert!(seg.text.contains('\u{2191}'), "expected ↑ in '{}'", seg.text);
-        assert!(seg.text.contains('\u{2193}'), "expected ↓ in '{}'", seg.text);
+        assert!(
+            seg.text.contains('\u{2191}'),
+            "expected ↑ in '{}'",
+            seg.text
+        );
+        assert!(
+            seg.text.contains('\u{2193}'),
+            "expected ↓ in '{}'",
+            seg.text
+        );
     }
 
     // 18
@@ -1040,9 +1054,7 @@ mod tests {
     #[test]
     fn trace_module_extracts_first_eight_chars_of_trace_id() {
         let ctx = ModuleContext {
-            traceparent: Some(
-                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_owned(),
-            ),
+            traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_owned()),
             ..make_ctx()
         };
         let seg = TraceModule.evaluate(&ctx).expect("should return Some");
@@ -1059,7 +1071,9 @@ mod tests {
     #[test]
     fn app_name_module_always_returns_smedja() {
         let ctx = make_ctx();
-        let seg = AppNameModule.evaluate(&ctx).expect("AppNameModule must return Some");
+        let seg = AppNameModule
+            .evaluate(&ctx)
+            .expect("AppNameModule must return Some");
         assert_eq!(seg.text, "smedja");
     }
 
@@ -1069,7 +1083,9 @@ mod tests {
             session_id: Some("abcdef1234567890".to_owned()),
             ..make_ctx()
         };
-        let seg = SessionIdModule.evaluate(&ctx).expect("SessionIdModule must return Some");
+        let seg = SessionIdModule
+            .evaluate(&ctx)
+            .expect("SessionIdModule must return Some");
         assert_eq!(seg.text, "abcdef12");
     }
 
@@ -1086,9 +1102,17 @@ mod tests {
             cwd: Some(long.to_owned()),
             ..make_ctx()
         };
-        let seg = CwdModule.evaluate(&ctx).expect("CwdModule must return Some");
-        assert!(seg.text.starts_with('\u{2026}'), "long cwd must start with ellipsis");
-        assert!(seg.text.chars().count() <= 41, "truncated cwd must be at most 41 chars (ellipsis + 40)");
+        let seg = CwdModule
+            .evaluate(&ctx)
+            .expect("CwdModule must return Some");
+        assert!(
+            seg.text.starts_with('\u{2026}'),
+            "long cwd must start with ellipsis"
+        );
+        assert!(
+            seg.text.chars().count() <= 41,
+            "truncated cwd must be at most 41 chars (ellipsis + 40)"
+        );
     }
 
     #[test]
@@ -1097,7 +1121,9 @@ mod tests {
             cwd: Some("/home/user".to_owned()),
             ..make_ctx()
         };
-        let seg = CwdModule.evaluate(&ctx).expect("CwdModule must return Some");
+        let seg = CwdModule
+            .evaluate(&ctx)
+            .expect("CwdModule must return Some");
         assert_eq!(seg.text, "/home/user");
     }
 

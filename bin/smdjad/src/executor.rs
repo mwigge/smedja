@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::sandbox::SandboxExecutor;
 
-/// Local-tool allowlist shared with the OTel classification logic in `run_turn`.
+/// Local-tool allowlist shared with the `OTel` classification logic in `run_turn`.
 ///
 /// Every tool whose dispatch is handled natively inside [`execute_tool`] must
 /// appear here.  Anything absent from this list is routed to [`dispatch_mcp_tool`]
@@ -145,23 +145,22 @@ pub(crate) async fn execute_tool(
     if matches!(tool_name, "write_file" | "edit_file") {
         if let Some(path_str) = input.get("path").and_then(Value::as_str) {
             let raw_join = workspace.join(path_str);
-            let full = match raw_join.canonicalize() {
-                Ok(p) => p,
-                Err(_) => {
-                    let workspace_canon = workspace
-                        .canonicalize()
-                        .unwrap_or_else(|_| workspace.to_owned());
-                    let tentative = workspace.join(path_str);
-                    if !tentative.starts_with(&workspace_canon) {
-                        tracing::warn!(
-                            tool = tool_name,
-                            path = path_str,
-                            "smedja.security.data_access_blocked: write outside workspace rejected"
-                        );
-                        return r#"{"error": "path outside workspace"}"#.to_owned();
-                    }
-                    tentative
+            let full = if let Ok(p) = raw_join.canonicalize() {
+                p
+            } else {
+                let workspace_canon = workspace
+                    .canonicalize()
+                    .unwrap_or_else(|_| workspace.to_owned());
+                let tentative = workspace.join(path_str);
+                if !tentative.starts_with(&workspace_canon) {
+                    tracing::warn!(
+                        tool = tool_name,
+                        path = path_str,
+                        "smedja.security.data_access_blocked: write outside workspace rejected"
+                    );
+                    return r#"{"error": "path outside workspace"}"#.to_owned();
                 }
+                tentative
             };
             let workspace_canon = workspace
                 .canonicalize()
@@ -268,18 +267,17 @@ pub(crate) async fn execute_tool(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let raw_join = workspace.join(path_str);
-            let full = match raw_join.canonicalize() {
-                Ok(p) => p,
-                Err(_) => {
-                    let workspace_canon = workspace
-                        .canonicalize()
-                        .unwrap_or_else(|_| workspace.to_owned());
-                    let tentative = workspace.join(path_str);
-                    if !tentative.starts_with(&workspace_canon) {
-                        return r#"{"error": "path outside workspace"}"#.to_owned();
-                    }
-                    tentative
+            let full = if let Ok(p) = raw_join.canonicalize() {
+                p
+            } else {
+                let workspace_canon = workspace
+                    .canonicalize()
+                    .unwrap_or_else(|_| workspace.to_owned());
+                let tentative = workspace.join(path_str);
+                if !tentative.starts_with(&workspace_canon) {
+                    return r#"{"error": "path outside workspace"}"#.to_owned();
                 }
+                tentative
             };
             let workspace_canon = workspace
                 .canonicalize()
@@ -295,18 +293,17 @@ pub(crate) async fn execute_tool(
         "list_files" => {
             let dir_str = input.get("path").and_then(Value::as_str).unwrap_or(".");
             let raw_join = workspace.join(dir_str);
-            let full = match raw_join.canonicalize() {
-                Ok(p) => p,
-                Err(_) => {
-                    let workspace_canon = workspace
-                        .canonicalize()
-                        .unwrap_or_else(|_| workspace.to_owned());
-                    let tentative = workspace.join(dir_str);
-                    if !tentative.starts_with(&workspace_canon) {
-                        return r#"{"error": "path outside workspace"}"#.to_owned();
-                    }
-                    tentative
+            let full = if let Ok(p) = raw_join.canonicalize() {
+                p
+            } else {
+                let workspace_canon = workspace
+                    .canonicalize()
+                    .unwrap_or_else(|_| workspace.to_owned());
+                let tentative = workspace.join(dir_str);
+                if !tentative.starts_with(&workspace_canon) {
+                    return r#"{"error": "path outside workspace"}"#.to_owned();
                 }
+                tentative
             };
             let workspace_canon = workspace
                 .canonicalize()
@@ -377,8 +374,7 @@ pub(crate) async fn execute_tool(
             let entry_id = input
                 .get("id")
                 .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| Uuid::new_v4().to_string());
+                .map_or_else(|| Uuid::new_v4().to_string(), ToOwned::to_owned);
             let payload = input
                 .get("payload")
                 .cloned()

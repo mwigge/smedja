@@ -22,6 +22,7 @@ impl SubprocessProvider {
     }
 
     /// Returns `true` if the binary is found on `$PATH`.
+    #[must_use]
     pub fn available(binary: &str) -> bool {
         which::which(binary).is_ok()
     }

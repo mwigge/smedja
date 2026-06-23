@@ -8,7 +8,7 @@ use super::ServiceAction;
 
 const SERVICE_NAME: &str = "smdjad";
 
-pub fn dispatch(action: ServiceAction) -> Result<()> {
+pub fn dispatch(action: &ServiceAction) -> Result<()> {
     match action {
         ServiceAction::Install => install(),
         ServiceAction::Uninstall => uninstall(),
@@ -34,7 +34,12 @@ fn write_unit(smdjad_bin: &Path) -> Result<()> {
     let unit = unit_path()?;
     let xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_owned());
     let otlp_endpoint = std::env::var("SMEDJA_OTLP_ENDPOINT").ok();
-    write_unit_inner(smdjad_bin, &unit, &xdg_runtime_dir, otlp_endpoint.as_deref())
+    write_unit_inner(
+        smdjad_bin,
+        &unit,
+        &xdg_runtime_dir,
+        otlp_endpoint.as_deref(),
+    )
 }
 
 fn write_unit_inner(
@@ -114,10 +119,7 @@ pub fn logs() -> Result<()> {
 
 pub fn restart() -> Result<()> {
     let status = systemctl(&["restart", SERVICE_NAME])?;
-    anyhow::ensure!(
-        status.success(),
-        "systemctl restart {SERVICE_NAME} failed"
-    );
+    anyhow::ensure!(status.success(), "systemctl restart {SERVICE_NAME} failed");
     println!("smdjad restarted");
     Ok(())
 }
