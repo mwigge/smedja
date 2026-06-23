@@ -24,7 +24,7 @@ mod tests {
 
     #[test]
     fn ponytail_flags_println() {
-        let diff = concat!("+    println", "!(\"x\");\n");
+        let diff = "+    println!(\"x\");\n";
         let result = check(diff);
         assert!(result.is_err());
         let violation = result.unwrap_err();

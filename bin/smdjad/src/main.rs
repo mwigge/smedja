@@ -9,6 +9,7 @@ pub mod local_provider;
 pub mod loop_runner;
 pub mod mcp_http;
 pub mod mcp_oauth;
+pub mod methodology_gate;
 pub mod orchestrator;
 pub mod price_table;
 pub mod provider_pool;
