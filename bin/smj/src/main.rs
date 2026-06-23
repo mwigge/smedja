@@ -1,3 +1,5 @@
+pub mod service;
+
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
@@ -102,6 +104,11 @@ enum Cmd {
     Timeline {
         #[command(subcommand)]
         action: TimelineCmd,
+    },
+    /// Manage smdjad as a system service (launchd / systemd)
+    Service {
+        #[command(subcommand)]
+        action: service::ServiceAction,
     },
 }
 
@@ -1295,6 +1302,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Service { action } => service::run(action)?,
         Cmd::Term { action } => match action {
             TermCmd::Migrate { from, out } => {
                 let lua_source = std::fs::read_to_string(&from)
