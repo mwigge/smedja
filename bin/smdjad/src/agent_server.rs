@@ -27,6 +27,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, Mutex};
 
+use smedja_bellows::event::CorrelationCtx;
 use smedja_bellows::{Dispatcher, TurnEvent};
 
 type SubList = Arc<Mutex<Vec<mpsc::Sender<String>>>>;
@@ -129,9 +130,9 @@ fn turn_event_to_pane_json(
         TurnEvent::Started {
             session_id,
             turn_id,
-            trace_id,
-            span_id,
-            ..
+            correlation: CorrelationCtx {
+                trace_id, span_id, ..
+            },
         } => {
             start_times.insert(turn_id.clone(), tokio::time::Instant::now());
             json!({
@@ -216,13 +217,10 @@ mod tests {
         let event = TurnEvent::Started {
             session_id: "sess-1".into(),
             turn_id: "turn-1".into(),
-            conversation_id: None,
-            trace_id: Some("abc".into()),
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx {
+                trace_id: Some("abc".into()),
+                ..CorrelationCtx::default()
+            },
         };
         let line = turn_event_to_pane_json(&event, &mut start_times);
         assert!(line.contains("turn_start"));
@@ -239,13 +237,7 @@ mod tests {
             session_id: "s".into(),
             turn_id: "t-fail".into(),
             reason: "timeout".into(),
-            conversation_id: None,
-            trace_id: None,
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx::default(),
         };
         let line = turn_event_to_pane_json(&event, &mut start_times);
         assert!(line.contains("turn_end"));
@@ -263,13 +255,7 @@ mod tests {
             output_tokens: 88,
             input_tokens: Some(412),
             traceparent: Some("00-abc123def456-0102030405060708-01".into()),
-            conversation_id: None,
-            trace_id: None,
-            span_id: None,
-            parent_span_id: None,
-            operation_name: None,
-            agent_name: None,
-            status: None,
+            correlation: CorrelationCtx::default(),
         };
         let line = turn_event_to_pane_json(&event, &mut start_times);
         assert!(line.contains("turn_end"));

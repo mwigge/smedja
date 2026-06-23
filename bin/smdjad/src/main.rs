@@ -25,13 +25,15 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use smedja_adapter::types::{Message as AdapterMessage, Role as AdapterRole};
 use smedja_adapter::{CallOptions, Delta};
-use smedja_assayer::{Assayer, Role as AgentRole, Runner, Tier, WorktreePool};
+use smedja_assayer::{AgentRole, Assayer, Runner, Tier, WorktreePool};
 
 use crate::price_table::PriceTable;
 use crate::provider_pool::{build_provider_pool, ProviderPool};
+use smedja_bellows::event::CorrelationCtx;
 use smedja_bellows::{Dispatcher, TurnEvent};
 use smedja_ingot::{Checkpoint, CostRow, Ingot, IngotHandle, McpServer, Session, Task};
 use smedja_rpc::{codes, router::Router, server::Server, RpcError};
+use smedja_types::Timestamp;
 use smedja_vault::{Vault, VaultEntry};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -236,13 +238,7 @@ async fn drain_stream(
                 dispatcher.publish(TurnEvent::AssistantDelta {
                     content: t,
                     turn_id: turn_id.map(str::to_owned),
-                    conversation_id: None,
-                    trace_id: None,
-                    span_id: None,
-                    parent_span_id: None,
-                    operation_name: None,
-                    agent_name: None,
-                    status: None,
+                    correlation: CorrelationCtx::default(),
                 });
             }
             Some(Ok(Delta::Usage {
@@ -261,25 +257,16 @@ async fn drain_stream(
                     tool_name: name,
                     input_summary,
                     turn_id: turn_id.map(str::to_owned),
-                    conversation_id: None,
-                    trace_id: None,
-                    span_id: None,
-                    parent_span_id: None,
-                    operation_name: Some(tel::OPERATION_EXECUTE_TOOL.to_owned()),
-                    agent_name: None,
-                    status: None,
+                    correlation: CorrelationCtx {
+                        operation_name: Some(tel::OPERATION_EXECUTE_TOOL.to_owned()),
+                        ..CorrelationCtx::default()
+                    },
                     tool_call_id: None,
                 });
                 dispatcher.publish(TurnEvent::AssistantDelta {
                     content: line,
                     turn_id: turn_id.map(str::to_owned),
-                    conversation_id: None,
-                    trace_id: None,
-                    span_id: None,
-                    parent_span_id: None,
-                    operation_name: None,
-                    agent_name: None,
-                    status: None,
+                    correlation: CorrelationCtx::default(),
                 });
             }
             Some(Ok(Delta::ToolResult {
@@ -292,13 +279,7 @@ async fn drain_stream(
                 dispatcher.publish(TurnEvent::AssistantDelta {
                     content: line,
                     turn_id: turn_id.map(str::to_owned),
-                    conversation_id: None,
-                    trace_id: None,
-                    span_id: None,
-                    parent_span_id: None,
-                    operation_name: None,
-                    agent_name: None,
-                    status: None,
+                    correlation: CorrelationCtx::default(),
                 });
             }
             Some(Ok(Delta::SessionId(id))) => {
@@ -621,7 +602,7 @@ fn build_router(
                 .and_then(Value::as_str)
                 .map(str::to_owned);
 
-            let now = now_epoch();
+            let now = Timestamp::now();
             let session_id = Uuid::new_v4();
 
             // When task_description is provided, create the linked task first so
@@ -850,7 +831,7 @@ fn build_router(
                     .map_err(|e| ingot_err(&e))?
             };
 
-            let now = now_epoch();
+            let now = Timestamp::now();
             let new_id = Uuid::new_v4().to_string();
 
             {
@@ -881,6 +862,7 @@ fn build_router(
                     turn_n: cp.turn_n,
                     messages_json: cp.messages_json,
                     created_at: now,
+                    compaction_id: cp.compaction_id,
                 })
                 .await
                 .map_err(|e| ingot_err(&e))?;
@@ -998,7 +980,7 @@ fn build_router(
                 title,
                 description,
                 status: "planned".to_owned(),
-                created_at: now_epoch(),
+                created_at: Timestamp::now(),
                 session_id,
                 response: None,
             };
@@ -1051,7 +1033,7 @@ fn build_router(
                 title: content,
                 description: String::new(),
                 status: "planned".to_owned(),
-                created_at: now_epoch(),
+                created_at: Timestamp::now(),
                 session_id: Some(session_id.clone()),
                 response: None,
             };
@@ -1077,13 +1059,15 @@ fn build_router(
             dispatcher.publish(TurnEvent::Started {
                 session_id: session_id.clone(),
                 turn_id: task_id.to_string(),
-                conversation_id: Some(session_id.clone()),
-                trace_id: ts_trace_id,
-                span_id: ts_span_id,
-                parent_span_id: None,
-                operation_name: Some(tel::OPERATION_INVOKE_AGENT.to_owned()),
-                agent_name: Some("interactive".to_owned()),
-                status: None,
+                correlation: CorrelationCtx {
+                    conversation_id: Some(session_id.clone()),
+                    trace_id: ts_trace_id,
+                    span_id: ts_span_id,
+                    parent_span_id: None,
+                    operation_name: Some(tel::OPERATION_INVOKE_AGENT.to_owned()),
+                    agent_name: Some("interactive".to_owned()),
+                    status: None,
+                },
             });
 
             Ok(json!({ "task_id": task_id }))
@@ -1219,7 +1203,8 @@ fn build_router(
                 RpcError::new(codes::INTERNAL_ERROR, format!("compaction failed: {e}"))
             })?;
 
-            // Save pre-compaction checkpoint tagged with turn_n = -1.
+            // Save the pre-compaction checkpoint, tagged with a compaction id so
+            // it is retrievable via `list_compaction_checkpoints`.
             let turn_count = {
                 ig.list_checkpoints(&session_id)
                     .await
@@ -1228,9 +1213,10 @@ fn build_router(
             let cp = Checkpoint {
                 id: Uuid::new_v4(),
                 session_id: session_id.clone(),
-                turn_n: -1, // compaction marker
+                turn_n: turn_count,
                 messages_json: messages_json.clone(),
-                created_at: now_epoch(),
+                created_at: Timestamp::now(),
+                compaction_id: Some(Uuid::new_v4().to_string()),
             };
             {
                 if let Err(e) = ig.save_checkpoint(cp).await {
@@ -1327,13 +1313,13 @@ fn build_router(
                         "turns": r.turns,
                         "input_tok": r.input_tok,
                         "output_tok": r.output_tok,
-                        "cost_usd": r.cost_usd,
+                        "cost_usd": r.cost_usd.as_usd_f64(),
                     })
                 })
                 .collect();
             Ok(json!({
                 "session_id": session_id,
-                "total_usd": total_usd,
+                "total_usd": total_usd.as_usd_f64(),
                 "breakdown": breakdown,
             }))
         }
@@ -1438,7 +1424,7 @@ fn build_router(
                     .map_err(|e| ingot_err(&e))?
             };
 
-            let now = now_epoch();
+            let now = Timestamp::now();
             let new_id = Uuid::new_v4().to_string();
 
             {
@@ -1470,6 +1456,7 @@ fn build_router(
                     turn_n: cp.turn_n,
                     messages_json: cp.messages_json.clone(),
                     created_at: now,
+                    compaction_id: cp.compaction_id.clone(),
                 })
                 .await
                 .map_err(|e| ingot_err(&e))?;
@@ -1592,7 +1579,7 @@ fn build_router(
                 .get("enabled")
                 .and_then(Value::as_bool)
                 .ok_or_else(|| missing_param("enabled"))?;
-            ig.set_cowork_mode(&session_id, enabled)
+            ig.update_session_cowork_mode(&session_id, enabled)
                 .await
                 .map_err(|e| ingot_err(&e))?;
 
@@ -1871,8 +1858,11 @@ fn build_router(
             {
                 for role in &loop_roles {
                     if let Some(ref resume_sid) = role.resume_session_id {
-                        let cps = ig.list_checkpoints(resume_sid).await.unwrap_or_default();
-                        let depth = cps.iter().filter(|cp| cp.turn_n == -1).count();
+                        let depth = ig
+                            .list_compaction_checkpoints(resume_sid)
+                            .await
+                            .unwrap_or_default()
+                            .len();
                         #[allow(clippy::cast_possible_truncation)]
                         if depth as u8 >= smedja_assayer::MAX_ROLE_DEPTH {
                             return Err(RpcError::new(
@@ -2081,7 +2071,7 @@ fn build_router(
                 .as_str()
                 .ok_or_else(|| missing_param("change_name"))?
                 .to_owned();
-            let now = now_epoch();
+            let now = Timestamp::now();
             let rec = smedja_ingot::LoopRecord {
                 id: Uuid::new_v4().to_string(),
                 change_name,
@@ -2126,7 +2116,7 @@ fn build_router(
                 .as_str()
                 .ok_or_else(|| missing_param("loop_id"))?
                 .to_owned();
-            ig.update_loop_status(&loop_id, "cancelled", now_epoch())
+            ig.update_loop_status(&loop_id, "cancelled", Timestamp::now())
                 .await
                 .map_err(|e| ingot_err(&e))?;
             Ok(json!({ "loop_id": loop_id, "status": "cancelled" }))
@@ -2180,7 +2170,7 @@ fn build_router(
                     ),
                 ));
             }
-            ig.update_loop_status(&loop_id, "retired", now_epoch())
+            ig.update_loop_status(&loop_id, "retired", Timestamp::now())
                 .await
                 .map_err(|e| ingot_err(&e))?;
             Ok(json!({ "loop_id": loop_id, "status": "retired" }))
@@ -2667,8 +2657,10 @@ mod tests {
 
     // ── turn.subscribe event-driven wait ──────────────────────────────────────
 
+    use smedja_bellows::event::CorrelationCtx;
     use smedja_bellows::{Dispatcher, TurnEvent};
     use smedja_ingot::{Ingot, IngotHandle, Task};
+    use smedja_types::Timestamp;
 
     fn task(id: uuid::Uuid, status: &str, response: Option<&str>) -> Task {
         Task {
@@ -2676,7 +2668,7 @@ mod tests {
             title: "t".to_owned(),
             description: String::new(),
             status: status.to_owned(),
-            created_at: 0.0,
+            created_at: Timestamp::from_micros(0),
             session_id: None,
             response: response.map(str::to_owned),
         }
@@ -2774,13 +2766,10 @@ mod tests {
                 output_tokens: 0,
                 input_tokens: Some(0),
                 traceparent: None,
-                conversation_id: None,
-                trace_id: None,
-                span_id: None,
-                parent_span_id: None,
-                operation_name: None,
-                agent_name: None,
-                status: Some("ok".to_owned()),
+                correlation: CorrelationCtx {
+                    status: Some("ok".to_owned()),
+                    ..CorrelationCtx::default()
+                },
             });
         });
 
@@ -3056,7 +3045,7 @@ mod tests {
 
         let ig = IngotHandle::new(Ingot::open_in_memory().unwrap());
         let session_id = Uuid::new_v4().to_string();
-        let now = 1_700_000_000.0_f64;
+        let now = Timestamp::from_secs_f64(1_700_000_000.0);
         ig.create_session(Session {
             id: Uuid::parse_str(&session_id).unwrap(),
             created_at: now,
@@ -3086,7 +3075,7 @@ mod tests {
 
         let ig = IngotHandle::new(Ingot::open_in_memory().unwrap());
         let parent_id = Uuid::new_v4().to_string();
-        let now = 1_700_000_000.0_f64;
+        let now = Timestamp::from_secs_f64(1_700_000_000.0);
         ig.create_session(Session {
             id: Uuid::parse_str(&parent_id).unwrap(),
             created_at: now,
@@ -3108,8 +3097,8 @@ mod tests {
         let parent = ig.get_session(&parent_id).await.unwrap().unwrap();
         ig.create_session(Session {
             id: Uuid::parse_str(&new_id).unwrap(),
-            created_at: now + 1.0,
-            updated_at: now + 1.0,
+            created_at: Timestamp::from_secs_f64(1_700_000_001.0),
+            updated_at: Timestamp::from_secs_f64(1_700_000_001.0),
             status: "active".into(),
             task_id: None,
             mode: parent.mode.clone(),
@@ -3143,7 +3132,8 @@ mod tests {
             session_id: session_id.clone(),
             turn_n: 0,
             messages_json: messages.clone(),
-            created_at: 1_700_000_000.0,
+            created_at: Timestamp::from_secs_f64(1_700_000_000.0),
+            compaction_id: None,
         }];
 
         // Simulate the warm snapshot logic from task.parallel.

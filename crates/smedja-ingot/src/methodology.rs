@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn spec_and_approval_round_trip() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         ig.set_spec_recorded("sess-1", true).unwrap();
         ig.set_approval_recorded("sess-1", true).unwrap();
         let state = ig.get_methodology_state("sess-1").unwrap();
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn no_spec_gate_round_trip_independent_of_spec_flags() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         ig.set_no_spec_gate("sess-2", true).unwrap();
         let state = ig.get_methodology_state("sess-2").unwrap();
         assert!(state.no_spec_gate);
@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn flags_are_independently_updatable() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         ig.set_spec_recorded("sess-3", true).unwrap();
         ig.set_spec_recorded("sess-3", false).unwrap();
         ig.set_approval_recorded("sess-3", true).unwrap();

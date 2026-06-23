@@ -8,10 +8,10 @@
 //! # Quick start
 //!
 //! ```rust
-//! use smedja_assayer::{Assayer, Complexity, Role, Runner, Tier};
+//! use smedja_assayer::{AgentRole, Assayer, Complexity, Runner, Tier};
 //!
 //! let assayer = Assayer::default_rules();
-//! let route = assayer.route(Role::Review, Complexity::Coding);
+//! let route = assayer.route(AgentRole::Review, Complexity::Coding);
 //! assert_eq!(route.runner, Runner::Claude);
 //! assert_eq!(route.tier, Tier::Deep);
 //! ```
@@ -26,4 +26,4 @@ pub use assayer::{Assayer, RoutingRule};
 pub use bash_arity::{classify_bash, BashArity};
 pub use config::load_rules;
 pub use parallel::{Task, TaskStatus, WorktreePool};
-pub use types::{Complexity, Role, Route, Runner, Tier, MAX_ROLE_DEPTH};
+pub use types::{AgentRole, Complexity, Route, RoutingDecision, Runner, Tier, MAX_ROLE_DEPTH};

@@ -871,16 +871,10 @@ mod tests {
     fn st_agent_decodes_legacy_started_event() {
         let json = r#"{"Started":{"session_id":"old","turn_id":"t0"}}"#;
         let ev: smedja_bellows::event::TurnEvent = serde_json::from_str(json).unwrap();
-        if let smedja_bellows::event::TurnEvent::Started {
-            conversation_id,
-            trace_id,
-            agent_name,
-            ..
-        } = ev
-        {
-            assert!(conversation_id.is_none());
-            assert!(trace_id.is_none());
-            assert!(agent_name.is_none());
+        if let smedja_bellows::event::TurnEvent::Started { correlation, .. } = ev {
+            assert!(correlation.conversation_id.is_none());
+            assert!(correlation.trace_id.is_none());
+            assert!(correlation.agent_name.is_none());
         } else {
             panic!("expected TurnEvent::Started");
         }

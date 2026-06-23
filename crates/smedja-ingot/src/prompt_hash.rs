@@ -100,7 +100,7 @@ mod tests {
 
     #[test]
     fn save_and_get_prompt_hash() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         ig.save_prompt_hash("smedja", "implementer", "deadbeef")
             .unwrap();
         let h = ig.get_prompt_hash("smedja", "implementer").unwrap();
@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn get_latest_returns_most_recent_hash() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         ig.save_prompt_hash("smedja", "implementer", "aaa").unwrap();
         ig.save_prompt_hash("smedja", "implementer", "bbb").unwrap();
         // bbb must win because it was inserted later (higher ts).
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn list_prompt_hashes_for_change() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         ig.save_prompt_hash("smedja", "implementer", "aaa").unwrap();
         ig.save_prompt_hash("smedja", "reviewer", "bbb").unwrap();
         let hashes = ig.list_prompt_hashes("smedja").unwrap();
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn list_prompt_hashes_isolates_by_change() {
-        let mut ig = Ingot::open_in_memory().unwrap();
+        let ig = Ingot::open_in_memory().unwrap();
         ig.save_prompt_hash("alpha", "implementer", "aaa").unwrap();
         ig.save_prompt_hash("beta", "reviewer", "bbb").unwrap();
         let hashes = ig.list_prompt_hashes("alpha").unwrap();
