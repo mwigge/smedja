@@ -24,6 +24,7 @@ smedja-plugins  = { path = "../../crates/smedja-plugins" }
 smedja-rpc      = { path = "../../crates/smedja-rpc" }
 st-config       = { path = "../../term/crates/st-config" }
 tokio           = { workspace = true }
+which           = { workspace = true }
 tracing         = { workspace = true }
 tracing-subscriber = { workspace = true }
 
