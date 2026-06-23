@@ -1,8 +1,11 @@
 use crate::types::{GateResult, MethodologyViolation};
 
 const GATE: &str = "CleanGate";
-// Split to avoid triggering the pre-commit println! scanner on this file itself.
-const PRINTLN_MARKER: &str = concat!("println", "!");
+/// The debug-output macro this gate blocks in production code. Written as an
+/// honest literal so the gate matches exactly the construct it is meant to
+/// detect (the previous `concat!`-split form could only match a runtime-
+/// reconstructed string and left the test bed never exercising the real macro).
+const PRINTLN_MARKER: &str = "println!";
 
 /// Checks a diff for hard structural violations.
 ///
@@ -58,7 +61,7 @@ pub(crate) fn check_added_lines(gate: &'static str, diff: &str) -> GateResult {
         if content.contains(PRINTLN_MARKER) {
             return Err(MethodologyViolation::new(
                 gate,
-                concat!("println", "!", " in library code").to_owned(),
+                "println! in library code".to_owned(),
             ));
         }
     }
@@ -81,11 +84,20 @@ mod tests {
 
     #[test]
     fn clean_fails_on_println() {
-        let diff = concat!("+    println", "!(\"debug output\");\n");
+        // Exercise the real macro literal so a regression in the matcher fails here.
+        let diff = "+    println!(\"debug output\");\n";
         let result = check(diff);
         assert!(result.is_err());
         let violation = result.unwrap_err();
         assert_eq!(violation.gate, GATE);
+        assert_eq!(violation.message, "println! in library code");
+    }
+
+    #[test]
+    fn marker_is_the_literal_macro() {
+        // The marker must be the exact construct the gate claims to block, not a
+        // runtime-reconstructed split that the test bed never exercises.
+        assert_eq!(PRINTLN_MARKER, "println!");
     }
 
     #[test]
