@@ -1,4 +1,5 @@
 # Maintainer: Morgan Wigge <morgan@wigge.nu>
+# To release: bump pkgver, run updpkgsums, then makepkg --printsrcinfo > .SRCINFO && git push
 pkgname=smedja
 pkgver=0.12.0
 pkgrel=1
