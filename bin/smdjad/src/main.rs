@@ -37,7 +37,7 @@ use smedja_types::Timestamp;
 use smedja_vault::{Vault, VaultEntry};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use smedja_telemetry as tel;
@@ -225,6 +225,7 @@ async fn drain_stream(
     mut stream: smedja_adapter::DeltaStream,
     dispatcher: &Dispatcher,
     turn_id: Option<&str>,
+    correlation: &CorrelationCtx,
 ) -> Result<(String, u32, u32, Option<String>), DrainError> {
     let mut full_response = String::new();
     let mut input_tokens = 0u32;
@@ -238,7 +239,7 @@ async fn drain_stream(
                 dispatcher.publish(TurnEvent::AssistantDelta {
                     content: t,
                     turn_id: turn_id.map(str::to_owned),
-                    correlation: CorrelationCtx::default(),
+                    correlation: correlation.clone(),
                 });
             }
             Some(Ok(Delta::Usage {
@@ -259,14 +260,14 @@ async fn drain_stream(
                     turn_id: turn_id.map(str::to_owned),
                     correlation: CorrelationCtx {
                         operation_name: Some(tel::OPERATION_EXECUTE_TOOL.to_owned()),
-                        ..CorrelationCtx::default()
+                        ..correlation.clone()
                     },
                     tool_call_id: None,
                 });
                 dispatcher.publish(TurnEvent::AssistantDelta {
                     content: line,
                     turn_id: turn_id.map(str::to_owned),
-                    correlation: CorrelationCtx::default(),
+                    correlation: correlation.clone(),
                 });
             }
             Some(Ok(Delta::ToolResult {
@@ -279,7 +280,7 @@ async fn drain_stream(
                 dispatcher.publish(TurnEvent::AssistantDelta {
                     content: line,
                     turn_id: turn_id.map(str::to_owned),
-                    correlation: CorrelationCtx::default(),
+                    correlation: correlation.clone(),
                 });
             }
             Some(Ok(Delta::SessionId(id))) => {
@@ -373,6 +374,7 @@ async fn terminal_envelope(ingot: &IngotHandle, task_id: &str) -> Result<Option<
 /// Subscribes to the dispatcher *before* the initial state read so no terminal
 /// event published after subscription is missed; on subscriber lag it falls back
 /// to a direct state read; the wait is bounded by `timeout`.
+#[tracing::instrument(skip(ingot, dispatcher), fields(turn_id = %task_id))]
 async fn await_turn_terminal(
     ingot: &IngotHandle,
     dispatcher: &Dispatcher,
@@ -516,9 +518,47 @@ fn spawn_worker(
     });
 }
 
+/// Returns `true` when `addr` falls in a range the daemon must never reach
+/// (SSRF defence): loopback, unspecified, RFC-1918 private, link-local
+/// (incl. the cloud IMDS endpoint), CGNAT, IPv6 ULA, and IPv6 link-local.
+///
+/// IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are unwrapped to their embedded
+/// IPv4 first, so a mapped private address cannot bypass the IPv4 rules.
+fn is_blocked_ip(addr: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+
+    // Unwrap IPv4-mapped IPv6 so the IPv4 range checks apply.
+    let addr = match addr {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+    };
+
+    if addr.is_loopback() || addr.is_unspecified() {
+        return true;
+    }
+
+    match addr {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 10
+                || (o[0] == 172 && (16..=31).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 168)
+                || v4.is_link_local() // 169.254.0.0/16 (incl. IMDS 169.254.169.254)
+                || (o[0] == 100 && (64..=127).contains(&o[1])) // 100.64.0.0/10 CGNAT
+        }
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            (seg[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
+                || (seg[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+        }
+    }
+}
+
 /// Returns `true` only for publicly routable HTTP/HTTPS URLs.
-/// Blocks RFC-1918 private ranges, loopback, the unspecified address, and the
-/// cloud IMDS endpoint (169.254.169.254).
+///
+/// Rejects non-HTTP schemes, the `localhost` hostname, and any host that parses
+/// to an IP address blocked by [`is_blocked_ip`]. Hostnames that do not parse as
+/// an IP are allowed (DNS resolution is the caller's network policy).
 fn is_safe_mcp_url(url: &str) -> bool {
     let Ok(parsed) = url.parse::<url::Url>() else {
         return false;
@@ -527,21 +567,18 @@ fn is_safe_mcp_url(url: &str) -> bool {
         return false;
     }
     let host = parsed.host_str().unwrap_or("");
-    if host == "localhost" || host == "169.254.169.254" {
+    if host == "localhost" {
         return false;
     }
-    if let Ok(addr) = host.parse::<std::net::IpAddr>() {
-        if addr.is_loopback() || addr.is_unspecified() {
+    // IPv6 literals come bracketed from the URL host (e.g. "[::1]"); strip the
+    // brackets so the address parses.
+    let host_ip = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(addr) = host_ip.parse::<std::net::IpAddr>() {
+        if is_blocked_ip(addr) {
             return false;
-        }
-        if let std::net::IpAddr::V4(v4) = addr {
-            let o = v4.octets();
-            if o[0] == 10
-                || (o[0] == 172 && o[1] >= 16 && o[1] <= 31)
-                || (o[0] == 192 && o[1] == 168)
-            {
-                return false;
-            }
         }
     }
     true
@@ -1199,7 +1236,9 @@ fn build_router(
                 &opts,
             );
             let dispatcher = Dispatcher::new(1);
-            let (summary, _, _, _) = drain_stream(stream, &dispatcher, None).await.map_err(|e| {
+            let (summary, _, _, _) = drain_stream(stream, &dispatcher, None, &CorrelationCtx::default())
+                .await
+                .map_err(|e| {
                 RpcError::new(codes::INTERNAL_ERROR, format!("compaction failed: {e}"))
             })?;
 
@@ -2297,19 +2336,37 @@ fn build_router(
 ///
 /// Path preference: `$XDG_RUNTIME_DIR/smdjad.secret` → `$HOME/.cache/smdjad.secret`
 /// → `/tmp/smdjad.secret`.
+/// Resolves the private path for the ACP secret from the runtime/home inputs, or
+/// `None` when only a world-traversable location (e.g. `/tmp`) would be available.
+///
+/// The secret is never written to `/tmp`: a world-traversable directory lets any
+/// local user learn the secret file's existence and (with lax permissions)
+/// content, so the daemon refuses rather than falling back there.
+fn acp_secret_path_from(
+    xdg_runtime_dir: Option<&str>,
+    home: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    if let Some(dir) = xdg_runtime_dir {
+        if !dir.is_empty() {
+            return Some(std::path::PathBuf::from(dir).join("smdjad.secret"));
+        }
+    }
+    home.map(|h| h.join(".cache").join("smdjad.secret"))
+}
+
 fn write_acp_secret(token: &str) {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    let secret_path = std::env::var("XDG_RUNTIME_DIR").map_or_else(
-        |_| {
-            dirs_home().map_or_else(
-                || std::path::PathBuf::from("/tmp/smdjad.secret"),
-                |h| h.join(".cache").join("smdjad.secret"),
-            )
-        },
-        |d| std::path::PathBuf::from(d).join("smdjad.secret"),
-    );
+    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+    let home = dirs_home();
+    let Some(secret_path) = acp_secret_path_from(xdg.as_deref(), home.as_deref()) else {
+        tracing::error!(
+            "no private directory for the ACP secret (set XDG_RUNTIME_DIR or HOME); \
+             refusing to write it to a world-traversable location like /tmp"
+        );
+        return;
+    };
 
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .write(true)
@@ -2324,13 +2381,78 @@ fn write_acp_secret(token: &str) {
     }
 }
 
+/// Resolves the daemon workspace root from an explicit env value and the current
+/// directory, never returning the bare relative `"."`.
+fn resolve_workspace_root_from(env: Option<String>, cwd: std::path::PathBuf) -> std::path::PathBuf {
+    match env {
+        Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => cwd,
+    }
+}
+
+/// Resolves the workspace root: `SMEDJA_WORKSPACE` if set, else the absolute
+/// current directory. The relative `"."` default is avoided because its meaning
+/// depends on the launcher's working directory under a supervisor.
+fn resolve_workspace_root() -> std::path::PathBuf {
+    let env = std::env::var("SMEDJA_WORKSPACE").ok();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    resolve_workspace_root_from(env, cwd)
+}
+
+/// Signals `READY=1` to systemd via `$NOTIFY_SOCKET` (for `Type=notify` units),
+/// after the socket is bound and the database is open. A no-op when not run
+/// under systemd (the variable is absent) or off Linux.
+#[cfg(target_os = "linux")]
+fn sd_notify_ready() {
+    let Ok(path) = std::env::var("NOTIFY_SOCKET") else {
+        return;
+    };
+    let Ok(sock) = std::os::unix::net::UnixDatagram::unbound() else {
+        return;
+    };
+    let sent = if let Some(name) = path.strip_prefix('@') {
+        // Abstract namespace socket (common for user services).
+        use std::os::linux::net::SocketAddrExt as _;
+        std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
+            .and_then(|addr| sock.send_to_addr(b"READY=1", &addr))
+            .is_ok()
+    } else {
+        sock.send_to(b"READY=1", &path).is_ok()
+    };
+    if sent {
+        tracing::debug!("notified systemd: READY=1");
+    }
+}
+
+/// No-op readiness notification off Linux (systemd is Linux-only).
+#[cfg(not(target_os = "linux"))]
+fn sd_notify_ready() {}
+
+/// Initialises the tracing subscriber, honouring `SMEDJA_LOG_FORMAT`.
+///
+/// `text` (default) uses the human-readable formatter; `json` emits structured
+/// JSON for log-ingestion pipelines (Loki, `OpenSearch`); an unrecognised value
+/// falls back to text with a warning.
+fn init_tracing() {
+    match std::env::var("SMEDJA_LOG_FORMAT").as_deref() {
+        Ok("json") => tracing_subscriber::fmt().json().init(),
+        Ok("text" | "") | Err(_) => tracing_subscriber::fmt().init(),
+        Ok(other) => {
+            tracing_subscriber::fmt().init();
+            tracing::warn!(format = other, "unrecognised SMEDJA_LOG_FORMAT; using text");
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)] // startup sequence: bind, migrate, orphan sweep, spawn workers
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    init_tracing();
 
-    // Install an OTLP exporter when SMEDJA_OTLP_ENDPOINT is set.
-    // Without this, all OTel spans are silently discarded by the no-op provider.
+    // Install an OTLP exporter when SMEDJA_OTLP_ENDPOINT is set; otherwise fall
+    // back to recording spans through the structured-log layer. The trace
+    // destination is logged in both branches so operators always know where
+    // span data goes (no silent discard).
     if let Ok(endpoint) = std::env::var("SMEDJA_OTLP_ENDPOINT") {
         use opentelemetry_otlp::WithExportConfig as _;
         let build_result = opentelemetry_otlp::SpanExporter::builder()
@@ -2343,14 +2465,14 @@ async fn main() -> anyhow::Result<()> {
                     .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
                     .build();
                 opentelemetry::global::set_tracer_provider(provider);
-                info!(endpoint = %endpoint, "OTLP trace exporter installed");
+                info!(endpoint = %endpoint, "trace destination: OTLP exporter");
             }
             Err(e) => {
-                warn!(error = %e, endpoint = %endpoint, "failed to install OTLP exporter; traces will not be exported");
+                warn!(error = %e, endpoint = %endpoint, "failed to install OTLP exporter; trace destination: structured logs only");
             }
         }
     } else {
-        warn!("SMEDJA_OTLP_ENDPOINT not set; OTel traces will not be exported");
+        info!("SMEDJA_OTLP_ENDPOINT not set; trace destination: structured logs only (set the endpoint to export OTLP spans)");
     }
 
     let path = socket_path();
@@ -2469,14 +2591,21 @@ async fn main() -> anyhow::Result<()> {
 
     // Build the provider pool and assayer once at startup; thread through Arc.
     let pool = build_provider_pool().await;
+    if pool.is_empty() {
+        // Loud degraded state: the daemon stays up (so config can be fixed
+        // without a restart loop) but every turn will fail until a provider
+        // is configured. build_provider_pool already logged the details.
+        error!("starting in a DEGRADED state: no LLM provider configured — turns will fail");
+    }
     let startup_runner: &'static str =
         Box::leak(pool.default_runner_name().to_owned().into_boxed_str());
     let startup_model: &'static str = Box::leak(pool.default_model().to_owned().into_boxed_str());
     let pool = Arc::new(pool);
 
     // Load workspace-local routing overrides if .smedja/agents.toml exists.
-    let workspace_root = std::env::var("SMEDJA_WORKSPACE")
-        .map_or_else(|_| std::path::PathBuf::from("."), std::path::PathBuf::from);
+    // Default to the absolute current directory (deterministic) rather than the
+    // relative "." whose meaning depends on the launcher's cwd under a supervisor.
+    let workspace_root = resolve_workspace_root();
     let mut assayer = Assayer::default_rules();
     match smedja_assayer::load_rules(&workspace_root) {
         Ok(rules) if !rules.is_empty() => {
@@ -2607,6 +2736,9 @@ async fn main() -> anyhow::Result<()> {
 
     let server = Server::new(router);
 
+    // Socket is bound and the database is open: signal readiness to systemd.
+    sd_notify_ready();
+
     tokio::select! {
         result = server.serve(listener) => {
             result?;
@@ -2621,6 +2753,16 @@ async fn main() -> anyhow::Result<()> {
                 .await
         } => {
             info!("received SIGTERM; shutting down");
+        }
+        _ = async {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("SIGHUP handler failed")
+                .recv()
+                .await
+        } => {
+            // Treat SIGHUP as a graceful shutdown so the drain and SocketGuard
+            // cleanup run, rather than the default terminate-without-cleanup.
+            info!("received SIGHUP; shutting down");
         }
     }
 
@@ -2801,6 +2943,81 @@ mod tests {
         }
         assert_eq!(reaped, 5);
         assert!(set.is_empty(), "set must be empty after reaping");
+    }
+
+    // ── SSRF guard ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_blocked_ip_rejects_private_and_special_ranges() {
+        let blocked = [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.5.5",
+            "192.168.1.1",
+            "169.254.169.254", // cloud IMDS (link-local)
+            "100.64.0.1",      // CGNAT
+            "0.0.0.0",
+            "::1",             // IPv6 loopback
+            "fc00::1",         // IPv6 ULA
+            "fe80::1",         // IPv6 link-local
+            "::ffff:10.0.0.1", // IPv4-mapped private
+        ];
+        for ip in blocked {
+            assert!(
+                super::is_blocked_ip(ip.parse().unwrap()),
+                "{ip} must be blocked"
+            );
+        }
+        let allowed = ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"];
+        for ip in allowed {
+            assert!(
+                !super::is_blocked_ip(ip.parse().unwrap()),
+                "{ip} must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn is_safe_mcp_url_allows_public_rejects_local() {
+        assert!(super::is_safe_mcp_url("https://example.com/mcp"));
+        assert!(super::is_safe_mcp_url("https://8.8.8.8/mcp"));
+        assert!(!super::is_safe_mcp_url("http://localhost/mcp"));
+        assert!(!super::is_safe_mcp_url("http://10.0.0.1/mcp"));
+        assert!(!super::is_safe_mcp_url("http://[::1]/mcp"));
+        assert!(!super::is_safe_mcp_url("ftp://example.com")); // non-http scheme
+    }
+
+    // ── ACP secret path ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn acp_secret_path_prefers_private_dirs_and_refuses_tmp() {
+        use std::path::Path;
+        assert_eq!(
+            super::acp_secret_path_from(Some("/run/user/501"), None),
+            Some(std::path::PathBuf::from("/run/user/501/smdjad.secret"))
+        );
+        assert_eq!(
+            super::acp_secret_path_from(None, Some(Path::new("/home/u"))),
+            Some(std::path::PathBuf::from("/home/u/.cache/smdjad.secret"))
+        );
+        // No XDG_RUNTIME_DIR and no HOME → refuse (would only be /tmp).
+        assert_eq!(super::acp_secret_path_from(None, None), None);
+        assert_eq!(super::acp_secret_path_from(Some(""), None), None);
+    }
+
+    // ── workspace root default ───────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_workspace_root_uses_explicit_env_else_absolute_cwd() {
+        let cwd = std::path::PathBuf::from("/abs/cwd");
+        assert_eq!(
+            super::resolve_workspace_root_from(Some("/ws".to_owned()), cwd.clone()),
+            std::path::PathBuf::from("/ws")
+        );
+        // Unset/empty → the (absolute) cwd, never the relative ".".
+        let got = super::resolve_workspace_root_from(None, cwd.clone());
+        assert_eq!(got, cwd);
+        assert_ne!(got, std::path::PathBuf::from("."));
     }
 
     #[test]

@@ -32,27 +32,20 @@ fn unit_path() -> Result<PathBuf> {
 
 fn write_unit(smdjad_bin: &Path) -> Result<()> {
     let unit = unit_path()?;
-    let xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_owned());
     let otlp_endpoint = std::env::var("SMEDJA_OTLP_ENDPOINT").ok();
-    write_unit_inner(
-        smdjad_bin,
-        &unit,
-        &xdg_runtime_dir,
-        otlp_endpoint.as_deref(),
-    )
+    write_unit_inner(smdjad_bin, &unit, otlp_endpoint.as_deref())
 }
 
-fn write_unit_inner(
-    smdjad_bin: &Path,
-    unit: &Path,
-    xdg_runtime_dir: &str,
-    otlp_endpoint: Option<&str>,
-) -> Result<()> {
+fn write_unit_inner(smdjad_bin: &Path, unit: &Path, otlp_endpoint: Option<&str>) -> Result<()> {
     let parent = unit.parent().expect("unit path always has a parent");
     std::fs::create_dir_all(parent)
         .with_context(|| format!("cannot create {}", parent.display()))?;
 
-    let mut env_lines = format!("Environment=\"XDG_RUNTIME_DIR={xdg_runtime_dir}\"\n");
+    // Use the systemd %U specifier rather than baking the installer's literal
+    // XDG_RUNTIME_DIR. %U resolves to the running user's UID at unit-start
+    // time, so /run/user/%U stays correct even if the UID differs from the one
+    // that installed the unit. This mirrors assets/smdjad.service.
+    let mut env_lines = String::from("Environment=XDG_RUNTIME_DIR=/run/user/%U\n");
     if let Some(ep) = otlp_endpoint {
         env_lines.push_str(&format!("Environment=\"SMEDJA_OTLP_ENDPOINT={ep}\"\n"));
     }
@@ -144,12 +137,27 @@ mod tests {
         std::fs::write(&fake_bin, b"").unwrap();
         let unit_dest = dir.path().join("smdjad.service");
 
-        write_unit_inner(&fake_bin, &unit_dest, "/run/user/1000", None).unwrap();
+        write_unit_inner(&fake_bin, &unit_dest, None).unwrap();
 
         let content = std::fs::read_to_string(&unit_dest).unwrap();
         assert!(content.contains(fake_bin.to_str().unwrap()));
         assert!(content.contains("smdjad agent daemon"));
         assert!(content.contains("Restart=on-failure"));
+    }
+
+    #[test]
+    fn write_unit_inner_uses_runtime_dir_specifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_bin = dir.path().join("smdjad");
+        std::fs::write(&fake_bin, b"").unwrap();
+        let unit_dest = dir.path().join("smdjad.service");
+
+        write_unit_inner(&fake_bin, &unit_dest, None).unwrap();
+
+        let content = std::fs::read_to_string(&unit_dest).unwrap();
+        // The %U specifier keeps the runtime dir correct across UID changes;
+        // a literal /run/user/<uid> must never be baked in.
+        assert!(content.contains("XDG_RUNTIME_DIR=/run/user/%U"));
     }
 
     #[test]
@@ -159,13 +167,7 @@ mod tests {
         std::fs::write(&fake_bin, b"").unwrap();
         let unit_dest = dir.path().join("smdjad.service");
 
-        write_unit_inner(
-            &fake_bin,
-            &unit_dest,
-            "/run/user/1000",
-            Some("http://localhost:4317"),
-        )
-        .unwrap();
+        write_unit_inner(&fake_bin, &unit_dest, Some("http://localhost:4317")).unwrap();
 
         let content = std::fs::read_to_string(&unit_dest).unwrap();
         assert!(content.contains("SMEDJA_OTLP_ENDPOINT"));
@@ -179,7 +181,7 @@ mod tests {
         std::fs::write(&fake_bin, b"").unwrap();
         let unit_dest = dir.path().join("smdjad.service");
 
-        write_unit_inner(&fake_bin, &unit_dest, "/run/user/1000", None).unwrap();
+        write_unit_inner(&fake_bin, &unit_dest, None).unwrap();
 
         let content = std::fs::read_to_string(&unit_dest).unwrap();
         assert!(!content.contains("SMEDJA_OTLP_ENDPOINT"));

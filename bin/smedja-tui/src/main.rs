@@ -2237,10 +2237,23 @@ impl Drop for TerminalGuard {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Initialises tracing, honouring `SMEDJA_LOG_FORMAT` (`text` default | `json`;
+/// unrecognised → text + warning).
+fn init_tracing() {
+    match std::env::var("SMEDJA_LOG_FORMAT").as_deref() {
+        Ok("json") => tracing_subscriber::fmt().json().init(),
+        Ok("text" | "") | Err(_) => tracing_subscriber::fmt().init(),
+        Ok(other) => {
+            tracing_subscriber::fmt().init();
+            tracing::warn!(format = other, "unrecognised SMEDJA_LOG_FORMAT; using text");
+        }
+    }
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)] // event loop + render + poll in a single binary entry point
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    init_tracing();
 
     let cli = Cli::parse();
     let sock = socket_path(cli.sock);
