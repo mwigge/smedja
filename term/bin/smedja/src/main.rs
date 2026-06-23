@@ -465,13 +465,21 @@ impl ApplicationHandler<UserEvent> for App {
                     // The modules run in parallel (rayon + per-module threads)
                     // within an 8 ms budget.  Live agent state comes from the
                     // st-agent bridge running in its own thread.
-                    let (tier, model, active_task) = {
+                    let (tier, model, active_task, input_tokens, output_tokens, latency_ms, traceparent) = {
                         // Non-blocking try_read: if the lock is contended (agent
                         // event writing) skip the update this frame.
                         if let Ok(s) = self.pane_state.0.try_read() {
-                            (s.tier.clone(), s.model.clone(), s.active_task.clone())
+                            (
+                                s.tier.clone(),
+                                s.model.clone(),
+                                s.active_task.clone(),
+                                s.last_input_tokens,
+                                s.last_output_tokens,
+                                s.last_latency_ms,
+                                s.last_traceparent.clone(),
+                            )
                         } else {
-                            (None, None, None)
+                            (None, None, None, None, None, None, None)
                         }
                     };
 
@@ -494,6 +502,10 @@ impl ApplicationHandler<UserEvent> for App {
                         context_window: 0,
                         active_task,
                         last_exit_code,
+                        input_tokens,
+                        output_tokens,
+                        latency_ms,
+                        traceparent,
                     };
 
                     let git_branch_disabled = self
@@ -508,6 +520,9 @@ impl ApplicationHandler<UserEvent> for App {
                     let mut sb_modules: Vec<Box<dyn st_statusbar::StatusModule>> = vec![
                         Box::new(st_statusbar::TierModule),
                         Box::new(st_statusbar::ModelModule),
+                        Box::new(st_statusbar::TokensModule),
+                        Box::new(st_statusbar::LatencyModule),
+                        Box::new(st_statusbar::TraceModule),
                         Box::new(st_statusbar::ExitCodeModule),
                         Box::new(st_statusbar::TimeModule),
                     ];
@@ -844,7 +859,7 @@ fn spawn_agent_bridge(state: SharedPaneState, agent_manager: SharedAgentManager,
                     debug!("agent bridge: smdjad socket absent — skipping");
                     return;
                 }
-                let Ok(mut client) = st_agent::SmdjadClient::connect().await else {
+                let Ok(mut client) = st_agent::SmdjadClient::connect_agent().await else {
                     return;
                 };
                 if client.subscribe_pane(&pane_id).await.is_err() {
@@ -862,14 +877,27 @@ fn spawn_agent_bridge(state: SharedPaneState, agent_manager: SharedAgentManager,
                             turn_id,
                             ..
                         } => {
-                            s.tier = Some(tier);
-                            s.model = Some(model.clone());
+                            if !tier.is_empty() {
+                                s.tier = Some(tier);
+                            }
+                            if !model.is_empty() {
+                                s.model = Some(model.clone());
+                                current_model = model;
+                            }
                             s.is_agent_turn = true;
                             current_turn_id = turn_id;
-                            current_model = model;
                         }
-                        st_agent::PaneEvent::TurnEnd { .. } => {
+                        st_agent::PaneEvent::TurnEnd {
+                            input_tokens,
+                            output_tokens,
+                            latency_ms,
+                            traceparent,
+                        } => {
                             s.is_agent_turn = false;
+                            s.last_input_tokens = Some(input_tokens);
+                            s.last_output_tokens = Some(output_tokens);
+                            s.last_latency_ms = Some(latency_ms);
+                            s.last_traceparent = traceparent;
                             // Mark the session done.
                             if !current_turn_id.is_empty() {
                                 let mut mgr = agent_manager
