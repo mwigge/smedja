@@ -13,6 +13,7 @@ pub mod guard;
 pub mod handle;
 pub mod loop_state;
 pub mod mcp;
+pub mod methodology;
 pub mod openspec_store;
 pub mod prompt_hash;
 pub mod session;
@@ -27,6 +28,7 @@ pub use guard::{classify as classify_command, is_safe as command_is_safe, Comman
 pub use handle::IngotHandle;
 pub use loop_state::LoopRecord;
 pub use mcp::McpServer;
+pub use methodology::MethodologyState;
 pub use openspec_store::OpenSpecStore;
 pub use prompt_hash::PromptHashRecord;
 pub use session::Session;
@@ -43,22 +45,49 @@ const SCHEMA_VERSION: i64 = 3;
 /// and recorded in `schema_migrations` so they are never applied twice.
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, "ALTER TABLE tasks ADD COLUMN response TEXT;"),
-    (2, "ALTER TABLE sessions ADD COLUMN cowork_mode INTEGER NOT NULL DEFAULT 0;"),
+    (
+        2,
+        "ALTER TABLE sessions ADD COLUMN cowork_mode INTEGER NOT NULL DEFAULT 0;",
+    ),
     (3, "ALTER TABLE sessions ADD COLUMN workspace_root TEXT;"),
     (4, "ALTER TABLE sessions ADD COLUMN model_override TEXT;"),
     (5, "ALTER TABLE sessions ADD COLUMN runner_override TEXT;"),
     (6, "ALTER TABLE audit_events ADD COLUMN role_id TEXT;"),
-    (7, "ALTER TABLE audit_events ADD COLUMN conversation_id TEXT;"),
+    (
+        7,
+        "ALTER TABLE audit_events ADD COLUMN conversation_id TEXT;",
+    ),
     (8, "ALTER TABLE audit_events ADD COLUMN trace_id TEXT;"),
     (9, "ALTER TABLE audit_events ADD COLUMN span_id TEXT;"),
-    (10, "ALTER TABLE audit_events ADD COLUMN parent_span_id TEXT;"),
+    (
+        10,
+        "ALTER TABLE audit_events ADD COLUMN parent_span_id TEXT;",
+    ),
     (11, "ALTER TABLE audit_events ADD COLUMN agent_name TEXT;"),
-    (12, "ALTER TABLE audit_events ADD COLUMN operation_name TEXT;"),
+    (
+        12,
+        "ALTER TABLE audit_events ADD COLUMN operation_name TEXT;",
+    ),
     (13, "ALTER TABLE audit_events ADD COLUMN status TEXT;"),
     (14, "ALTER TABLE audit_events ADD COLUMN error_kind TEXT;"),
-    (15, "ALTER TABLE audit_events ADD COLUMN error_count INTEGER;"),
+    (
+        15,
+        "ALTER TABLE audit_events ADD COLUMN error_count INTEGER;",
+    ),
     (16, "ALTER TABLE audit_events ADD COLUMN tool_call_id TEXT;"),
-    (17, "ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT '';"),
+    (
+        17,
+        "ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT '';",
+    ),
+    (
+        18,
+        "CREATE TABLE IF NOT EXISTS session_methodology ( \
+            session_id TEXT PRIMARY KEY, \
+            spec_recorded INTEGER NOT NULL DEFAULT 0, \
+            approval_recorded INTEGER NOT NULL DEFAULT 0, \
+            no_spec_gate INTEGER NOT NULL DEFAULT 0 \
+         );",
+    ),
 ];
 
 /// Aggregated statistics for a single multi-agent conversation.
@@ -1039,6 +1068,51 @@ impl Ingot {
     #[must_use = "check the Result to confirm the loop record was created"]
     pub fn create_loop(&mut self, rec: &LoopRecord) -> Result<(), IngotError> {
         loop_state::insert(&self.conn, rec)
+    }
+
+    /// Returns the spec-first methodology state for `session_id`, or the
+    /// all-false default when no row exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned methodology state"]
+    pub fn get_methodology_state(&self, session_id: &str) -> Result<MethodologyState, IngotError> {
+        methodology::get(&self.conn, session_id)
+    }
+
+    /// Sets the `spec_recorded` flag for `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPSERT fails.
+    #[must_use = "check the Result to confirm the flag was set"]
+    pub fn set_spec_recorded(&mut self, session_id: &str, value: bool) -> Result<(), IngotError> {
+        methodology::set_spec_recorded(&self.conn, session_id, value)
+    }
+
+    /// Sets the `approval_recorded` flag for `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPSERT fails.
+    #[must_use = "check the Result to confirm the flag was set"]
+    pub fn set_approval_recorded(
+        &mut self,
+        session_id: &str,
+        value: bool,
+    ) -> Result<(), IngotError> {
+        methodology::set_approval_recorded(&self.conn, session_id, value)
+    }
+
+    /// Sets the per-session `no_spec_gate` escape-hatch flag for `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPSERT fails.
+    #[must_use = "check the Result to confirm the flag was set"]
+    pub fn set_no_spec_gate(&mut self, session_id: &str, value: bool) -> Result<(), IngotError> {
+        methodology::set_no_spec_gate(&self.conn, session_id, value)
     }
 
     /// Retrieves a [`LoopRecord`] by `id`, returning `None` when not found.

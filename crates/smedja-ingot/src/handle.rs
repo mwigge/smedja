@@ -65,10 +65,7 @@ impl IngotHandle {
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
-    pub async fn list_audit_events(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<AuditEvent>, IngotError> {
+    pub async fn list_audit_events(&self, session_id: &str) -> Result<Vec<AuditEvent>, IngotError> {
         let inner = Arc::clone(&self.inner);
         let session_id = session_id.to_owned();
         tokio::task::spawn_blocking(move || {
@@ -205,10 +202,7 @@ impl IngotHandle {
         let inner = Arc::clone(&self.inner);
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
-            inner
-                .lock()
-                .expect("ingot mutex poisoned")
-                .get_session(&id)
+            inner.lock().expect("ingot mutex poisoned").get_session(&id)
         })
         .await
         .map_err(join_err)?
@@ -222,10 +216,7 @@ impl IngotHandle {
     pub async fn list_sessions(&self) -> Result<Vec<Session>, IngotError> {
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            inner
-                .lock()
-                .expect("ingot mutex poisoned")
-                .list_sessions()
+            inner.lock().expect("ingot mutex poisoned").list_sessions()
         })
         .await
         .map_err(join_err)?
@@ -275,11 +266,7 @@ impl IngotHandle {
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying UPDATE.
-    pub async fn set_cowork_mode(
-        &self,
-        session_id: &str,
-        enabled: bool,
-    ) -> Result<(), IngotError> {
+    pub async fn set_cowork_mode(&self, session_id: &str, enabled: bool) -> Result<(), IngotError> {
         let inner = Arc::clone(&self.inner);
         let session_id = session_id.to_owned();
         tokio::task::spawn_blocking(move || {
@@ -507,7 +494,10 @@ impl IngotHandle {
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
-    pub async fn get_stale_servers(&self, older_than_secs: f64) -> Result<Vec<McpServer>, IngotError> {
+    pub async fn get_stale_servers(
+        &self,
+        older_than_secs: f64,
+    ) -> Result<Vec<McpServer>, IngotError> {
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
             inner
@@ -642,10 +632,7 @@ impl IngotHandle {
         let inner = Arc::clone(&self.inner);
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
-            inner
-                .lock()
-                .expect("ingot mutex poisoned")
-                .get_task(&id)
+            inner.lock().expect("ingot mutex poisoned").get_task(&id)
         })
         .await
         .map_err(join_err)?
@@ -738,10 +725,7 @@ impl IngotHandle {
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
-    pub async fn list_checkpoints(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<Checkpoint>, IngotError> {
+    pub async fn list_checkpoints(&self, session_id: &str) -> Result<Vec<Checkpoint>, IngotError> {
         let inner = Arc::clone(&self.inner);
         let session_id = session_id.to_owned();
         tokio::task::spawn_blocking(move || {
@@ -818,10 +802,7 @@ impl IngotHandle {
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
-    pub async fn session_cost_entries(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<CostRow>, IngotError> {
+    pub async fn session_cost_entries(&self, session_id: &str) -> Result<Vec<CostRow>, IngotError> {
         let inner = Arc::clone(&self.inner);
         let session_id = session_id.to_owned();
         tokio::task::spawn_blocking(move || {
@@ -839,10 +820,7 @@ impl IngotHandle {
     /// # Errors
     ///
     /// Propagates [`IngotError::Db`] from the underlying query.
-    pub async fn session_last_model(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<String>, IngotError> {
+    pub async fn session_last_model(&self, session_id: &str) -> Result<Option<String>, IngotError> {
         let inner = Arc::clone(&self.inner);
         let session_id = session_id.to_owned();
         tokio::task::spawn_blocking(move || {
@@ -914,6 +892,86 @@ impl IngotHandle {
         .map_err(join_err)?
     }
 
+    /// Returns the spec-first methodology state for `session_id`, or the
+    /// all-false default when no row exists.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query.
+    pub async fn get_methodology_state(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::MethodologyState, IngotError> {
+        let inner = Arc::clone(&self.inner);
+        let session_id = session_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            inner
+                .lock()
+                .expect("ingot mutex poisoned")
+                .get_methodology_state(&session_id)
+        })
+        .await
+        .map_err(join_err)?
+    }
+
+    /// Sets the `spec_recorded` flag for `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPSERT.
+    pub async fn set_spec_recorded(&self, session_id: &str, value: bool) -> Result<(), IngotError> {
+        let inner = Arc::clone(&self.inner);
+        let session_id = session_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            inner
+                .lock()
+                .expect("ingot mutex poisoned")
+                .set_spec_recorded(&session_id, value)
+        })
+        .await
+        .map_err(join_err)?
+    }
+
+    /// Sets the `approval_recorded` flag for `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPSERT.
+    pub async fn set_approval_recorded(
+        &self,
+        session_id: &str,
+        value: bool,
+    ) -> Result<(), IngotError> {
+        let inner = Arc::clone(&self.inner);
+        let session_id = session_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            inner
+                .lock()
+                .expect("ingot mutex poisoned")
+                .set_approval_recorded(&session_id, value)
+        })
+        .await
+        .map_err(join_err)?
+    }
+
+    /// Sets the per-session `no_spec_gate` escape-hatch flag for `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPSERT.
+    pub async fn set_no_spec_gate(&self, session_id: &str, value: bool) -> Result<(), IngotError> {
+        let inner = Arc::clone(&self.inner);
+        let session_id = session_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            inner
+                .lock()
+                .expect("ingot mutex poisoned")
+                .set_no_spec_gate(&session_id, value)
+        })
+        .await
+        .map_err(join_err)?
+    }
+
     /// Retrieves a [`LoopRecord`] by `id`, returning `None` when not found.
     ///
     /// # Errors
@@ -923,10 +981,7 @@ impl IngotHandle {
         let inner = Arc::clone(&self.inner);
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
-            inner
-                .lock()
-                .expect("ingot mutex poisoned")
-                .get_loop(&id)
+            inner.lock().expect("ingot mutex poisoned").get_loop(&id)
         })
         .await
         .map_err(join_err)?
@@ -1117,10 +1172,7 @@ impl IngotHandle {
     ///
     /// Propagates [`IngotError::Json`] or [`IngotError::Db`] from the underlying
     /// import logic.
-    pub async fn import_jsonl(
-        &self,
-        records: Vec<serde_json::Value>,
-    ) -> Result<usize, IngotError> {
+    pub async fn import_jsonl(&self, records: Vec<serde_json::Value>) -> Result<usize, IngotError> {
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
             inner

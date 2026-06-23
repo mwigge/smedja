@@ -29,6 +29,7 @@ smedja-graph       = { path = "../../crates/smedja-graph" }
 smedja-ingot       = { path = "../../crates/smedja-ingot" }
 smedja-loop        = { path = "../../crates/smedja-loop", package = "smedja-loop-types" }
 smedja-memory      = { path = "../../crates/smedja-memory" }
+smedja-methodology = { path = "../../crates/smedja-methodology" }
 smedja-rpc         = { path = "../../crates/smedja-rpc" }
 smedja-sre         = { path = "../../crates/smedja-sre" }
 smedja-telemetry   = { path = "../../crates/smedja-telemetry" }

@@ -44,6 +44,32 @@ fn retrieve_store() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
     STORE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
+/// Extracts the proposed file content from a `write_file` / `edit_file` tool
+/// input, trying the common field names used by file-writing MCP tools.
+///
+/// Returns `None` when no content-bearing field is present, in which case the
+/// diff gate is skipped (it cannot build a meaningful diff).
+fn extract_proposed_content(input: &Value) -> Option<String> {
+    input
+        .get("content")
+        .or_else(|| input.get("new_string"))
+        .or_else(|| input.get("new_str"))
+        .or_else(|| input.get("replacement"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+/// Reads the current contents of `path_str` relative to `workspace`, returning
+/// an empty string when the file is absent (new file) or unreadable.
+async fn read_current_content(workspace: &std::path::Path, path_str: &str) -> String {
+    if path_str.is_empty() {
+        return String::new();
+    }
+    tokio::fs::read_to_string(workspace.join(path_str))
+        .await
+        .unwrap_or_default()
+}
+
 /// Returns `true` when the session's mode permits write-arity bash commands.
 ///
 /// The `"review"` mode is read-only by default; all other modes are unrestricted.
@@ -122,8 +148,9 @@ pub(crate) async fn execute_tool(
             let full = match raw_join.canonicalize() {
                 Ok(p) => p,
                 Err(_) => {
-                    let workspace_canon =
-                        workspace.canonicalize().unwrap_or_else(|_| workspace.to_owned());
+                    let workspace_canon = workspace
+                        .canonicalize()
+                        .unwrap_or_else(|_| workspace.to_owned());
                     let tentative = workspace.join(path_str);
                     if !tentative.starts_with(&workspace_canon) {
                         tracing::warn!(
@@ -136,8 +163,9 @@ pub(crate) async fn execute_tool(
                     tentative
                 }
             };
-            let workspace_canon =
-                workspace.canonicalize().unwrap_or_else(|_| workspace.to_owned());
+            let workspace_canon = workspace
+                .canonicalize()
+                .unwrap_or_else(|_| workspace.to_owned());
             if !full.starts_with(&workspace_canon) {
                 tracing::warn!(
                     tool = tool_name,
@@ -145,6 +173,63 @@ pub(crate) async fn execute_tool(
                     "smedja.security.data_access_blocked: write outside workspace rejected"
                 );
                 return r#"{"error": "path outside workspace"}"#.to_owned();
+            }
+        }
+    }
+
+    // Methodology gate: block non-conforming writes for gated sessions. Runs
+    // after the path-traversal guard and before any bytes are written (the actual
+    // write is performed downstream — by an MCP file tool — only if we proceed).
+    if matches!(tool_name, "write_file" | "edit_file") {
+        if let Some(s) = session {
+            let session_id = s.id.to_string();
+            let state = ingot
+                .get_methodology_state(&session_id)
+                .await
+                .unwrap_or_default();
+            // The escape hatch bypasses both the spec-first check and diff gates.
+            if !state.no_spec_gate {
+                let mode = crate::methodology_gate::parse_mode(s.mode.as_deref());
+                if matches!(mode, Some(smedja_methodology::Mode::Spec)) {
+                    // Spec-first lifecycle: no writes until spec and approval recorded.
+                    if !(state.spec_recorded && state.approval_recorded) {
+                        let missing = if state.spec_recorded {
+                            "approval"
+                        } else {
+                            "specification"
+                        };
+                        tracing::warn!(
+                            tool = tool_name,
+                            session = %session_id,
+                            "smedja.methodology.blocked: spec-first gate blocked write"
+                        );
+                        return format!(
+                            "error: spec-first gate — record a {missing} for the active task \
+                             before writing files (METHODOLOGY_BLOCKED)"
+                        );
+                    }
+                } else if let Some(mode) = mode {
+                    // Diff-level gate for tdd / clean / ponytail modes.
+                    if let Some(proposed) = extract_proposed_content(&input) {
+                        let path_str = input
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let current = read_current_content(workspace, path_str).await;
+                        let diff = crate::methodology_gate::build_added_diff(&current, &proposed);
+                        if let Some(violation) = crate::methodology_gate::run_gates(&mode, &diff) {
+                            tracing::warn!(
+                                tool = tool_name,
+                                gate = violation.gate,
+                                "smedja.methodology.blocked: gate blocked write"
+                            );
+                            return format!(
+                                "error: {} — {} (METHODOLOGY_BLOCKED)",
+                                violation.gate, violation.message
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -186,8 +271,9 @@ pub(crate) async fn execute_tool(
             let full = match raw_join.canonicalize() {
                 Ok(p) => p,
                 Err(_) => {
-                    let workspace_canon =
-                        workspace.canonicalize().unwrap_or_else(|_| workspace.to_owned());
+                    let workspace_canon = workspace
+                        .canonicalize()
+                        .unwrap_or_else(|_| workspace.to_owned());
                     let tentative = workspace.join(path_str);
                     if !tentative.starts_with(&workspace_canon) {
                         return r#"{"error": "path outside workspace"}"#.to_owned();
@@ -195,8 +281,9 @@ pub(crate) async fn execute_tool(
                     tentative
                 }
             };
-            let workspace_canon =
-                workspace.canonicalize().unwrap_or_else(|_| workspace.to_owned());
+            let workspace_canon = workspace
+                .canonicalize()
+                .unwrap_or_else(|_| workspace.to_owned());
             if !full.starts_with(&workspace_canon) {
                 return r#"{"error": "path outside workspace"}"#.to_owned();
             }
@@ -211,8 +298,9 @@ pub(crate) async fn execute_tool(
             let full = match raw_join.canonicalize() {
                 Ok(p) => p,
                 Err(_) => {
-                    let workspace_canon =
-                        workspace.canonicalize().unwrap_or_else(|_| workspace.to_owned());
+                    let workspace_canon = workspace
+                        .canonicalize()
+                        .unwrap_or_else(|_| workspace.to_owned());
                     let tentative = workspace.join(dir_str);
                     if !tentative.starts_with(&workspace_canon) {
                         return r#"{"error": "path outside workspace"}"#.to_owned();
@@ -220,8 +308,9 @@ pub(crate) async fn execute_tool(
                     tentative
                 }
             };
-            let workspace_canon =
-                workspace.canonicalize().unwrap_or_else(|_| workspace.to_owned());
+            let workspace_canon = workspace
+                .canonicalize()
+                .unwrap_or_else(|_| workspace.to_owned());
             if !full.starts_with(&workspace_canon) {
                 return r#"{"error": "path outside workspace"}"#.to_owned();
             }
@@ -242,10 +331,8 @@ pub(crate) async fn execute_tool(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_owned();
-            let k = usize::try_from(
-                input.get("k").and_then(Value::as_u64).unwrap_or(5),
-            )
-            .unwrap_or(5);
+            let k =
+                usize::try_from(input.get("k").and_then(Value::as_u64).unwrap_or(5)).unwrap_or(5);
             let ns = input
                 .get("namespace")
                 .and_then(Value::as_str)
@@ -469,7 +556,12 @@ pub(crate) async fn dispatch_mcp_tool(
 
     let client = match crate::mcp_http::McpHttpClient::new(&server.url, "") {
         Ok(c) => c,
-        Err(e) => return format!("error: could not connect to MCP server '{}': {e}", server.name),
+        Err(e) => {
+            return format!(
+                "error: could not connect to MCP server '{}': {e}",
+                server.name
+            )
+        }
     };
 
     tracing::debug!(
@@ -559,6 +651,123 @@ mod tests {
         );
     }
 
+    // ── methodology gate ──────────────────────────────────────────────────────
+
+    fn session_with_mode(mode: Option<&str>) -> smedja_ingot::Session {
+        smedja_ingot::Session {
+            id: uuid::Uuid::new_v4(),
+            created_at: 0.0,
+            updated_at: 0.0,
+            status: "active".to_owned(),
+            task_id: None,
+            mode: mode.map(str::to_owned),
+            title: String::new(),
+            cowork_mode: false,
+            workspace_root: None,
+            model_override: None,
+            runner_override: None,
+        }
+    }
+
+    async fn run_write(
+        ingot: &smedja_ingot::IngotHandle,
+        session: &smedja_ingot::Session,
+        workspace: &std::path::Path,
+        content: &str,
+    ) -> String {
+        use smedja_vault::Vault;
+        use tokio::sync::Mutex;
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+        let input = serde_json::json!({ "path": "f.rs", "content": content }).to_string();
+        super::execute_tool(
+            "write_file",
+            &input,
+            workspace,
+            Some(session),
+            ingot,
+            &vault,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn clean_mode_blocks_unwrap_write() {
+        let ingot = smedja_ingot::IngotHandle::new(smedja_ingot::Ingot::open_in_memory().unwrap());
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let session = session_with_mode(Some("clean"));
+        let result = run_write(&ingot, &session, &ws, "fn f() {\n    x.unwrap()\n}\n").await;
+        assert!(result.contains("METHODOLOGY_BLOCKED"), "got: {result}");
+        assert!(result.contains("CleanGate"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn clean_mode_allows_conforming_write() {
+        let ingot = smedja_ingot::IngotHandle::new(smedja_ingot::Ingot::open_in_memory().unwrap());
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let session = session_with_mode(Some("clean"));
+        // Clean content passes the gate; it then falls through to MCP dispatch.
+        let result = run_write(&ingot, &session, &ws, "fn f() -> u32 {\n    1\n}\n").await;
+        assert!(
+            !result.contains("METHODOLOGY_BLOCKED"),
+            "conforming write must pass the gate; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unmoded_session_is_ungated() {
+        let ingot = smedja_ingot::IngotHandle::new(smedja_ingot::Ingot::open_in_memory().unwrap());
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let session = session_with_mode(None);
+        let result = run_write(&ingot, &session, &ws, "fn f() {\n    x.unwrap()\n}\n").await;
+        assert!(
+            !result.contains("METHODOLOGY_BLOCKED"),
+            "a session with no mode must not be gated; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_spec_gate_escape_hatch_bypasses_gates() {
+        let ingot = smedja_ingot::IngotHandle::new(smedja_ingot::Ingot::open_in_memory().unwrap());
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let session = session_with_mode(Some("clean"));
+        ingot
+            .set_no_spec_gate(&session.id.to_string(), true)
+            .await
+            .unwrap();
+        let result = run_write(&ingot, &session, &ws, "fn f() {\n    x.unwrap()\n}\n").await;
+        assert!(
+            !result.contains("METHODOLOGY_BLOCKED"),
+            "escape hatch must bypass the gate; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_mode_blocks_write_until_spec_and_approval_recorded() {
+        let ingot = smedja_ingot::IngotHandle::new(smedja_ingot::Ingot::open_in_memory().unwrap());
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let session = session_with_mode(Some("spec"));
+
+        // No spec recorded → blocked, naming the missing specification.
+        let blocked = run_write(&ingot, &session, &ws, "fn f() -> u32 { 1 }\n").await;
+        assert!(blocked.contains("METHODOLOGY_BLOCKED"), "got: {blocked}");
+        assert!(blocked.contains("specification"), "got: {blocked}");
+
+        // Record spec + approval → the spec-first gate releases.
+        let sid = session.id.to_string();
+        ingot.set_spec_recorded(&sid, true).await.unwrap();
+        ingot.set_approval_recorded(&sid, true).await.unwrap();
+        let released = run_write(&ingot, &session, &ws, "fn f() -> u32 { 1 }\n").await;
+        assert!(
+            !released.contains("METHODOLOGY_BLOCKED"),
+            "spec+approval must release the spec-first gate; got: {released}"
+        );
+    }
+
     // ── dispatch_mcp_tool ─────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -566,8 +775,7 @@ mod tests {
         let ig = smedja_ingot::IngotHandle::new(
             smedja_ingot::Ingot::open_in_memory().expect("in-memory Ingot must open"),
         );
-        let result =
-            super::dispatch_mcp_tool("unknown_tool", &serde_json::json!({}), &ig).await;
+        let result = super::dispatch_mcp_tool("unknown_tool", &serde_json::json!({}), &ig).await;
         assert!(
             result.starts_with("error:"),
             "unregistered tool must return an error; got: {result}"
@@ -747,7 +955,10 @@ mod tests {
         )
         .await;
         let stored: serde_json::Value = serde_json::from_str(&store_result).unwrap();
-        assert_eq!(stored["stored"], true, "entry must be stored before searching");
+        assert_eq!(
+            stored["stored"], true,
+            "entry must be stored before searching"
+        );
 
         // Query with text similar to the inserted entry.
         let search_result = super::execute_tool(
