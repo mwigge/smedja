@@ -158,13 +158,21 @@ mod tests {
         let giant = "x".repeat(MAX_FRAME_BYTES + 1) + "\n";
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt as _;
-            client.stream.get_mut().write_all(giant.as_bytes()).await.unwrap();
+            client
+                .stream
+                .get_mut()
+                .write_all(giant.as_bytes())
+                .await
+                .unwrap();
         });
 
         let result = server.recv_request().await;
         assert!(result.is_err(), "oversized frame must be rejected");
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("too large"), "error must mention 'too large': {msg}");
+        assert!(
+            msg.contains("too large"),
+            "error must mention 'too large': {msg}"
+        );
     }
 
     #[tokio::test]

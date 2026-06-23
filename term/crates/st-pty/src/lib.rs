@@ -1278,7 +1278,10 @@ impl PtySession {
 
         std::thread::spawn(move || {
             let mut parser = vte::Parser::new();
-            let mut handler = VtHandler { grid, glyph_registry };
+            let mut handler = VtHandler {
+                grid,
+                glyph_registry,
+            };
             let mut apc_scanner = ApcScanner::new();
             let mut buf = [0u8; 4096];
 
@@ -1331,7 +1334,10 @@ impl PtySession {
         };
         std::thread::spawn(move || {
             let mut parser = vte::Parser::new();
-            let mut handler = VtHandler { grid, glyph_registry };
+            let mut handler = VtHandler {
+                grid,
+                glyph_registry,
+            };
             let mut apc_scanner = ApcScanner::new();
             let mut buf = [0u8; 4096];
             loop {
@@ -1934,7 +1940,7 @@ mod tests {
         let mut scanner = ApcScanner::new();
         let seq = b"\x1b_hello;world\x1b\\";
         let mut result = None;
-        for &byte in seq.iter() {
+        for &byte in seq {
             if let Some(payload) = scanner.advance(byte) {
                 result = Some(payload);
             }
@@ -1945,7 +1951,7 @@ mod tests {
     #[test]
     fn apc_scanner_returns_none_for_incomplete_sequence() {
         let mut scanner = ApcScanner::new();
-        for &byte in b"\x1b_incomplete".iter() {
+        for &byte in b"\x1b_incomplete" {
             assert!(scanner.advance(byte).is_none());
         }
     }
@@ -1956,13 +1962,16 @@ mod tests {
         // ESC followed by 'X' (not backslash) inside APC payload — should be included in payload.
         let seq = b"\x1b_foo\x1bXbar\x1b\\";
         let mut result = None;
-        for &byte in seq.iter() {
+        for &byte in seq {
             if let Some(payload) = scanner.advance(byte) {
                 result = Some(payload);
             }
         }
         let payload = result.expect("complete APC sequence should yield a payload");
-        assert!(payload.contains(&b'\x1b'), "ESC inside payload should be preserved");
+        assert!(
+            payload.contains(&b'\x1b'),
+            "ESC inside payload should be preserved"
+        );
     }
 
     #[test]
@@ -1976,7 +1985,7 @@ mod tests {
         let registry = Arc::new(Mutex::new(st_glyph::GlyphRegistry::new()));
         let mut scanner = ApcScanner::new();
 
-        for &byte in apc_seq.iter() {
+        for &byte in &apc_seq {
             if let Some(payload) = scanner.advance(byte) {
                 if let Some(reg) = st_glyph::parse_glyph_registration(&payload) {
                     let mut r = registry.lock();

@@ -25,7 +25,7 @@ use std::sync::Arc;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Mutex};
 
 use smedja_bellows::{Dispatcher, TurnEvent};
 
@@ -66,9 +66,7 @@ pub async fn serve(listener: UnixListener, dispatcher: Arc<Dispatcher>) {
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             };
-            let Some(line) = turn_event_to_pane_json(&event, &mut start_times) else {
-                continue;
-            };
+            let line = turn_event_to_pane_json(&event, &mut start_times);
             let mut locked = subs_bg.lock().await;
             locked.retain(|tx| tx.try_send(line.clone()).is_ok());
         }
@@ -120,14 +118,13 @@ async fn handle_connection(stream: UnixStream, subs: SubList) {
     }
 }
 
-/// Convert a [`TurnEvent`] to a PaneEvent JSON line.
+/// Convert a [`TurnEvent`] to a `PaneEvent` JSON line.
 ///
 /// `start_times` is used to compute latency for `Completed` events.
-/// Returns `None` for events that have no PaneEvent counterpart.
 fn turn_event_to_pane_json(
     event: &TurnEvent,
     start_times: &mut HashMap<String, tokio::time::Instant>,
-) -> Option<String> {
+) -> String {
     match event {
         TurnEvent::Started {
             session_id,
@@ -137,40 +134,34 @@ fn turn_event_to_pane_json(
             ..
         } => {
             start_times.insert(turn_id.clone(), tokio::time::Instant::now());
-            Some(
-                json!({
-                    "type": "turn_start",
-                    "params": {
-                        "session_id": session_id,
-                        "turn_id": turn_id,
-                        "trace_id": trace_id,
-                        "span_id": span_id,
-                    }
-                })
-                .to_string(),
-            )
+            json!({
+                "type": "turn_start",
+                "params": {
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "trace_id": trace_id,
+                    "span_id": span_id,
+                }
+            })
+            .to_string()
         }
         TurnEvent::ToolCalled {
             tool_name,
             input_summary,
             ..
-        } => Some(
-            json!({
-                "type": "tool_call",
-                "params": {
-                    "tool_name": tool_name,
-                    "args_summary": input_summary,
-                }
-            })
-            .to_string(),
-        ),
-        TurnEvent::AssistantDelta { content, .. } => Some(
-            json!({
-                "type": "stream_delta",
-                "params": { "text": content }
-            })
-            .to_string(),
-        ),
+        } => json!({
+            "type": "tool_call",
+            "params": {
+                "tool_name": tool_name,
+                "args_summary": input_summary,
+            }
+        })
+        .to_string(),
+        TurnEvent::AssistantDelta { content, .. } => json!({
+            "type": "stream_delta",
+            "params": { "text": content }
+        })
+        .to_string(),
         TurnEvent::Completed {
             turn_id,
             output_tokens,
@@ -178,9 +169,9 @@ fn turn_event_to_pane_json(
             traceparent,
             ..
         } => {
-            let latency_ms = start_times
-                .remove(turn_id)
-                .map_or(0, |t| t.elapsed().as_millis() as u64);
+            let latency_ms = start_times.remove(turn_id).map_or(0, |t| {
+                u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+            });
             let mut params = serde_json::Map::new();
             params.insert(
                 "input_tokens".into(),
@@ -191,24 +182,19 @@ fn turn_event_to_pane_json(
             if let Some(tp) = traceparent {
                 params.insert("traceparent".into(), json!(tp));
             }
-            Some(
-                json!({ "type": "turn_end", "params": serde_json::Value::Object(params) })
-                    .to_string(),
-            )
+            json!({ "type": "turn_end", "params": serde_json::Value::Object(params) }).to_string()
         }
         TurnEvent::Failed { turn_id, .. } => {
             start_times.remove(turn_id);
-            Some(
-                json!({
-                    "type": "turn_end",
-                    "params": {
-                        "input_tokens": 0u64,
-                        "output_tokens": 0u64,
-                        "latency_ms": 0u64,
-                    }
-                })
-                .to_string(),
-            )
+            json!({
+                "type": "turn_end",
+                "params": {
+                    "input_tokens": 0u64,
+                    "output_tokens": 0u64,
+                    "latency_ms": 0u64,
+                }
+            })
+            .to_string()
         }
     }
 }
@@ -238,7 +224,7 @@ mod tests {
             agent_name: None,
             status: None,
         };
-        let line = turn_event_to_pane_json(&event, &mut start_times).expect("must produce line");
+        let line = turn_event_to_pane_json(&event, &mut start_times);
         assert!(line.contains("turn_start"));
         assert!(line.contains("sess-1"));
         assert!(line.contains("turn-1"));
@@ -261,8 +247,7 @@ mod tests {
             agent_name: None,
             status: None,
         };
-        let line =
-            turn_event_to_pane_json(&event, &mut start_times).expect("must produce turn_end");
+        let line = turn_event_to_pane_json(&event, &mut start_times);
         assert!(line.contains("turn_end"));
         assert!(line.contains(r#""latency_ms":0"#));
         assert!(line.contains(r#""input_tokens":0"#));
@@ -286,8 +271,7 @@ mod tests {
             agent_name: None,
             status: None,
         };
-        let line =
-            turn_event_to_pane_json(&event, &mut start_times).expect("must produce turn_end");
+        let line = turn_event_to_pane_json(&event, &mut start_times);
         assert!(line.contains("turn_end"));
         assert!(line.contains(r#""input_tokens":412"#));
         assert!(line.contains(r#""output_tokens":88"#));

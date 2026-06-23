@@ -959,8 +959,7 @@ mod tests {
 
     #[test]
     fn turn_end_from_json_without_traceparent() {
-        let json =
-            r#"{"type":"turn_end","params":{"input_tokens":10,"output_tokens":5,"latency_ms":100}}"#;
+        let json = r#"{"type":"turn_end","params":{"input_tokens":10,"output_tokens":5,"latency_ms":100}}"#;
         let ev = PaneEvent::from_json_line(json).expect("must parse");
         if let PaneEvent::TurnEnd { traceparent, .. } = ev {
             assert!(traceparent.is_none(), "missing traceparent must be None");

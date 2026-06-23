@@ -25,6 +25,7 @@ pub enum BashArity {
 /// command name that precedes them.  This closes the blind spot where
 /// `cat foo > /etc/passwd` would otherwise be classified as `Read` because
 /// the first token (`cat`) is in the read-only allowlist.
+#[must_use]
 pub fn classify_bash(cmd: &str) -> BashArity {
     if contains_output_redirection(cmd) {
         return BashArity::Write;

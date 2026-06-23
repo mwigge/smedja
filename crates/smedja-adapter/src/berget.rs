@@ -7,6 +7,7 @@ pub struct BergetProvider(OpenAiProvider);
 
 impl BergetProvider {
     /// Returns `Some(Self)` if `BERGET_API_KEY` is set in the environment.
+    #[must_use]
     pub fn detect() -> Option<Self> {
         std::env::var("BERGET_API_KEY")
             .ok()

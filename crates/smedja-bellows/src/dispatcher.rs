@@ -41,6 +41,7 @@ impl Dispatcher {
     /// Returns the number of receivers that were sent the event.
     /// If there are no active receivers the event is silently discarded and
     /// `0` is returned — this is not an error condition.
+    #[allow(clippy::must_use_candidate)] // fire-and-forget: receiver count is advisory, callers routinely ignore it
     pub fn publish(&self, event: TurnEvent) -> usize {
         self.sender.send(event).unwrap_or(0)
     }

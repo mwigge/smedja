@@ -218,7 +218,7 @@ struct AppState {
     /// First `g` press received; waiting for a second `g` to jump to top.
     g_pending: bool,
     /// Byte offset of the insertion cursor within `input`.
-    /// Invariant: always on a UTF-8 char boundary, 0 ≤ cursor ≤ input.len().
+    /// Invariant: always on a UTF-8 char boundary, 0 ≤ cursor ≤ `input.len()`.
     input_cursor: usize,
     /// Pending cowork approvals waiting for a decision.
     pending_cowork: Vec<cowork_widget::CoworkItem>,
@@ -318,8 +318,7 @@ async fn start_stream_reader(
                     continue;
                 }
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                    let is_terminal =
-                        matches!(v["type"].as_str(), Some("done") | Some("error"));
+                    let is_terminal = matches!(v["type"].as_str(), Some("done" | "error"));
                     let _ = tx.send(v);
                     if is_terminal {
                         break;
@@ -442,12 +441,9 @@ fn extract_code_block<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
 fn save_generator_output(output_type: &OutputType, content: &str, state: &mut AppState) {
     match output_type {
         OutputType::DrawIo { slug } => {
-            let xml = match extract_code_block(content, "xml") {
-                Some(x) => x,
-                None => {
-                    push_system_message(state, "no ```xml block found in response");
-                    return;
-                }
+            let Some(xml) = extract_code_block(content, "xml") else {
+                push_system_message(state, "no ```xml block found in response");
+                return;
             };
             let path = format!("{slug}.drawio");
             match std::fs::write(&path, xml) {
@@ -456,12 +452,9 @@ fn save_generator_output(output_type: &OutputType, content: &str, state: &mut Ap
             }
         }
         OutputType::Pptx { slug } => {
-            let script = match extract_code_block(content, "python") {
-                Some(s) => s,
-                None => {
-                    push_system_message(state, "no ```python block found in response");
-                    return;
-                }
+            let Some(script) = extract_code_block(content, "python") else {
+                push_system_message(state, "no ```python block found in response");
+                return;
             };
             let script_path = format!("{slug}-gen.py");
             if let Err(e) = std::fs::write(&script_path, script) {
@@ -703,6 +696,7 @@ fn apply_agent(args: &str, state: &mut AppState) -> String {
     }
 }
 
+#[allow(clippy::too_many_lines)] // flat slash-command dispatch table; splitting is out of scope here
 async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) -> Result<bool> {
     let trimmed = input.trim();
     let Some(command_line) = trimmed.strip_prefix('/') else {
@@ -771,12 +765,10 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
             let bin = bin.clone();
             let (sub, rest) = args.split_once(' ').unwrap_or((args, ""));
             let text = match sub {
-                "" | "list" => {
-                    match run_openspec(&bin, &["list", "--json"]).await {
-                        Ok(json) => format_openspec_list(&json),
-                        Err(e) => e,
-                    }
-                }
+                "" | "list" => match run_openspec(&bin, &["list", "--json"]).await {
+                    Ok(json) => format_openspec_list(&json),
+                    Err(e) => e,
+                },
                 "status" => {
                     let extra: Vec<&str> = if rest.is_empty() {
                         vec!["status", "--json"]
@@ -877,11 +869,17 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
             let id = args.to_owned();
             let session_id = state.session_id.clone();
             let result = client
-                .call("cowork.approve", json!({ "session_id": session_id, "id": id }))
+                .call(
+                    "cowork.approve",
+                    json!({ "session_id": session_id, "id": id }),
+                )
                 .await;
             match result {
                 Ok(v) => {
-                    let resolved = v.get("resolved").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let resolved = v
+                        .get("resolved")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
                     let text = if resolved {
                         format!("approved: {id}")
                     } else {
@@ -910,7 +908,10 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
                 .await;
             match result {
                 Ok(v) => {
-                    let resolved = v.get("resolved").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let resolved = v
+                        .get("resolved")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
                     let text = if resolved {
                         format!("denied: {id}")
                     } else {
@@ -1077,7 +1078,7 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
                         .and_then(|r| r.as_str())
                         .unwrap_or(args)
                         .to_owned();
-                    state.runner = canonical.clone();
+                    state.runner.clone_from(&canonical);
                     push_system_message(state, format!("runner switched to {canonical}"));
                 }
                 Err(e) => push_system_message(state, format!("session.set_runner error: {e}")),
@@ -1111,8 +1112,8 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
                         .and_then(|r| r.as_str())
                         .unwrap_or(args)
                         .to_owned();
-                    state.session_id = new_session_id.clone();
-                    state.runner = runner.clone();
+                    state.session_id.clone_from(&new_session_id);
+                    state.runner.clone_from(&runner);
                     push_system_message(
                         state,
                         format!(
@@ -1153,10 +1154,7 @@ fn format_agents_table(v: &serde_json::Value) -> String {
         return "no runners available".to_owned();
     }
     let mut lines = vec![
-        format!(
-            " {:<14} {:<8} {}",
-            "runner", "tier", "model"
-        ),
+        format!(" {:<14} {:<8} {}", "runner", "tier", "model"),
         format!(" {}", "─".repeat(60)),
     ];
     for r in runners {
@@ -1180,11 +1178,11 @@ fn format_metrics(
                 let last = arr.last();
                 let total_in = last
                     .and_then(|r| r.get("cumulative_input"))
-                    .and_then(|v| v.as_i64())
+                    .and_then(serde_json::Value::as_i64)
                     .unwrap_or(0);
                 let total_out = last
                     .and_then(|r| r.get("cumulative_output"))
-                    .and_then(|v| v.as_i64())
+                    .and_then(serde_json::Value::as_i64)
                     .unwrap_or(0);
                 (arr.len(), total_in, total_out)
             })
@@ -1194,7 +1192,7 @@ fn format_metrics(
     let cost_usd = match cost {
         Ok(v) => v
             .get("total_usd")
-            .and_then(|c| c.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .unwrap_or(0.0),
         Err(_) => 0.0,
     };
@@ -1274,7 +1272,7 @@ async fn handle_key(
             }
         } else {
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                KeyCode::Char('y' | 'Y') => {
                     if let Some(item) = state.pending_cowork.first() {
                         let id = item.id.clone();
                         let _ = client
@@ -1286,7 +1284,7 @@ async fn handle_key(
                         state.pending_cowork.remove(0);
                     }
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') => {
+                KeyCode::Char('n' | 'N') => {
                     if let Some(item) = state.pending_cowork.first() {
                         let id = item.id.clone();
                         let _ = client
@@ -1302,7 +1300,7 @@ async fn handle_key(
                         state.pending_cowork.remove(0);
                     }
                 }
-                KeyCode::Char('m') | KeyCode::Char('M') => {
+                KeyCode::Char('m' | 'M') => {
                     state.cowork_modify_mode = true;
                 }
                 _ => {}
@@ -1352,16 +1350,18 @@ async fn handle_key(
                                     .and_then(|r| r.as_str())
                                     .unwrap_or(&runner_name)
                                     .to_owned();
-                                state.runner = canonical.clone();
+                                state.runner.clone_from(&canonical);
                                 push_system_message(
                                     state,
                                     format!("runner switched to {canonical}"),
                                 );
                             }
-                            Err(e) => push_system_message(
-                                state,
-                                format!("session.set_runner error: {e}"),
-                            ),
+                            Err(e) => {
+                                push_system_message(
+                                    state,
+                                    format!("session.set_runner error: {e}"),
+                                );
+                            }
                         }
                         state.runner_picker_mode = false;
                         state.slash_popup_visible = false;
@@ -1431,9 +1431,7 @@ async fn handle_key(
                 if query.is_empty() {
                     state.saved_input.clone_into(&mut state.input);
                     state.input_cursor = state.input.len();
-                } else if let Some((_, matched)) =
-                    history_search(&state.prompt_history, &query)
-                {
+                } else if let Some((_, matched)) = history_search(&state.prompt_history, &query) {
                     matched.clone_into(&mut state.input);
                     state.input_cursor = state.input.len();
                 }
@@ -1515,9 +1513,7 @@ async fn handle_key(
                         // (format: version-trace_id-parent_id-flags), which is a
                         // 32-hex-char trace ID.
                         let trace_id = tp.split('-').nth(1).unwrap_or("");
-                        format!(
-                            " — open in Jaeger: http://localhost:16686/trace/{trace_id}"
-                        )
+                        format!(" — open in Jaeger: http://localhost:16686/trace/{trace_id}")
                     } else {
                         " — set SMEDJA_OTLP_ENDPOINT to export traces".to_owned()
                     };
@@ -1525,7 +1521,7 @@ async fn handle_key(
                 }
                 return Ok(());
             }
-            KeyCode::Char('i') | KeyCode::Char('a') => {
+            KeyCode::Char('i' | 'a') => {
                 state.scroll_focus = false;
                 state.selection_mode = false;
                 state.g_pending = false;
@@ -1992,6 +1988,7 @@ async fn handle_key(
 // Render
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)] // single-pass frame layout; splitting is out of scope here
 fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     let area = frame.area();
 
@@ -2090,9 +2087,15 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         let prefix_len = state.input.rfind('\n').map_or(0, |i| i + 1);
         let cursor_in_line = state.input_cursor.saturating_sub(prefix_len);
         let last_line = &state.input[prefix_len..];
-        format!("... {}", render_input_with_cursor(last_line, cursor_in_line))
+        format!(
+            "... {}",
+            render_input_with_cursor(last_line, cursor_in_line)
+        )
     } else {
-        format!("> {}", render_input_with_cursor(&state.input, state.input_cursor))
+        format!(
+            "> {}",
+            render_input_with_cursor(&state.input, state.input_cursor)
+        )
     };
     let input_widget = Paragraph::new(input_display);
     frame.render_widget(input_widget, input_area);
@@ -2104,8 +2107,11 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
             "(reverse-i-search) `{}`: {}",
             state.history_search_query, matched
         );
-        let search_widget = Paragraph::new(search_text)
-            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM));
+        let search_widget = Paragraph::new(search_text).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::DIM),
+        );
         frame.render_widget(search_widget, search_area);
     }
 
@@ -2204,7 +2210,11 @@ fn render_slash_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, s
         })
         .collect();
 
-    let title = if state.runner_picker_mode { "runners" } else { "commands" };
+    let title = if state.runner_picker_mode {
+        "runners"
+    } else {
+        "commands"
+    };
     frame.render_widget(Clear, popup_rect);
     let popup = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(popup, popup_rect);
@@ -2418,28 +2428,25 @@ async fn main() -> Result<()> {
                             // Split on newlines so each line is a separate panel entry.
                             let mut remaining = text;
                             loop {
-                                match remaining.find('\n') {
-                                    Some(pos) => {
-                                        let chunk = &remaining[..pos];
-                                        if !chunk.is_empty() {
-                                            state.main_panel.push_delta(chunk);
-                                        }
-                                        state.main_panel.push_line(String::new());
-                                        remaining = &remaining[pos + 1..];
+                                if let Some(pos) = remaining.find('\n') {
+                                    let chunk = &remaining[..pos];
+                                    if !chunk.is_empty() {
+                                        state.main_panel.push_delta(chunk);
+                                    }
+                                    state.main_panel.push_line(String::new());
+                                    remaining = &remaining[pos + 1..];
+                                    if let Some(ref mut block) = state.current_block {
+                                        block.push_text(chunk);
+                                        block.push_text("\n");
+                                    }
+                                } else {
+                                    if !remaining.is_empty() {
+                                        state.main_panel.push_delta(remaining);
                                         if let Some(ref mut block) = state.current_block {
-                                            block.push_text(chunk);
-                                            block.push_text("\n");
+                                            block.push_text(remaining);
                                         }
                                     }
-                                    None => {
-                                        if !remaining.is_empty() {
-                                            state.main_panel.push_delta(remaining);
-                                            if let Some(ref mut block) = state.current_block {
-                                                block.push_text(remaining);
-                                            }
-                                        }
-                                        break;
-                                    }
+                                    break;
                                 }
                             }
                         }
@@ -2462,7 +2469,7 @@ async fn main() -> Result<()> {
                             u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
                         });
                         state.turn_submitted_at = None;
-                        state.last_traceparent = tp.clone();
+                        state.last_traceparent.clone_from(&tp);
 
                         let block_content = if let Some(mut block) = state.current_block.take() {
                             block.complete(elapsed_ms);
@@ -2559,14 +2566,20 @@ async fn main() -> Result<()> {
                                 block.complete(elapsed_ms);
                                 for line in block.render_lines(80) {
                                     state.main_panel.push_line(line.clone());
-                                    state.messages.push(Message { role: Role::System, text: line });
+                                    state.messages.push(Message {
+                                        role: Role::System,
+                                        text: line,
+                                    });
                                 }
                                 state.block_store.push(block);
                             } else {
                                 if !response.is_empty() {
                                     state.main_panel.push_delta(&response);
                                 }
-                                state.messages.push(Message { role: Role::System, text: response });
+                                state.messages.push(Message {
+                                    role: Role::System,
+                                    text: response,
+                                });
                             }
 
                             let footer =
@@ -2620,7 +2633,10 @@ async fn main() -> Result<()> {
                             format!("turn error: {e}")
                         };
                         state.main_panel.push_line(text.clone());
-                        state.messages.push(Message { role: Role::System, text });
+                        state.messages.push(Message {
+                            role: Role::System,
+                            text,
+                        });
                         state.pending_task_id = None;
                         state.last_poll = None;
                         state.turn_in_flight = false;
@@ -2652,6 +2668,8 @@ async fn main() -> Result<()> {
                     .filter_map(|v| {
                         let id = v["id"].as_str()?.to_owned();
                         let tool = v["tool"].as_str().unwrap_or("?").to_owned();
+                        #[allow(clippy::cast_possible_truncation)]
+                        // step counter is bounded well below u32::MAX
                         let step_n = v["step_n"].as_u64().unwrap_or(0) as u32;
                         let args_display = v["args"]
                             .as_object()
@@ -2815,7 +2833,10 @@ mod tests {
         assert!(state.input.is_empty(), "input must be cleared on Esc");
         assert_eq!(state.input_cursor, 0, "cursor must reset to 0 on Esc");
         assert!(!state.slash_popup_visible, "popup must close on Esc");
-        assert!(state.slash_completions.is_empty(), "completions must be cleared on Esc");
+        assert!(
+            state.slash_completions.is_empty(),
+            "completions must be cleared on Esc"
+        );
         assert_eq!(state.slash_cursor, 0);
     }
 
@@ -2877,7 +2898,10 @@ mod tests {
         assert!(out.contains("runner"), "header must include 'runner'");
         assert!(out.contains("claude-cli"), "table must list runner name");
         assert!(out.contains("fast"), "table must list tier");
-        assert!(out.contains("claude-haiku-4-5-20251001"), "table must list model");
+        assert!(
+            out.contains("claude-haiku-4-5-20251001"),
+            "table must list model"
+        );
     }
 
     #[test]
@@ -2935,7 +2959,10 @@ mod tests {
     fn format_approvals_list_empty_shows_no_pending_message() {
         let v = serde_json::json!([]);
         let out = format_approvals_list(&v);
-        assert!(out.contains("no pending"), "empty list must say no pending approvals");
+        assert!(
+            out.contains("no pending"),
+            "empty list must say no pending approvals"
+        );
     }
 
     #[test]
@@ -2948,15 +2975,27 @@ mod tests {
         let out = format_model_list(&v);
         assert!(out.contains("claude-cli"), "must include runner name");
         assert!(out.contains("fast"), "must include tier");
-        assert!(out.contains("claude-haiku-4-5-20251001"), "must include model");
+        assert!(
+            out.contains("claude-haiku-4-5-20251001"),
+            "must include model"
+        );
     }
 
     #[test]
     fn slash_completions_include_new_commands() {
         let required = [
-            "/agents", "/approve", "/approvals", "/briefing",
-            "/deny", "/login", "/metrics", "/model", "/quota", "/review",
-            "/switch", "/takeover",
+            "/agents",
+            "/approve",
+            "/approvals",
+            "/briefing",
+            "/deny",
+            "/login",
+            "/metrics",
+            "/model",
+            "/quota",
+            "/review",
+            "/switch",
+            "/takeover",
         ];
         for cmd in required {
             assert!(
@@ -2989,8 +3028,7 @@ mod tests {
         // Simulate what dispatch_slash("switch", "") does on successful runner.list:
         // populate slash_completions with runner names and set picker flags.
         let mut state = make_state("sess-switch");
-        state.slash_completions =
-            vec!["claude".to_owned(), "codex".to_owned(), "local".to_owned()];
+        state.slash_completions = vec!["claude".to_owned(), "codex".to_owned(), "local".to_owned()];
         state.slash_popup_visible = true;
         state.runner_picker_mode = true;
         state.input.clear();
@@ -2998,7 +3036,10 @@ mod tests {
 
         assert!(state.slash_popup_visible, "picker popup must open");
         assert!(state.runner_picker_mode, "runner_picker_mode must be set");
-        assert!(!state.slash_completions.is_empty(), "completions must list runner names");
+        assert!(
+            !state.slash_completions.is_empty(),
+            "completions must list runner names"
+        );
     }
 
     #[test]
@@ -3559,10 +3600,8 @@ mod tests {
             .get("model")
             .and_then(|v| v.as_str())
             .map(str::to_owned);
-        let resp_tier: Option<String> = resp
-            .get("tier")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned);
+        let resp_tier: Option<String> =
+            resp.get("tier").and_then(|v| v.as_str()).map(str::to_owned);
         let effective_tier = cli_tier.or(resp_tier);
         (runner, model, effective_tier)
     }
@@ -3659,9 +3698,15 @@ mod tests {
             state.selection_mode = false;
         }
 
-        assert!(!state.selection_mode, "selection must be cancelled after Esc");
+        assert!(
+            !state.selection_mode,
+            "selection must be cancelled after Esc"
+        );
         assert_eq!(state.main_panel.scroll, 3, "scroll must not change on Esc");
-        assert!(state.scroll_focus, "scroll_focus must remain active after cancelling selection");
+        assert!(
+            state.scroll_focus,
+            "scroll_focus must remain active after cancelling selection"
+        );
     }
 
     #[test]
@@ -3672,7 +3717,10 @@ mod tests {
         // Simulate the last else branch of Esc: no overlay, no selection, no scroll focus.
         state.scroll_focus = true;
 
-        assert!(state.scroll_focus, "scroll_focus must be set by Esc when idle");
+        assert!(
+            state.scroll_focus,
+            "scroll_focus must be set by Esc when idle"
+        );
     }
 
     #[test]
@@ -3845,7 +3893,7 @@ mod tests {
         state.main_panel.push_line("line gamma".to_owned());
         state.messages_top = 1;
         state.mouse_drag_start = Some(1); // row 1 → line 0 + scroll(0)
-        state.mouse_drag_end = Some(2);   // row 2 → line 1 + scroll(0)
+        state.mouse_drag_end = Some(2); // row 2 → line 1 + scroll(0)
 
         let me = MouseEvent {
             kind: MouseEventKind::Up(MouseButton::Left),
@@ -3855,8 +3903,14 @@ mod tests {
         };
         handle_mouse(&mut state, me);
 
-        assert!(state.clipboard.is_some(), "clipboard must be populated after drag release");
-        assert!(state.mouse_drag_start.is_none(), "drag start must be cleared");
+        assert!(
+            state.clipboard.is_some(),
+            "clipboard must be populated after drag release"
+        );
+        assert!(
+            state.mouse_drag_start.is_none(),
+            "drag start must be cleared"
+        );
         assert!(state.mouse_drag_end.is_none(), "drag end must be cleared");
         let has_msg = state
             .main_panel
@@ -3876,7 +3930,10 @@ mod tests {
         } else {
             state.quit = true;
         }
-        assert!(!state.quit, "Ctrl-C must not quit when clipboard is non-empty");
+        assert!(
+            !state.quit,
+            "Ctrl-C must not quit when clipboard is non-empty"
+        );
     }
 
     #[test]
@@ -3908,7 +3965,14 @@ mod tests {
 
     #[test]
     fn help_text_covers_all_major_commands() {
-        for cmd in ["/switch", "/health", "/tier", "/agents", "/briefing", "/clear"] {
+        for cmd in [
+            "/switch",
+            "/health",
+            "/tier",
+            "/agents",
+            "/briefing",
+            "/clear",
+        ] {
             assert!(HELP_TEXT.contains(cmd), "HELP_TEXT must mention {cmd}");
         }
     }
@@ -3943,10 +4007,20 @@ mod tests {
         state.slash_cursor = 0;
 
         assert_eq!(state.runner, "codex");
-        assert!(!state.runner_picker_mode, "runner_picker_mode must be cleared after confirm");
-        assert!(!state.slash_popup_visible, "popup must be closed after confirm");
         assert!(
-            state.main_panel.lines_text(0, 100).iter().any(|l| l.contains("runner switched")),
+            !state.runner_picker_mode,
+            "runner_picker_mode must be cleared after confirm"
+        );
+        assert!(
+            !state.slash_popup_visible,
+            "popup must be closed after confirm"
+        );
+        assert!(
+            state
+                .main_panel
+                .lines_text(0, 100)
+                .iter()
+                .any(|l| l.contains("runner switched")),
             "confirmation message must appear in panel"
         );
     }
@@ -3960,7 +4034,10 @@ mod tests {
 
         clear_slash_popup(&mut state);
 
-        assert!(!state.runner_picker_mode, "runner_picker_mode must be false after clear");
+        assert!(
+            !state.runner_picker_mode,
+            "runner_picker_mode must be false after clear"
+        );
         assert!(!state.slash_popup_visible);
         assert!(state.slash_completions.is_empty());
     }
@@ -3970,7 +4047,11 @@ mod tests {
         let mut state = make_state("sess-mode");
         state.scroll_focus = false;
         let buf = render_frame(&mut state);
-        let content: String = buf.content().iter().map(ratatui::buffer::Cell::symbol).collect();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
         assert!(
             content.contains("[I]"),
             "status bar must show [I] when scroll_focus=false; got: {content}"
@@ -3982,7 +4063,11 @@ mod tests {
         let mut state = make_state("sess-mode");
         state.scroll_focus = true;
         let buf = render_frame(&mut state);
-        let content: String = buf.content().iter().map(ratatui::buffer::Cell::symbol).collect();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
         assert!(
             content.contains("[N]"),
             "status bar must show [N] when scroll_focus=true; got: {content}"
@@ -3993,9 +4078,17 @@ mod tests {
 
     #[test]
     fn history_search_finds_most_recent_match() {
-        let history = vec!["git status".to_owned(), "git diff".to_owned(), "ls".to_owned()];
+        let history = vec![
+            "git status".to_owned(),
+            "git diff".to_owned(),
+            "ls".to_owned(),
+        ];
         let result = history_search(&history, "git");
-        assert_eq!(result, Some((1, "git diff")), "should return most recent match");
+        assert_eq!(
+            result,
+            Some((1, "git diff")),
+            "should return most recent match"
+        );
     }
 
     #[test]
@@ -4021,8 +4114,14 @@ mod tests {
         let mut state = make_state("sess-clear");
         state.main_panel.push_line("old line 1".into());
         state.main_panel.push_line("old line 2".into());
-        state.messages.push(Message { role: Role::System, text: "old line 1".into() });
-        state.messages.push(Message { role: Role::System, text: "old line 2".into() });
+        state.messages.push(Message {
+            role: Role::System,
+            text: "old line 1".into(),
+        });
+        state.messages.push(Message {
+            role: Role::System,
+            text: "old line 2".into(),
+        });
 
         // Simulate /clear dispatch
         state.display_start_idx = state.messages.len();
@@ -4097,7 +4196,10 @@ mod tests {
             }
         }
 
-        assert!(state.history_idx.is_none(), "history_idx must be None after returning to live input");
+        assert!(
+            state.history_idx.is_none(),
+            "history_idx must be None after returning to live input"
+        );
         assert_eq!(state.input, "live input");
     }
 
@@ -4125,7 +4227,10 @@ mod tests {
         // Simulate Ctrl-R in scroll mode
         state.context_rail_visible = !state.context_rail_visible;
 
-        assert!(!state.context_rail_visible, "context rail must be toggled off");
+        assert!(
+            !state.context_rail_visible,
+            "context rail must be toggled off"
+        );
     }
 
     #[test]
@@ -4158,8 +4263,14 @@ mod tests {
         state.history_search_mode = false;
         state.history_search_query.clear();
 
-        assert!(!state.history_search_mode, "search mode must be cleared on Enter");
-        assert_eq!(state.input, "git status", "matched input must be kept on Enter");
+        assert!(
+            !state.history_search_mode,
+            "search mode must be cleared on Enter"
+        );
+        assert_eq!(
+            state.input, "git status",
+            "matched input must be kept on Enter"
+        );
     }
 
     // --- tui-spec-command tests ---
@@ -4172,7 +4283,7 @@ mod tests {
 
     #[test]
     fn format_openspec_list_missing_changes_key_returns_no_active() {
-        let json = r#"{}"#;
+        let json = r"{}";
         assert_eq!(format_openspec_list(json), "no active changes");
     }
 
@@ -4183,8 +4294,14 @@ mod tests {
             {"name": "smdjad-service",  "status": "implementing"}
         ]}"#;
         let result = format_openspec_list(json);
-        assert!(result.contains("tui-input-modes"), "must contain first change name");
-        assert!(result.contains("smdjad-service"), "must contain second change name");
+        assert!(
+            result.contains("tui-input-modes"),
+            "must contain first change name"
+        );
+        assert!(
+            result.contains("smdjad-service"),
+            "must contain second change name"
+        );
         assert!(result.contains("proposed"), "must contain status");
     }
 
@@ -4201,9 +4318,18 @@ mod tests {
     fn format_openspec_status_renders_key_value_lines() {
         let json = r#"{"name": "my-change", "state": "implementing", "progress": "3/7"}"#;
         let result = format_openspec_status(json);
-        assert!(result.contains("name: my-change"), "must contain name field");
-        assert!(result.contains("state: implementing"), "must contain state field");
-        assert!(result.contains("progress: 3/7"), "must contain progress field");
+        assert!(
+            result.contains("name: my-change"),
+            "must contain name field"
+        );
+        assert!(
+            result.contains("state: implementing"),
+            "must contain state field"
+        );
+        assert!(
+            result.contains("progress: 3/7"),
+            "must contain progress field"
+        );
     }
 
     #[test]
@@ -4230,14 +4356,20 @@ mod tests {
             .lines_text(0, 100)
             .iter()
             .any(|l| l.contains("openspec not found"));
-        assert!(has_msg, "missing binary must produce openspec-not-found message");
+        assert!(
+            has_msg,
+            "missing binary must produce openspec-not-found message"
+        );
     }
 
     #[test]
     fn spec_unknown_subcommand_returns_usage() {
         // Test the "_ =>" branch of the spec arm directly via format.
         let text = "usage: /spec [list|status [name]|archive <name>]";
-        assert!(text.contains("usage:"), "unknown sub-command must show usage");
+        assert!(
+            text.contains("usage:"),
+            "unknown sub-command must show usage"
+        );
         assert!(text.contains("list"), "usage must mention list");
         assert!(text.contains("status"), "usage must mention status");
         assert!(text.contains("archive"), "usage must mention archive");

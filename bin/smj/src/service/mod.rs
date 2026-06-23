@@ -5,10 +5,10 @@
 use anyhow::Result;
 use clap::Subcommand;
 
-#[cfg(target_os = "macos")]
-mod macos;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 
 #[derive(Subcommand, Debug)]
 pub enum ServiceAction {
@@ -30,7 +30,7 @@ pub enum ServiceAction {
 ///
 /// Returns an error if the platform is unsupported, the binary cannot be
 /// located on PATH, or any sub-process invocation fails.
-pub fn run(action: ServiceAction) -> Result<()> {
+pub fn run(action: &ServiceAction) -> Result<()> {
     #[cfg(target_os = "macos")]
     return macos::dispatch(action);
 

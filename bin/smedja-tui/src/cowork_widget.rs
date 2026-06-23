@@ -48,7 +48,10 @@ impl Widget for CoworkWidget<'_> {
             String::new()
         };
 
-        let title = format!(" COWORK  step {} · {}{} ", item.step_n, item.tool, queue_suffix);
+        let title = format!(
+            " COWORK  step {} · {}{} ",
+            item.step_n, item.tool, queue_suffix
+        );
 
         // Truncate args to fit widget width minus 2 padding chars.
         let inner_width = (area.width as usize).saturating_sub(4).max(1);
@@ -65,22 +68,35 @@ impl Widget for CoworkWidget<'_> {
             ])
         } else {
             Line::from(vec![
-                Span::styled(" [y] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " [y] ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("approve  "),
-                Span::styled("[n] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "[n] ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("deny  "),
-                Span::styled("[m] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "[m] ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("modify"),
             ])
         };
 
         let lines = vec![
             Line::from(Span::styled(
-                format!(" {} ", args_truncated),
+                format!(" {args_truncated} "),
                 Style::default().fg(Color::White),
             )),
             Line::from(Span::styled(
-                format!(" {} ", reasoning_truncated),
+                format!(" {reasoning_truncated} "),
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(""),
@@ -90,7 +106,12 @@ impl Widget for CoworkWidget<'_> {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow))
-            .title(Span::styled(title, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
+            .title(Span::styled(
+                title,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ))
             .title_alignment(Alignment::Left);
 
         // Clear the area first so the overlay is opaque.
@@ -161,7 +182,10 @@ mod tests {
         let mut rows = Vec::new();
         for y in 0..buf.area.height {
             let row: String = (0..buf.area.width)
-                .map(|x| buf.cell((x, y)).map_or(' ', |c| c.symbol().chars().next().unwrap_or(' ')))
+                .map(|x| {
+                    buf.cell((x, y))
+                        .map_or(' ', |c| c.symbol().chars().next().unwrap_or(' '))
+                })
                 .collect();
             rows.push(row.trim_end().to_owned());
         }
@@ -195,7 +219,10 @@ mod tests {
             output.contains("instruction:"),
             "modify mode must show instruction prompt; got:\n{output}"
         );
-        assert!(output.contains("revert the file"), "must show current input");
+        assert!(
+            output.contains("revert the file"),
+            "must show current input"
+        );
     }
 
     #[test]
@@ -226,6 +253,9 @@ mod tests {
         // x is centred: left margin ≈ right margin
         let left = r.x;
         let right = parent.width - r.x - r.width;
-        assert!(left.abs_diff(right) <= 1, "rect must be horizontally centred");
+        assert!(
+            left.abs_diff(right) <= 1,
+            "rect must be horizontally centred"
+        );
     }
 }

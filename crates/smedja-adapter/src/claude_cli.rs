@@ -19,6 +19,7 @@ impl ClaudeCliProvider {
     /// Selects CLI if the `claude` binary is on `$PATH`, otherwise uses the API key.
     ///
     /// Returns `None` if neither is available.
+    #[must_use]
     pub fn detect(api_key: Option<String>) -> Option<Self> {
         if SubprocessProvider::available("claude") {
             Some(Self::Cli)
@@ -112,11 +113,11 @@ fn stream_claude_cli(messages: &[Message], opts: &CallOptions) -> DeltaStream {
 }
 
 async fn read_stderr(stderr: Option<tokio::process::ChildStderr>) -> String {
+    use tokio::io::AsyncReadExt as _;
     let Some(mut stderr) = stderr else {
         return String::new();
     };
     let mut buf = String::new();
-    use tokio::io::AsyncReadExt as _;
     let _ = stderr.read_to_string(&mut buf).await;
     buf
 }
@@ -138,7 +139,7 @@ fn parse_line(line: &str) -> Option<Delta> {
             return Some(Delta::SessionId(session_id.to_owned()));
         }
         if let Some(usage) = value.get("usage") {
-            return parse_usage(usage);
+            return Some(parse_usage(usage));
         }
     }
 
@@ -187,7 +188,7 @@ fn parse_line(line: &str) -> Option<Delta> {
     None
 }
 
-fn parse_usage(usage: &serde_json::Value) -> Option<Delta> {
+fn parse_usage(usage: &serde_json::Value) -> Delta {
     let input_tokens = usage
         .get("input_tokens")
         .and_then(serde_json::Value::as_u64)
@@ -198,10 +199,10 @@ fn parse_usage(usage: &serde_json::Value) -> Option<Delta> {
         .and_then(serde_json::Value::as_u64)
         .and_then(|n| u32::try_from(n).ok())
         .unwrap_or(0);
-    Some(Delta::Usage {
+    Delta::Usage {
         input_tokens,
         output_tokens,
-    })
+    }
 }
 
 fn stringify_content(value: &serde_json::Value) -> String {
@@ -299,6 +300,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the stream to serialize $PATH mutation across concurrent tests
     async fn cli_provider_streams_mock_claude_and_passes_resume() {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp_dir = std::env::temp_dir().join(format!(

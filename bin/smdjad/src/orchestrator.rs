@@ -5,6 +5,7 @@
 //! [`TurnOrchestrator::run`] to execute a single agent turn end-to-end.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,11 +17,11 @@ use opentelemetry::{
 use smedja_adapter::types::{Message as AdapterMessage, Role as AdapterRole};
 use smedja_adapter::CallOptions;
 use smedja_assayer::{Assayer, Complexity, Role as AgentRole, Route, Runner, Tier};
+use smedja_bellows::{Dispatcher, TurnEvent};
+use smedja_ingot::{Checkpoint, CostEntry, IngotHandle, TokenSnapshot};
 use smedja_memory::{
     estimate_messages_tokens, estimate_tokens, inject_conciseness, StrataConfig, WorkingMemory,
 };
-use smedja_bellows::{Dispatcher, TurnEvent};
-use smedja_ingot::{Checkpoint, CostEntry, IngotHandle, TokenSnapshot};
 use smedja_vault::Vault;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -98,7 +99,11 @@ impl TurnOrchestrator {
     /// [`TurnEvent::fail`] events and the task is marked `"failed"` in the
     /// ingot.  The function returns `()` rather than propagating, matching the
     /// existing `tokio::spawn` call sites.
+    #[allow(clippy::too_many_lines)] // sequential turn pipeline kept inline to preserve a single tracing span scope
     pub(crate) async fn run(self, session_id: String, turn_id: String) {
+        const MAX_RATE_LIMIT_RETRIES: u32 = 4;
+        const RATE_LIMIT_BACKOFF_BASE_SECS: u64 = 1;
+
         let ingot = &self.ingot;
         let dispatcher = &self.dispatcher;
         let gates = &self.gates;
@@ -136,7 +141,12 @@ impl TurnOrchestrator {
         //    Role comes from session.mode; complexity is conservatively Coding for now.
         let route = {
             let session_mode = {
-                ingot.get_session(&session_id).await.ok().flatten().and_then(|s| s.mode)
+                ingot
+                    .get_session(&session_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.mode)
             };
             let role = session_mode
                 .as_deref()
@@ -155,7 +165,8 @@ impl TurnOrchestrator {
         // Apply session runner override.
         let route = {
             let override_runner = {
-                ingot.get_session(&session_id)
+                ingot
+                    .get_session(&session_id)
                     .await
                     .ok()
                     .flatten()
@@ -163,23 +174,23 @@ impl TurnOrchestrator {
                     .and_then(|r| crate::parse_runner_str(&r))
             };
             if let Some(overridden) = override_runner {
-                Route { runner: overridden, ..route }
+                Route {
+                    runner: overridden,
+                    ..route
+                }
             } else {
                 route
             }
         };
 
-        let pool_entry = match pool.get(route.runner, route.tier) {
-            Some(e) => e,
-            None => {
-                let reason = "no LLM provider available; turn cannot execute".to_owned();
-                warn!(session_id = %session_id, turn_id = %turn_id, "{reason}");
-                let _ = ingot.update_task_status(&turn_id, "failed").await;
-                dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
-                turn_span.set_status(SpanStatus::error(reason));
-                turn_span.end();
-                return;
-            }
+        let Some(pool_entry) = pool.get(route.runner, route.tier) else {
+            let reason = "no LLM provider available; turn cannot execute".to_owned();
+            warn!(session_id = %session_id, turn_id = %turn_id, "{reason}");
+            let _ = ingot.update_task_status(&turn_id, "failed").await;
+            dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
+            turn_span.set_status(SpanStatus::error(reason));
+            turn_span.end();
+            return;
         };
 
         let provider = &pool_entry.provider;
@@ -193,9 +204,7 @@ impl TurnOrchestrator {
             .unwrap_or_else(|| pool_entry.default_model.to_owned());
 
         // 3. Load session for workspace root, cowork mode, and task context.
-        let session = {
-            ingot.get_session(&session_id).await.ok().flatten()
-        };
+        let session = { ingot.get_session(&session_id).await.ok().flatten() };
 
         let model = session
             .as_ref()
@@ -279,7 +288,8 @@ impl TurnOrchestrator {
         };
 
         let mcp_tools: Vec<serde_json::Value> = {
-            ingot.list_mcp_servers()
+            ingot
+                .list_mcp_servers()
                 .await
                 .unwrap_or_default()
                 .into_iter()
@@ -465,10 +475,11 @@ impl TurnOrchestrator {
                                                 )
                                             })
                                             .collect();
-                                        content.push_str(&format!(
+                                        let _ = write!(
+                                            content,
                                             "\n\n<graph_symbols>\n{}\n</graph_symbols>",
                                             snippets.join("\n\n")
-                                        ));
+                                        );
                                         injected_count = symbols.len();
                                     }
                                 }
@@ -522,9 +533,6 @@ impl TurnOrchestrator {
             }
         }
 
-        const MAX_RATE_LIMIT_RETRIES: u32 = 4;
-        const RATE_LIMIT_BACKOFF_BASE_SECS: u64 = 1;
-
         let mut full_response = String::new();
         let mut total_input_tokens = 0u32;
         let mut total_output_tokens = 0u32;
@@ -557,13 +565,8 @@ impl TurnOrchestrator {
                                 let reason =
                                     "rate limited by provider; retry limit exceeded".to_owned();
                                 warn!(turn_id = %turn_id, "rate limit retry limit exceeded");
-                                let _ =
-                                    ingot.update_task_status(&turn_id, "failed").await;
-                                dispatcher.publish(TurnEvent::fail(
-                                    &session_id,
-                                    &turn_id,
-                                    &reason,
-                                ));
+                                let _ = ingot.update_task_status(&turn_id, "failed").await;
+                                dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
                                 turn_span.set_status(SpanStatus::error(reason));
                                 turn_span.end();
                                 return;
@@ -698,8 +701,7 @@ impl TurnOrchestrator {
                     ));
                     tool_span.set_attribute(KeyValue::new(tel::TOOL_NAME, tool_name.clone()));
                     tool_span.set_attribute(KeyValue::new(tel::TOOL_TYPE, tool_type_val));
-                    tool_span
-                        .set_attribute(KeyValue::new(tel::TOOL_CALL_ID, tool_call_id.clone()));
+                    tool_span.set_attribute(KeyValue::new(tel::TOOL_CALL_ID, tool_call_id.clone()));
                     match tel::tool_args_capture_mode() {
                         tel::CaptureMode::Hash => {
                             tool_span.set_attribute(KeyValue::new(
@@ -821,7 +823,8 @@ impl TurnOrchestrator {
         }
 
         let turn_n: i64 = {
-            ingot.list_checkpoints(&session_id)
+            ingot
+                .list_checkpoints(&session_id)
                 .await
                 .map_or(0, |v| i64::try_from(v.len()).unwrap_or(i64::MAX))
         };
@@ -881,7 +884,8 @@ impl TurnOrchestrator {
             let input_tok = i64::from(total_input_tokens);
             let output_tok = i64::from(total_output_tokens);
             let (prior_in, prior_out) =
-                ingot.session_token_snapshots(&session_id)
+                ingot
+                    .session_token_snapshots(&session_id)
                     .await
                     .map_or((0, 0), |snaps| {
                         snaps
@@ -1043,9 +1047,7 @@ mod tests {
         use smedja_bellows::TurnEvent;
 
         // Arrange: build the shared dispatcher first so we can subscribe before run().
-        let ingot = IngotHandle::new(
-            Ingot::open_in_memory().expect("in-memory Ingot must open"),
-        );
+        let ingot = IngotHandle::new(Ingot::open_in_memory().expect("in-memory Ingot must open"));
         let dispatcher = Arc::new(Dispatcher::new(64));
         let mut rx = dispatcher.subscribe();
         let gates = Arc::new(Mutex::new(std::collections::HashMap::new()));

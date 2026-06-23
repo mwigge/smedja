@@ -23,8 +23,8 @@ use std::sync::Arc;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
 use tokio::sync::broadcast;
+use tokio::sync::Mutex;
 
 use smedja_bellows::{Dispatcher, TurnEvent};
 
@@ -32,11 +32,11 @@ use smedja_bellows::{Dispatcher, TurnEvent};
 const MAX_BUFFER_PER_TURN: usize = 2048;
 
 /// Maximum seconds to wait for a turn to start emitting events after a stream
-/// connection arrives.  If the task_id is valid but the turn has not yet fired
+/// connection arrives.  If the `task_id` is valid but the turn has not yet fired
 /// `Started`, the subscriber waits up to this duration before giving up.
 const STREAM_TIMEOUT_SECS: u64 = 90;
 
-/// Per-turn event buffer — keyed by turn_id (= task_id in smdjad).
+/// Per-turn event buffer — keyed by `turn_id` (= `task_id` in smdjad).
 ///
 /// Populated by a background subscriber task; drained by each streaming
 /// connection for that turn before it switches to live Bellows events.
@@ -50,7 +50,8 @@ pub type DeltaStore = Arc<Mutex<HashMap<String, VecDeque<String>>>>;
 /// (`Completed` or `Failed`) the buffer entry is retained so late-connecting
 /// stream clients can still replay it; callers should call
 /// [`cleanup_turn`](cleanup_turn) after a short delay to reclaim memory.
-pub fn spawn_delta_buffer(dispatcher: Arc<Dispatcher>) -> DeltaStore {
+#[must_use]
+pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
     let store: DeltaStore = Arc::new(Mutex::new(HashMap::new()));
     let store_inner = Arc::clone(&store);
     // Subscribe before spawning to avoid losing events published between
@@ -76,10 +77,7 @@ pub fn spawn_delta_buffer(dispatcher: Arc<Dispatcher>) -> DeltaStore {
                     ref turn_id,
                     ..
                 } => {
-                    let tid = match turn_id {
-                        Some(t) => t,
-                        None => continue,
-                    };
+                    let Some(tid) = turn_id else { continue };
                     if let Some(buf) = store.get_mut(tid) {
                         let line = json!({"type": "delta", "text": content}).to_string();
                         if buf.len() >= MAX_BUFFER_PER_TURN {
@@ -94,10 +92,7 @@ pub fn spawn_delta_buffer(dispatcher: Arc<Dispatcher>) -> DeltaStore {
                     ref turn_id,
                     ..
                 } => {
-                    let tid = match turn_id {
-                        Some(t) => t,
-                        None => continue,
-                    };
+                    let Some(tid) = turn_id else { continue };
                     if let Some(buf) = store.get_mut(tid) {
                         let line =
                             json!({"type": "tool_call", "name": tool_name, "input": input_summary})
@@ -151,6 +146,7 @@ pub async fn cleanup_turn(store: &DeltaStore, turn_id: &str) {
 }
 
 /// Returns the stream socket path for a given RPC socket path.
+#[must_use]
 pub fn stream_socket_path(rpc_path: &Path) -> std::path::PathBuf {
     let mut p = rpc_path.as_os_str().to_owned();
     p.push(".stream");
@@ -218,8 +214,8 @@ async fn handle_stream_connection(
 
     let mut saw_terminal = false;
     for event_line in &buffered {
-        let is_terminal = event_line.contains(r#""type":"done""#)
-            || event_line.contains(r#""type":"error""#);
+        let is_terminal =
+            event_line.contains(r#""type":"done""#) || event_line.contains(r#""type":"error""#);
         if write_line(&mut writer, event_line).await.is_err() {
             return;
         }
@@ -235,8 +231,8 @@ async fn handle_stream_connection(
     }
 
     // Forward live events filtered to this turn's task_id.
-    let deadline = tokio::time::Instant::now()
-        + std::time::Duration::from_secs(STREAM_TIMEOUT_SECS);
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(STREAM_TIMEOUT_SECS);
 
     loop {
         let event = match tokio::time::timeout_at(deadline, rx.recv()).await {
@@ -281,7 +277,7 @@ async fn handle_stream_connection(
 
 /// Convert a [`TurnEvent`] to `(turn_id, ndjson_line, is_terminal)`.
 ///
-/// Returns `(None, _, _)` for events where the turn_id is unknown or not
+/// Returns `(None, _, _)` for events where the `turn_id` is unknown or not
 /// relevant to the caller's filter (e.g. daemon-level events).
 fn turn_event_to_ndjson(
     event: &TurnEvent,
@@ -335,14 +331,11 @@ fn turn_event_to_ndjson(
             let line = json!({"type": "error", "message": reason}).to_string();
             (Some(turn_id.clone()), line, true)
         }
-        _ => (None, String::new(), false),
+        TurnEvent::Started { .. } => (None, String::new(), false),
     }
 }
 
-async fn write_line(
-    writer: &mut (impl AsyncWriteExt + Unpin),
-    line: &str,
-) -> std::io::Result<()> {
+async fn write_line(writer: &mut (impl AsyncWriteExt + Unpin), line: &str) -> std::io::Result<()> {
     let mut buf = line.to_owned();
     buf.push('\n');
     writer.write_all(buf.as_bytes()).await?;
@@ -357,7 +350,7 @@ mod tests {
     #[tokio::test]
     async fn delta_buffer_populates_on_assistant_delta() {
         let dispatcher = Arc::new(Dispatcher::new(32));
-        let store = spawn_delta_buffer(Arc::clone(&dispatcher));
+        let store = spawn_delta_buffer(&dispatcher);
 
         dispatcher.publish(TurnEvent::Started {
             session_id: "sess".into(),
@@ -388,13 +381,17 @@ mod tests {
         let s = store.lock().await;
         let buf = s.get("t1").expect("buffer entry for t1");
         assert_eq!(buf.len(), 1);
-        assert!(buf[0].contains("hello"), "expected delta line, got: {}", buf[0]);
+        assert!(
+            buf[0].contains("hello"),
+            "expected delta line, got: {}",
+            buf[0]
+        );
     }
 
     #[tokio::test]
     async fn delta_buffer_caps_at_max_per_turn() {
         let dispatcher = Arc::new(Dispatcher::new(4096));
-        let store = spawn_delta_buffer(Arc::clone(&dispatcher));
+        let store = spawn_delta_buffer(&dispatcher);
 
         dispatcher.publish(TurnEvent::Started {
             session_id: "sess".into(),

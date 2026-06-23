@@ -1,5 +1,6 @@
 /// Extract a structured JSON summary from raw context text.
 /// If input starts with `{` or `[` (after trimming), parse as JSON and return Some; else None.
+#[must_use]
 pub fn extract_json_structure(input: &str) -> Option<serde_json::Value> {
     let trimmed = input.trim_start();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
@@ -10,6 +11,7 @@ pub fn extract_json_structure(input: &str) -> Option<serde_json::Value> {
 }
 
 /// Re-expand a compacted JSON structure back to pretty-printed JSON text.
+#[must_use]
 pub fn expand(compact: &serde_json::Value) -> String {
     serde_json::to_string_pretty(compact).unwrap_or_default()
 }
