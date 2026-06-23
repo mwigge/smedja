@@ -249,14 +249,19 @@ Alternatively: right-click the binary or app in Finder → Open → Open anyway.
 
 ### Arch Linux / CachyOS
 
+Install from the AUR using any AUR helper:
+
 ```sh
 yay -S smedja
+# or: paru -S smedja
 ```
 
-or with another AUR helper:
+Or build from the PKGBUILD directly:
 
 ```sh
-paru -S smedja
+git clone https://github.com/mwigge/smedja
+cd smedja/assets
+makepkg -si
 ```
 
 After install, enable the daemon for auto-start on login:

@@ -170,36 +170,3 @@ jobs:
           ```
           EOF
 
-  aur-publish:
-    needs: release
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: update PKGBUILD checksums
-        run: |
-          VERSION="${{ github.ref_name }}"
-          PKGVER="${VERSION#v}"
-          BASE="https://github.com/mwigge/smedja/releases/download/${VERSION}"
-
-          curl -fsSL "${BASE}/smedja-linux-x86_64.tar.gz" -o /tmp/x86_64.tar.gz
-          curl -fsSL "${BASE}/smedja-linux-aarch64.tar.gz" -o /tmp/aarch64.tar.gz
-
-          SHA_X86=$(sha256sum /tmp/x86_64.tar.gz | awk '{print $1}')
-          SHA_ARM=$(sha256sum /tmp/aarch64.tar.gz | awk '{print $1}')
-
-          cp assets/PKGBUILD /tmp/PKGBUILD
-          sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" /tmp/PKGBUILD
-          sed -i "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('${SHA_X86}')/" /tmp/PKGBUILD
-          sed -i "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('${SHA_ARM}')/" /tmp/PKGBUILD
-
-      - uses: KSXGitHub/github-actions-deploy-aur@v2.7.2
-        with:
-          pkgname: smedja
-          pkgbuild: /tmp/PKGBUILD
-          commit_username: "GitHub Actions"
-          commit_email: "41898282+github-actions[bot]@users.noreply.github.com"
-          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          commit_message: "Update to ${{ github.ref_name }}"
-          force_push: "true"
