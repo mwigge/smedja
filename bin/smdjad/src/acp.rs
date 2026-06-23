@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use subtle::ConstantTimeEq;
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::routing::{delete, post};
@@ -17,6 +16,7 @@ use serde::Deserialize;
 use serde_json::json;
 use smedja_bellows::{Dispatcher, TurnHandle};
 use smedja_ingot::{IngotHandle, Session, Task};
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 /// Shared state for ACP route handlers.
@@ -453,12 +453,7 @@ mod tests {
         assert_eq!(json["session_id"], session_id);
 
         // Verify the override was persisted in the DB.
-        let fetched = state
-            .ingot
-            .get_session(&session_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let fetched = state.ingot.get_session(&session_id).await.unwrap().unwrap();
         assert_eq!(fetched.model_override.as_deref(), Some("gemma4-27b"));
     }
 
@@ -487,7 +482,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "prefix token must be rejected");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "prefix token must be rejected"
+        );
 
         // Same length as "test-token" but wrong content.
         let app = build_acp_router(test_state());
@@ -502,7 +501,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "wrong same-length token must be rejected");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "wrong same-length token must be rejected"
+        );
 
         // Correct token must be accepted.
         let app = build_acp_router(test_state());
@@ -517,6 +520,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "correct token must be accepted");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "correct token must be accepted"
+        );
     }
 }

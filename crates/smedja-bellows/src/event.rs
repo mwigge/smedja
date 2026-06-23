@@ -769,7 +769,10 @@ mod tests {
             status: None,
         };
         let result = ControlEvent::try_from(turn_event);
-        assert!(result.is_ok(), "TurnEvent::Started must convert to ControlEvent");
+        assert!(
+            result.is_ok(),
+            "TurnEvent::Started must convert to ControlEvent"
+        );
         if let Ok(ControlEvent::Started {
             session_id,
             turn_id,
@@ -825,7 +828,10 @@ mod tests {
             status: None,
         };
         let result: Option<DeltaEvent> = turn_event.into();
-        assert!(result.is_some(), "AssistantDelta must produce Some(DeltaEvent)");
+        assert!(
+            result.is_some(),
+            "AssistantDelta must produce Some(DeltaEvent)"
+        );
         let delta = result.unwrap();
         assert_eq!(delta.delta, "hello delta");
         assert_eq!(delta.turn_id.as_deref(), Some("turn-delta"));

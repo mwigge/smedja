@@ -343,8 +343,7 @@ fn effective_max_tool_turns() -> usize {
     std::env::var("SMEDJA_MAX_TOOL_TURNS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .map(|n| n.min(50))
-        .unwrap_or(MAX_TOOL_TURNS)
+        .map_or(MAX_TOOL_TURNS, |n| n.min(50))
 }
 
 /// Executes a single turn: loads the task, calls the LLM, handles tool calls,
@@ -472,7 +471,7 @@ fn build_router(
     assayer: &Arc<Assayer>,
     startup_runner: &'static str,
     startup_model: &'static str,
-    price_table: Arc<PriceTable>,
+    price_table: &Arc<PriceTable>,
     vault: &Arc<Mutex<Vault>>,
 ) -> Router {
     let mut router = Router::new();
@@ -1468,7 +1467,7 @@ fn build_router(
 
     // ── session.context ─────────────────────────────────────────────────────
     let ig = ingot.clone();
-    let pt = Arc::clone(&price_table);
+    let pt = Arc::clone(price_table);
     let vault_ctx = Arc::clone(&vault);
     router.register("session.context", move |params: Value| {
         let ig = ig.clone();
@@ -1865,8 +1864,8 @@ fn build_router(
             // agents can retrieve shared context via smedja_vault_search.
             let fan_out_id = Uuid::new_v4().to_string();
             if let Some(ref sid) = session_id {
-                let checkpoints = ig.list_checkpoints(sid).await.unwrap_or_default();
                 const WARM_WINDOW: usize = 5;
+                let checkpoints = ig.list_checkpoints(sid).await.unwrap_or_default();
                 let recent: Vec<_> = checkpoints.into_iter().rev().take(WARM_WINDOW).collect();
                 if !recent.is_empty() {
                     let fid = fan_out_id.clone();
@@ -2171,7 +2170,7 @@ fn build_router(
     let loop_run_gates = Arc::clone(&gates);
     let loop_run_pool = Arc::clone(&provider_pool);
     let loop_run_assayer = Arc::clone(assayer);
-    let loop_run_price = Arc::clone(&price_table);
+    let loop_run_price = Arc::clone(price_table);
     let loop_run_vault = Arc::clone(&vault);
     router.register("loop.run", move |params: Value| {
         let ig = loop_run_ingot.clone();
@@ -2448,7 +2447,7 @@ async fn main() -> anyhow::Result<()> {
         &assayer,
         startup_runner,
         startup_model,
-        Arc::clone(&price_table),
+        &price_table,
         &vault,
     );
 
@@ -2489,7 +2488,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Streaming NDJSON server — sibling socket for live turn events.
-    let delta_store = stream_server::spawn_delta_buffer(Arc::clone(&dispatcher));
+    let delta_store = stream_server::spawn_delta_buffer(&dispatcher);
     let stream_sock_path = stream_server::stream_socket_path(&path);
     let _ = std::fs::remove_file(&stream_sock_path);
     let _stream_sock_guard = SocketGuard {

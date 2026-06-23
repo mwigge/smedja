@@ -149,12 +149,11 @@ impl MainPanel {
                     LineStyle::Removed => Style::default().fg(Color::Red),
                     LineStyle::Code => Style::default().fg(Color::Yellow),
                 };
-                let style =
-                    if selection.is_some_and(|(lo, hi)| abs_line >= lo && abs_line <= hi) {
-                        Style::default().fg(Color::Black).bg(Color::White)
-                    } else {
-                        base
-                    };
+                let style = if selection.is_some_and(|(lo, hi)| abs_line >= lo && abs_line <= hi) {
+                    Style::default().fg(Color::Black).bg(Color::White)
+                } else {
+                    base
+                };
                 Line::from(Span::styled(sl.text.clone(), style))
             })
             .collect();
@@ -225,6 +224,7 @@ impl MainPanel {
     /// Only compiled under `#[cfg(test)]` — used by unit tests to inspect panel
     /// state without coupling them to the internal `Vec<StyledLine>` layout.
     #[cfg(test)]
+    #[must_use]
     pub fn visible_text(&self) -> String {
         self.lines
             .iter()
@@ -446,7 +446,10 @@ mod tests {
         panel.scroll_to_bottom();
         let before = panel.scroll;
         panel.scroll_down();
-        assert_eq!(panel.scroll, before, "scroll must not exceed last line index");
+        assert_eq!(
+            panel.scroll, before,
+            "scroll must not exceed last line index"
+        );
     }
 
     #[test]
@@ -488,7 +491,10 @@ mod tests {
         panel.clear_display();
         panel.push_line("after clear".into());
         panel.scroll_up();
-        assert_eq!(panel.scroll, panel.display_start, "scroll must not cross the clear watermark");
+        assert_eq!(
+            panel.scroll, panel.display_start,
+            "scroll must not cross the clear watermark"
+        );
     }
 
     #[test]
@@ -500,7 +506,11 @@ mod tests {
         panel.clear_display();
         panel.push_line("new line".into());
         // scroll == display_start == 3; new line is at index 3 → visible
-        let vis: Vec<&StyledLine> = panel.lines.iter().skip(panel.scroll.max(panel.display_start)).collect();
+        let vis: Vec<&StyledLine> = panel
+            .lines
+            .iter()
+            .skip(panel.scroll.max(panel.display_start))
+            .collect();
         assert_eq!(vis.len(), 1);
         assert_eq!(vis[0].text, "new line");
     }

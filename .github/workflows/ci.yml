@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: fmt · clippy · test · audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: install linux deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            libssl-dev pkg-config lld
+
+      # Fail-fast order: cheap, deterministic checks first.
+      - name: format check
+        run: cargo fmt --all -- --check
+
+      - name: clippy (pedantic, warnings as errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic
+
+      - name: test (whole workspace, incl. term/)
+        run: cargo test --workspace --all-targets
+
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      # Advisories fail the build. Time-boxed suppressions use a single
+      # `--ignore` each with a tracking note, never a blanket disable.
+      #
+      # RUSTSEC-2023-0071 (rsa "Marvin" timing sidechannel, medium): pulled in
+      # transitively by russh; no fixed rsa release is available yet. Tracked —
+      # drop this ignore once russh ships a patched rsa.
+      - name: cargo audit
+        run: cargo audit --ignore RUSTSEC-2023-0071

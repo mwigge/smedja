@@ -13,7 +13,7 @@ use crate::{
 pub enum CodexCliProvider {
     /// Uses the locally installed `codex` CLI binary.
     Cli,
-    /// Delegates to the OpenAI HTTP API using an API key.
+    /// Delegates to the `OpenAI` HTTP API using an API key.
     Api(OpenAiProvider),
 }
 
@@ -21,6 +21,7 @@ impl CodexCliProvider {
     /// Selects CLI if the `codex` binary is on `$PATH`, otherwise uses the API key.
     ///
     /// Returns `None` if neither is available.
+    #[must_use]
     pub fn detect(api_key: Option<String>) -> Option<Self> {
         if SubprocessProvider::available("codex") {
             Some(Self::Cli)
@@ -40,7 +41,9 @@ impl Provider for CodexCliProvider {
 }
 
 fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
-    let prompt = messages.last().map_or_else(String::new, |m| m.content.clone());
+    let prompt = messages
+        .last()
+        .map_or_else(String::new, |m| m.content.clone());
     let resume_id = opts.provider_session_id.clone();
     let model = opts.model.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -104,9 +107,7 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        let _ = tx
-                            .send(Err(AdapterError::Request(e.to_string())))
-                            .await;
+                        let _ = tx.send(Err(AdapterError::Request(e.to_string()))).await;
                         break;
                     }
                 }
@@ -122,14 +123,10 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
                 } else {
                     format!("{status}: {}", stderr_text.trim())
                 };
-                let _ = tx
-                    .send(Err(AdapterError::Request(detail)))
-                    .await;
+                let _ = tx.send(Err(AdapterError::Request(detail))).await;
             }
             Err(e) => {
-                let _ = tx
-                    .send(Err(AdapterError::Request(e.to_string())))
-                    .await;
+                let _ = tx.send(Err(AdapterError::Request(e.to_string()))).await;
             }
         }
     });
@@ -138,18 +135,18 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
 }
 
 async fn read_stderr(stderr: Option<tokio::process::ChildStderr>) -> String {
+    use tokio::io::AsyncReadExt as _;
     let Some(mut stderr) = stderr else {
         return String::new();
     };
     let mut buf = String::new();
-    use tokio::io::AsyncReadExt as _;
     let _ = stderr.read_to_string(&mut buf).await;
     buf
 }
 
 /// Parses a single JSONL line from `codex exec --json`.
 ///
-/// Tries multiple known OpenAI Responses-API event shapes before falling back
+/// Tries multiple known `OpenAI` Responses-API event shapes before falling back
 /// to treating a non-empty, non-JSON line as plain text. Returns `None` for
 /// blank lines and unrecognised JSON objects.
 fn parse_codex_line(line: &str) -> Option<Delta> {
@@ -318,9 +315,7 @@ mod tests {
 
     #[test]
     fn parse_codex_line_openai_streaming() {
-        let delta = parse_codex_line(
-            r#"{"choices":[{"delta":{"content":"streamed text"}}]}"#,
-        );
+        let delta = parse_codex_line(r#"{"choices":[{"delta":{"content":"streamed text"}}]}"#);
         assert!(matches!(delta, Some(Delta::Text(t)) if t == "streamed text"));
     }
 
@@ -415,12 +410,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the stream to serialize $PATH mutation across concurrent tests
     async fn mock_codex_streams_plain_text() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir().join(format!(
-            "smedja-codex-mock-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("smedja-codex-mock-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         make_mock_codex(&tmp, "#!/bin/sh\nprintf 'line one\\nline two\\n'\n");
 
@@ -446,12 +439,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the stream to serialize $PATH mutation across concurrent tests
     async fn session_id_emitted_at_stream_start() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir().join(format!(
-            "smedja-codex-sessionid-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("smedja-codex-sessionid-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         make_mock_codex(&tmp, "#!/bin/sh\nprintf 'hello\\n'\n");
 
@@ -472,12 +464,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the stream to serialize $PATH mutation across concurrent tests
     async fn resume_passes_last_flag() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir().join(format!(
-            "smedja-codex-resume-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("smedja-codex-resume-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         // Echo argv so we can verify --last appeared.
         make_mock_codex(&tmp, "#!/bin/sh\nprintf \"args: $*\\n\"\n");
@@ -504,12 +494,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the stream to serialize $PATH mutation across concurrent tests
     async fn model_flag_forwarded_to_command() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir().join(format!(
-            "smedja-codex-model-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("smedja-codex-model-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         make_mock_codex(&tmp, "#!/bin/sh\nprintf \"args: $*\\n\"\n");
 

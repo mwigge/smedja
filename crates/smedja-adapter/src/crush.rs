@@ -28,6 +28,7 @@ fn bypass_enabled() -> bool {
 ///
 /// Non-JSON input is returned unchanged.  Honouring `SMEDJA_NO_TOOL_COMPRESS=1`
 /// bypasses all processing and returns the content as-is.
+#[must_use]
 pub fn compress_tool_result(content: &str) -> String {
     if bypass_enabled() {
         return content.to_owned();
@@ -74,6 +75,7 @@ fn strip_nulls(value: serde_json::Value) -> serde_json::Value {
 /// - All others — removes blank lines only.
 ///
 /// `SMEDJA_NO_TOOL_COMPRESS=1` bypasses all processing.
+#[must_use]
 pub fn compress_command_output(cmd: &str, output: &str) -> (String, f32) {
     if bypass_enabled() {
         return (output.to_owned(), 1.0_f32);
@@ -182,6 +184,7 @@ fn remove_blank_lines(output: &str) -> String {
 ///
 /// `SMEDJA_NO_TOOL_COMPRESS=1` is **not** honoured here — code block trimming
 /// is independent of tool-result compression.
+#[must_use]
 pub fn trim_code_block(lang: &str, body: &str) -> String {
     const THRESHOLD: usize = 80;
     const KEEP: usize = 20;
@@ -223,6 +226,7 @@ pub struct ContentPipeline {
 
 impl ContentPipeline {
     /// Creates an empty pipeline.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             transforms: Vec::new(),
@@ -239,6 +243,7 @@ impl ContentPipeline {
     }
 
     /// Runs all transforms in order and returns the final content.
+    #[must_use]
     pub fn run(&self, content: &str) -> String {
         self.transforms
             .iter()

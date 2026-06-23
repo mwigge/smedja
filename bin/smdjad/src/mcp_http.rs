@@ -76,9 +76,16 @@ impl McpHttpClient {
             return Err(format!("MCP server error: {msg}"));
         }
 
-        let result = resp.get("result").cloned().unwrap_or(serde_json::Value::Null);
+        let result = resp
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
 
-        if result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if result
+            .get("isError")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
             let msg = result
                 .get("content")
                 .and_then(|c| c.as_array())
@@ -199,14 +206,9 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         let client = McpHttpClient::new(&format!("http://{addr}"), "").unwrap();
-        let result = client
-            .call_tool("restricted", &serde_json::json!({}))
-            .await;
+        let result = client.call_tool("restricted", &serde_json::json!({})).await;
 
-        assert!(
-            result.is_err(),
-            "isError: true must produce an Err result"
-        );
+        assert!(result.is_err(), "isError: true must produce an Err result");
         assert!(
             result.unwrap_err().contains("permission denied"),
             "error message must include tool's error text"

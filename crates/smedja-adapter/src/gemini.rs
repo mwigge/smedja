@@ -7,7 +7,10 @@ use reqwest::Client;
 use serde_json::json;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt as _};
 
-use crate::{otel::inject_traceparent, AdapterError, CallOptions, Delta, DeltaStream, Message, Provider, Role};
+use crate::{
+    otel::inject_traceparent, AdapterError, CallOptions, Delta, DeltaStream, Message, Provider,
+    Role,
+};
 
 /// Gemini streaming chat-completion provider.
 ///

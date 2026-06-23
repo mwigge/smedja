@@ -297,8 +297,7 @@ mod tests {
     fn find_mcp_server_for_tool_returns_owning_server() {
         let mut ig = Ingot::open_in_memory().unwrap();
         let s = McpServer {
-            tools_json: r#"[{"name":"echo","description":"Echo input","input_schema":{}}]"#
-                .into(),
+            tools_json: r#"[{"name":"echo","description":"Echo input","input_schema":{}}]"#.into(),
             ..server("echo-server")
         };
         ig.register_mcp_server(&s).unwrap();

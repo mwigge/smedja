@@ -17,6 +17,7 @@ impl OpenCodeProvider {
     ///
     /// The base URL defaults to `https://api.opencode.ai/v1` but can be
     /// overridden via the `OPENCODE_BASE_URL` environment variable.
+    #[must_use]
     pub fn detect() -> Option<Self> {
         let api_key = std::env::var("OPENCODE_API_KEY").ok()?;
         let base_url =

@@ -757,8 +757,7 @@ async fn main() -> Result<()> {
                         let output = row["output_tok"].as_i64().unwrap_or(0);
                         let cost = row["cost_usd"].as_f64().unwrap_or(0.0);
                         println!(
-                            "{:<32}  {:<12}  {:>5}  {:>8}  {:>8}  ${cost:.6}",
-                            model, runner, turns, input, output,
+                            "{model:<32}  {runner:<12}  {turns:>5}  {input:>8}  {output:>8}  ${cost:.6}",
                         );
                     }
                 }
@@ -1302,7 +1301,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Service { action } => service::run(action)?,
+        Cmd::Service { action } => service::run(&action)?,
         Cmd::Term { action } => match action {
             TermCmd::Migrate { from, out } => {
                 let lua_source = std::fs::read_to_string(&from)

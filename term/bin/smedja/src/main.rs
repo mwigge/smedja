@@ -474,7 +474,15 @@ impl ApplicationHandler<UserEvent> for App {
                     // The modules run in parallel (rayon + per-module threads)
                     // within an 8 ms budget.  Live agent state comes from the
                     // st-agent bridge running in its own thread.
-                    let (tier, model, active_task, input_tokens, output_tokens, latency_ms, traceparent) = {
+                    let (
+                        tier,
+                        model,
+                        active_task,
+                        input_tokens,
+                        output_tokens,
+                        latency_ms,
+                        traceparent,
+                    ) = {
                         // Non-blocking try_read: if the lock is contended (agent
                         // event writing) skip the update this frame.
                         if let Ok(s) = self.pane_state.0.try_read() {
@@ -552,9 +560,9 @@ impl ApplicationHandler<UserEvent> for App {
                         Box::new(st_statusbar::TimeModule),
                     ];
                     if !git_branch_disabled {
-                        sb_modules.push(Box::new(
-                            st_statusbar::GitBranchModule::with_symbol(git_branch_symbol),
-                        ));
+                        sb_modules.push(Box::new(st_statusbar::GitBranchModule::with_symbol(
+                            git_branch_symbol,
+                        )));
                     }
                     let segments =
                         st_statusbar::render_status_bar_parallel(&sb_modules, &sb_ctx, 8);
@@ -1143,7 +1151,10 @@ mod tests {
         assert!(title.contains("smedja"), "must contain app name");
         assert!(title.contains("[fast]"), "must contain tier");
         assert!(title.contains("[impl]"), "must contain mode");
-        assert!(title.contains("abc12345"), "must contain first 8 chars of session_id");
+        assert!(
+            title.contains("abc12345"),
+            "must contain first 8 chars of session_id"
+        );
         assert!(title.contains("/home/u/proj"), "must contain cwd");
     }
 
@@ -1159,8 +1170,14 @@ mod tests {
         use super::truncate_cwd;
         let long = "/very/long/path/that/exceeds/limit";
         let result = truncate_cwd(long, 10);
-        assert!(result.starts_with('\u{2026}'), "expected … prefix, got '{result}'");
-        assert!(result.chars().count() <= 11, "result must be at most max+1 chars");
+        assert!(
+            result.starts_with('\u{2026}'),
+            "expected … prefix, got '{result}'"
+        );
+        assert!(
+            result.chars().count() <= 11,
+            "result must be at most max+1 chars"
+        );
     }
 
     #[test]
