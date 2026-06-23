@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The role of a message participant in a conversation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     /// A system-level instruction message.
@@ -18,6 +18,7 @@ pub enum Role {
 
 impl Role {
     /// Returns a static string representation of the role.
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::System => "system",
@@ -29,12 +30,41 @@ impl Role {
 }
 
 /// A single message in a conversation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     /// The role of the entity that produced this message.
     pub role: Role,
     /// The text content of this message.
     pub content: String,
+}
+
+impl Message {
+    /// Creates a new system message.
+    #[must_use]
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::System,
+            content: content.into(),
+        }
+    }
+
+    /// Creates a new user message.
+    #[must_use]
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            content: content.into(),
+        }
+    }
+
+    /// Creates a new assistant message.
+    #[must_use]
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+        }
+    }
 }
 
 /// Options controlling a single chat-completion call.
