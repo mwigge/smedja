@@ -2,6 +2,8 @@
 //!
 //! This module owns the [`execute_tool`] entry point plus its direct helpers:
 //! [`find_tool_call_json`], [`parse_tool_call`], and [`dispatch_mcp_tool`].
+//! Filesystem-path helpers (workspace-boundary checks, content reads, role gating)
+//! live in the [`fs_tools`] submodule.
 //!
 //! `exec_bash` lives in `main.rs` and is re-used via `super::exec_bash` because it
 //! has additional callers in the supervision tree.
@@ -17,6 +19,11 @@ use uuid::Uuid;
 
 use crate::sandbox::SandboxExecutor;
 
+mod fs_tools;
+use fs_tools::{
+    assert_within_workspace, extract_proposed_content, read_current_content, role_allows_write_bash,
+};
+
 /// Local-tool allowlist shared with the `OTel` classification logic in `run_turn`.
 ///
 /// Every tool whose dispatch is handled natively inside [`execute_tool`] must
@@ -31,6 +38,7 @@ pub(crate) const LOCAL_TOOLS: &[&str] = &[
     "list_files",
     "smedja_vault_search",
     "smedja_vault_store",
+    "smedja_retrieve",
     "graph_query",
     "otel_query",
     "metric_query",
@@ -42,40 +50,6 @@ pub(crate) const LOCAL_TOOLS: &[&str] = &[
 fn retrieve_store() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
     static STORE: OnceLock<tokio::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
     STORE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
-}
-
-/// Extracts the proposed file content from a `write_file` / `edit_file` tool
-/// input, trying the common field names used by file-writing MCP tools.
-///
-/// Returns `None` when no content-bearing field is present, in which case the
-/// diff gate is skipped (it cannot build a meaningful diff).
-fn extract_proposed_content(input: &Value) -> Option<String> {
-    input
-        .get("content")
-        .or_else(|| input.get("new_string"))
-        .or_else(|| input.get("new_str"))
-        .or_else(|| input.get("replacement"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-/// Reads the current contents of `path_str` relative to `workspace`, returning
-/// an empty string when the file is absent (new file) or unreadable.
-async fn read_current_content(workspace: &std::path::Path, path_str: &str) -> String {
-    if path_str.is_empty() {
-        return String::new();
-    }
-    tokio::fs::read_to_string(workspace.join(path_str))
-        .await
-        .unwrap_or_default()
-}
-
-/// Returns `true` when the session's mode permits write-arity bash commands.
-///
-/// The `"review"` mode is read-only by default; all other modes are unrestricted.
-fn role_allows_write_bash(session: &Session) -> bool {
-    // ponytail: review role is read-only by default; all others are unrestricted
-    session.mode.as_deref() != Some("review")
 }
 
 /// Finds the first JSON object with a `"tool"` key anywhere in `text`.
@@ -144,34 +118,13 @@ pub(crate) async fn execute_tool(
     // Path traversal guard: reject write_file / edit_file paths outside workspace.
     if matches!(tool_name, "write_file" | "edit_file") {
         if let Some(path_str) = input.get("path").and_then(Value::as_str) {
-            let raw_join = workspace.join(path_str);
-            let full = if let Ok(p) = raw_join.canonicalize() {
-                p
-            } else {
-                let workspace_canon = workspace
-                    .canonicalize()
-                    .unwrap_or_else(|_| workspace.to_owned());
-                let tentative = workspace.join(path_str);
-                if !tentative.starts_with(&workspace_canon) {
-                    tracing::warn!(
-                        tool = tool_name,
-                        path = path_str,
-                        "smedja.security.data_access_blocked: write outside workspace rejected"
-                    );
-                    return r#"{"error": "path outside workspace"}"#.to_owned();
-                }
-                tentative
-            };
-            let workspace_canon = workspace
-                .canonicalize()
-                .unwrap_or_else(|_| workspace.to_owned());
-            if !full.starts_with(&workspace_canon) {
+            if let Err(err) = assert_within_workspace(workspace, path_str) {
                 tracing::warn!(
                     tool = tool_name,
                     path = path_str,
                     "smedja.security.data_access_blocked: write outside workspace rejected"
                 );
-                return r#"{"error": "path outside workspace"}"#.to_owned();
+                return err;
             }
         }
     }
@@ -266,25 +219,10 @@ pub(crate) async fn execute_tool(
                 .get("path")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let raw_join = workspace.join(path_str);
-            let full = if let Ok(p) = raw_join.canonicalize() {
-                p
-            } else {
-                let workspace_canon = workspace
-                    .canonicalize()
-                    .unwrap_or_else(|_| workspace.to_owned());
-                let tentative = workspace.join(path_str);
-                if !tentative.starts_with(&workspace_canon) {
-                    return r#"{"error": "path outside workspace"}"#.to_owned();
-                }
-                tentative
+            let full = match assert_within_workspace(workspace, path_str) {
+                Ok(p) => p,
+                Err(err) => return err,
             };
-            let workspace_canon = workspace
-                .canonicalize()
-                .unwrap_or_else(|_| workspace.to_owned());
-            if !full.starts_with(&workspace_canon) {
-                return r#"{"error": "path outside workspace"}"#.to_owned();
-            }
             match tokio::fs::read_to_string(&full).await {
                 Ok(contents) => contents,
                 Err(e) => format!("error reading {path_str}: {e}"),
@@ -292,25 +230,10 @@ pub(crate) async fn execute_tool(
         }
         "list_files" => {
             let dir_str = input.get("path").and_then(Value::as_str).unwrap_or(".");
-            let raw_join = workspace.join(dir_str);
-            let full = if let Ok(p) = raw_join.canonicalize() {
-                p
-            } else {
-                let workspace_canon = workspace
-                    .canonicalize()
-                    .unwrap_or_else(|_| workspace.to_owned());
-                let tentative = workspace.join(dir_str);
-                if !tentative.starts_with(&workspace_canon) {
-                    return r#"{"error": "path outside workspace"}"#.to_owned();
-                }
-                tentative
+            let full = match assert_within_workspace(workspace, dir_str) {
+                Ok(p) => p,
+                Err(err) => return err,
             };
-            let workspace_canon = workspace
-                .canonicalize()
-                .unwrap_or_else(|_| workspace.to_owned());
-            if !full.starts_with(&workspace_canon) {
-                return r#"{"error": "path outside workspace"}"#.to_owned();
-            }
             match tokio::fs::read_dir(&full).await {
                 Ok(mut rd) => {
                     let mut entries = Vec::new();
