@@ -7,7 +7,7 @@ use smedja_adapter::{
     LocalProvider, MinimaxProvider, OpenAiProvider, PoolsideProvider, Provider, SubprocessProvider,
 };
 use smedja_assayer::{Runner, Tier};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// A single pool entry: the provider plus the strings needed for logging and
 /// session-store keying.
@@ -65,6 +65,13 @@ impl ProviderPool {
     #[must_use]
     pub fn get_default(&self) -> Option<&ProviderEntry> {
         self.default.as_ref().and_then(|d| self.entries.get(d))
+    }
+
+    /// Returns `true` when no provider is configured — every turn will fail and
+    /// the daemon is in a loud degraded state.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Returns the names of all runners currently available in the pool.
@@ -243,7 +250,10 @@ pub async fn build_provider_pool() -> ProviderPool {
     }
 
     if entries.is_empty() {
-        warn!("provider pool is empty — all turns will fail until a provider is configured");
+        error!(
+            "provider pool is EMPTY — no LLM provider is configured, so every turn will fail. \
+             Set ANTHROPIC_API_KEY / OPENAI_API_KEY or a local endpoint and restart."
+        );
     } else {
         info!(
             runners = ?entries.values().map(|e| e.runner_name).collect::<Vec<_>>(),
@@ -325,6 +335,19 @@ mod tests {
             default: None,
         };
         assert!(pool.get(Runner::Claude, Tier::Fast).is_none());
+    }
+
+    #[test]
+    fn empty_pool_reports_is_empty() {
+        let pool = ProviderPool {
+            entries: std::collections::HashMap::new(),
+            default: None,
+        };
+        assert!(
+            pool.is_empty(),
+            "a pool with no providers must report empty"
+        );
+        assert_eq!(pool.default_runner_name(), "unknown");
     }
 
     #[test]

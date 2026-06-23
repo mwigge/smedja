@@ -3,11 +3,36 @@ Description=smedja AI orchestration daemon
 After=network.target graphical-session.target
 
 [Service]
-Type=simple
+# Type=notify: smdjad sends sd_notify(READY=1) once the control socket is bound
+# and the database is open, so systemd only considers the unit started when it
+# is actually ready to serve.
+Type=notify
 ExecStart=%h/.local/bin/smdjad
 Restart=on-failure
 RestartSec=5s
+TimeoutStopSec=35
+StandardOutput=journal
+StandardError=journal
+KillMode=mixed
 Environment=XDG_RUNTIME_DIR=/run/user/%U
+
+# ── Sandboxing ────────────────────────────────────────────────────────────
+# ProtectHome=read-only locks down $HOME, but smdjad legitimately needs to
+# write its config, state (ingot DB), and runtime socket/secret. ReadWritePaths
+# punches holes back through ProtectSystem/ProtectHome for exactly those dirs:
+#   %h/.config/smedja        — config (prices.toml, etc.)
+#   %h/.local/share/smedja   — ingot DB and durable state
+#   %t                       — $XDG_RUNTIME_DIR (= /run/user/%U): socket, pid, secret
+# Everything else under $HOME stays read-only. CapabilityBoundingSet= is empty
+# (all capabilities dropped); RestrictAddressFamilies allows the UNIX control
+# socket plus outbound IPv4/IPv6 for LLM/OTLP traffic.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/smedja %h/.local/share/smedja %t
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=default.target

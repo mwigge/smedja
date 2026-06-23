@@ -1,4 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TEMPLATE — NOT FOR DIRECT USE.
+
+  The PLACEHOLDER_INSTALL_DIR / PLACEHOLDER_HOME tokens below are never
+  substituted at runtime, so copying this file verbatim into
+  ~/Library/LaunchAgents will produce a broken launchd job.
+
+  This file is reference only and is deliberately NOT shipped in the release
+  tarball. The real per-user plist is generated, fully resolved, by
+  scripts/install.sh (see its launchd setup section) on macOS installs.
+-->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
