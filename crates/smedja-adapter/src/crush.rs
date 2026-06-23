@@ -337,6 +337,7 @@ mod tests {
 
     #[test]
     fn bypass_env_skips_compression() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         std::env::set_var("SMEDJA_NO_TOOL_COMPRESS", "1");
         let input = r#"{"a":null,"b":1}"#;
         let output = compress_tool_result(input);
@@ -403,6 +404,7 @@ Changes not staged for commit:\n\
 
     #[test]
     fn bypass_env_skips_command_compression() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         std::env::set_var("SMEDJA_NO_TOOL_COMPRESS", "1");
         let input = "running 1 tests\ntest result: ok. 1 passed\n";
         let (compressed, ratio) = compress_command_output("cargo test", input);

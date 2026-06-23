@@ -258,11 +258,10 @@ fn parse_codex_line(line: &str) -> Option<Delta> {
 mod tests {
     use super::*;
     use futures_util::StreamExt as _;
-    use std::sync::Mutex;
 
     use crate::Role;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Shared process-wide lock so env-mutating tests serialise across modules.
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
     // --- detect ---
 

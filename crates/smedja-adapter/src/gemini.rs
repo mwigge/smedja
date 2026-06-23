@@ -276,6 +276,7 @@ mod tests {
 
     #[test]
     fn from_env_errors_when_key_absent() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         let saved = std::env::var("GEMINI_API_KEY").ok();
         std::env::remove_var("GEMINI_API_KEY");
         let result = GeminiProvider::from_env();
@@ -290,6 +291,7 @@ mod tests {
 
     #[test]
     fn from_env_succeeds_when_key_present() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         std::env::set_var("GEMINI_API_KEY", "test-key");
         let result = GeminiProvider::from_env();
         std::env::remove_var("GEMINI_API_KEY");

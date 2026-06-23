@@ -226,9 +226,9 @@ fn stringify_content(value: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use futures_util::StreamExt as _;
-    use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Shared process-wide lock so env-mutating tests serialise across modules.
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
     #[test]
     fn detect_returns_none_when_no_binary_and_no_key() {

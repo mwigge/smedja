@@ -23,12 +23,11 @@ impl Provider for BergetProvider {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
 
-    // ponytail: global lock — env vars are process-global, tests run in parallel
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Shared process-wide lock — env vars are process-global and tests run in
+    // parallel, so all env-mutating tests serialise against one crate-wide lock.
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
     #[test]
     fn detect_returns_none_when_key_absent() {
