@@ -26,6 +26,14 @@ case "$ARCH" in
   *) echo "error: unsupported arch: $ARCH" >&2; exit 1 ;;
 esac
 
+# detect WSL2
+IS_WSL=false
+if [ "$OS" = "linux" ] && [ -f /proc/version ]; then
+  case "$(cat /proc/version)" in
+    *[Mm]icrosoft*) IS_WSL=true ;;
+  esac
+fi
+
 TARBALL="smedja-$OS-$ARCH.tar.gz"
 
 if [ "$VERSION" = "latest" ]; then
@@ -48,21 +56,31 @@ else
   echo "error: curl or wget required" >&2; exit 1
 fi
 
+EXTRACT_DIR="$TMP/smedja-$OS-$ARCH"
+
 for bin in smdjad smj smedja smedja-tui; do
-  src="$TMP/smedja-$OS-$ARCH/$bin"
+  src="$EXTRACT_DIR/$bin"
   if [ -f "$src" ]; then
     install -m755 "$src" "$INSTALL_DIR/$bin"
     echo "  $bin → $INSTALL_DIR/$bin"
   fi
 done
 
-# register smdjad as a LaunchAgent (macOS only)
-if [ "$OS" = "darwin" ] && [ -f "$INSTALL_DIR/smdjad" ]; then
-  LAUNCHAGENT_DIR="$HOME/Library/LaunchAgents"
-  LAUNCHAGENT_PLIST="$LAUNCHAGENT_DIR/nu.wigge.smedja.smdjad.plist"
-  LOG_DIR="$HOME/Library/Logs/smedja"
-  mkdir -p "$LAUNCHAGENT_DIR" "$LOG_DIR"
-  cat > "$LAUNCHAGENT_PLIST" <<PLIST_EOF
+# ── macOS: remove Gatekeeper quarantine + register LaunchAgent ────────────────
+if [ "$OS" = "darwin" ]; then
+  # Remove com.apple.quarantine so macOS does not block the binaries.
+  for bin in smdjad smj smedja smedja-tui; do
+    if [ -f "$INSTALL_DIR/$bin" ]; then
+      xattr -dr com.apple.quarantine "$INSTALL_DIR/$bin" 2>/dev/null || true
+    fi
+  done
+
+  if [ -f "$INSTALL_DIR/smdjad" ]; then
+    LAUNCHAGENT_DIR="$HOME/Library/LaunchAgents"
+    LAUNCHAGENT_PLIST="$LAUNCHAGENT_DIR/nu.wigge.smedja.smdjad.plist"
+    LOG_DIR="$HOME/Library/Logs/smedja"
+    mkdir -p "$LAUNCHAGENT_DIR" "$LOG_DIR"
+    cat > "$LAUNCHAGENT_PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -93,43 +111,83 @@ if [ "$OS" = "darwin" ] && [ -f "$INSTALL_DIR/smdjad" ]; then
 </dict>
 </plist>
 PLIST_EOF
-  # Bootstrap the service into the user session.
-  # launchctl load works on macOS < 11; bootstrap on 11+.  Try both.
-  launchctl load -w "$LAUNCHAGENT_PLIST" 2>/dev/null || \
-    launchctl bootstrap "gui/$(id -u)" "$LAUNCHAGENT_PLIST" 2>/dev/null || true
-  echo "  smdjad LaunchAgent → $LAUNCHAGENT_PLIST"
-  echo "  logs → $LOG_DIR/"
+    # Bootstrap the service into the user session.
+    # launchctl load works on macOS < 11; bootstrap on 11+.  Try both.
+    launchctl load -w "$LAUNCHAGENT_PLIST" 2>/dev/null || \
+      launchctl bootstrap "gui/$(id -u)" "$LAUNCHAGENT_PLIST" 2>/dev/null || true
+    echo "  smdjad LaunchAgent → $LAUNCHAGENT_PLIST"
+    echo "  logs → $LOG_DIR/"
+  fi
 fi
 
-# register smedja as a .desktop app (Linux only)
+# ── Linux: install icon + .desktop + systemd user unit ────────────────────────
 if [ "$OS" = "linux" ] && [ -f "$INSTALL_DIR/smedja" ]; then
+  # Icon
+  ICON_SRC="$EXTRACT_DIR/smedja-256.png"
+  if [ -f "$ICON_SRC" ]; then
+    ICON_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/256x256/apps"
+    mkdir -p "$ICON_DIR"
+    install -m644 "$ICON_SRC" "$ICON_DIR/smedja.png"
+    gtk-update-icon-cache "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" 2>/dev/null || true
+  fi
+
+  # .desktop entry
   DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
   mkdir -p "$DESKTOP_DIR"
-  cat > "$DESKTOP_DIR/smedja.desktop" <<EOF
+  DESKTOP_SRC="$EXTRACT_DIR/smedja.desktop"
+  if [ -f "$DESKTOP_SRC" ]; then
+    install -m644 "$DESKTOP_SRC" "$DESKTOP_DIR/smedja.desktop"
+  else
+    # Fallback: generate inline
+    cat > "$DESKTOP_DIR/smedja.desktop" <<EOF
 [Desktop Entry]
 Name=smedja
-Comment=smedja GPU terminal
+Comment=GPU-accelerated terminal emulator and AI orchestration forge
 Exec=$INSTALL_DIR/smedja
-Icon=utilities-terminal
+Icon=smedja
 Type=Application
 Categories=System;TerminalEmulator;
 StartupNotify=true
 EOF
-  # register as default terminal handler if update-alternatives is available
+  fi
+  # Register as default terminal handler if update-alternatives is available
   if command -v update-alternatives >/dev/null 2>&1; then
     update-alternatives --install /usr/bin/x-terminal-emulator x-terminal-emulator "$INSTALL_DIR/smedja" 50 2>/dev/null || true
   fi
   echo "  smedja.desktop → $DESKTOP_DIR"
+
+  # systemd user unit
+  SERVICE_SRC="$EXTRACT_DIR/smdjad.service"
+  if [ -f "$SERVICE_SRC" ]; then
+    SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+    mkdir -p "$SYSTEMD_USER_DIR"
+    install -m644 "$SERVICE_SRC" "$SYSTEMD_USER_DIR/smdjad.service"
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user daemon-reload 2>/dev/null; then
+      systemctl --user enable --now smdjad 2>/dev/null && \
+        echo "  smdjad systemd unit → enabled" || \
+        echo "  smdjad systemd unit installed (enable manually: systemctl --user enable --now smdjad)"
+    else
+      if [ "$IS_WSL" = "true" ]; then
+        echo ""
+        echo "note: systemd not detected in this WSL2 environment."
+        echo "  To start smdjad automatically, add to ~/.bashrc or ~/.zshrc:"
+        echo "    pgrep -u \"\$USER\" smdjad >/dev/null || smdjad &"
+      else
+        echo ""
+        echo "note: systemd --user not available. Start smdjad manually or add to your shell RC:"
+        echo "    pgrep -u \"\$USER\" smdjad >/dev/null || smdjad &"
+      fi
+    fi
+  fi
 fi
 
-# add to PATH if not already there
+# ── PATH note ─────────────────────────────────────────────────────────────────
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *)
     echo ""
     echo "note: $INSTALL_DIR is not in PATH. Add it:"
     echo ""
-    # detect shell and suggest the right rc file
     case "${SHELL:-}" in
       */fish)  echo "  fish_add_path $INSTALL_DIR" ;;
       */zsh)   echo "  echo 'export PATH=\"\$PATH:$INSTALL_DIR\"' >> ~/.zshrc && source ~/.zshrc" ;;
@@ -147,6 +205,10 @@ echo "  smedja-tui  — agent dashboard TUI (run inside smedja)"
 echo ""
 if [ "$OS" = "darwin" ]; then
   echo "quickstart: smedja  (smdjad starts automatically via LaunchAgent)"
+elif [ "$IS_WSL" = "true" ]; then
+  echo "quickstart: smdjad & && smedja"
+  echo ""
+  echo "note: smedja renders via WSLg. Ensure WSLg is enabled in your Windows setup."
 else
   echo "quickstart: smdjad & && smedja"
 fi

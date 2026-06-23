@@ -205,6 +205,8 @@ pub enum MarkerKind {
     CommandDone { exit_code: Option<i32> },
     /// Heuristic prompt detection (PS1 pattern match).
     PromptHeuristic,
+    /// OSC 7 — current working directory notification.
+    Osc7Cwd { path: String },
 }
 
 /// Marks a row as a shell integration boundary.
@@ -252,6 +254,22 @@ pub fn parse_osc777(payload: &str) -> Option<Notification> {
     } else {
         None
     }
+}
+
+/// Parse an OSC 7 URI (`file://hostname/path` or `file:///path`) into a path string.
+///
+/// Returns `None` if the URI does not start with `file://`.
+#[must_use]
+pub fn parse_osc7_uri(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    // `file:///path` → hostname is empty, rest starts with `/path`
+    // `file://host/path` → skip to the first `/`
+    let path = if rest.starts_with('/') {
+        rest.to_owned()
+    } else {
+        rest.find('/').map(|i| rest[i..].to_owned())?
+    };
+    Some(path)
 }
 
 // ── CellGrid ──────────────────────────────────────────────────────────────────
@@ -857,6 +875,18 @@ impl vte::Perform for VtHandler {
                         });
                     }
                     _ => {}
+                }
+            }
+            "7" => {
+                // OSC 7 ; file://hostname/path BEL — current working directory.
+                if let Some(uri) = params.get(1).and_then(|b| std::str::from_utf8(b).ok()) {
+                    if let Some(path) = parse_osc7_uri(uri) {
+                        let row = grid.cursor.1;
+                        grid.block_markers.push(BlockMarker {
+                            kind: MarkerKind::Osc7Cwd { path },
+                            row,
+                        });
+                    }
                 }
             }
             "9" => {
@@ -1604,6 +1634,26 @@ mod tests {
         assert!(parse_osc777("toast;oops").is_none());
         assert!(parse_osc777("").is_none());
         assert!(parse_osc777("notify;only-title").is_none());
+    }
+
+    // ── parse_osc7_uri ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_osc7_uri_localhost_triple_slash() {
+        let path = parse_osc7_uri("file:///home/user/project").unwrap();
+        assert_eq!(path, "/home/user/project");
+    }
+
+    #[test]
+    fn parse_osc7_uri_with_hostname() {
+        let path = parse_osc7_uri("file://myhost/home/user/project").unwrap();
+        assert_eq!(path, "/home/user/project");
+    }
+
+    #[test]
+    fn parse_osc7_uri_non_file_scheme_returns_none() {
+        assert!(parse_osc7_uri("http://example.com/path").is_none());
+        assert!(parse_osc7_uri("").is_none());
     }
 
     // ── CellGrid::resize ──────────────────────────────────────────────────────
