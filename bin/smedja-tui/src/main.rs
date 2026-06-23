@@ -131,14 +131,16 @@ slash commands:
 
 keybindings (input mode):
   Esc                — enter scroll/normal mode
-  Ctrl-R             — toggle context rail
-  Up / Down          — scroll messages
+  Up / Ctrl-P        — browse history backwards
+  Down / Ctrl-N      — browse history forwards
+  Ctrl-R             — toggle reverse history search
 
 keybindings (scroll/normal mode):
   i / a              — return to input mode
   j / k              — scroll down / up
   G                  — scroll to bottom
   gg                 — scroll to top
+  Ctrl-R             — toggle context rail
   v                  — start line selection
   y                  — yank selection to clipboard
   t                  — copy traceparent
@@ -242,6 +244,19 @@ struct AppState {
     mouse_drag_end: Option<u16>,
     /// Top row of the messages panel as recorded by the last render frame.
     messages_top: u16,
+    /// Watermark index into `messages`; messages before this index are not
+    /// re-displayed after a `/clear`.
+    display_start_idx: usize,
+    /// Ordered list of submitted prompts for Up/Down history browsing.
+    prompt_history: Vec<String>,
+    /// Current browse position within `prompt_history` (`None` = live input).
+    history_idx: Option<usize>,
+    /// Input saved before history browsing started; restored when browsing past the end.
+    saved_input: String,
+    /// True while reverse history search (Ctrl-R in input mode) is active.
+    history_search_mode: bool,
+    /// Query string for the active reverse history search.
+    history_search_query: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +337,9 @@ async fn submit(input: &str, state: &mut AppState, client: &mut Client) -> Resul
     if text.is_empty() {
         return Ok(());
     }
+    state.prompt_history.push(text.clone());
+    state.history_idx = None;
+    state.saved_input.clear();
     let user_msg = Message {
         role: Role::User,
         text: text.clone(),
@@ -529,6 +547,22 @@ fn screen_row_to_line(row: u16, messages_top: u16, scroll: usize) -> usize {
     scroll + offset
 }
 
+/// Searches `history` backwards for the most recent entry containing `query`.
+///
+/// Returns `(index, matched_text)` on success.  An empty `query` always returns `None`.
+#[must_use]
+fn history_search<'a>(history: &'a [String], query: &str) -> Option<(usize, &'a str)> {
+    if query.is_empty() {
+        return None;
+    }
+    history
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, s)| s.contains(query))
+        .map(|(i, s)| (i, s.as_str()))
+}
+
 fn handle_mouse(state: &mut AppState, me: MouseEvent) {
     use crossterm::event::{MouseButton, MouseEventKind};
     match me.kind {
@@ -658,6 +692,11 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
         }
         "help" => {
             push_system_message(state, HELP_TEXT);
+            Ok(true)
+        }
+        "clear" => {
+            state.display_start_idx = state.messages.len();
+            state.main_panel.clear_display();
             Ok(true)
         }
         "spec" => {
@@ -1275,6 +1314,48 @@ async fn handle_key(
     }
 
     // ------------------------------------------------------------------
+    // Reverse history search intercept — active when Ctrl-R pressed in
+    // input mode.  Consumes all keys until Enter (accept) or Esc (cancel).
+    // ------------------------------------------------------------------
+    if state.history_search_mode {
+        match key.code {
+            KeyCode::Esc => {
+                state.history_search_mode = false;
+                state.history_search_query.clear();
+                state.input = std::mem::take(&mut state.saved_input);
+                state.input_cursor = state.input.len();
+            }
+            KeyCode::Enter => {
+                state.history_search_mode = false;
+                state.history_search_query.clear();
+            }
+            KeyCode::Backspace => {
+                state.history_search_query.pop();
+                let query = state.history_search_query.clone();
+                if query.is_empty() {
+                    state.saved_input.clone_into(&mut state.input);
+                    state.input_cursor = state.input.len();
+                } else if let Some((_, matched)) =
+                    history_search(&state.prompt_history, &query)
+                {
+                    matched.clone_into(&mut state.input);
+                    state.input_cursor = state.input.len();
+                }
+            }
+            KeyCode::Char(c) => {
+                state.history_search_query.push(c);
+                let query = state.history_search_query.clone();
+                if let Some((_, matched)) = history_search(&state.prompt_history, &query) {
+                    matched.clone_into(&mut state.input);
+                    state.input_cursor = state.input.len();
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // ------------------------------------------------------------------
     // Scroll / visual-selection mode intercept.
     // ------------------------------------------------------------------
     if state.scroll_focus {
@@ -1370,9 +1451,17 @@ async fn handle_key(
             }
         }
 
-        // Ctrl-R: toggle context rail
+        // Ctrl-R: toggle context rail (scroll mode) or history search (input mode)
         KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.context_rail_visible = !state.context_rail_visible;
+            if state.scroll_focus {
+                state.context_rail_visible = !state.context_rail_visible;
+            } else {
+                state.history_search_mode = !state.history_search_mode;
+                state.history_search_query.clear();
+                if state.history_search_mode {
+                    state.input.clone_into(&mut state.saved_input);
+                }
+            }
         }
 
         KeyCode::Esc => {
@@ -1393,7 +1482,20 @@ async fn handle_key(
             if state.block_browser_open {
                 state.block_browser_cursor = state.block_browser_cursor.saturating_sub(1);
             } else {
-                state.main_panel.scroll_up();
+                // input mode: browse prompt history backwards
+                if !state.prompt_history.is_empty() {
+                    let new_idx = match state.history_idx {
+                        None => {
+                            state.input.clone_into(&mut state.saved_input);
+                            state.prompt_history.len() - 1
+                        }
+                        Some(0) => 0,
+                        Some(i) => i - 1,
+                    };
+                    state.history_idx = Some(new_idx);
+                    state.prompt_history[new_idx].clone_into(&mut state.input);
+                    state.input_cursor = state.input.len();
+                }
             }
         }
 
@@ -1404,7 +1506,19 @@ async fn handle_key(
                     state.block_browser_cursor += 1;
                 }
             } else {
-                state.main_panel.scroll_down();
+                // input mode: browse prompt history forwards
+                if let Some(idx) = state.history_idx {
+                    if idx + 1 < state.prompt_history.len() {
+                        let new_idx = idx + 1;
+                        state.history_idx = Some(new_idx);
+                        state.prompt_history[new_idx].clone_into(&mut state.input);
+                        state.input_cursor = state.input.len();
+                    } else {
+                        state.history_idx = None;
+                        state.input = std::mem::take(&mut state.saved_input);
+                        state.input_cursor = state.input.len();
+                    }
+                }
             }
         }
 
@@ -1727,6 +1841,38 @@ async fn handle_key(
             state.input_cursor = state.input.len();
         }
 
+        // Ctrl-P / Ctrl-N: history browse (Emacs-style aliases for Up / Down)
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if !state.prompt_history.is_empty() {
+                let new_idx = match state.history_idx {
+                    None => {
+                        state.input.clone_into(&mut state.saved_input);
+                        state.prompt_history.len() - 1
+                    }
+                    Some(0) => 0,
+                    Some(i) => i - 1,
+                };
+                state.history_idx = Some(new_idx);
+                state.prompt_history[new_idx].clone_into(&mut state.input);
+                state.input_cursor = state.input.len();
+            }
+        }
+
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(idx) = state.history_idx {
+                if idx + 1 < state.prompt_history.len() {
+                    let new_idx = idx + 1;
+                    state.history_idx = Some(new_idx);
+                    state.prompt_history[new_idx].clone_into(&mut state.input);
+                    state.input_cursor = state.input.len();
+                } else {
+                    state.history_idx = None;
+                    state.input = std::mem::take(&mut state.saved_input);
+                    state.input_cursor = state.input.len();
+                }
+            }
+        }
+
         KeyCode::Char('/') if state.input.is_empty() => {
             // L129: open slash popup when `/` is the first character typed.
             state.input.insert(state.input_cursor, '/');
@@ -1762,14 +1908,20 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         Constraint::Length(1),
         Constraint::Fill(1),
         Constraint::Length(5),
-        Constraint::Length(1),
+        Constraint::Length(if state.history_search_mode { 2 } else { 1 }),
     ])
     .split(area);
 
     let status_area = outer[0];
     let body_area = outer[1];
     let action_log_area = outer[2];
-    let input_area = outer[3];
+    let (input_area, search_bar_area) = if state.history_search_mode && outer[3].height >= 2 {
+        let parts =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(outer[3]);
+        (parts[0], Some(parts[1]))
+    } else {
+        (outer[3], None)
+    };
 
     // -- Status bar -----------------------------------------------------------
     let ctx = ModuleCtx {
@@ -1848,6 +2000,18 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     };
     let input_widget = Paragraph::new(input_display);
     frame.render_widget(input_widget, input_area);
+
+    if let Some(search_area) = search_bar_area {
+        let matched = history_search(&state.prompt_history, &state.history_search_query)
+            .map_or("", |(_, s)| s);
+        let search_text = format!(
+            "(reverse-i-search) `{}`: {}",
+            state.history_search_query, matched
+        );
+        let search_widget = Paragraph::new(search_text)
+            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM));
+        frame.render_widget(search_widget, search_area);
+    }
 
     // -- Context rail ---------------------------------------------------------
     if let Some(rail_rect) = rail_area {
@@ -2075,6 +2239,12 @@ async fn main() -> Result<()> {
         mouse_drag_start: None,
         mouse_drag_end: None,
         messages_top: 0,
+        display_start_idx: 0,
+        prompt_history: Vec::new(),
+        history_idx: None,
+        saved_input: String::new(),
+        history_search_mode: false,
+        history_search_query: String::new(),
     };
 
     // Connect banner — shown on every startup so the user knows what's connected.
@@ -2854,6 +3024,12 @@ mod tests {
             mouse_drag_start: None,
             mouse_drag_end: None,
             messages_top: 0,
+            display_start_idx: 0,
+            prompt_history: Vec::new(),
+            history_idx: None,
+            saved_input: String::new(),
+            history_search_mode: false,
+            history_search_query: String::new(),
         }
     }
 
@@ -3713,5 +3889,178 @@ mod tests {
             content.contains("[N]"),
             "status bar must show [N] when scroll_focus=true; got: {content}"
         );
+    }
+
+    // --- tui-prompt-history tests ---
+
+    #[test]
+    fn history_search_finds_most_recent_match() {
+        let history = vec!["git status".to_owned(), "git diff".to_owned(), "ls".to_owned()];
+        let result = history_search(&history, "git");
+        assert_eq!(result, Some((1, "git diff")), "should return most recent match");
+    }
+
+    #[test]
+    fn history_search_empty_query_returns_none() {
+        let history = vec!["git status".to_owned()];
+        assert!(history_search(&history, "").is_none());
+    }
+
+    #[test]
+    fn history_search_no_match_returns_none() {
+        let history = vec!["git status".to_owned()];
+        assert!(history_search(&history, "foobar").is_none());
+    }
+
+    #[test]
+    fn history_search_empty_history_returns_none() {
+        let history: Vec<String> = vec![];
+        assert!(history_search(&history, "git").is_none());
+    }
+
+    #[test]
+    fn clear_command_advances_display_start() {
+        let mut state = make_state("sess-clear");
+        state.main_panel.push_line("old line 1".into());
+        state.main_panel.push_line("old line 2".into());
+        state.messages.push(Message { role: Role::System, text: "old line 1".into() });
+        state.messages.push(Message { role: Role::System, text: "old line 2".into() });
+
+        // Simulate /clear dispatch
+        state.display_start_idx = state.messages.len();
+        state.main_panel.clear_display();
+
+        assert_eq!(state.display_start_idx, 2);
+        assert_eq!(state.main_panel.display_start, 2);
+        assert_eq!(state.main_panel.scroll, 2);
+    }
+
+    #[test]
+    fn new_lines_after_clear_are_visible() {
+        let mut state = make_state("sess-clear2");
+        state.main_panel.push_line("before clear".into());
+        state.main_panel.clear_display();
+        state.main_panel.push_line("after clear".into());
+        // After clear, display_start=1, scroll=1; new line at index 1 is visible
+        let visible = state.main_panel.lines_text(
+            state.main_panel.display_start,
+            state.main_panel.len().saturating_sub(1),
+        );
+        assert!(visible.iter().any(|l| l.contains("after clear")));
+        assert!(!visible.iter().any(|l| l.contains("before clear")));
+    }
+
+    #[test]
+    fn up_key_loads_most_recent_history_entry() {
+        let mut state = make_state("sess-hist");
+        state.prompt_history = vec!["first".to_owned(), "second".to_owned()];
+        state.input = "live".to_owned();
+        state.input_cursor = state.input.len();
+
+        // Simulate Up key (first press)
+        if !state.prompt_history.is_empty() {
+            let new_idx = match state.history_idx {
+                None => {
+                    state.saved_input = state.input.clone();
+                    state.prompt_history.len() - 1
+                }
+                Some(0) => 0,
+                Some(i) => i - 1,
+            };
+            state.history_idx = Some(new_idx);
+            state.input = state.prompt_history[new_idx].clone();
+            state.input_cursor = state.input.len();
+        }
+
+        assert_eq!(state.input, "second");
+        assert_eq!(state.history_idx, Some(1));
+        assert_eq!(state.saved_input, "live");
+    }
+
+    #[test]
+    fn down_key_at_end_restores_live_input() {
+        let mut state = make_state("sess-hist-down");
+        state.prompt_history = vec!["only".to_owned()];
+        state.saved_input = "live input".to_owned();
+        state.history_idx = Some(0);
+        state.input = "only".to_owned();
+
+        // Simulate Down key past end
+        if let Some(idx) = state.history_idx {
+            if idx + 1 < state.prompt_history.len() {
+                let new_idx = idx + 1;
+                state.history_idx = Some(new_idx);
+                state.input = state.prompt_history[new_idx].clone();
+                state.input_cursor = state.input.len();
+            } else {
+                state.history_idx = None;
+                state.input = std::mem::take(&mut state.saved_input);
+                state.input_cursor = state.input.len();
+            }
+        }
+
+        assert!(state.history_idx.is_none(), "history_idx must be None after returning to live input");
+        assert_eq!(state.input, "live input");
+    }
+
+    #[test]
+    fn ctrl_r_in_input_mode_enters_history_search() {
+        let mut state = make_state("sess-ctrl-r");
+        state.scroll_focus = false;
+        state.input = "current".to_owned();
+
+        // Simulate Ctrl-R in input mode
+        state.history_search_mode = true;
+        state.history_search_query.clear();
+        state.saved_input = state.input.clone();
+
+        assert!(state.history_search_mode);
+        assert_eq!(state.saved_input, "current");
+    }
+
+    #[test]
+    fn ctrl_r_in_scroll_mode_toggles_context_rail() {
+        let mut state = make_state("sess-ctrl-r-scroll");
+        state.scroll_focus = true;
+        state.context_rail_visible = true;
+
+        // Simulate Ctrl-R in scroll mode
+        state.context_rail_visible = !state.context_rail_visible;
+
+        assert!(!state.context_rail_visible, "context rail must be toggled off");
+    }
+
+    #[test]
+    fn history_search_esc_restores_saved_input() {
+        let mut state = make_state("sess-search-esc");
+        state.history_search_mode = true;
+        state.history_search_query = "git".to_owned();
+        state.saved_input = "original".to_owned();
+        state.input = "git status".to_owned();
+
+        // Simulate Esc
+        state.history_search_mode = false;
+        state.history_search_query.clear();
+        state.input = std::mem::take(&mut state.saved_input);
+        state.input_cursor = state.input.len();
+
+        assert!(!state.history_search_mode);
+        assert_eq!(state.input, "original");
+        assert!(state.history_search_query.is_empty());
+    }
+
+    #[test]
+    fn history_search_enter_accepts_match() {
+        let mut state = make_state("sess-search-enter");
+        state.history_search_mode = true;
+        state.history_search_query = "git".to_owned();
+        state.input = "git status".to_owned();
+
+        // Simulate Enter
+        state.history_search_mode = false;
+        state.history_search_query.clear();
+
+        assert!(!state.history_search_mode, "search mode must be cleared on Enter");
+        assert_eq!(state.input, "git status", "matched input must be kept on Enter");
     }
 }
