@@ -62,6 +62,7 @@ pub(crate) struct LoopRoleRunner {
     assayer: Arc<Assayer>,
     price_table: Arc<PriceTable>,
     vault: Arc<Mutex<Vault>>,
+    provider_sessions: crate::orchestrator::ProviderSessions,
     workspace_root: PathBuf,
     agent_timeout_s: u64,
 }
@@ -90,7 +91,7 @@ impl RoleRunner for LoopRoleRunner {
             cowork_mode: false,
             workspace_root: Some(self.workspace_root.display().to_string()),
             model_override: role.model.clone(),
-            runner_override: Some(crate::runner_session_key(role.runner).to_owned()),
+            runner_override: Some(crate::common::runner_session_key(role.runner).to_owned()),
         };
         if let Err(e) = self.ingot.create_session(session).await {
             anyhow::bail!("role '{}': failed to create session: {e}", role.name);
@@ -119,6 +120,7 @@ impl RoleRunner for LoopRoleRunner {
             Arc::clone(&self.assayer),
             Arc::clone(&self.price_table),
             Arc::clone(&self.vault),
+            Arc::clone(&self.provider_sessions),
         );
         let run = orchestrator.run(session_id.to_string(), task_id.to_string());
         if tokio::time::timeout(std::time::Duration::from_secs(self.agent_timeout_s), run)
@@ -196,7 +198,7 @@ async fn read_pending_slices(workspace_root: &Path, change_name: &str) -> Vec<St
 /// verification gate and bounded fix retries — persisting status through the
 /// ingot as it goes.
 #[allow(clippy::too_many_arguments)] // forwards the turn-orchestrator dependencies
-#[tracing::instrument(skip(ingot, dispatcher, gates, pool, assayer, price_table, vault, workspace_root), fields(loop_id = %loop_id, change = %change_name))]
+#[tracing::instrument(skip(ingot, dispatcher, gates, pool, assayer, price_table, vault, provider_sessions, workspace_root), fields(loop_id = %loop_id, change = %change_name))]
 pub(crate) async fn run(
     ingot: IngotHandle,
     dispatcher: Arc<Dispatcher>,
@@ -205,6 +207,7 @@ pub(crate) async fn run(
     assayer: Arc<Assayer>,
     price_table: Arc<PriceTable>,
     vault: Arc<Mutex<Vault>>,
+    provider_sessions: crate::orchestrator::ProviderSessions,
     loop_id: String,
     change_name: String,
     workspace_root: PathBuf,
@@ -241,6 +244,7 @@ pub(crate) async fn run(
         assayer,
         price_table,
         vault,
+        provider_sessions,
         workspace_root: workspace_root.clone(),
         agent_timeout_s: config.limits.agent_timeout_s,
     };
@@ -338,6 +342,7 @@ mod tests {
             assayer,
             price_table,
             vault,
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
             "loop-missing".to_owned(),
             "demo".to_owned(),
             ws.path().to_path_buf(),
@@ -385,6 +390,7 @@ mod tests {
             assayer,
             price_table,
             vault,
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
             "loop-empty".to_owned(),
             "demo".to_owned(),
             ws.path().to_path_buf(),

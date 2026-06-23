@@ -1,10 +1,11 @@
 pub mod acp;
 pub mod agent_server;
 pub mod alert;
-pub mod compact;
+pub mod common;
 pub mod cowork;
 pub mod embedder;
 pub mod executor;
+pub mod handlers;
 pub mod local_provider;
 pub mod loop_runner;
 pub mod mcp_http;
@@ -18,29 +19,21 @@ pub mod stream_server;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
-use futures_util::StreamExt;
 use serde_json::{json, Value};
-use smedja_adapter::types::{Message as AdapterMessage, Role as AdapterRole};
-use smedja_adapter::{CallOptions, Delta};
-use smedja_assayer::{AgentRole, Assayer, Runner, Tier, WorktreePool};
+use smedja_adapter::types::Message as AdapterMessage;
+use smedja_assayer::{Assayer, WorktreePool};
 
 use crate::price_table::PriceTable;
 use crate::provider_pool::{build_provider_pool, ProviderPool};
-use smedja_bellows::event::CorrelationCtx;
 use smedja_bellows::{Dispatcher, TurnEvent};
-use smedja_ingot::{Checkpoint, CostRow, Ingot, IngotHandle, McpServer, Session, Task};
+use smedja_ingot::{Ingot, IngotHandle, McpServer};
 use smedja_rpc::{codes, router::Router, server::Server, RpcError};
-use smedja_types::Timestamp;
-use smedja_vault::{Vault, VaultEntry};
+use smedja_vault::Vault;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
-use uuid::Uuid;
-
-use smedja_telemetry as tel;
 
 use crate::cowork::CoworkGate;
 
@@ -66,25 +59,12 @@ impl Drop for SocketGuard {
     }
 }
 
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn now_epoch() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
-}
-
 /// Assembles a conversation transcript for compaction from a checkpoint's
 /// `messages_json` blob, routing it through working-memory strata (deep tier) so
 /// the same windowing the live prompt path uses is applied. Invalid or empty JSON
 /// yields an empty transcript. The raw blob is preserved separately in the
 /// pre-compaction checkpoint, so this rendering is not lossy for rollback.
-fn assemble_compaction_transcript(messages_json: &str) -> String {
+pub(crate) fn assemble_compaction_transcript(messages_json: &str) -> String {
     let parsed: Vec<AdapterMessage> = serde_json::from_str(messages_json).unwrap_or_default();
     let mut mem = smedja_memory::WorkingMemory::new(100_000);
     mem.set_strata(smedja_memory::StrataConfig::deep());
@@ -96,12 +76,6 @@ fn assemble_compaction_transcript(messages_json: &str) -> String {
         .map(|m| format!("{}: {}", m.role.as_str(), m.content))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// In-memory map from smedja sessions to provider-native resume identifiers.
-fn provider_session_store() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
-    static STORE: OnceLock<tokio::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
-    STORE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
 fn open_ingot() -> anyhow::Result<Ingot> {
@@ -144,160 +118,15 @@ fn dirs_home() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }
 
-fn ingot_err(e: &smedja_ingot::IngotError) -> RpcError {
+pub(crate) fn ingot_err(e: &smedja_ingot::IngotError) -> RpcError {
     RpcError::new(codes::INTERNAL_ERROR, e.to_string())
 }
 
-fn missing_param(name: &str) -> RpcError {
+pub(crate) fn missing_param(name: &str) -> RpcError {
     RpcError::new(
         codes::INVALID_PARAMS,
         format!("missing required param: {name}"),
     )
-}
-
-/// Maps a session mode string to an [`AgentRole`] for routing purposes.
-fn parse_session_mode_to_role(mode: &str) -> Option<AgentRole> {
-    match mode {
-        "impl" => Some(AgentRole::Impl),
-        "test" => Some(AgentRole::Test),
-        "review" => Some(AgentRole::Review),
-        "sre" => Some(AgentRole::Sre),
-        "orchestrator" => Some(AgentRole::Orchestrator),
-        _ => None,
-    }
-}
-
-/// Maps a [`Runner`] enum value to the short string used in the session-resume store.
-fn runner_session_key(runner: Runner) -> &'static str {
-    match runner {
-        Runner::Claude => "claude-cli",
-        Runner::Codex => "codex-cli",
-        Runner::Local => "local",
-        Runner::Copilot => "copilot",
-        Runner::Minimax => "minimax",
-        Runner::Berget => "berget",
-    }
-}
-
-/// Parses a user-supplied or stored runner string to a [`Runner`] enum value.
-///
-/// Accepts both canonical keys (`"claude-cli"`) and short aliases (`"claude"`).
-fn parse_runner_str(s: &str) -> Option<Runner> {
-    match s {
-        "claude" | "claude-cli" => Some(Runner::Claude),
-        "codex" | "codex-cli" => Some(Runner::Codex),
-        "local" => Some(Runner::Local),
-        "copilot" => Some(Runner::Copilot),
-        "minimax" => Some(Runner::Minimax),
-        "berget" => Some(Runner::Berget),
-        _ => None,
-    }
-}
-
-/// Drains `stream`, accumulating text deltas into a single string.
-///
-/// Returns `Ok((full_response, input_tokens, output_tokens, provider_session_id))` on success, or
-/// `Err(reason)` if the stream yields an error item.  Each `Delta::Text` chunk
-/// is forwarded to `dispatcher` as a [`TurnEvent::AssistantDelta`].
-/// Error returned by [`drain_stream`], distinguishing rate-limit responses from
-/// other failures so callers can apply an appropriate retry strategy.
-enum DrainError {
-    /// The provider returned HTTP 429; back off for `retry_after` before retrying.
-    RateLimited {
-        retry_after: Option<std::time::Duration>,
-    },
-    /// Any other stream-level error; treat as fatal for this turn.
-    Other(String),
-}
-
-impl std::fmt::Display for DrainError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::RateLimited { retry_after } => {
-                write!(f, "rate limited by provider (retry after {retry_after:?})")
-            }
-            Self::Other(s) => f.write_str(s),
-        }
-    }
-}
-
-async fn drain_stream(
-    mut stream: smedja_adapter::DeltaStream,
-    dispatcher: &Dispatcher,
-    turn_id: Option<&str>,
-    correlation: &CorrelationCtx,
-) -> Result<(String, u32, u32, Option<String>), DrainError> {
-    let mut full_response = String::new();
-    let mut input_tokens = 0u32;
-    let mut output_tokens = 0u32;
-    let mut provider_session_id = None;
-    loop {
-        match stream.next().await {
-            None => break,
-            Some(Ok(Delta::Text(t))) => {
-                full_response.push_str(&t);
-                dispatcher.publish(TurnEvent::AssistantDelta {
-                    content: t,
-                    turn_id: turn_id.map(str::to_owned),
-                    correlation: correlation.clone(),
-                });
-            }
-            Some(Ok(Delta::Usage {
-                input_tokens: i,
-                output_tokens: n,
-            })) => {
-                input_tokens = i;
-                output_tokens = n;
-            }
-            Some(Ok(Delta::ToolCall { name, input })) => {
-                let input_summary: String = input.to_string().chars().take(120).collect();
-                let line = format!("▶ {name}({input_summary})");
-                full_response.push_str(&line);
-                full_response.push('\n');
-                dispatcher.publish(TurnEvent::ToolCalled {
-                    tool_name: name,
-                    input_summary,
-                    turn_id: turn_id.map(str::to_owned),
-                    correlation: CorrelationCtx {
-                        operation_name: Some(tel::OPERATION_EXECUTE_TOOL.to_owned()),
-                        ..correlation.clone()
-                    },
-                    tool_call_id: None,
-                });
-                dispatcher.publish(TurnEvent::AssistantDelta {
-                    content: line,
-                    turn_id: turn_id.map(str::to_owned),
-                    correlation: correlation.clone(),
-                });
-            }
-            Some(Ok(Delta::ToolResult {
-                tool_use_id,
-                content,
-            })) => {
-                let line = format!("✓ {tool_use_id} -> {} chars", content.chars().count());
-                full_response.push_str(&line);
-                full_response.push('\n');
-                dispatcher.publish(TurnEvent::AssistantDelta {
-                    content: line,
-                    turn_id: turn_id.map(str::to_owned),
-                    correlation: correlation.clone(),
-                });
-            }
-            Some(Ok(Delta::SessionId(id))) => {
-                provider_session_id = Some(id);
-            }
-            Some(Err(smedja_adapter::AdapterError::RateLimited { retry_after })) => {
-                return Err(DrainError::RateLimited { retry_after });
-            }
-            Some(Err(e)) => return Err(DrainError::Other(e.to_string())),
-        }
-    }
-    Ok((
-        full_response,
-        input_tokens,
-        output_tokens,
-        provider_session_id,
-    ))
 }
 
 /// Executes a bash command in `workspace` using `sh -c`, returning stdout or a
@@ -314,18 +143,6 @@ async fn exec_bash(cmd: &str, workspace: &std::path::Path) -> String {
         Ok(out) => format!("error: {}", String::from_utf8_lossy(&out.stderr)),
         Err(e) => format!("error: {e}"),
     }
-}
-
-/// Maximum number of tool-dispatch iterations in a single turn.
-/// Override with `SMEDJA_MAX_TOOL_TURNS` (e.g. `SMEDJA_MAX_TOOL_TURNS=5`).
-/// Values above 50 are clamped to 50 to prevent runaway LLM loops.
-const MAX_TOOL_TURNS: usize = 10;
-
-fn effective_max_tool_turns() -> usize {
-    std::env::var("SMEDJA_MAX_TOOL_TURNS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map_or(MAX_TOOL_TURNS, |n| n.min(50))
 }
 
 /// Builds the `turn.subscribe` response envelope from a task's current state.
@@ -375,7 +192,7 @@ async fn terminal_envelope(ingot: &IngotHandle, task_id: &str) -> Result<Option<
 /// event published after subscription is missed; on subscriber lag it falls back
 /// to a direct state read; the wait is bounded by `timeout`.
 #[tracing::instrument(skip(ingot, dispatcher), fields(turn_id = %task_id))]
-async fn await_turn_terminal(
+pub(crate) async fn await_turn_terminal(
     ingot: &IngotHandle,
     dispatcher: &Dispatcher,
     task_id: &str,
@@ -444,6 +261,7 @@ async fn run_turn(
     assayer: Arc<Assayer>,
     price_table: Arc<PriceTable>,
     vault: Arc<Mutex<Vault>>,
+    provider_sessions: orchestrator::ProviderSessions,
 ) {
     orchestrator::TurnOrchestrator::new(
         ingot,
@@ -453,6 +271,7 @@ async fn run_turn(
         assayer,
         price_table,
         vault,
+        provider_sessions,
     )
     .run(session_id, turn_id)
     .await;
@@ -473,6 +292,7 @@ fn spawn_worker(
     assayer: Arc<Assayer>,
     price_table: Arc<PriceTable>,
     vault: Arc<Mutex<Vault>>,
+    provider_sessions: orchestrator::ProviderSessions,
     task_set: Arc<Mutex<tokio::task::JoinSet<()>>>,
 ) {
     tokio::spawn(async move {
@@ -507,8 +327,11 @@ fn spawn_worker(
                     let as_ = Arc::clone(&assayer);
                     let pt = Arc::clone(&price_table);
                     let vt = Arc::clone(&vault);
+                    let ps = Arc::clone(&provider_sessions);
                     let mut set = task_set.lock().await;
-                    set.spawn(run_turn(ig, dp, session_id, turn_id, g, pl, as_, pt, vt));
+                    set.spawn(run_turn(
+                        ig, dp, session_id, turn_id, g, pl, as_, pt, vt, ps,
+                    ));
                     // Reap finished tasks so the set tracks only in-flight work.
                     while set.try_join_next().is_some() {}
                 }
@@ -524,7 +347,7 @@ fn spawn_worker(
 ///
 /// IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are unwrapped to their embedded
 /// IPv4 first, so a mapped private address cannot bypass the IPv4 rules.
-fn is_blocked_ip(addr: std::net::IpAddr) -> bool {
+pub(crate) fn is_blocked_ip(addr: std::net::IpAddr) -> bool {
     use std::net::IpAddr;
 
     // Unwrap IPv4-mapped IPv6 so the IPv4 range checks apply.
@@ -559,7 +382,7 @@ fn is_blocked_ip(addr: std::net::IpAddr) -> bool {
 /// Rejects non-HTTP schemes, the `localhost` hostname, and any host that parses
 /// to an IP address blocked by [`is_blocked_ip`]. Hostnames that do not parse as
 /// an IP are allowed (DNS resolution is the caller's network policy).
-fn is_safe_mcp_url(url: &str) -> bool {
+pub(crate) fn is_safe_mcp_url(url: &str) -> bool {
     let Ok(parsed) = url.parse::<url::Url>() else {
         return false;
     };
@@ -584,1749 +407,338 @@ fn is_safe_mcp_url(url: &str) -> bool {
     true
 }
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // all RPC methods live in one function per the spec
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // thin wiring: one registration per RPC method
 fn build_router(
     ingot: &IngotHandle,
-    dispatcher: Arc<Dispatcher>,
+    dispatcher: &Arc<Dispatcher>,
     gates: &Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
-    pool: Arc<ProviderPool>,
+    pool: &Arc<ProviderPool>,
     assayer: &Arc<Assayer>,
-    startup_runner: &'static str,
-    startup_model: &'static str,
+    startup_runner: &Arc<str>,
+    startup_model: &Arc<str>,
     price_table: &Arc<PriceTable>,
     vault: &Arc<Mutex<Vault>>,
+    provider_sessions: &orchestrator::ProviderSessions,
     task_set: &Arc<Mutex<tokio::task::JoinSet<()>>>,
 ) -> Router {
     let mut router = Router::new();
 
-    // Clone gates so the closures below can each hold an independent Arc.
-    let gates = Arc::clone(gates);
-
-    // Clone vault so each RPC closure gets its own Arc.
-    let vault = Arc::clone(vault);
-
-    // Stash provider pool Arc before the name is shadowed by the WorktreePool below.
-    let provider_pool = pool;
-
-    // Create two Arcs for the worktree pool so task.parallel and task.cancel each hold one.
-    let pool = Arc::new(Mutex::new(WorktreePool::default()));
-    let pool_cancel = Arc::clone(&pool);
+    // The shared handler state bundle: every handler closure clones this and
+    // calls the corresponding module function. This is the only construction
+    // point; the registrations below are thin wiring over `handlers::*`.
+    let state = handlers::HandlerState {
+        ingot: ingot.clone(),
+        dispatcher: Arc::clone(dispatcher),
+        gates: Arc::clone(gates),
+        provider_pool: Arc::clone(pool),
+        // Worktree pool shared by task.parallel and task.cancel.
+        worktree_pool: Arc::new(Mutex::new(WorktreePool::default())),
+        assayer: Arc::clone(assayer),
+        price_table: Arc::clone(price_table),
+        vault: Arc::clone(vault),
+        provider_sessions: Arc::clone(provider_sessions),
+        task_set: Arc::clone(task_set),
+        startup_runner: Arc::clone(startup_runner),
+        startup_model: Arc::clone(startup_model),
+    };
 
     // ── ping ────────────────────────────────────────────────────────────────
     router.register("ping", |_| async { Ok(json!("pong")) });
 
     // ── session.create ──────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let session_create_state = state.clone();
     router.register("session.create", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let title = params
-                .get("title")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-
-            let mode = params
-                .get("mode")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-
-            let cowork_mode = params
-                .get("cowork_mode")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let task_description: Option<String> = params
-                .get("task_description")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-
-            let now = Timestamp::now();
-            let session_id = Uuid::new_v4();
-
-            // When task_description is provided, create the linked task first so
-            // its ID can be stored directly in the Session row.
-            let task_id: Option<String> = if let Some(ref desc) = task_description {
-                let task = Task {
-                    id: Uuid::new_v4(),
-                    title: desc.clone(),
-                    description: String::new(),
-                    status: "planned".to_owned(),
-                    created_at: now,
-                    session_id: Some(session_id.to_string()),
-                    response: None,
-                };
-                ig.create_task(task.clone())
-                    .await
-                    .map_err(|e| ingot_err(&e))?;
-                Some(task.id.to_string())
-            } else {
-                None
-            };
-
-            let session = Session {
-                id: session_id,
-                created_at: now,
-                updated_at: now,
-                status: "active".to_owned(),
-                task_id: task_id.clone(),
-                mode,
-                title: title.clone().unwrap_or_default(),
-                cowork_mode,
-                workspace_root: None,
-                model_override: None,
-                runner_override: None,
-            };
-
-            ig.create_session(session.clone())
-                .await
-                .map_err(|e| ingot_err(&e))?;
-
-            // Auto-index: check workspace.toml in cwd; if stale, index in background.
-            {
-                let cwd = std::env::var("SMEDJA_WORKSPACE")
-                    .map_or_else(|_| std::path::PathBuf::from("."), std::path::PathBuf::from);
-                let toml_path = cwd.join(".smedja").join("workspace.toml");
-                let needs_index = if toml_path.exists() {
-                    let content = std::fs::read_to_string(&toml_path).unwrap_or_default();
-                    if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
-                        parsed
-                            .get("graph")
-                            .and_then(|g| g.get("last_indexed_at"))
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                            .is_none_or(|ts| {
-                                let age = chrono::Utc::now()
-                                    .signed_duration_since(ts.with_timezone(&chrono::Utc));
-                                age.num_hours() >= 24
-                            })
-                    } else {
-                        true
-                    }
-                } else {
-                    // Only auto-index if workspace.toml already exists (workspace was initialised).
-                    false
-                };
-
-                if needs_index {
-                    let bg_cwd = cwd.clone();
-                    let bg_toml = toml_path.clone();
-                    tokio::task::spawn(async move {
-                        use opentelemetry::trace::Span as _;
-                        let tracer = opentelemetry::global::tracer("smedja");
-                        let mut span =
-                            opentelemetry::trace::Tracer::start(&tracer, "smedja.workspace.index");
-                        let start = std::time::Instant::now();
-                        let db_path = bg_cwd.join(".smedja").join("graph.db");
-                        let bg_cwd_clone = bg_cwd.clone();
-                        let symbol_count = tokio::task::spawn_blocking(move || {
-                            smedja_graph::GraphStore::open(&db_path)
-                                .and_then(|mut s| {
-                                    s.index_workspace_incremental(&bg_cwd_clone, "workspace", None)
-                                })
-                                .unwrap_or(0)
-                        })
-                        .await
-                        .unwrap_or(0);
-                        let duration_ms = start.elapsed().as_millis();
-                        span.set_attribute(opentelemetry::KeyValue::new(
-                            "workspace_path",
-                            bg_cwd.to_string_lossy().into_owned(),
-                        ));
-                        span.set_attribute(opentelemetry::KeyValue::new(
-                            "symbol_count",
-                            i64::try_from(symbol_count).unwrap_or(i64::MAX),
-                        ));
-                        span.set_attribute(opentelemetry::KeyValue::new(
-                            "duration_ms",
-                            i64::try_from(duration_ms).unwrap_or(i64::MAX),
-                        ));
-                        span.end();
-                        let ts = chrono::Utc::now().to_rfc3339();
-                        let new_content = format!(
-                            "[graph]\nauto_index = true\nlast_indexed_at = \"{ts}\"\n"
-                        );
-                        if let Err(e) = std::fs::write(&bg_toml, new_content) {
-                            tracing::warn!(error = %e, "failed to update workspace.toml after auto-index");
-                        }
-                    });
-                }
-            }
-
-            // When cowork_mode is requested, register the per-session gate.
-            // The gate map is owned by build_router; session.create handles the DB flag
-            // only here. Callers that need the gate active must also call cowork.set.
-
-            let tier = if startup_runner.contains("local") { "local" } else { "fast" };
-            Ok(json!({
-                "id": session.id,
-                "title": title,
-                "created_at": session.created_at,
-                "cowork_mode": cowork_mode,
-                "task_id": task_id,
-                "runner": startup_runner,
-                "model": startup_model,
-                "tier": tier,
-            }))
-        }
+        let state = session_create_state.clone();
+        async move { handlers::session::create(state, params).await }
     });
 
     // ── session.list ────────────────────────────────────────────────────────
-    let ig = ingot.clone();
-    router.register("session.list", move |_| {
-        let ig = ig.clone();
-        async move {
-            let sessions = ig.list_sessions().await.map_err(|e| ingot_err(&e))?;
-            let out: Vec<Value> = sessions
-                .into_iter()
-                .map(|s| {
-                    json!({
-                        "id": s.id,
-                        "title": s.title,
-                        "mode": s.mode,
-                        "created_at": s.created_at,
-                        "updated_at": s.updated_at,
-                    })
-                })
-                .collect();
-            Ok(Value::Array(out))
-        }
+    let session_list_state = state.clone();
+    router.register("session.list", move |params: Value| {
+        let state = session_list_state.clone();
+        async move { handlers::session::list(state, params).await }
     });
 
     // ── session.get ─────────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let session_get_state = state.clone();
     router.register("session.get", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let id = params
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("id"))?;
-
-            let session = ig
-                .get_session(id)
-                .await
-                .map_err(|e| ingot_err(&e))?
-                .ok_or_else(|| {
-                    RpcError::new(codes::INTERNAL_ERROR, format!("session not found: {id}"))
-                })?;
-
-            Ok(json!({
-                "id": session.id,
-                "title": session.title,
-                "mode": session.mode,
-                "created_at": session.created_at,
-                "updated_at": session.updated_at,
-                "status": session.status,
-                "task_id": session.task_id,
-            }))
-        }
+        let state = session_get_state.clone();
+        async move { handlers::session::get(state, params).await }
     });
 
     // ── session.delete ──────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let session_delete_state = state.clone();
     router.register("session.delete", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let id = params
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("id"))?;
-
-            ig.delete_session(id).await.map_err(|e| ingot_err(&e))?;
-            Ok(Value::Bool(true))
-        }
+        let state = session_delete_state.clone();
+        async move { handlers::session::delete(state, params).await }
     });
 
     // ── session.fork ────────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let session_fork_state = state.clone();
     router.register("session.fork", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let session_id = params
-                .get("session_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("session_id"))?
-                .to_owned();
-
-            // Each DB call acquires and immediately releases the lock so other
-            // concurrent RPC handlers (including turn.subscribe's polling loop)
-            // are not serialised behind the entire fork sequence.
-            let parent = {
-                ig.get_session(&session_id)
-                    .await
-                    .map_err(|e| ingot_err(&e))?
-                    .ok_or_else(|| {
-                        RpcError::new(
-                            codes::INTERNAL_ERROR,
-                            format!("session not found: {session_id}"),
-                        )
-                    })?
-            };
-
-            let latest_cp = {
-                ig.latest_checkpoint(&session_id)
-                    .await
-                    .map_err(|e| ingot_err(&e))?
-            };
-
-            let now = Timestamp::now();
-            let new_id = Uuid::new_v4().to_string();
-
-            {
-                ig.create_session(Session {
-                    id: Uuid::parse_str(&new_id).map_err(|e| {
-                        RpcError::new(codes::INTERNAL_ERROR, format!("uuid error: {e}"))
-                    })?,
-                    created_at: now,
-                    updated_at: now,
-                    status: "active".into(),
-                    task_id: None,
-                    mode: parent.mode.clone(),
-                    title: parent.title.clone(),
-                    cowork_mode: parent.cowork_mode,
-                    workspace_root: parent.workspace_root.clone(),
-                    model_override: parent.model_override.clone(),
-                    runner_override: None,
-                })
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            }
-
-            let has_checkpoint = latest_cp.is_some();
-            if let Some(cp) = latest_cp {
-                ig.save_checkpoint(Checkpoint {
-                    id: Uuid::new_v4(),
-                    session_id: new_id.clone(),
-                    turn_n: cp.turn_n,
-                    messages_json: cp.messages_json,
-                    created_at: now,
-                    compaction_id: cp.compaction_id,
-                })
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            }
-
-            Ok(json!({
-                "session_id": new_id,
-                "forked_from": session_id,
-                "has_checkpoint": has_checkpoint,
-            }))
-        }
+        let state = session_fork_state.clone();
+        async move { handlers::session::fork(state, params).await }
     });
 
     // ── turn.subscribe ──────────────────────────────────────────────────────
     // Blocks until the named task reaches a terminal status (complete / failed)
     // or a 60-second deadline expires.  Returns a single response envelope so
     // callers do not need to poll task.get in a loop.
-    let ig = ingot.clone();
-    let dispatcher_subscribe = Arc::clone(&dispatcher);
+    let turn_subscribe_state = state.clone();
     router.register("turn.subscribe", move |params: Value| {
-        let ig = ig.clone();
-        let dispatcher = Arc::clone(&dispatcher_subscribe);
-        async move {
-            let task_id = params
-                .get("task_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("task_id"))?
-                .to_owned();
-            // Event-driven: resolve on the terminal TurnEvent for this turn,
-            // bounded by a 60s deadline. No fixed-interval polling.
-            await_turn_terminal(
-                &ig,
-                &dispatcher,
-                &task_id,
-                std::time::Duration::from_mins(1),
-            )
-            .await
-        }
+        let state = turn_subscribe_state.clone();
+        async move { handlers::turn::subscribe(state, params).await }
     });
 
     // ── task.get ────────────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let task_get_state = state.clone();
     router.register("task.get", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let id = params
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("id"))?;
-
-            let task = ig
-                .get_task(id)
-                .await
-                .map_err(|e| ingot_err(&e))?
-                .ok_or_else(|| {
-                    RpcError::new(codes::INTERNAL_ERROR, format!("task not found: {id}"))
-                })?;
-
-            Ok(json!({
-                "id": task.id,
-                "status": task.status,
-                "title": task.title,
-                "response": task.response,
-            }))
-        }
+        let state = task_get_state.clone();
+        async move { handlers::task::get(state, params).await }
     });
 
     // ── task.list ───────────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let task_list_state = state.clone();
     router.register("task.list", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let status = params
-                .get("status")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let tasks = ig.list_tasks(status).await.map_err(|e| ingot_err(&e))?;
-            let out: Vec<Value> = tasks
-                .iter()
-                .map(|t| {
-                    json!({
-                        "id": t.id,
-                        "title": t.title,
-                        "status": t.status,
-                        "created_at": t.created_at,
-                        "session_id": t.session_id,
-                    })
-                })
-                .collect();
-            Ok(Value::Array(out))
-        }
+        let state = task_list_state.clone();
+        async move { handlers::task::list(state, params).await }
     });
 
     // ── task.create ─────────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let task_create_state = state.clone();
     router.register("task.create", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let title = params
-                .get("title")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("title"))?
-                .to_owned();
-            let description = params
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned();
-            let session_id = params
-                .get("session_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let task = Task {
-                id: Uuid::new_v4(),
-                title,
-                description,
-                status: "planned".to_owned(),
-                created_at: Timestamp::now(),
-                session_id,
-                response: None,
-            };
-            ig.create_task(task.clone())
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            Ok(json!({ "id": task.id, "status": task.status }))
-        }
+        let state = task_create_state.clone();
+        async move { handlers::task::create(state, params).await }
     });
 
     // ── task.close ──────────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let task_close_state = state.clone();
     router.register("task.close", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let id = params
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("id"))?;
-            ig.update_task_status(id, "complete")
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            Ok(json!({ "id": id, "status": "complete" }))
-        }
+        let state = task_close_state.clone();
+        async move { handlers::task::close(state, params).await }
     });
 
     // ── turn.submit ─────────────────────────────────────────────────────────
-    // Clone dispatcher before turn.submit moves it, so loop.run can hold its
-    // own Arc without requiring a second clone point after the move.
-    let dispatcher_loop_run = Arc::clone(&dispatcher);
-    let ig = ingot.clone();
+    let turn_submit_state = state.clone();
     router.register("turn.submit", move |params: Value| {
-        let ig = ig.clone();
-        let dispatcher = Arc::clone(&dispatcher);
-        async move {
-            let session_id = params
-                .get("session_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("session_id"))?
-                .to_owned();
-            let content = params
-                .get("content")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("content"))?
-                .to_owned();
-
-            let task_id = Uuid::new_v4();
-            let task = Task {
-                id: task_id,
-                title: content,
-                description: String::new(),
-                status: "planned".to_owned(),
-                created_at: Timestamp::now(),
-                session_id: Some(session_id.clone()),
-                response: None,
-            };
-
-            ig.create_task(task.clone())
-                .await
-                .map_err(|e| ingot_err(&e))?;
-
-            // Extract current span IDs for turn start event correlation.
-            let (ts_trace_id, ts_span_id) = {
-                use opentelemetry::trace::TraceContextExt as _;
-                let cx = opentelemetry::Context::current();
-                let sc = cx.span().span_context().clone();
-                if sc.is_valid() {
-                    (
-                        Some(format!("{}", sc.trace_id())),
-                        Some(format!("{}", sc.span_id())),
-                    )
-                } else {
-                    (None, None)
-                }
-            };
-            dispatcher.publish(TurnEvent::Started {
-                session_id: session_id.clone(),
-                turn_id: task_id.to_string(),
-                correlation: CorrelationCtx {
-                    conversation_id: Some(session_id.clone()),
-                    trace_id: ts_trace_id,
-                    span_id: ts_span_id,
-                    parent_span_id: None,
-                    operation_name: Some(tel::OPERATION_INVOKE_AGENT.to_owned()),
-                    agent_name: Some("interactive".to_owned()),
-                    status: None,
-                },
-            });
-
-            Ok(json!({ "task_id": task_id }))
-        }
+        let state = turn_submit_state.clone();
+        async move { handlers::turn::submit(state, params).await }
     });
 
     // ── session.checkpoint.list ─────────────────────────────────────────────
-    let ig = ingot.clone();
+    let checkpoint_list_state = state.clone();
     router.register("session.checkpoint.list", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let session_id = params
-                .get("session_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("session_id"))?;
-            let cps = ig
-                .list_checkpoints(session_id)
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            let out: Vec<Value> = cps
-                .iter()
-                .map(|cp| {
-                    json!({
-                        "turn_n": cp.turn_n,
-                        "created_at": cp.created_at,
-                    })
-                })
-                .collect();
-            Ok(Value::Array(out))
-        }
+        let state = checkpoint_list_state.clone();
+        async move { handlers::checkpoint::list(state, params).await }
     });
 
     // ── session.rollback ────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let rollback_state = state.clone();
     router.register("session.rollback", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let session_id = params
-                .get("session_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("session_id"))?
-                .to_owned();
-            let turn_n_raw = params
-                .get("turn_n")
-                .and_then(Value::as_i64)
-                .ok_or_else(|| missing_param("turn_n"))?;
-            let turn_n_u32 = u32::try_from(turn_n_raw).map_err(|_| {
-                RpcError::new(
-                    codes::INVALID_PARAMS,
-                    "turn_n must be a non-negative integer",
-                )
-            })?;
-
-            // Atomically load the target checkpoint and prune all later checkpoints
-            // for this session in a single SQLite transaction.
-            let cp = ig
-                .rollback_session(&session_id, turn_n_u32)
-                .await
-                .map_err(|e| ingot_err(&e))?;
-
-            match cp {
-                Some(cp) => Ok(json!({
-                    "session_id": session_id,
-                    "turn_n": cp.turn_n,
-                    "messages_json": cp.messages_json,
-                    "created_at": cp.created_at,
-                })),
-                None => Err(RpcError::new(codes::INVALID_PARAMS, "checkpoint not found")),
-            }
-        }
+        let state = rollback_state.clone();
+        async move { handlers::checkpoint::rollback(state, params).await }
     });
 
     // ── session.compact ──────────────────────────────────────────────────────
-    let ig = ingot.clone();
-    let compact_pool = Arc::clone(&provider_pool);
-    let vault_compact = Arc::clone(&vault);
+    let compact_state = state.clone();
     router.register("session.compact", move |params: Value| {
-        let ig = ig.clone();
-        let pool = Arc::clone(&compact_pool);
-        let vt = Arc::clone(&vault_compact);
-        async move {
-            let session_id = params
-                .get("session_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("session_id"))?
-                .to_owned();
-
-            // Load latest checkpoint for conversation history.
-            let messages_json = {
-                ig.latest_checkpoint(&session_id)
-                    .await
-                    .map_err(|e| ingot_err(&e))?
-                    .map_or_else(|| "[]".to_owned(), |cp| cp.messages_json)
-            };
-
-            // Assemble the summarisation input through working-memory strata
-            // rather than feeding the raw checkpoint blob. The raw blob is still
-            // preserved in the pre-compaction checkpoint below for rollback.
-            let history_transcript = assemble_compaction_transcript(&messages_json);
-
-            // Call provider to produce a summary.
-            let compaction_prompt = format!(
-                "Summarise this conversation in 3–5 bullet points, then state the current goal. \
-                 Be concise.\n\nConversation history:\n{history_transcript}"
-            );
-            let pool_entry = pool
-                .get(Runner::Claude, Tier::Fast)
-                .or_else(|| pool.get(Runner::Codex, Tier::Fast))
-                .or_else(|| pool.get_default())
-                .ok_or_else(|| {
-                    RpcError::new(codes::INTERNAL_ERROR, "no provider available for compaction")
-                })?;
-            let provider = &pool_entry.provider;
-            let opts = CallOptions {
-                model: std::env::var("SMEDJA_MODEL")
-                    .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_owned()),
-                max_tokens: Some(512),
-                temperature: Some(0.3),
-                system: Some("You are a summarisation assistant.".to_owned()),
-                tools: None,
-                provider_session_id: None,
-                stable_prefix_len: None,
-            };
-            let stream = provider.stream_chat(
-                &[AdapterMessage {
-                    role: AdapterRole::User,
-                    content: compaction_prompt,
-                }],
-                &opts,
-            );
-            let dispatcher = Dispatcher::new(1);
-            let (summary, _, _, _) = drain_stream(stream, &dispatcher, None, &CorrelationCtx::default())
-                .await
-                .map_err(|e| {
-                RpcError::new(codes::INTERNAL_ERROR, format!("compaction failed: {e}"))
-            })?;
-
-            // Save the pre-compaction checkpoint, tagged with a compaction id so
-            // it is retrievable via `list_compaction_checkpoints`.
-            let turn_count = {
-                ig.list_checkpoints(&session_id)
-                    .await
-                    .map_or(0i64, |v| i64::try_from(v.len()).unwrap_or(i64::MAX))
-            };
-            let cp = Checkpoint {
-                id: Uuid::new_v4(),
-                session_id: session_id.clone(),
-                turn_n: turn_count,
-                messages_json: messages_json.clone(),
-                created_at: Timestamp::now(),
-                compaction_id: Some(Uuid::new_v4().to_string()),
-            };
-            {
-                if let Err(e) = ig.save_checkpoint(cp).await {
-                    warn!(error = %e, "failed to save pre-compaction checkpoint");
-                }
-            }
-
-            // Fire-and-forget: index compaction summary into vault cold storage.
-            let compact_sid = session_id.clone();
-            let compact_summary = summary.clone();
-            tokio::task::spawn_blocking(move || {
-                let entry = VaultEntry {
-                    id: format!("compact:{compact_sid}:{turn_count}"),
-                    embedding: crate::embedder::embed(&compact_summary),
-                    payload: serde_json::json!({
-                        "session_id": compact_sid,
-                        "turn_count": turn_count,
-                    }),
-                    namespace: "compact".to_owned(),
-                    content: compact_summary,
-                    source_file: None,
-                    added_by: Some("session.compact".to_owned()),
-                    chunk_index: None,
-                    parent_id: None,
-                    created_at: 0.0,
-                };
-                let mut guard = vt.blocking_lock();
-                if let Err(e) = guard.upsert(&entry) {
-                    tracing::warn!(error = %e, "session.compact: vault upsert failed, compaction data lost");
-                }
-            });
-
-            Ok(json!({
-                "session_id": session_id,
-                "summary": summary,
-                "turn_count": turn_count,
-                "compaction_checkpoint_saved": true,
-            }))
-        }
+        let state = compact_state.clone();
+        async move { handlers::checkpoint::compact(state, params).await }
     });
 
     // ── session.token_usage ──────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let token_usage_state = state.clone();
     router.register("session.token_usage", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let session_id = params
-                .get("session_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("session_id"))?;
-            let snaps = ig
-                .session_token_snapshots(session_id)
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            let rows: Vec<Value> = snaps
-                .iter()
-                .map(|s| {
-                    json!({
-                        "turn_n": s.turn_n,
-                        "input_tok": s.input_tok,
-                        "output_tok": s.output_tok,
-                        "cumulative_input": s.cumulative_input,
-                        "cumulative_output": s.cumulative_output,
-                    })
-                })
-                .collect();
-            Ok(json!({ "session_id": session_id, "turns": rows }))
-        }
+        let state = token_usage_state.clone();
+        async move { handlers::session::token_usage(state, params).await }
     });
 
     // ── session.cost ────────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let cost_state = state.clone();
     router.register("session.cost", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let session_id = params
-                .get("session_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("session_id"))?;
-            let total_usd = ig
-                .session_cost(session_id)
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            let rows: Vec<CostRow> = ig
-                .session_cost_entries(session_id)
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            let breakdown: Vec<Value> = rows
-                .into_iter()
-                .map(|r| {
-                    json!({
-                        "model": r.model,
-                        "runner": r.runner,
-                        "turns": r.turns,
-                        "input_tok": r.input_tok,
-                        "output_tok": r.output_tok,
-                        "cost_usd": r.cost_usd.as_usd_f64(),
-                    })
-                })
-                .collect();
-            Ok(json!({
-                "session_id": session_id,
-                "total_usd": total_usd.as_usd_f64(),
-                "breakdown": breakdown,
-            }))
-        }
+        let state = cost_state.clone();
+        async move { handlers::cost::cost(state, params).await }
     });
 
     // ── session.set_model ────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let set_model_state = state.clone();
     router.register("session.set_model", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let session_id = params["session_id"]
-                .as_str()
-                .ok_or_else(|| missing_param("session_id"))?
-                .to_owned();
-            let model = params["model"]
-                .as_str()
-                .ok_or_else(|| missing_param("model"))?
-                .to_owned();
-            ig.update_session_model_override(&session_id, &model)
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            Ok(json!({ "session_id": session_id, "model": model }))
-        }
+        let state = set_model_state.clone();
+        async move { handlers::session::set_model(state, params).await }
     });
 
     // ── session.set_runner ───────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let set_runner_state = state.clone();
     router.register("session.set_runner", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let session_id = params["session_id"]
-                .as_str()
-                .ok_or_else(|| missing_param("session_id"))?
-                .to_owned();
-            let runner_str = params["runner"]
-                .as_str()
-                .ok_or_else(|| missing_param("runner"))?
-                .to_owned();
-            // Validate and normalise to the canonical key stored in the DB.
-            let canonical = parse_runner_str(&runner_str)
-                .map(runner_session_key)
-                .ok_or_else(|| {
-                    RpcError::new(
-                        codes::INVALID_PARAMS,
-                        format!(
-                            "unknown runner: {runner_str}; valid: claude, codex, local, copilot"
-                        ),
-                    )
-                })?;
-            ig.update_session_runner_override(&session_id, canonical)
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            Ok(json!({ "session_id": session_id, "runner": canonical }))
-        }
+        let state = set_runner_state.clone();
+        async move { handlers::session::set_runner(state, params).await }
     });
 
     // ── session.takeover ─────────────────────────────────────────────────────
     // Forks the current session onto a new runner in one atomic operation:
     // creates a new session, copies the latest checkpoint, and sets the
     // runner_override so the next turn routes to the requested runner.
-    let ig = ingot.clone();
-    let vault_takeover = Arc::clone(&vault);
+    let takeover_state = state.clone();
     router.register("session.takeover", move |params: Value| {
-        let ig = ig.clone();
-        let vt = Arc::clone(&vault_takeover);
-        async move {
-            let session_id = params["session_id"]
-                .as_str()
-                .ok_or_else(|| missing_param("session_id"))?
-                .to_owned();
-            let runner_str = params["runner"]
-                .as_str()
-                .ok_or_else(|| missing_param("runner"))?
-                .to_owned();
-
-            let canonical = parse_runner_str(&runner_str)
-                .map(runner_session_key)
-                .ok_or_else(|| {
-                    RpcError::new(
-                        codes::INVALID_PARAMS,
-                        format!(
-                            "unknown runner: {runner_str}; valid: claude, codex, local, copilot"
-                        ),
-                    )
-                })?;
-
-            let parent = {
-                ig.get_session(&session_id)
-                    .await
-                    .map_err(|e| ingot_err(&e))?
-                    .ok_or_else(|| {
-                        RpcError::new(
-                            codes::INTERNAL_ERROR,
-                            format!("session not found: {session_id}"),
-                        )
-                    })?
-            };
-
-            let latest_cp = {
-                ig.latest_checkpoint(&session_id)
-                    .await
-                    .map_err(|e| ingot_err(&e))?
-            };
-
-            let now = Timestamp::now();
-            let new_id = Uuid::new_v4().to_string();
-
-            {
-                ig.create_session(Session {
-                    id: Uuid::parse_str(&new_id).map_err(|e| {
-                        RpcError::new(codes::INTERNAL_ERROR, format!("uuid error: {e}"))
-                    })?,
-                    created_at: now,
-                    updated_at: now,
-                    status: "active".into(),
-                    task_id: None,
-                    mode: parent.mode.clone(),
-                    title: parent.title.clone(),
-                    cowork_mode: parent.cowork_mode,
-                    workspace_root: parent.workspace_root.clone(),
-                    model_override: parent.model_override.clone(),
-                    runner_override: Some(canonical.to_owned()),
-                })
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            }
-
-            let has_checkpoint = latest_cp.is_some();
-            let handoff_context_id = format!("handoff:{session_id}:{new_id}");
-            if let Some(cp) = latest_cp {
-                ig.save_checkpoint(Checkpoint {
-                    id: Uuid::new_v4(),
-                    session_id: new_id.clone(),
-                    turn_n: cp.turn_n,
-                    messages_json: cp.messages_json.clone(),
-                    created_at: now,
-                    compaction_id: cp.compaction_id.clone(),
-                })
-                .await
-                .map_err(|e| ingot_err(&e))?;
-
-                // Fire-and-forget vault write so the receiving session can retrieve
-                // the handoff context via smedja_vault_search namespace="handoff".
-                let hid = handoff_context_id.clone();
-                let from_sid = session_id.clone();
-                let to_sid = new_id.clone();
-                let runner_str = canonical.to_owned();
-                let messages = cp.messages_json.clone();
-                tokio::task::spawn_blocking(move || {
-                    let entry = VaultEntry {
-                        id: hid.clone(),
-                        embedding: crate::embedder::embed(&messages),
-                        payload: serde_json::json!({
-                            "from_session_id": from_sid,
-                            "to_session_id": to_sid,
-                            "runner": runner_str,
-                        }),
-                        namespace: "handoff".to_owned(),
-                        content: messages,
-                        source_file: None,
-                        added_by: Some("session.takeover".to_owned()),
-                        chunk_index: None,
-                        parent_id: None,
-                        created_at: 0.0,
-                    };
-                    let mut guard = vt.blocking_lock();
-                    let _ = guard.upsert(&entry);
-                });
-            }
-
-            Ok(json!({
-                "new_session_id": new_id,
-                "forked_from": session_id,
-                "runner": canonical,
-                "has_checkpoint": has_checkpoint,
-                "context_namespace": "handoff",
-                "context_id": handoff_context_id,
-            }))
-        }
+        let state = takeover_state.clone();
+        async move { handlers::session::takeover(state, params).await }
     });
 
     // ── runner.list ──────────────────────────────────────────────────────────
-    let rl_pool = Arc::clone(&provider_pool);
-    router.register("runner.list", move |_params: Value| {
-        let pool = Arc::clone(&rl_pool);
-        async move {
-            let runners: Vec<Value> = pool
-                .list_all_entries()
-                .into_iter()
-                .map(|(runner, tier, model)| {
-                    json!({ "runner": runner, "tier": tier, "model": model })
-                })
-                .collect();
-            Ok(json!({ "runners": runners }))
-        }
+    let runner_list_state = state.clone();
+    router.register("runner.list", move |params: Value| {
+        let state = runner_list_state.clone();
+        async move { handlers::session::runner_list(state, params).await }
     });
 
     // ── session.context ─────────────────────────────────────────────────────
-    let ig = ingot.clone();
-    let pt = Arc::clone(price_table);
-    let vault_ctx = Arc::clone(&vault);
+    let context_state = state.clone();
     router.register("session.context", move |params: Value| {
-        let ig = ig.clone();
-        let pt = Arc::clone(&pt);
-        let vt = Arc::clone(&vault_ctx);
-        async move {
-            let session_id = params
-                .get("session_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("session_id"))?;
-            let snaps = ig
-                .session_token_snapshots(session_id)
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            let (cumulative_input, cumulative_output) = snaps
-                .last()
-                .map_or((0i64, 0i64), |s| (s.cumulative_input, s.cumulative_output));
-            let used_tok = cumulative_input.saturating_add(cumulative_output);
-            let model = ig
-                .session_last_model(session_id)
-                .await
-                .map_err(|e| ingot_err(&e))?
-                .unwrap_or_default();
-            let window_tok = u64::from(pt.context_window(&model));
-            let (vault_warm_count, vault_cold_count) = tokio::task::spawn_blocking(move || {
-                let guard = vt.blocking_lock();
-                let warm = guard.count_by_namespace("warm").unwrap_or(0);
-                let cold = guard.count_by_namespace("default").unwrap_or(0);
-                (warm, cold)
-            })
-            .await
-            .unwrap_or((0, 0));
-            Ok(json!({
-                "session_id": session_id,
-                "used_tok": used_tok,
-                "window_tok": window_tok,
-                "model": model,
-                "vault_warm_count": vault_warm_count,
-                "vault_cold_count": vault_cold_count,
-            }))
-        }
+        let state = context_state.clone();
+        async move { handlers::session::context(state, params).await }
     });
 
     // ── cowork.set ──────────────────────────────────────────────────────────
-    let ig = ingot.clone();
-    let gates_set = Arc::clone(&gates);
+    let cowork_set_state = state.clone();
     router.register("cowork.set", move |params: Value| {
-        let ig = ig.clone();
-        let gates = Arc::clone(&gates_set);
-        async move {
-            let session_id = params
-                .get("session_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("session_id"))?
-                .to_owned();
-            let enabled = params
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .ok_or_else(|| missing_param("enabled"))?;
-            ig.update_session_cowork_mode(&session_id, enabled)
-                .await
-                .map_err(|e| ingot_err(&e))?;
-
-            // Manage the per-session gate.
-            let mut g = gates.lock().await;
-            if enabled {
-                g.entry(session_id.clone())
-                    .or_insert_with(|| Arc::new(CoworkGate::default()));
-            } else {
-                g.remove(&session_id);
-            }
-
-            Ok(json!({ "session_id": session_id, "cowork_mode": enabled }))
-        }
+        let state = cowork_set_state.clone();
+        async move { handlers::audit::set(state, params).await }
     });
 
     // ── session.set_mode ────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let set_mode_state = state.clone();
     router.register("session.set_mode", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let session_id = params
-                .get("session_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("session_id"))?
-                .to_owned();
-            let mode = params
-                .get("mode")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("mode"))?
-                .to_owned();
-            // Prevent escalation out of read-only review sessions.
-            let existing_session = ig
-                .get_session(&session_id)
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            if let Some(existing_session) = existing_session {
-                if existing_session.mode.as_deref() == Some("review") {
-                    return Err(RpcError::new(
-                        codes::INVALID_PARAMS,
-                        "review sessions are read-only",
-                    ));
-                }
-            }
-            ig.update_session_mode(&session_id, &mode)
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            Ok(json!({ "session_id": session_id, "mode": mode }))
-        }
+        let state = set_mode_state.clone();
+        async move { handlers::session::set_mode(state, params).await }
     });
 
     // ── mcp.register ────────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let mcp_register_state = state.clone();
     router.register("mcp.register", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let name = params
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| missing_param("name"))?
-                .to_owned();
-            let url = params
-                .get("url")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned();
-            if !is_safe_mcp_url(&url) {
-                return Err(RpcError::new(codes::INVALID_PARAMS, "url not permitted"));
-            }
-            let transport = params
-                .get("transport")
-                .and_then(Value::as_str)
-                .unwrap_or("http")
-                .to_owned();
-            let server = McpServer {
-                id: Uuid::new_v4().to_string(),
-                name,
-                url,
-                transport,
-                tools_json: "[]".into(),
-                last_refresh: 0.0,
-            };
-            ig.register_mcp_server(server.clone())
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            Ok(json!({ "id": server.id }))
-        }
+        let state = mcp_register_state.clone();
+        async move { handlers::mcp::register(state, params).await }
     });
 
     // ── mcp.list ────────────────────────────────────────────────────────────
-    let ig = ingot.clone();
-    router.register("mcp.list", move |_: Value| {
-        let ig = ig.clone();
-        async move {
-            let servers = ig.list_mcp_servers().await.map_err(|e| ingot_err(&e))?;
-            let out: Vec<Value> = servers
-                .iter()
-                .map(|s| {
-                    json!({
-                        "id": s.id,
-                        "name": s.name,
-                        "url": s.url,
-                        "transport": s.transport,
-                    })
-                })
-                .collect();
-            Ok(Value::Array(out))
-        }
+    let mcp_list_state = state.clone();
+    router.register("mcp.list", move |params: Value| {
+        let state = mcp_list_state.clone();
+        async move { handlers::mcp::list(state, params).await }
     });
 
     // ── cowork.approve ───────────────────────────────────────────────────────
-    let gates_approve = Arc::clone(&gates);
+    let cowork_approve_state = state.clone();
     router.register("cowork.approve", move |params: Value| {
-        let gates = Arc::clone(&gates_approve);
-        async move {
-            let session_id = params["session_id"]
-                .as_str()
-                .ok_or_else(|| missing_param("session_id"))?
-                .to_owned();
-            let id = params["id"]
-                .as_str()
-                .ok_or_else(|| missing_param("id"))?
-                .to_owned();
-            let gate = gates
-                .lock()
-                .await
-                .get(&session_id)
-                .cloned()
-                .ok_or_else(|| {
-                    RpcError::new(
-                        codes::INTERNAL_ERROR,
-                        format!("no cowork gate for session: {session_id}"),
-                    )
-                })?;
-            let found = gate.approve(&id).await;
-            Ok(json!({ "id": id, "resolved": found }))
-        }
+        let state = cowork_approve_state.clone();
+        async move { handlers::audit::approve(state, params).await }
     });
 
     // ── cowork.deny ──────────────────────────────────────────────────────────
-    let gates_deny = Arc::clone(&gates);
+    let cowork_deny_state = state.clone();
     router.register("cowork.deny", move |params: Value| {
-        let gates = Arc::clone(&gates_deny);
-        async move {
-            let session_id = params["session_id"]
-                .as_str()
-                .ok_or_else(|| missing_param("session_id"))?
-                .to_owned();
-            let id = params["id"]
-                .as_str()
-                .ok_or_else(|| missing_param("id"))?
-                .to_owned();
-            let reason = params["reason"].as_str().unwrap_or("denied").to_owned();
-            let gate = gates
-                .lock()
-                .await
-                .get(&session_id)
-                .cloned()
-                .ok_or_else(|| {
-                    RpcError::new(
-                        codes::INTERNAL_ERROR,
-                        format!("no cowork gate for session: {session_id}"),
-                    )
-                })?;
-            let found = gate.deny(&id, reason).await;
-            Ok(json!({ "id": id, "resolved": found }))
-        }
+        let state = cowork_deny_state.clone();
+        async move { handlers::audit::deny(state, params).await }
     });
 
     // ── cowork.modify ────────────────────────────────────────────────────────
-    let gates_modify = Arc::clone(&gates);
+    let cowork_modify_state = state.clone();
     router.register("cowork.modify", move |params: Value| {
-        let gates = Arc::clone(&gates_modify);
-        async move {
-            let session_id = params["session_id"]
-                .as_str()
-                .ok_or_else(|| missing_param("session_id"))?
-                .to_owned();
-            let id = params["id"]
-                .as_str()
-                .ok_or_else(|| missing_param("id"))?
-                .to_owned();
-            let instruction = params["instruction"].as_str().unwrap_or("").to_owned();
-            let gate = gates
-                .lock()
-                .await
-                .get(&session_id)
-                .cloned()
-                .ok_or_else(|| {
-                    RpcError::new(
-                        codes::INTERNAL_ERROR,
-                        format!("no cowork gate for session: {session_id}"),
-                    )
-                })?;
-            let found = gate.modify(&id, instruction).await;
-            Ok(json!({ "id": id, "resolved": found }))
-        }
+        let state = cowork_modify_state.clone();
+        async move { handlers::audit::modify(state, params).await }
     });
 
     // ── cowork.pending ───────────────────────────────────────────────────────
-    let gates_pending = Arc::clone(&gates);
+    let cowork_pending_state = state.clone();
     router.register("cowork.pending", move |params: Value| {
-        let gates = Arc::clone(&gates_pending);
-        async move {
-            let session_id = params["session_id"]
-                .as_str()
-                .ok_or_else(|| missing_param("session_id"))?
-                .to_owned();
-            let gate = gates
-                .lock()
-                .await
-                .get(&session_id)
-                .cloned()
-                .ok_or_else(|| {
-                    RpcError::new(
-                        codes::INTERNAL_ERROR,
-                        format!("no cowork gate for session: {session_id}"),
-                    )
-                })?;
-            let pending = gate.list_pending().await;
-            let out: Vec<Value> = pending
-                .into_iter()
-                .map(|(id, p)| {
-                    json!({
-                        "id": id,
-                        "tool": p.tool,
-                        "step_n": p.step_n,
-                        "args": p.args_scrubbed,
-                        "reasoning": p.reasoning,
-                    })
-                })
-                .collect();
-            Ok(Value::Array(out))
-        }
+        let state = cowork_pending_state.clone();
+        async move { handlers::audit::pending(state, params).await }
     });
 
     // ── task.parallel ────────────────────────────────────────────────────────
-    let ig = ingot.clone();
-    let vault_parallel = Arc::clone(&vault);
+    let task_parallel_state = state.clone();
     router.register("task.parallel", move |params: Value| {
-        let pool = Arc::clone(&pool);
-        let ig = ig.clone();
-        let vt = Arc::clone(&vault_parallel);
-        async move {
-            let session_id = params["session_id"].as_str().map(str::to_owned);
-            let goal = params["goal"]
-                .as_str()
-                .ok_or_else(|| missing_param("goal"))?
-                .to_owned();
-            // Roles may be plain strings or `{name, resume_session_id?}` objects.
-            // Both produce the consolidated `smedja_loop::LoopRole` (single source
-            // of truth); the fan-out path uses only `name` + `resume_session_id`.
-            let loop_roles: Vec<smedja_loop::LoopRole> = params["roles"]
-                .as_array()
-                .unwrap_or(&vec![])
-                .iter()
-                .filter_map(|v| {
-                    if let Some(name) = v.as_str() {
-                        Some(smedja_loop::LoopRole::for_parallel(name, None))
-                    } else if let Some(obj) = v.as_object() {
-                        obj.get("name").and_then(Value::as_str).map(|name| {
-                            smedja_loop::LoopRole::for_parallel(
-                                name,
-                                obj.get("resume_session_id")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_owned),
-                            )
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            // Enforce MAX_ROLE_DEPTH: reject any role that tries to resume a session at depth ≥ 4.
-            {
-                for role in &loop_roles {
-                    if let Some(ref resume_sid) = role.resume_session_id {
-                        let depth = ig
-                            .list_compaction_checkpoints(resume_sid)
-                            .await
-                            .unwrap_or_default()
-                            .len();
-                        #[allow(clippy::cast_possible_truncation)]
-                        if depth as u8 >= smedja_assayer::MAX_ROLE_DEPTH {
-                            return Err(RpcError::new(
-                                codes::INVALID_PARAMS,
-                                format!(
-                                    "resume depth exceeded for role '{}': max {}",
-                                    role.name,
-                                    smedja_assayer::MAX_ROLE_DEPTH,
-                                ),
-                            ));
-                        }
-                    }
-                }
-            }
-            let roles: Vec<String> = loop_roles.iter().map(|r| r.name.clone()).collect();
-
-            // Derive workspace root: prefer session.workspace_root, then env, then ".".
-            let env_workspace = || {
-                std::env::var("SMEDJA_WORKSPACE").map_or_else(|_| PathBuf::from("."), PathBuf::from)
-            };
-            let workspace_root = if let Some(ref sid) = session_id {
-                ig.get_session(sid)
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.workspace_root)
-                    .map_or_else(env_workspace, PathBuf::from)
-            } else {
-                env_workspace()
-            };
-
-            if !workspace_root.join(".git").exists() {
-                tracing::warn!(
-                    path = %workspace_root.display(),
-                    "task.parallel workspace does not contain .git",
-                );
-            }
-
-            let mut p = pool.lock().await;
-
-            // Register all roles first (synchronous — no await).
-            let registered: Vec<(String, String)> = roles
-                .iter()
-                .map(|role| {
-                    let id = p.register(role, &goal, &workspace_root);
-                    (role.clone(), id)
-                })
-                .collect();
-
-            // Create the git worktrees for all pending tasks.
-            let started = p.start_worktrees(&workspace_root).await;
-
-            // Warm-context snapshot: write recent checkpoints to vault so parallel
-            // agents can retrieve shared context via smedja_vault_search.
-            let fan_out_id = Uuid::new_v4().to_string();
-            if let Some(ref sid) = session_id {
-                const WARM_WINDOW: usize = 5;
-                let checkpoints = ig.list_checkpoints(sid).await.unwrap_or_default();
-                let recent: Vec<_> = checkpoints.into_iter().rev().take(WARM_WINDOW).collect();
-                if !recent.is_empty() {
-                    let fid = fan_out_id.clone();
-                    let parent_sid = sid.clone();
-                    let vt2 = Arc::clone(&vt);
-                    tokio::task::spawn_blocking(move || {
-                        let mut guard = vt2.blocking_lock();
-                        for cp in &recent {
-                            let entry = VaultEntry {
-                                id: format!("warm:{}:{}", fid, cp.id),
-                                embedding: crate::embedder::embed(&cp.messages_json),
-                                payload: serde_json::json!({
-                                    "fan_out_id": fid,
-                                    "session_id": parent_sid,
-                                    "turn_n": cp.turn_n,
-                                }),
-                                namespace: "warm".to_owned(),
-                                content: cp.messages_json.clone(),
-                                source_file: None,
-                                added_by: Some("task.parallel".to_owned()),
-                                chunk_index: None,
-                                parent_id: None,
-                                created_at: 0.0,
-                            };
-                            let _ = guard.upsert(&entry);
-                        }
-                    });
-                }
-            }
-
-            // Build the per-task response, including worktree_path where available.
-            let tasks: Vec<Value> = registered
-                .iter()
-                .map(|(role, task_id)| {
-                    let worktree_path = p
-                        .get(task_id)
-                        .map(|t| t.worktree_path.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    json!({
-                        "role": role,
-                        "task_id": task_id,
-                        "worktree_path": worktree_path,
-                    })
-                })
-                .collect();
-
-            Ok(json!({
-                "goal": goal,
-                "tasks": tasks,
-                "started": started,
-                "fan_out_id": fan_out_id,
-                "warm_context_namespace": "warm",
-            }))
-        }
+        let state = task_parallel_state.clone();
+        async move { handlers::task::parallel(state, params).await }
     });
 
     // ── task.cancel ──────────────────────────────────────────────────────────
+    let task_cancel_state = state.clone();
     router.register("task.cancel", move |params: Value| {
-        let pool = Arc::clone(&pool_cancel);
-        async move {
-            let task_id = params["task_id"]
-                .as_str()
-                .ok_or_else(|| missing_param("task_id"))?
-                .to_owned();
-            let found = pool.lock().await.cancel(&task_id);
-            Ok(json!({ "task_id": task_id, "cancelled": found }))
-        }
+        let state = task_cancel_state.clone();
+        async move { handlers::task::cancel(state, params).await }
     });
 
     // ── mcp.remove ───────────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let mcp_remove_state = state.clone();
     router.register("mcp.remove", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let name = params["name"]
-                .as_str()
-                .ok_or_else(|| missing_param("name"))?
-                .to_owned();
-            ig.remove_mcp_server(&name)
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            Ok(json!({ "name": name, "removed": true }))
-        }
+        let state = mcp_remove_state.clone();
+        async move { handlers::mcp::remove(state, params).await }
     });
 
     // ── mcp.refresh ──────────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let mcp_refresh_state = state.clone();
     router.register("mcp.refresh", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let name_filter: Option<String> = params
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-
-            // Load the candidate servers — all registered, or the named one.
-            let servers = {
-                let all = ig
-                    .list_mcp_servers()
-                    .await
-                    .map_err(|e| ingot_err(&e))?;
-                match name_filter {
-                    Some(ref name) => all
-                        .into_iter()
-                        .filter(|s| &s.name == name)
-                        .collect::<Vec<_>>(),
-                    None => all,
-                }
-            };
-
-            let mut refreshed = 0usize;
-            for server in servers {
-                let client = match crate::mcp_http::McpHttpClient::new(&server.url, "") {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(name = %server.name, error = %e, "mcp.refresh: failed to build client");
-                        continue;
-                    }
-                };
-                match client.list_tools().await {
-                    Ok(tools) => {
-                        let tools_json = serde_json::to_string(&tools)
-                            .unwrap_or_else(|_| "[]".to_owned());
-                        let updated = McpServer {
-                            tools_json,
-                            last_refresh: now_epoch(),
-                            ..server.clone()
-                        };
-                        let _ = ig.register_mcp_server(updated).await;
-                        refreshed += 1;
-                    }
-                    Err(e) => {
-                        tracing::warn!(name = %server.name, error = %e, "mcp.refresh failed");
-                    }
-                }
-            }
-
-            Ok(json!({ "refreshed": refreshed }))
-        }
+        let state = mcp_refresh_state.clone();
+        async move { handlers::mcp::refresh(state, params).await }
     });
 
     // ── loop.create ──────────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let loop_create_state = state.clone();
     router.register("loop.create", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let change_name = params["change_name"]
-                .as_str()
-                .ok_or_else(|| missing_param("change_name"))?
-                .to_owned();
-            let now = Timestamp::now();
-            let rec = smedja_ingot::LoopRecord {
-                id: Uuid::new_v4().to_string(),
-                change_name,
-                status: "planned".to_owned(),
-                current_slice: 0,
-                attempt: 1,
-                created_at: now,
-                updated_at: now,
-            };
-            let loop_id = rec.id.clone();
-            ig.create_loop(rec).await.map_err(|e| ingot_err(&e))?;
-            Ok(json!({ "loop_id": loop_id }))
-        }
+        let state = loop_create_state.clone();
+        async move { handlers::loops::create(state, params).await }
     });
 
     // ── loop.status ──────────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let loop_status_state = state.clone();
     router.register("loop.status", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let loop_id = params["loop_id"]
-                .as_str()
-                .ok_or_else(|| missing_param("loop_id"))?
-                .to_owned();
-            let rec = ig
-                .get_loop(&loop_id)
-                .await
-                .map_err(|e| ingot_err(&e))?
-                .ok_or_else(|| {
-                    RpcError::new(codes::INVALID_PARAMS, format!("loop not found: {loop_id}"))
-                })?;
-            Ok(serde_json::to_value(&rec).unwrap_or(Value::Null))
-        }
+        let state = loop_status_state.clone();
+        async move { handlers::loops::status(state, params).await }
     });
 
     // ── loop.cancel ──────────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let loop_cancel_state = state.clone();
     router.register("loop.cancel", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let loop_id = params["loop_id"]
-                .as_str()
-                .ok_or_else(|| missing_param("loop_id"))?
-                .to_owned();
-            ig.update_loop_status(&loop_id, "cancelled", Timestamp::now())
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            Ok(json!({ "loop_id": loop_id, "status": "cancelled" }))
-        }
+        let state = loop_cancel_state.clone();
+        async move { handlers::loops::cancel(state, params).await }
     });
 
     // ── loop.list ────────────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let loop_list_state = state.clone();
     router.register("loop.list", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let change_name = params["change_name"]
-                .as_str()
-                .ok_or_else(|| missing_param("change_name"))?
-                .to_owned();
-            let loops = ig
-                .list_loops(&change_name)
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            let loops_json: Vec<Value> = loops
-                .into_iter()
-                .map(|r| serde_json::to_value(&r).unwrap_or(Value::Null))
-                .collect();
-            Ok(json!({ "loops": loops_json }))
-        }
+        let state = loop_list_state.clone();
+        async move { handlers::loops::list(state, params).await }
     });
 
     // ── loop.retire ──────────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let loop_retire_state = state.clone();
     router.register("loop.retire", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let loop_id = params["loop_id"]
-                .as_str()
-                .ok_or_else(|| missing_param("loop_id"))?
-                .to_owned();
-            let rec = ig
-                .get_loop(&loop_id)
-                .await
-                .map_err(|e| ingot_err(&e))?
-                .ok_or_else(|| {
-                    RpcError::new(codes::INVALID_PARAMS, format!("loop not found: {loop_id}"))
-                })?;
-            // Only complete or failed loops can be retired.
-            if rec.status != "complete" && rec.status != "failed" {
-                return Err(RpcError::new(
-                    codes::INVALID_PARAMS,
-                    format!(
-                        "loop is in state '{}'; only complete or failed loops can be retired",
-                        rec.status
-                    ),
-                ));
-            }
-            ig.update_loop_status(&loop_id, "retired", Timestamp::now())
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            Ok(json!({ "loop_id": loop_id, "status": "retired" }))
-        }
+        let state = loop_retire_state.clone();
+        async move { handlers::loops::retire(state, params).await }
     });
 
     // ── loop.list_by_status ──────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let loop_lbs_state = state.clone();
     router.register("loop.list_by_status", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let status = params["status"].as_str().map(str::to_owned);
-            let loops = ig
-                .list_loops_by_status(status)
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            let loops_json: Vec<Value> = loops
-                .into_iter()
-                .map(|r| serde_json::to_value(&r).unwrap_or(Value::Null))
-                .collect();
-            Ok(json!({ "loops": loops_json }))
-        }
+        let state = loop_lbs_state.clone();
+        async move { handlers::loops::list_by_status(state, params).await }
     });
 
     // ── audit.list ───────────────────────────────────────────────────────────
-    let ig = ingot.clone();
+    let audit_list_state = state.clone();
     router.register("audit.list", move |params: Value| {
-        let ig = ig.clone();
-        async move {
-            let session_id = params["session_id"]
-                .as_str()
-                .ok_or_else(|| missing_param("session_id"))?
-                .to_owned();
-            let events = ig
-                .list_audit_events(&session_id)
-                .await
-                .map_err(|e| ingot_err(&e))?;
-            let events_json: Vec<Value> = events
-                .into_iter()
-                .map(|ev| serde_json::to_value(&ev).unwrap_or(Value::Null))
-                .collect();
-            Ok(json!({ "events": events_json }))
-        }
+        let state = audit_list_state.clone();
+        async move { handlers::audit::list(state, params).await }
     });
 
     // ── loop.run ────────────────────────────────────────────────────────────
     // Drives the real `smedja-loop` engine: load `.smedja/loop.json`, verify the
     // policy hash, enforce evaluator separation, then run each slice through the
     // implementer / verification gate / reviewer / bounded fix-retry pipeline.
-    let loop_run_ingot = ingot.clone();
-    let loop_run_dispatcher = Arc::clone(&dispatcher_loop_run);
-    let loop_run_gates = Arc::clone(&gates);
-    let loop_run_pool = Arc::clone(&provider_pool);
-    let loop_run_assayer = Arc::clone(assayer);
-    let loop_run_price = Arc::clone(price_table);
-    let loop_run_vault = Arc::clone(&vault);
-    let loop_run_tasks = Arc::clone(task_set);
+    let loop_run_state = state.clone();
     router.register("loop.run", move |params: Value| {
-        let ig = loop_run_ingot.clone();
-        let dispatcher = Arc::clone(&loop_run_dispatcher);
-        let gates = Arc::clone(&loop_run_gates);
-        let pool = Arc::clone(&loop_run_pool);
-        let assayer = Arc::clone(&loop_run_assayer);
-        let price_table = Arc::clone(&loop_run_price);
-        let vault = Arc::clone(&loop_run_vault);
-        let task_set = Arc::clone(&loop_run_tasks);
-        async move {
-            let loop_id = params["loop_id"]
-                .as_str()
-                .ok_or_else(|| missing_param("loop_id"))?
-                .to_owned();
-
-            // Verify the loop record exists before spawning background work.
-            let rec = ig
-                .get_loop(&loop_id)
-                .await
-                .map_err(|e| ingot_err(&e))?
-                .ok_or_else(|| {
-                    RpcError::new(codes::INVALID_PARAMS, format!("loop not found: {loop_id}"))
-                })?;
-
-            // Retired loops cannot be re-run.
-            if rec.status == "retired" {
-                return Err(RpcError::new(
-                    codes::INVALID_PARAMS,
-                    "loop is retired and cannot be re-run",
-                ));
-            }
-
-            // Guard against path traversal via change_name.
-            if rec.change_name.contains("..") || rec.change_name.contains('/') {
-                return Err(RpcError::new(codes::INVALID_PARAMS, "invalid change_name"));
-            }
-
-            let workspace_root = std::path::PathBuf::from(
-                std::env::var("SMEDJA_WORKSPACE").unwrap_or_else(|_| ".".into()),
-            );
-            let change_name = rec.change_name.clone();
-            let bg_loop_id = loop_id.clone();
-
-            // Spawn the engine-backed runner into the shared task set so it is
-            // drained at shutdown; the caller gets an immediate response.
-            task_set.lock().await.spawn(crate::loop_runner::run(
-                ig,
-                dispatcher,
-                gates,
-                pool,
-                assayer,
-                price_table,
-                vault,
-                bg_loop_id,
-                change_name,
-                workspace_root,
-            ));
-
-            Ok(json!({ "loop_id": loop_id, "status": "slicing" }))
-        }
+        let state = loop_run_state.clone();
+        async move { handlers::loops::run(state, params).await }
     });
 
     router
@@ -2548,7 +960,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Refresh MCP server tool lists that have not been updated in the last hour.
     {
-        let stale_threshold = now_epoch() - 3600.0;
+        let stale_threshold = crate::common::now_epoch() - 3600.0;
         let servers = ingot
             .list_mcp_servers()
             .await
@@ -2565,7 +977,7 @@ async fn main() -> anyhow::Result<()> {
                             serde_json::to_string(&tools).unwrap_or_else(|_| "[]".to_owned());
                         let updated = McpServer {
                             tools_json,
-                            last_refresh: now_epoch(),
+                            last_refresh: crate::common::now_epoch(),
                             ..server.clone()
                         };
                         if let Err(e) = ingot.register_mcp_server(updated).await {
@@ -2597,9 +1009,8 @@ async fn main() -> anyhow::Result<()> {
         // is configured. build_provider_pool already logged the details.
         error!("starting in a DEGRADED state: no LLM provider configured — turns will fail");
     }
-    let startup_runner: &'static str =
-        Box::leak(pool.default_runner_name().to_owned().into_boxed_str());
-    let startup_model: &'static str = Box::leak(pool.default_model().to_owned().into_boxed_str());
+    let startup_runner: Arc<str> = Arc::from(pool.default_runner_name());
+    let startup_model: Arc<str> = Arc::from(pool.default_model());
     let pool = Arc::new(pool);
 
     // Load workspace-local routing overrides if .smedja/agents.toml exists.
@@ -2623,6 +1034,10 @@ async fn main() -> anyhow::Result<()> {
 
     let vault = Arc::new(Mutex::new(open_vault()));
 
+    // Single provider-session map, constructed once and threaded to every
+    // handler and the orchestrator (replaces the former OnceLock singleton).
+    let provider_sessions: orchestrator::ProviderSessions = Arc::new(Mutex::new(HashMap::new()));
+
     // Shared set tracking in-flight turn tasks and loop.run background tasks, so
     // both are drained together at shutdown and completed tasks are reaped.
     let task_set: Arc<Mutex<tokio::task::JoinSet<()>>> =
@@ -2630,14 +1045,15 @@ async fn main() -> anyhow::Result<()> {
 
     let router = build_router(
         &ingot,
-        Arc::clone(&dispatcher),
+        &dispatcher,
         &gates,
-        Arc::clone(&pool),
+        &pool,
         &assayer,
-        startup_runner,
-        startup_model,
+        &startup_runner,
+        &startup_model,
         &price_table,
         &vault,
+        &provider_sessions,
         &task_set,
     );
 
@@ -2649,6 +1065,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&assayer),
         Arc::clone(&price_table),
         Arc::clone(&vault),
+        Arc::clone(&provider_sessions),
         Arc::clone(&task_set),
     );
 
@@ -3228,7 +1645,9 @@ mod tests {
 
     #[test]
     fn parse_runner_str_accepts_short_aliases() {
-        use super::{parse_runner_str, Runner};
+        use smedja_assayer::Runner;
+
+        use crate::common::parse_runner_str;
         assert!(matches!(parse_runner_str("claude"), Some(Runner::Claude)));
         assert!(matches!(parse_runner_str("codex"), Some(Runner::Codex)));
         assert!(matches!(parse_runner_str("local"), Some(Runner::Local)));
@@ -3237,7 +1656,9 @@ mod tests {
 
     #[test]
     fn parse_runner_str_accepts_canonical_keys() {
-        use super::{parse_runner_str, Runner};
+        use smedja_assayer::Runner;
+
+        use crate::common::parse_runner_str;
         assert!(matches!(
             parse_runner_str("claude-cli"),
             Some(Runner::Claude)
@@ -3247,7 +1668,7 @@ mod tests {
 
     #[test]
     fn parse_runner_str_rejects_unknown_values() {
-        use super::parse_runner_str;
+        use crate::common::parse_runner_str;
         assert!(parse_runner_str("openai").is_none());
         assert!(parse_runner_str("").is_none());
         assert!(parse_runner_str("anthropic").is_none());

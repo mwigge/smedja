@@ -16,14 +16,12 @@ use opentelemetry::{
 };
 use smedja_adapter::types::{Message as AdapterMessage, Role as AdapterRole};
 use smedja_adapter::CallOptions;
-use smedja_assayer::{AgentRole, Assayer, Complexity, Route, Runner, Tier};
+use smedja_assayer::{AgentRole, Assayer, Complexity, Route, Runner};
 use smedja_bellows::event::CorrelationCtx;
 use smedja_bellows::{Dispatcher, TurnEvent};
 use smedja_ingot::{Checkpoint, CostEntry, IngotHandle, TokenSnapshot};
-use smedja_memory::{
-    estimate_messages_tokens, estimate_tokens, inject_conciseness, StrataConfig, WorkingMemory,
-};
-use smedja_types::{Microdollars, Timestamp, ToolOutcome};
+use smedja_memory::{estimate_messages_tokens, estimate_tokens, inject_conciseness, WorkingMemory};
+use smedja_types::{Microdollars, Timestamp};
 use smedja_vault::Vault;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -36,54 +34,15 @@ use crate::executor::execute_tool;
 use crate::price_table::PriceTable;
 use crate::provider_pool::ProviderPool;
 
-/// Maps a routed runner tier to its retention strata and warm-stratum token
-/// budget. `fast` keeps a shallow warm window and small budget; `deep` keeps the
-/// full warm window and a large budget; `local` sits between. The stable prefix
-/// and hot turns are always included verbatim regardless of budget.
-pub(crate) fn strata_for_tier(tier: Tier) -> (StrataConfig, usize) {
-    match tier {
-        Tier::Fast => (StrataConfig::fast(), 4_000),
-        Tier::Local => (StrataConfig::local(), 8_000),
-        Tier::Deep => (StrataConfig::deep(), 32_000),
-    }
-}
+mod context;
+use context::{classify_tool_outcome, model_context_window, strata_for_tier};
 
-/// Returns the approximate context-window size (in tokens) for a model.
+/// Shared map from session-resume keys to provider-native resume identifiers.
 ///
-/// Used to scale verbosity steering — the conciseness directive is appended once
-/// the assembled prompt exceeds 60% of this window. Unknown models fall back to a
-/// conservative 128k window.
-fn model_context_window(model: &str) -> usize {
-    if model.to_lowercase().contains("claude") {
-        200_000
-    } else {
-        // gpt-4o / o1 / o3 and unknown models share the conservative default.
-        128_000
-    }
-}
-
-/// Classifies an `execute_tool` result string into a [`ToolOutcome`].
-///
-/// The tool layer signals failures through textual prefixes rather than a typed
-/// error, so this bridges that convention onto the typed outcome: an
-/// `"error:"`-prefixed result that mentions a timeout becomes
-/// [`ToolOutcome::Timeout`], other `"error:"` results become
-/// [`ToolOutcome::Failure`], `"permission denied"` becomes
-/// [`ToolOutcome::ApprovalDenied`], and everything else is
-/// [`ToolOutcome::Success`].  The text fed back to the agent is unchanged.
-fn classify_tool_outcome(result: &str) -> ToolOutcome {
-    if result.starts_with("permission denied") {
-        ToolOutcome::ApprovalDenied(result.to_owned())
-    } else if result.starts_with("error:") {
-        if result.contains("timed out") || result.contains("timeout") {
-            ToolOutcome::Timeout
-        } else {
-            ToolOutcome::Failure(result.to_owned())
-        }
-    } else {
-        ToolOutcome::Success(result.to_owned())
-    }
-}
+/// Constructed once in `main()` and threaded explicitly to every orchestrator
+/// (replacing the former process-static `OnceLock` singleton) so tests can
+/// supply their own map.
+pub(crate) type ProviderSessions = Arc<Mutex<HashMap<String, String>>>;
 
 /// Owns all the shared resources needed to execute a single agent turn.
 pub(crate) struct TurnOrchestrator {
@@ -94,9 +53,11 @@ pub(crate) struct TurnOrchestrator {
     assayer: Arc<Assayer>,
     price_table: Arc<PriceTable>,
     vault: Arc<Mutex<Vault>>,
+    provider_sessions: ProviderSessions,
 }
 
 impl TurnOrchestrator {
+    #[allow(clippy::too_many_arguments)] // forwarded directly from run_turn / loop runner
     pub(crate) fn new(
         ingot: IngotHandle,
         dispatcher: Arc<Dispatcher>,
@@ -105,6 +66,7 @@ impl TurnOrchestrator {
         assayer: Arc<Assayer>,
         price_table: Arc<PriceTable>,
         vault: Arc<Mutex<Vault>>,
+        provider_sessions: ProviderSessions,
     ) -> Self {
         Self {
             ingot,
@@ -114,6 +76,7 @@ impl TurnOrchestrator {
             assayer,
             price_table,
             vault,
+            provider_sessions,
         }
     }
 
@@ -136,6 +99,7 @@ impl TurnOrchestrator {
         let assayer = &self.assayer;
         let price_table = &self.price_table;
         let vault = &self.vault;
+        let provider_sessions = &self.provider_sessions;
 
         let tracer = global::tracer("smedja");
         let mut turn_span = tracer.start(tel::SPAN_AGENT_INVOKE);
@@ -175,7 +139,7 @@ impl TurnOrchestrator {
             };
             let role = session_mode
                 .as_deref()
-                .and_then(crate::parse_session_mode_to_role)
+                .and_then(crate::common::parse_session_mode_to_role)
                 .unwrap_or(AgentRole::Orchestrator);
             let complexity = Complexity::Coding;
             let decision = assayer.route_decision(role, complexity);
@@ -202,7 +166,7 @@ impl TurnOrchestrator {
                     .ok()
                     .flatten()
                     .and_then(|s| s.runner_override)
-                    .and_then(|r| crate::parse_runner_str(&r))
+                    .and_then(|r| crate::common::parse_runner_str(&r))
             };
             if let Some(overridden) = override_runner {
                 Route {
@@ -287,8 +251,8 @@ impl TurnOrchestrator {
                         match ingot.get_task(task_id).await {
                             Ok(Some(active_task)) => format!(
                                 "\n\n<active_task>\n<title>{}</title>\n<description>{}</description>\n</active_task>",
-                                crate::xml_escape(&active_task.title),
-                                crate::xml_escape(active_task.description.as_str()),
+                                crate::common::xml_escape(&active_task.title),
+                                crate::common::xml_escape(active_task.description.as_str()),
                             ),
                             _ => String::new(),
                         }
@@ -349,7 +313,7 @@ impl TurnOrchestrator {
             let health_arc = crate::local_provider::global_health();
             let needs_recheck = {
                 let h = health_arc.lock().await;
-                (crate::now_epoch() - h.last_checked) > 30.0
+                (crate::common::now_epoch() - h.last_checked) > 30.0
             };
             if needs_recheck {
                 let fresh = crate::local_provider::check_health(&local_base).await;
@@ -446,9 +410,9 @@ impl TurnOrchestrator {
         let all_tools: Vec<serde_json::Value> =
             builtin_tools.into_iter().chain(mcp_tools).collect();
 
-        let session_store_key = crate::runner_session_key(runner_enum);
+        let session_store_key = crate::common::runner_session_key(runner_enum);
         let provider_session_id = if matches!(runner_enum, Runner::Claude | Runner::Codex) {
-            crate::provider_session_store()
+            provider_sessions
                 .lock()
                 .await
                 .get(session_store_key)
@@ -587,7 +551,7 @@ impl TurnOrchestrator {
             }
         };
 
-        'tool_loop: for _iteration in 0..crate::effective_max_tool_turns() {
+        'tool_loop: for _iteration in 0..crate::common::effective_max_tool_turns() {
             // 5a. Stream LLM response with rate-limit retry.
             let (response_text, input_tokens, output_tokens, native_session_id) = {
                 let mut backoff_secs = RATE_LIMIT_BACKOFF_BASE_SECS;
@@ -604,7 +568,7 @@ impl TurnOrchestrator {
                     let stream = provider.stream_chat(&prompt, &opts);
                     let drain_result = tokio::time::timeout(
                         std::time::Duration::from_mins(5),
-                        crate::drain_stream(
+                        crate::common::drain_stream(
                             stream,
                             dispatcher,
                             Some(turn_id.as_str()),
@@ -614,7 +578,7 @@ impl TurnOrchestrator {
                     .await;
                     match drain_result {
                         Ok(Ok(triple)) => break triple,
-                        Ok(Err(crate::DrainError::RateLimited { retry_after })) => {
+                        Ok(Err(crate::common::DrainError::RateLimited { retry_after })) => {
                             attempt += 1;
                             if attempt > MAX_RATE_LIMIT_RETRIES {
                                 let reason =
@@ -637,7 +601,7 @@ impl TurnOrchestrator {
                             tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
                             backoff_secs = (backoff_secs * 2).min(60);
                         }
-                        Ok(Err(crate::DrainError::Other(reason))) => {
+                        Ok(Err(crate::common::DrainError::Other(reason))) => {
                             warn!(turn_id = %turn_id, error = %reason, "stream error during turn");
                             let _ = ingot.update_task_status(&turn_id, "failed").await;
                             dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
@@ -659,7 +623,7 @@ impl TurnOrchestrator {
             };
             if matches!(runner_enum, Runner::Claude | Runner::Codex) {
                 if let Some(native_session_id) = native_session_id {
-                    crate::provider_session_store()
+                    provider_sessions
                         .lock()
                         .await
                         .insert(session_store_key.to_owned(), native_session_id);
@@ -1119,6 +1083,7 @@ mod tests {
             Vault::open_in_memory().expect("in-memory Vault must open"),
         ));
 
+        let provider_sessions = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let orc = super::TurnOrchestrator::new(
             ingot,
             Arc::clone(&dispatcher),
@@ -1127,6 +1092,7 @@ mod tests {
             assayer,
             price_table,
             vault,
+            provider_sessions,
         );
 
         let session_id = "sess-does-not-exist".to_owned();
