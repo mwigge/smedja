@@ -232,9 +232,13 @@ mod tests {
 
     #[test]
     fn detect_returns_none_when_no_binary_and_no_key() {
-        // Assumes `claude` is not on $PATH in CI. If it is, this picks Cli instead.
+        // Serialise with other $PATH-mutating tests, and read availability and
+        // detect under the same lock so the two observations stay consistent
+        // (otherwise a concurrent test can change $PATH between them).
+        let _guard = ENV_LOCK.lock().unwrap();
+        let has_cli = SubprocessProvider::available("claude");
         let provider = ClaudeCliProvider::detect(None);
-        if SubprocessProvider::available("claude") {
+        if has_cli {
             assert!(matches!(provider, Some(ClaudeCliProvider::Cli)));
         } else {
             assert!(provider.is_none());
@@ -243,6 +247,7 @@ mod tests {
 
     #[test]
     fn detect_returns_api_when_no_binary_but_key_present() {
+        let _guard = ENV_LOCK.lock().unwrap();
         if SubprocessProvider::available("claude") {
             // CLI wins over API key; skip this case.
             return;
