@@ -1,5 +1,6 @@
 //! Linux systemd --user service management for smdjad.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
@@ -18,20 +19,18 @@ pub fn dispatch(action: &ServiceAction) -> Result<()> {
     }
 }
 
-fn unit_path() -> Result<PathBuf> {
+fn unit_path() -> PathBuf {
     let config_home = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
-        std::env::var("HOME")
-            .map(|h| format!("{h}/.config"))
-            .unwrap_or_else(|_| ".config".to_owned())
+        std::env::var("HOME").map_or_else(|_| ".config".to_owned(), |h| format!("{h}/.config"))
     });
-    Ok(PathBuf::from(config_home)
+    PathBuf::from(config_home)
         .join("systemd")
         .join("user")
-        .join(format!("{SERVICE_NAME}.service")))
+        .join(format!("{SERVICE_NAME}.service"))
 }
 
 fn write_unit(smdjad_bin: &Path) -> Result<()> {
-    let unit = unit_path()?;
+    let unit = unit_path();
     let otlp_endpoint = std::env::var("SMEDJA_OTLP_ENDPOINT").ok();
     write_unit_inner(smdjad_bin, &unit, otlp_endpoint.as_deref())
 }
@@ -47,7 +46,7 @@ fn write_unit_inner(smdjad_bin: &Path, unit: &Path, otlp_endpoint: Option<&str>)
     // that installed the unit. This mirrors assets/smdjad.service.
     let mut env_lines = String::from("Environment=XDG_RUNTIME_DIR=/run/user/%U\n");
     if let Some(ep) = otlp_endpoint {
-        env_lines.push_str(&format!("Environment=\"SMEDJA_OTLP_ENDPOINT={ep}\"\n"));
+        let _ = writeln!(env_lines, "Environment=\"SMEDJA_OTLP_ENDPOINT={ep}\"");
     }
 
     let content = format!(
@@ -86,7 +85,7 @@ pub fn install() -> Result<()> {
 
 pub fn uninstall() -> Result<()> {
     let _ = systemctl(&["disable", "--now", SERVICE_NAME]);
-    let unit = unit_path()?;
+    let unit = unit_path();
     if unit.exists() {
         std::fs::remove_file(&unit)
             .with_context(|| format!("cannot remove unit file {}", unit.display()))?;
@@ -123,7 +122,7 @@ mod tests {
 
     #[test]
     fn unit_path_ends_with_correct_filename() {
-        let path = unit_path().unwrap();
+        let path = unit_path();
         assert_eq!(
             path.file_name().unwrap().to_str().unwrap(),
             "smdjad.service"
@@ -141,7 +140,7 @@ mod tests {
 
         let content = std::fs::read_to_string(&unit_dest).unwrap();
         assert!(content.contains(fake_bin.to_str().unwrap()));
-        assert!(content.contains("smdjad agent daemon"));
+        assert!(content.contains("smedja agent daemon"));
         assert!(content.contains("Restart=on-failure"));
     }
 
