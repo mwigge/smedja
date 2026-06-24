@@ -163,10 +163,13 @@ impl std::fmt::Display for DrainError {
 
 /// Drains `stream`, accumulating text deltas into a single string.
 ///
-/// Returns `Ok((full_response, input_tokens, output_tokens, provider_session_id))`
+/// Returns
+/// `Ok((full_response, input_tokens, output_tokens, cache_read_tokens, provider_session_id))`
 /// on success, or `Err(reason)` if the stream yields an error item. Each
 /// `Delta::Text` chunk is forwarded to `dispatcher` as a
-/// [`TurnEvent::AssistantDelta`].
+/// [`TurnEvent::AssistantDelta`]. `cache_read_tokens` is the maximum
+/// provider-reported `cache_read_input_tokens` seen on the stream (Anthropic
+/// emits usage across two events; taking the max captures the cache figure).
 ///
 /// # Errors
 ///
@@ -177,10 +180,11 @@ pub(crate) async fn drain_stream(
     dispatcher: &Dispatcher,
     turn_id: Option<&str>,
     correlation: &CorrelationCtx,
-) -> Result<(String, u32, u32, Option<String>), DrainError> {
+) -> Result<(String, u32, u32, u32, Option<String>), DrainError> {
     let mut full_response = String::new();
     let mut input_tokens = 0u32;
     let mut output_tokens = 0u32;
+    let mut cache_read_tokens = 0u32;
     let mut provider_session_id = None;
     loop {
         match stream.next().await {
@@ -196,9 +200,14 @@ pub(crate) async fn drain_stream(
             Some(Ok(Delta::Usage {
                 input_tokens: i,
                 output_tokens: n,
+                cache_read_tokens: c,
             })) => {
-                input_tokens = i;
-                output_tokens = n;
+                // Anthropic splits usage across message_start (input + cache) and
+                // message_delta (output); a zero from one event must not clobber a
+                // non-zero from the other, so accumulate the max per field.
+                input_tokens = input_tokens.max(i);
+                output_tokens = output_tokens.max(n);
+                cache_read_tokens = cache_read_tokens.max(c);
             }
             Some(Ok(Delta::ToolCall { name, input })) => {
                 let input_summary: String = input.to_string().chars().take(120).collect();
@@ -258,6 +267,7 @@ pub(crate) async fn drain_stream(
         full_response,
         input_tokens,
         output_tokens,
+        cache_read_tokens,
         provider_session_id,
     ))
 }

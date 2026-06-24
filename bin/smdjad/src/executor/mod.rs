@@ -142,7 +142,11 @@ async fn filter_command_output(
     // Single branch point: JSON routes through SmartCrusher; text routes through
     // the command filter. The bash/run_command path is text by construction.
     if serde_json::from_str::<Value>(&result).is_ok() {
-        return smedja_adapter::compress_tool_result(&result);
+        let compressed = smedja_adapter::compress_tool_result(&result);
+        // Attribute the SmartCrusher saving to its own source so it is not folded
+        // into the filter total. The estimate is recorded on this JSON path only.
+        record_tokens_saved(cmd, &result, &compressed, "crusher", session, ingot).await;
+        return compressed;
     }
 
     let registry = crate::filters::load_filter_registry(workspace);
@@ -163,7 +167,7 @@ async fn filter_command_output(
     tee_to_vault(&hash, &result, vault).await;
 
     // Record tokens saved (clamped ≥ 0), separate from billed cost.
-    record_tokens_saved(cmd, &result, &compressed, session, ingot).await;
+    record_tokens_saved(cmd, &result, &compressed, "filter", session, ingot).await;
 
     // Append the recovery marker naming the hash so the agent can expand it.
     format!("{compressed}\n[smedja_retrieve hash={hash} to expand full output]")
@@ -210,6 +214,7 @@ async fn record_tokens_saved(
     cmd: &str,
     original: &str,
     compressed: &str,
+    source: &str,
     session: Option<&Session>,
     ingot: &IngotHandle,
 ) {
@@ -228,6 +233,7 @@ async fn record_tokens_saved(
         turn_n: 0,
         command: cmd.to_owned(),
         tokens_saved: i64::try_from(saved).unwrap_or(i64::MAX),
+        source: source.to_owned(),
         created_at: smedja_types::Timestamp::from_micros(0),
     };
     if let Err(e) = ingot.insert_tokens_saved(entry).await {
@@ -831,6 +837,78 @@ mod tests {
             out.len() < raw.len(),
             "filtered output must be shorter than the original"
         );
+    }
+
+    #[tokio::test]
+    async fn filtered_command_writes_filter_tagged_row() {
+        use smedja_ingot::{Ingot, IngotHandle};
+        use smedja_vault::Vault;
+        use tokio::sync::Mutex;
+
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+        let ws = tempfile::tempdir().unwrap();
+        let session = filter_session();
+        let session_id = session.id.to_string();
+
+        let raw = format!(
+            "{}error[E0308]: mismatched types\n",
+            "   Compiling crate v0.1.0\n".repeat(40)
+        );
+        let _ = super::filter_command_output(
+            "cargo build",
+            raw,
+            ws.path(),
+            Some(&session),
+            &ingot,
+            &vault,
+        )
+        .await;
+
+        let by_source = ingot
+            .session_tokens_saved_by_source(&session_id)
+            .await
+            .unwrap();
+        assert_eq!(by_source.len(), 1, "exactly one source recorded");
+        assert_eq!(by_source[0].0, "filter", "filter path tags source=filter");
+        assert!(by_source[0].1 > 0, "a positive saving must be recorded");
+    }
+
+    #[tokio::test]
+    async fn crusher_json_path_writes_crusher_tagged_row() {
+        use smedja_ingot::{Ingot, IngotHandle};
+        use smedja_vault::Vault;
+        use tokio::sync::Mutex;
+
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+        let ws = tempfile::tempdir().unwrap();
+        let session = filter_session();
+        let session_id = session.id.to_string();
+
+        // A JSON result with null fields routes through SmartCrusher, which strips
+        // them, yielding a positive estimated saving tagged source=crusher.
+        let raw = serde_json::json!({
+            "a": 1, "b": null, "c": null, "d": null, "e": null,
+            "nested": { "x": null, "y": null, "z": "keep" }
+        })
+        .to_string();
+        let _ = super::filter_command_output(
+            "some_tool",
+            raw,
+            ws.path(),
+            Some(&session),
+            &ingot,
+            &vault,
+        )
+        .await;
+
+        let by_source = ingot
+            .session_tokens_saved_by_source(&session_id)
+            .await
+            .unwrap();
+        assert_eq!(by_source.len(), 1, "exactly one source recorded");
+        assert_eq!(by_source[0].0, "crusher", "JSON path tags source=crusher");
     }
 
     #[tokio::test]

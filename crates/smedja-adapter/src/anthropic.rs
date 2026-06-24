@@ -179,6 +179,7 @@ async fn run_sse_loop(
                             if let Delta::Usage {
                                 input_tokens,
                                 output_tokens,
+                                cache_read_tokens,
                             } = delta
                             {
                                 input_tok = Some(input_tokens);
@@ -187,6 +188,7 @@ async fn run_sse_loop(
                                     .send(Ok(Delta::Usage {
                                         input_tokens,
                                         output_tokens,
+                                        cache_read_tokens,
                                     }))
                                     .await
                                     .is_err()

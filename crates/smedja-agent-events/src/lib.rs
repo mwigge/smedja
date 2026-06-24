@@ -15,14 +15,16 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump this whenever the wire contract changes in a way receivers must
 /// notice. Legacy payloads lacking a version field decode as version `0`.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// A single agent event in the push-socket stream.
 ///
 /// Serialised with an internal `type` tag (`snake_case`), e.g.
 /// `{ "type": "tool_call", ... }`. Fields a UI does not always have are
 /// modelled as [`Option<String>`] so partial payloads remain valid.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` is intentionally not derived: `TurnEnd::efficiency_ratio` is an `f64`,
+// which is not `Eq`. `PartialEq` is sufficient for the wire round-trip tests.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     /// A new agent turn has started.
@@ -67,6 +69,16 @@ pub enum AgentEvent {
         turn_id: Option<String>,
         /// Owning session identifier.
         session_id: Option<String>,
+        /// Cumulative tokens saved by the token economy so far (all sources),
+        /// added in schema version 2. `None` on version-0/1 payloads that
+        /// predate the field, so the receiver renders no segment rather than a
+        /// misleading zero.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_saved: Option<u64>,
+        /// Cumulative efficiency ratio `saved / (saved + billed_input)` so far,
+        /// added in schema version 2. `None` on payloads that predate the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        efficiency_ratio: Option<f64>,
     },
     /// An incremental chunk of streamed assistant output.
     StreamDelta {
@@ -83,7 +95,8 @@ pub enum AgentEvent {
 /// legacy fieldless payloads (emitted before versioning existed) still decode.
 /// The event itself is flattened, so the wire form is a single flat JSON
 /// object combining the version and the tagged event fields.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` is intentionally not derived: the wrapped `AgentEvent` carries an `f64`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentEventEnvelope {
     /// Wire schema version. Defaults to `0` for legacy payloads.
     #[serde(default)]
@@ -179,7 +192,57 @@ mod tests {
         round_trip(AgentEvent::TurnEnd {
             turn_id: Some("t1".to_owned()),
             session_id: Some("s1".to_owned()),
+            tokens_saved: None,
+            efficiency_ratio: None,
         });
+    }
+
+    #[test]
+    fn round_trip_turn_end_with_savings() {
+        round_trip(AgentEvent::TurnEnd {
+            turn_id: Some("t1".to_owned()),
+            session_id: Some("s1".to_owned()),
+            tokens_saved: Some(123_456),
+            efficiency_ratio: Some(0.42),
+        });
+    }
+
+    #[test]
+    fn schema_version_is_two() {
+        assert_eq!(CURRENT_SCHEMA_VERSION, 2);
+    }
+
+    #[test]
+    fn legacy_turn_end_without_savings_fields_decodes() {
+        // A schema-version-1 TurnEnd line predates tokens_saved/efficiency_ratio;
+        // it must still decode with those fields defaulting to None.
+        let line = r#"{"schema_version":1,"type":"turn_end","turn_id":"t1","session_id":"s1"}"#;
+        let decoded = AgentEventEnvelope::from_json_line(line).expect("legacy v1 must decode");
+        assert_eq!(decoded.schema_version, 1);
+        assert_eq!(
+            decoded.event,
+            AgentEvent::TurnEnd {
+                turn_id: Some("t1".to_owned()),
+                session_id: Some("s1".to_owned()),
+                tokens_saved: None,
+                efficiency_ratio: None,
+            }
+        );
+    }
+
+    #[test]
+    fn turn_end_without_savings_omits_fields_on_wire() {
+        // skip_serializing_if keeps the wire form identical to v1 when the
+        // savings fields are absent, so older receivers are unaffected.
+        let line = AgentEventEnvelope::new(AgentEvent::TurnEnd {
+            turn_id: Some("t1".to_owned()),
+            session_id: Some("s1".to_owned()),
+            tokens_saved: None,
+            efficiency_ratio: None,
+        })
+        .to_json_line();
+        assert!(!line.contains("tokens_saved"));
+        assert!(!line.contains("efficiency_ratio"));
     }
 
     #[test]

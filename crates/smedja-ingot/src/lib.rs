@@ -17,6 +17,7 @@ pub mod methodology;
 pub mod metrics_rollup;
 pub mod openspec_store;
 pub mod prompt_hash;
+pub mod savings_rollup;
 pub mod session;
 pub mod task;
 pub mod token_snapshot;
@@ -33,6 +34,7 @@ pub use methodology::MethodologyState;
 pub use metrics_rollup::{MetricsBucket, RollupTier};
 pub use openspec_store::OpenSpecStore;
 pub use prompt_hash::PromptHashRecord;
+pub use savings_rollup::{SavingsBucket, SavingsSummary};
 pub use session::Session;
 pub use task::Task;
 pub use token_snapshot::TokenSnapshot;
@@ -184,6 +186,18 @@ const MIGRATIONS: &[(i64, &str)] = &[
          ); \
          CREATE INDEX IF NOT EXISTS idx_tokens_saved_session \
              ON tokens_saved_ledger(session_id);",
+    ),
+    // Multi-source savings ledger: add a `source` discriminator so every token
+    // saver (filter, crusher, cold-context, cache, lean-spec, …) writes a tagged
+    // row to one ledger. Existing rows are all written by the output-filter path,
+    // so the DEFAULT 'filter' backfills them with the historically-correct value.
+    // The defaulted ADD COLUMN and the IF NOT EXISTS index keep this re-runnable,
+    // matching migrations 22/23. The source index accelerates per-source rollups.
+    (
+        24,
+        "ALTER TABLE tokens_saved_ledger ADD COLUMN source TEXT NOT NULL DEFAULT 'filter'; \
+         CREATE INDEX IF NOT EXISTS idx_tokens_saved_source \
+             ON tokens_saved_ledger(source);",
     ),
 ];
 
@@ -1040,6 +1054,23 @@ impl Ingot {
         cost::session_tokens_saved(&self.conn, session_id)
     }
 
+    /// Returns the sum of `tokens_saved` grouped by `source` for `session_id`,
+    /// ordered by `source`.
+    ///
+    /// Each tuple is `(source, summed_tokens_saved)`. Cache savings
+    /// (`source = 'cache'`) stay distinct from compression savings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned per-source sums"]
+    pub fn session_tokens_saved_by_source(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(String, i64)>, IngotError> {
+        cost::session_tokens_saved_by_source(&self.conn, session_id)
+    }
+
     // metrics_rollups --------------------------------------------------------
 
     /// Computes time-tiered metrics buckets for `tier` over `[since, until)`.
@@ -1086,6 +1117,69 @@ impl Ingot {
             smedja_types::Timestamp::from_micros(0),
             until,
         )
+    }
+
+    // savings_rollup ---------------------------------------------------------
+
+    /// Computes time-tiered savings buckets for `tier` over `[since, until)`.
+    ///
+    /// Aggregates `tokens_saved` from `tokens_saved_ledger` per
+    /// `(bucket, source)`, reusing [`RollupTier::bucket_start`] so savings
+    /// buckets align with the billed buckets in [`Self::metrics_rollup`].
+    /// Results are ordered by `bucket_start` then `source`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the source query fails.
+    #[must_use = "check the Result and inspect the returned buckets"]
+    pub fn savings_rollup(
+        &self,
+        tier: metrics_rollup::RollupTier,
+        since: smedja_types::Timestamp,
+        until: smedja_types::Timestamp,
+    ) -> Result<Vec<SavingsBucket>, IngotError> {
+        savings_rollup::compute(&self.conn, tier, since, until)
+    }
+
+    /// Computes the efficiency ratio `saved / (saved + billed_input)` over
+    /// `[since, until)`.
+    ///
+    /// `saved` is the all-source `tokens_saved` sum; `billed_input` is the
+    /// `cost_ledger.input_tok` sum over the same range. Returns `0.0` for an
+    /// empty window. The `tier` argument is accepted for surface symmetry with
+    /// [`Self::savings_rollup`]; the ratio is computed over the whole window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if either source query fails.
+    #[must_use = "check the Result and inspect the returned ratio"]
+    pub fn efficiency_ratio(
+        &self,
+        tier: metrics_rollup::RollupTier,
+        since: smedja_types::Timestamp,
+        until: smedja_types::Timestamp,
+    ) -> Result<f64, IngotError> {
+        let _ = tier;
+        savings_rollup::efficiency_ratio(&self.conn, since, until)
+    }
+
+    /// Computes the full [`SavingsSummary`] for `tier` over `[since, until)`.
+    ///
+    /// Carries the per-`(bucket, source)` rows plus the headline split:
+    /// compression total (`filter` + `crusher` + `cold-context`) and cache total
+    /// kept as separate figures, never summed, and the efficiency ratio.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if any source query fails.
+    #[must_use = "check the Result and inspect the returned summary"]
+    pub fn savings_summary(
+        &self,
+        tier: metrics_rollup::RollupTier,
+        since: smedja_types::Timestamp,
+        until: smedja_types::Timestamp,
+    ) -> Result<SavingsSummary, IngotError> {
+        savings_rollup::summary(&self.conn, tier, since, until)
     }
 
     // JSONL export / import --------------------------------------------------
