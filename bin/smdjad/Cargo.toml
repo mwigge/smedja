@@ -55,7 +55,9 @@ tempfile = "3"
 name             = "smedja"
 maintainer       = "Morgan Wigge <morgan@wigge.nu>"
 copyright        = "2025, Morgan Wigge"
-license-file     = ["LICENSE", "0"]
+# Relative to this manifest dir (bin/smdjad/), like the asset paths below — the
+# LICENSE lives at the workspace root, not alongside this crate's Cargo.toml.
+license-file     = ["../../LICENSE", "0"]
 extended-description = """\
 GPU-accelerated terminal emulator and AI orchestration forge.
 Routes across local models, cloud APIs, and specialist roles with
