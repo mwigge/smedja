@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "id": "sre-coding",
+  "description": "Sre role routes to claude/deep at any complexity",
+  "kind": "routing",
+  "input": { "role": "sre", "complexity": "coding" },
+  "expectation": { "runner": "claude", "tier": "deep" }
+}

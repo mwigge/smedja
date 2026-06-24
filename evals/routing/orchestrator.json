@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "id": "orchestrator-coding",
+  "description": "Orchestrator role routes to claude/fast at any complexity",
+  "kind": "routing",
+  "input": { "role": "orchestrator", "complexity": "coding" },
+  "expectation": { "runner": "claude", "tier": "fast" }
+}

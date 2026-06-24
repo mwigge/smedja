@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "id": "coherent-diff",
+  "description": "Rubric example — the produced diff is judged for coherence by the injected LLM judge (skipped offline)",
+  "kind": "agent",
+  "input": { "scenario": "refactor the parser for clarity" },
+  "expectation": {
+    "rubric": "Does the produced diff implement a coherent, self-consistent refactor without leaving the code broken?"
+  },
+  "repetitions": 3,
+  "pass_threshold_k": 2
+}

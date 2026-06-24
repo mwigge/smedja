@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "id": "complete-loop",
+  "description": "A simple change drives the loop to a Complete terminal state with at least one slice done",
+  "kind": "agent",
+  "input": { "scenario": "add a one-line fix to the changelog" },
+  "expectation": {
+    "deterministic": { "final_state": "complete", "min_slices_completed": 1 }
+  },
+  "repetitions": 1,
+  "pass_threshold_k": 1
+}
