@@ -1,0 +1,41 @@
+;; smedja macOS Seatbelt profile template.
+;;
+;; Placeholders substituted at generation time by the SeatbeltBackend:
+;;   @CONFINED_ROOT@  — canonical confined writable root (the active worktree
+;;                      or session workspace)
+;;   @GIT_DIR@        — the confined root's .git directory (read-only)
+;;   @NETWORK_RULE@   — (deny|allow) network* line per the network policy
+;;
+;; The profile denies by default, grants read-write only under the confined
+;; root (plus an ephemeral /tmp and the system read paths a shell needs), keeps
+;; .git read-only, and applies the network policy.
+
+(version 1)
+(deny default)
+
+;; Allow process exec and basic operation.
+(allow process-exec)
+(allow process-fork)
+(allow signal (target self))
+(allow sysctl-read)
+(allow mach-lookup)
+
+;; System read paths required to launch a shell and common tools.
+(allow file-read*)
+
+;; Read-write only under the confined root.
+(allow file-write*
+  (subpath "@CONFINED_ROOT@"))
+
+;; Ephemeral scratch space.
+(allow file-write*
+  (subpath "/tmp")
+  (subpath "/private/tmp")
+  (subpath "/private/var/tmp"))
+
+;; Keep the repository .git directory read-only (deny writes beneath it).
+(deny file-write*
+  (subpath "@GIT_DIR@"))
+
+;; Network policy (substituted per NetworkPolicy).
+@NETWORK_RULE@

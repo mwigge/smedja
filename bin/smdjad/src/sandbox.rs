@@ -1,86 +1,311 @@
-//! Docker sandbox executor for tool isolation.
+//! Cross-platform sandbox executor for tool isolation.
 //!
-//! When `SMEDJA_TOOL_SANDBOX=docker` is set and the `docker` binary is
-//! reachable, write and execute tools run inside an ephemeral Alpine
-//! container with the workspace bind-mounted and no network access.
-//! Read-only tools bypass the sandbox entirely.
+//! Shell/tool execution (`bash`, `run_command`) is confined behind a
+//! [`SandboxBackend`] selected by capability detection:
+//!
+//! - [`DockerBackend`] — opt-in (`SMEDJA_TOOL_SANDBOX=docker` or
+//!   `SMEDJA_SANDBOX_MODE`/Docker reachable); strongest isolation.
+//! - [`SeatbeltBackend`] — macOS `sandbox-exec`; zero-config default on macOS.
+//! - [`LandlockBackend`] — Linux Landlock LSM; zero-config default on Linux.
+//!
+//! Selection precedence: Docker (when opted in and reachable) → the current
+//! platform's OS-native backend → none. Read-only tools (`read_file`,
+//! `list_files`, `graph_query`) bypass the sandbox entirely.
+//!
+//! The writable filesystem root is the *confined root* — the active worktree
+//! when a task owns one, otherwise the session workspace — with `.git`
+//! read-only and an ephemeral `/tmp`. A declarative [`NetworkPolicy`] governs
+//! egress and shares the daemon's `is_blocked_ip` SSRF floor. A
+//! [`SandboxMode`] governs the fallback when no backend is available.
 
 use std::path::Path;
 
+use async_trait::async_trait;
 use which::which;
+
+mod docker;
+#[cfg(target_os = "linux")]
+mod landlock_backend;
+#[cfg(target_os = "macos")]
+mod seatbelt;
+
+pub use docker::DockerBackend;
+#[cfg(target_os = "linux")]
+pub use landlock_backend::LandlockBackend;
+#[cfg(target_os = "macos")]
+pub use seatbelt::SeatbeltBackend;
 
 /// Tools exempt from sandboxing (read-only; no side-effects).
 const EXEMPT_TOOLS: &[&str] = &["read_file", "list_files", "graph_query"];
 
-/// Executes bash commands (and write-class tools) inside a Docker container.
+/// Per-command execution timeout for every backend.
+const EXEC_TIMEOUT_SECS: u64 = 30;
+
+/// Marker prefixed to a tool result that ran on the host without confinement.
+pub const UNCONFINED_MARKER: &str = "[unconfined] sandbox unavailable; command ran on the host\n";
+
+/// Structured attributes for the `smedja.sandbox.exec` span and the
+/// `smedja.sandbox.unconfined` event. Built once per sandboxed execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxTelemetry {
+    /// Selected backend name (`docker`/`seatbelt`/`landlock`/`none`).
+    pub backend: &'static str,
+    /// Active network policy.
+    pub network_policy: &'static str,
+    /// Active fallback mode.
+    pub mode: &'static str,
+    /// The confined writable root for this execution.
+    pub confined_root: String,
+}
+
+/// Declarative network policy for sandboxed commands.
+///
+/// Parsed from `SMEDJA_SANDBOX_NETWORK` (default [`NetworkPolicy::None`]). The
+/// `allowlist`/`open` policies share the daemon's `is_blocked_ip` predicate as
+/// the egress floor, so private/loopback/IMDS ranges stay blocked under every
+/// policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkPolicy {
+    /// No egress at all.
+    None,
+    /// Egress only to destinations not rejected by `is_blocked_ip`.
+    Allowlist,
+    /// General egress, but `is_blocked_ip` ranges stay blocked.
+    Open,
+}
+
+impl NetworkPolicy {
+    /// Parses the policy from `SMEDJA_SANDBOX_NETWORK`, defaulting to
+    /// [`NetworkPolicy::None`].
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::from_str_value(&std::env::var("SMEDJA_SANDBOX_NETWORK").unwrap_or_default())
+    }
+
+    /// Parses the policy from a raw string value (case-insensitive).
+    #[must_use]
+    pub fn from_str_value(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "allowlist" => Self::Allowlist,
+            "open" => Self::Open,
+            _ => Self::None,
+        }
+    }
+
+    /// Returns the canonical string form used in telemetry and status output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Allowlist => "allowlist",
+            Self::Open => "open",
+        }
+    }
+
+    /// Returns `true` when egress to a *publicly routable* destination is
+    /// permitted by this policy. The `is_blocked_ip` floor is applied
+    /// separately by [`NetworkPolicy::permits_dest`].
+    #[must_use]
+    pub fn permits_public_egress(self) -> bool {
+        matches!(self, Self::Allowlist | Self::Open)
+    }
+
+    /// Returns `true` when egress to `addr` is permitted under this policy.
+    ///
+    /// `None` denies everything. `Allowlist`/`Open` permit only destinations
+    /// not rejected by the shared `is_blocked_ip` SSRF floor, so the sandbox
+    /// and the SSRF guard share one source of truth.
+    #[must_use]
+    pub fn permits_dest(self, addr: std::net::IpAddr) -> bool {
+        match self {
+            Self::None => false,
+            Self::Allowlist | Self::Open => !crate::is_blocked_ip(addr),
+        }
+    }
+}
+
+/// Fallback behaviour when no isolation backend is available.
+///
+/// Parsed from `SMEDJA_SANDBOX_MODE` (default [`SandboxMode::Auto`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxMode {
+    /// Best-effort: fall back to host execution with an unconfined marker.
+    Auto,
+    /// Fail closed: error if no backend is available; never run unconfined.
+    Required,
+    /// Skip the sandbox entirely.
+    Off,
+}
+
+impl SandboxMode {
+    /// Parses the mode from `SMEDJA_SANDBOX_MODE`, defaulting to
+    /// [`SandboxMode::Auto`].
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::from_str_value(&std::env::var("SMEDJA_SANDBOX_MODE").unwrap_or_default())
+    }
+
+    /// Parses the mode from a raw string value (case-insensitive).
+    #[must_use]
+    pub fn from_str_value(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "required" => Self::Required,
+            "off" => Self::Off,
+            _ => Self::Auto,
+        }
+    }
+
+    /// Returns the canonical string form used in telemetry and status output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Required => "required",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// A platform isolation mechanism that can confine a shell command.
+#[async_trait]
+pub trait SandboxBackend: Send + Sync {
+    /// Stable identifier reported in telemetry and `smj sandbox status`.
+    fn name(&self) -> &'static str;
+
+    /// Returns `true` when this backend can actually confine a command on the
+    /// current host (binary present, kernel support, image built, …).
+    fn available(&self) -> bool;
+
+    /// Executes `cmd` confined to `confined_root` under `policy`.
+    ///
+    /// Returns the combined stdout on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` with a diagnostic string when the confined root is
+    /// invalid, the command times out, or the command exits non-zero.
+    async fn exec(
+        &self,
+        cmd: &str,
+        confined_root: &Path,
+        policy: NetworkPolicy,
+    ) -> Result<String, String>;
+}
+
+/// Selects the active backend from the available implementations.
+///
+/// Precedence: Docker when opted in and reachable, else the current platform's
+/// OS-native backend (when available), else `None`. `docker_opt_in` reflects
+/// whether the operator pinned Docker (legacy `SMEDJA_TOOL_SANDBOX=docker` or
+/// an explicit selection).
+fn select_backend(
+    docker_opt_in: bool,
+    docker: Box<dyn SandboxBackend>,
+    native: Option<Box<dyn SandboxBackend>>,
+) -> Option<Box<dyn SandboxBackend>> {
+    if docker_opt_in && docker.available() {
+        return Some(docker);
+    }
+    match native {
+        Some(n) if n.available() => Some(n),
+        _ => None,
+    }
+}
+
+/// Constructs the OS-native backend for the current platform, if any.
+// The return type is `Option` because the unsupported-platform arm yields
+// `None`; per-platform cfg makes some arms always-`Some`, which clippy can't see.
+#[cfg_attr(
+    any(target_os = "macos", target_os = "linux"),
+    allow(clippy::unnecessary_wraps)
+)]
+fn native_backend() -> Option<Box<dyn SandboxBackend>> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(Box::new(SeatbeltBackend::detect()))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Some(Box::new(LandlockBackend::detect()))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// Dispatches shell/tool execution to the selected [`SandboxBackend`].
 pub struct SandboxExecutor {
-    /// `true` if Docker is reachable and the sandbox image exists.
-    pub available: bool,
-    /// Digest of the smedja-sandbox image.
-    image: String,
+    backend: Option<Box<dyn SandboxBackend>>,
+    mode: SandboxMode,
+    network: NetworkPolicy,
 }
 
 impl SandboxExecutor {
-    /// Creates a new executor and checks Docker availability.
+    /// Creates an executor, selecting the backend by capability detection.
     ///
-    /// Sets `available = false` if the `docker` binary is absent or
-    /// `SMEDJA_TOOL_SANDBOX` is not set to `"docker"`.
+    /// The legacy `SMEDJA_TOOL_SANDBOX=docker` alias pins Docker and sets mode
+    /// `Auto`. Otherwise the mode comes from `SMEDJA_SANDBOX_MODE` and the
+    /// network policy from `SMEDJA_SANDBOX_NETWORK`.
     ///
     /// # Note
     ///
-    /// The image-inspect step uses a blocking `std::process::Command`. This is
-    /// intentional: `new()` is called once at daemon startup before the Tokio
-    /// runtime is accepting work, so a brief blocking call here is acceptable
-    /// and avoids the complexity of an `async fn new()`.
+    /// Capability detection (`new()`) runs once at daemon startup, before the
+    /// Tokio runtime is accepting work, so brief blocking probes (`which`,
+    /// `docker image inspect`) are acceptable here.
+    #[must_use]
     pub fn new() -> Self {
-        let enabled = std::env::var("SMEDJA_TOOL_SANDBOX").is_ok_and(|v| v == "docker");
+        let legacy_docker = std::env::var("SMEDJA_TOOL_SANDBOX").is_ok_and(|v| v == "docker");
+        let mode = if legacy_docker {
+            SandboxMode::Auto
+        } else {
+            SandboxMode::from_env()
+        };
+        let network = NetworkPolicy::from_env();
 
-        if !enabled {
+        if matches!(mode, SandboxMode::Off) {
             return Self {
-                available: false,
-                image: String::new(),
+                backend: None,
+                mode,
+                network,
             };
         }
 
-        let docker_ok = which("docker").is_ok();
-        if !docker_ok {
-            tracing::warn!("SMEDJA_TOOL_SANDBOX=docker but docker binary not found");
-            return Self {
-                available: false,
-                image: String::new(),
-            };
-        }
+        // Docker is opted into via the legacy alias, or implicitly considered
+        // when its daemon is reachable on PATH.
+        let docker_opt_in = legacy_docker || which("docker").is_ok();
+        let docker: Box<dyn SandboxBackend> = Box::new(DockerBackend::detect());
+        let backend = select_backend(docker_opt_in, docker, native_backend());
 
-        // Verify the image exists. Allow operator to pin to a digest via env var.
-        let image = std::env::var("SMEDJA_SANDBOX_IMAGE")
-            .unwrap_or_else(|_| "smedja-sandbox:latest".to_owned());
-        if image.ends_with(":latest") {
-            tracing::warn!(
-                %image,
-                "sandbox image uses :latest tag — pin to a digest with SMEDJA_SANDBOX_IMAGE=smedja-sandbox@sha256:<digest> for supply-chain safety"
-            );
+        Self {
+            backend,
+            mode,
+            network,
         }
-        let out = std::process::Command::new("docker")
-            .args(["image", "inspect", "--format", "{{.Id}}", &image])
-            .output();
+    }
 
-        match out {
-            Ok(o) if o.status.success() => {
-                let digest = String::from_utf8_lossy(&o.stdout).trim().to_owned();
-                tracing::info!(%image, digest = %digest, "sandbox image verified");
-                Self {
-                    available: true,
-                    image,
-                }
-            }
-            _ => {
-                tracing::warn!(%image, "sandbox image not found; run `smj sandbox build`");
-                Self {
-                    available: false,
-                    image,
-                }
-            }
-        }
+    /// Returns `true` when a usable backend was selected.
+    #[must_use]
+    pub fn available(&self) -> bool {
+        self.backend.as_ref().is_some_and(|b| b.available())
+    }
+
+    /// Returns the selected backend's name, or `"none"` when none is available.
+    #[must_use]
+    pub fn backend_name(&self) -> &'static str {
+        self.backend.as_ref().map_or("none", |b| b.name())
+    }
+
+    /// Returns the active network policy.
+    #[must_use]
+    pub fn network_policy(&self) -> NetworkPolicy {
+        self.network
+    }
+
+    /// Returns the active fallback mode.
+    #[must_use]
+    pub fn mode(&self) -> SandboxMode {
+        self.mode
     }
 
     /// Returns `true` if `tool_name` is exempt from sandboxing.
@@ -89,103 +314,83 @@ impl SandboxExecutor {
         EXEMPT_TOOLS.contains(&tool_name)
     }
 
-    /// Executes `cmd` inside the sandbox container.
-    ///
-    /// Mounts `workspace` at `/workspace` read-write; no network access.
-    /// Resource limits: 0.5 CPU, 256 MiB RAM, 64 PIDs, 30-second stop timeout.
-    /// Security: dropped capabilities, read-only root filesystem, `/tmp` tmpfs
-    /// (64 MiB), no-new-privileges, and the `.git` directory (if present)
-    /// bind-mounted read-only on top of the workspace mount to prevent git-hook
-    /// escape.
-    ///
-    /// Returns the combined stdout of the container.
+    /// Executes `cmd` confined to `confined_root` via the selected backend.
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the workspace path is invalid, Docker is unavailable,
-    /// the command times out after 30 seconds, or the container exits non-zero.
-    pub async fn exec(&self, cmd: &str, workspace: &Path) -> Result<String, String> {
-        if !self.available {
-            return Err("sandbox not available".into());
+    /// Returns `Err` when no backend is available or the backend fails.
+    pub async fn exec(&self, cmd: &str, confined_root: &Path) -> Result<String, String> {
+        match self.backend.as_ref() {
+            Some(b) => b.exec(cmd, confined_root, self.network).await,
+            None => Err("sandbox not available".into()),
         }
+    }
 
-        // Canonicalise and optionally validate against an allowed root.
-        let workspace = workspace
-            .canonicalize()
-            .map_err(|e| format!("invalid workspace: {e}"))?;
-        let allowed_root = std::env::var("SMEDJA_WORKSPACE_ROOT").map_or_else(
-            |_| {
-                std::env::var("HOME")
-                    .map_or_else(|_| std::path::PathBuf::from("/"), std::path::PathBuf::from)
-            },
-            std::path::PathBuf::from,
+    /// Builds the structured telemetry attributes for an execution rooted at
+    /// `confined_root`.
+    #[must_use]
+    pub fn telemetry(&self, confined_root: &Path) -> SandboxTelemetry {
+        SandboxTelemetry {
+            backend: self.backend_name(),
+            network_policy: self.network.as_str(),
+            mode: self.mode.as_str(),
+            confined_root: confined_root.display().to_string(),
+        }
+    }
+
+    /// Runs `cmd` confined to `confined_root`, applying the fallback contract
+    /// and emitting the `smedja.sandbox.exec` span and (on host fallback) the
+    /// `smedja.sandbox.unconfined` event. `host_run` is the unconfined host
+    /// runner used by the `Auto` fallback.
+    ///
+    /// Returns the tool-result string (an `error:`-form string under
+    /// `Required` with no backend; an [`UNCONFINED_MARKER`]-prefixed result
+    /// under `Auto` with no backend; the backend output otherwise).
+    pub async fn run_confined<F, Fut>(&self, cmd: &str, confined_root: &Path, host_run: F) -> String
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = String>,
+    {
+        let tel = self.telemetry(confined_root);
+        let span = tracing::info_span!(
+            "smedja.sandbox.exec",
+            backend = tel.backend,
+            network_policy = tel.network_policy,
+            mode = tel.mode,
+            confined_root = %tel.confined_root,
         );
-        if std::env::var("SMEDJA_WORKSPACE_ROOT").is_ok() && !workspace.starts_with(&allowed_root) {
-            return Err(format!(
-                "workspace {} is outside allowed root {}",
-                workspace.display(),
-                allowed_root.display()
-            ));
+        let _enter = span.enter();
+
+        if self.available() {
+            return match self.exec(cmd, confined_root).await {
+                Ok(out) => out,
+                Err(e) => format!("error: {e}"),
+            };
         }
 
-        let workspace_str = workspace
-            .to_str()
-            .ok_or("workspace path contains non-UTF-8 bytes")?;
-        let workspace_str_rw = format!("{workspace_str}:/workspace:rw");
-
-        let git_dir = workspace.join(".git");
-
-        // Build the args vec dynamically so we can conditionally add the
-        // read-only .git override mount.
-        let mut args: Vec<&str> = vec![
-            "run",
-            "--rm",
-            "--network",
-            "none",
-            "--cpus",
-            "0.5",
-            "--memory",
-            "256m",
-            "--pids-limit",
-            "64",
-            "--stop-timeout",
-            "30",
-            "--security-opt",
-            "no-new-privileges",
-            "--cap-drop",
-            "ALL",
-            "--read-only",
-            "--tmpfs",
-            "/tmp:size=64m",
-            "-v",
-            &workspace_str_rw,
-            "-w",
-            "/workspace",
-        ];
-
-        // Shadow .git with a read-only mount if the directory exists.
-        // This prevents an agent writing hooks that execute on the host.
-        let git_vol;
-        if git_dir.exists() {
-            git_vol = format!("{}:/workspace/.git:ro", git_dir.display());
-            args.push("-v");
-            args.push(&git_vol);
-        }
-
-        args.extend_from_slice(&["--", &self.image, "sh", "-c", cmd]);
-
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            tokio::process::Command::new("docker").args(&args).output(),
-        )
-        .await
-        {
-            Err(_) => Err("sandbox: command timed out after 30 seconds".to_owned()),
-            Ok(Err(e)) => Err(e.to_string()),
-            Ok(Ok(out)) if out.status.success() => {
-                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        // No backend available: apply the mode-driven fallback.
+        match self.mode {
+            SandboxMode::Off => host_run().await,
+            SandboxMode::Required => {
+                format!(
+                    "error: sandbox required but no isolation backend is available \
+                     (mode=required, network={}); install Docker or enable a supported \
+                     OS-native backend, or set SMEDJA_SANDBOX_MODE=auto",
+                    tel.network_policy
+                )
             }
-            Ok(Ok(out)) => Err(String::from_utf8_lossy(&out.stderr).into_owned()),
+            SandboxMode::Auto => {
+                tracing::info!(
+                    backend = tel.backend,
+                    network_policy = tel.network_policy,
+                    mode = tel.mode,
+                    confined_root = %tel.confined_root,
+                    reason = "no isolation backend available",
+                    "smedja.sandbox.unconfined"
+                );
+                let out = host_run().await;
+                format!("{UNCONFINED_MARKER}{out}")
+            }
         }
     }
 }
@@ -196,16 +401,162 @@ impl Default for SandboxExecutor {
     }
 }
 
+/// Canonicalises `confined_root` and resolves the writable subtree, the
+/// read-only `.git` path (when present), and the path string used for mounts.
+///
+/// Shared by the backends so they agree on the confined-root contract.
+///
+/// # Errors
+///
+/// Returns `Err` when the root cannot be canonicalised, is outside an
+/// `SMEDJA_WORKSPACE_ROOT` (when set), or contains non-UTF-8 bytes.
+pub(crate) fn resolve_confined_root(
+    confined_root: &Path,
+) -> Result<(std::path::PathBuf, Option<std::path::PathBuf>), String> {
+    let root = confined_root
+        .canonicalize()
+        .map_err(|e| format!("invalid confined root: {e}"))?;
+
+    if let Ok(allowed) = std::env::var("SMEDJA_WORKSPACE_ROOT") {
+        let allowed = std::path::PathBuf::from(allowed);
+        if !root.starts_with(&allowed) {
+            return Err(format!(
+                "confined root {} is outside allowed root {}",
+                root.display(),
+                allowed.display()
+            ));
+        }
+    }
+
+    let git_dir = root.join(".git");
+    let git = if git_dir.exists() {
+        Some(git_dir)
+    } else {
+        None
+    };
+    Ok((root, git))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A stub backend that records its inputs and returns a canned string.
+    struct StubBackend {
+        name: &'static str,
+        avail: bool,
+    }
+
+    #[async_trait]
+    impl SandboxBackend for StubBackend {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn available(&self) -> bool {
+            self.avail
+        }
+        async fn exec(
+            &self,
+            cmd: &str,
+            confined_root: &Path,
+            policy: NetworkPolicy,
+        ) -> Result<String, String> {
+            Ok(format!(
+                "stub:{}:{}:{}",
+                cmd,
+                confined_root.display(),
+                policy.as_str()
+            ))
+        }
+    }
+
+    // ── 1.1 trait dispatch ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn backend_trait_dispatches_to_selected_impl() {
+        let ex = SandboxExecutor {
+            backend: Some(Box::new(StubBackend {
+                name: "stub",
+                avail: true,
+            })),
+            mode: SandboxMode::Auto,
+            network: NetworkPolicy::None,
+        };
+        assert!(ex.available());
+        assert_eq!(ex.backend_name(), "stub");
+        let out = ex.exec("echo hi", Path::new("/tmp")).await.unwrap();
+        assert!(out.starts_with("stub:echo hi:"), "got: {out}");
+        assert!(
+            out.ends_with(":none"),
+            "policy must be threaded; got: {out}"
+        );
+    }
+
+    // ── 1.2 selection precedence ──────────────────────────────────────────────
+
     #[test]
-    fn new_when_env_unset_is_unavailable() {
-        // SMEDJA_TOOL_SANDBOX not set in test env → available = false.
-        // (Don't set it in tests to avoid requiring Docker in CI.)
-        let ex = SandboxExecutor::new();
-        assert!(!ex.available);
+    fn selection_prefers_docker_then_native_then_none() {
+        let docker_avail = || -> Box<dyn SandboxBackend> {
+            Box::new(StubBackend {
+                name: "docker",
+                avail: true,
+            })
+        };
+        let docker_unavail = || -> Box<dyn SandboxBackend> {
+            Box::new(StubBackend {
+                name: "docker",
+                avail: false,
+            })
+        };
+        let native_avail = || -> Box<dyn SandboxBackend> {
+            Box::new(StubBackend {
+                name: "native",
+                avail: true,
+            })
+        };
+
+        // Docker opted in and available → Docker wins.
+        let sel = select_backend(true, docker_avail(), Some(native_avail()));
+        assert_eq!(sel.unwrap().name(), "docker");
+
+        // Docker opted in but unavailable → native wins.
+        let sel = select_backend(true, docker_unavail(), Some(native_avail()));
+        assert_eq!(sel.unwrap().name(), "native");
+
+        // Docker not opted in → native wins even if docker is available.
+        let sel = select_backend(false, docker_avail(), Some(native_avail()));
+        assert_eq!(sel.unwrap().name(), "native");
+
+        // No native available → none.
+        let sel = select_backend(true, docker_unavail(), None);
+        assert!(sel.is_none());
+    }
+
+    // ── 1.4 env parsing ───────────────────────────────────────────────────────
+
+    #[test]
+    fn network_policy_parses_from_env_default_none() {
+        assert_eq!(
+            NetworkPolicy::from_str_value("allowlist"),
+            NetworkPolicy::Allowlist
+        );
+        assert_eq!(NetworkPolicy::from_str_value("open"), NetworkPolicy::Open);
+        assert_eq!(NetworkPolicy::from_str_value(""), NetworkPolicy::None);
+        assert_eq!(
+            NetworkPolicy::from_str_value("garbage"),
+            NetworkPolicy::None
+        );
+    }
+
+    #[test]
+    fn sandbox_mode_parses_from_env_default_auto() {
+        assert_eq!(
+            SandboxMode::from_str_value("required"),
+            SandboxMode::Required
+        );
+        assert_eq!(SandboxMode::from_str_value("off"), SandboxMode::Off);
+        assert_eq!(SandboxMode::from_str_value(""), SandboxMode::Auto);
+        assert_eq!(SandboxMode::from_str_value("garbage"), SandboxMode::Auto);
     }
 
     #[test]
@@ -220,35 +571,130 @@ mod tests {
 
     #[test]
     fn mcp_call_is_not_exempt() {
-        // mcp_call does not exist in the codebase; it must not be exempt.
         assert!(!SandboxExecutor::is_exempt("mcp_call"));
     }
 
     #[tokio::test]
     async fn exec_unavailable_returns_err() {
         let ex = SandboxExecutor {
-            available: false,
-            image: String::new(),
+            backend: None,
+            mode: SandboxMode::Auto,
+            network: NetworkPolicy::None,
         };
-        assert!(ex.exec("ls", std::path::Path::new("/tmp")).await.is_err());
+        assert!(!ex.available());
+        assert!(ex.exec("ls", Path::new("/tmp")).await.is_err());
+    }
+
+    // ── 6.1 fallback contract ─────────────────────────────────────────────────
+
+    fn no_backend(mode: SandboxMode) -> SandboxExecutor {
+        SandboxExecutor {
+            backend: None,
+            mode,
+            network: NetworkPolicy::None,
+        }
     }
 
     #[tokio::test]
-    async fn exec_rejects_workspace_outside_allowed_root() {
-        // Set a tight allowed root so /tmp is outside it.
-        std::env::set_var("SMEDJA_WORKSPACE_ROOT", "/nonexistent-root-xyz");
-        let ex = SandboxExecutor {
-            available: true,
-            image: "smedja-sandbox:latest".to_owned(),
-        };
-        let result = ex.exec("ls", std::path::Path::new("/tmp")).await;
-        std::env::remove_var("SMEDJA_WORKSPACE_ROOT");
-        // /tmp canonicalises to /tmp; /nonexistent-root-xyz doesn't contain it.
-        assert!(result.is_err());
-        let msg = result.unwrap_err();
+    async fn required_fails_closed() {
+        let ex = no_backend(SandboxMode::Required);
+        let mut ran = false;
+        let out = ex
+            .run_confined("echo hi", Path::new("/tmp"), || {
+                ran = true;
+                async { "host-output".to_owned() }
+            })
+            .await;
         assert!(
-            msg.contains("outside allowed root") || msg.contains("invalid workspace"),
-            "unexpected error: {msg}"
+            out.starts_with("error:"),
+            "required must fail closed; got: {out}"
         );
+        assert!(
+            out.contains("no isolation backend"),
+            "must name the missing capability; got: {out}"
+        );
+        assert!(!ran, "required must NOT execute the command");
+    }
+
+    #[tokio::test]
+    async fn auto_falls_back_with_marker() {
+        let ex = no_backend(SandboxMode::Auto);
+        let out = ex
+            .run_confined("echo hi", Path::new("/tmp"), || async {
+                "host-output".to_owned()
+            })
+            .await;
+        assert!(
+            out.starts_with(UNCONFINED_MARKER),
+            "auto must stamp the marker; got: {out}"
+        );
+        assert!(
+            out.contains("host-output"),
+            "auto must run on the host; got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn off_skips_sandbox() {
+        let ex = no_backend(SandboxMode::Off);
+        let out = ex
+            .run_confined("echo hi", Path::new("/tmp"), || async {
+                "host-output".to_owned()
+            })
+            .await;
+        assert_eq!(
+            out, "host-output",
+            "off must run on the host with no marker"
+        );
+    }
+
+    // ── 7.1 telemetry attributes ──────────────────────────────────────────────
+
+    #[test]
+    fn sandbox_exec_emits_span_with_backend_attributes() {
+        let ex = SandboxExecutor {
+            backend: Some(Box::new(StubBackend {
+                name: "stub",
+                avail: true,
+            })),
+            mode: SandboxMode::Required,
+            network: NetworkPolicy::Allowlist,
+        };
+        let tel = ex.telemetry(Path::new("/tmp/wt"));
+        assert_eq!(tel.backend, "stub");
+        assert_eq!(tel.network_policy, "allowlist");
+        assert_eq!(tel.mode, "required");
+        assert_eq!(tel.confined_root, "/tmp/wt");
+
+        // No backend → telemetry records "none".
+        let ex = no_backend(SandboxMode::Auto);
+        let tel = ex.telemetry(Path::new("/tmp/wt"));
+        assert_eq!(tel.backend, "none");
+    }
+
+    // ── 5.1 / 5.2 network policy reuses is_blocked_ip floor ────────────────────
+
+    #[test]
+    fn network_policy_reuses_is_blocked_ip_floor() {
+        use std::net::IpAddr;
+        let imds: IpAddr = "169.254.169.254".parse().unwrap();
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let private: IpAddr = "10.0.0.5".parse().unwrap();
+        let public: IpAddr = "93.184.216.34".parse().unwrap(); // example.com
+
+        // none: deny all egress.
+        assert!(!NetworkPolicy::None.permits_dest(public));
+        assert!(!NetworkPolicy::None.permits_dest(imds));
+
+        // allowlist: public allowed, blocked ranges denied.
+        assert!(NetworkPolicy::Allowlist.permits_dest(public));
+        assert!(!NetworkPolicy::Allowlist.permits_dest(imds));
+        assert!(!NetworkPolicy::Allowlist.permits_dest(loopback));
+        assert!(!NetworkPolicy::Allowlist.permits_dest(private));
+
+        // open: public allowed, but is_blocked_ip ranges stay blocked.
+        assert!(NetworkPolicy::Open.permits_dest(public));
+        assert!(!NetworkPolicy::Open.permits_dest(imds));
+        assert!(!NetworkPolicy::Open.permits_dest(loopback));
     }
 }

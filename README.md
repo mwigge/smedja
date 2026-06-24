@@ -233,6 +233,36 @@ Every span follows `gen_ai.*` semantic conventions. Every outbound HTTP request 
 
 ---
 
+## Tool Sandbox
+
+Shell tools (`bash`, `run_command`) run inside a per-platform isolation boundary selected by capability detection. Read-only tools (`read_file`, `list_files`, `graph_query`) are exempt.
+
+**Backends** (selection precedence): Docker when opted in and reachable → the current platform's OS-native backend → none.
+
+| Platform | Backend | Mechanism |
+|----------|---------|-----------|
+| any | Docker | ephemeral container; opt in with `SMEDJA_TOOL_SANDBOX=docker` and build the image via `smj sandbox build` |
+| macOS | Seatbelt | generated `sandbox-exec` profile (zero-config; ships with macOS) |
+| Linux | Landlock | Landlock LSM ruleset (zero-config on kernels ≥ 5.13) |
+
+The writable filesystem root is the **confined root** — the active worktree when a task owns one, otherwise the session workspace — with `.git` read-only and an ephemeral `/tmp`. Writes outside the confined root are denied by the kernel boundary.
+
+**Network policy** — `SMEDJA_SANDBOX_NETWORK` (default `none`):
+
+- `none` — no egress.
+- `allowlist` — egress only to destinations not rejected by the daemon's SSRF guard (`is_blocked_ip`), so private/loopback/IMDS ranges stay blocked.
+- `open` — general egress, but the same SSRF floor keeps private/loopback/IMDS ranges (including `169.254.169.254`) unreachable.
+
+**Fallback mode** — `SMEDJA_SANDBOX_MODE` (default `auto`) governs behaviour when no backend is available:
+
+- `auto` — run on the host but stamp the result with an unconfined marker and emit a `smedja.sandbox.unconfined` event.
+- `required` — fail the tool call closed with a diagnostic naming the missing capability; the command does not run.
+- `off` — skip the sandbox entirely.
+
+Each sandboxed execution emits a `smedja.sandbox.exec` span carrying `backend`, `network_policy`, `mode`, and `confined_root`. Run `smj sandbox status` to see the selected backend, its availability, the active network policy, and the fallback mode.
+
+---
+
 ## Spec-First Methodology
 
 `smedja-methodology` enforces a workflow before the agent can touch files. The gate is a compile-time `Mode` enum — not a runtime plugin, not optional in CI.
