@@ -231,6 +231,25 @@ Every span follows `gen_ai.*` semantic conventions. Every outbound HTTP request 
 
 `smj session cost` reads `smedja-ingot` and prints a per-session cost breakdown by model and runner. `prices.toml` ships bundled — no external API call required.
 
+### Local metrics rollups
+
+`smj metrics` aggregates tokens, cost, turns, and error counts **per runner over time** directly from the local ingot (`cost_ledger` for tokens/cost/turns, `audit_events` with `status = 'error'` for errors). It needs nothing but the ingot SQLite file:
+
+```sh
+smj metrics --tier daily --since 7d            # per-runner daily table for the last week
+smj metrics --tier hourly --since 24h --runner claude
+smj metrics --tier monthly --since 365d --json # raw metrics.summary payload
+```
+
+Five fixed tiers bucket each source timestamp to a UTC grid: `raw` (per-entry granularity), `hourly`, `daily`, `weekly` (ISO Monday 00:00), and `monthly` (first-of-month 00:00). `--since`/`--until` accept a duration back from now (`7d`, `24h`, `30m`, `90s`) or bare seconds. The command calls the `metrics.summary` RPC, which the daemon also exposes to the TUI metrics view (toggle with **Ctrl-T**). Cost is kept as exact integer microdollars end-to-end and converted to USD only at the display boundary. Rollups are computed on read from the source rows — no background writer, no staleness — with an optional idempotent materialisation into a `metrics_rollups` cache for large histories.
+
+**Local rollups vs external OTel.** These two metrics surfaces are complementary, not overlapping:
+
+- **Local rollups** (`smj metrics` / `metrics.summary`) read smedja's own ingot and always work offline. Use them for cost, token, and error accounting from the ledger smedja already writes — zero external dependencies.
+- **External OTel** (`smedja-sre::metric_query`, a Prometheus/SigNoz `query_range`) reads an external metrics backend and works only when one is deployed. Use it for infra-level metrics and cross-service correlation.
+
+Neither is implemented in terms of the other; pick local rollups for offline ledger accounting and the SRE OTel path when you run a real metrics backend.
+
 On startup the daemon signals readiness to the service manager via `sd_notify(READY=1)` (honoured by `Type=notify` systemd units) and exposes an unauthenticated `/health` readiness probe that returns `200` once the daemon is serving — suitable for liveness checks and container orchestration.
 
 ---
