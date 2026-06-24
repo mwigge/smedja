@@ -111,16 +111,33 @@ pub(crate) async fn refresh(state: HandlerState, params: Value) -> Result<Value,
         }
     };
 
+    let store = crate::mcp_oauth::TokenStore::default_store();
+    let env_token = std::env::var("MCP_TOKEN").ok();
+    let refreshed = refresh_servers(&ig, servers, &store, env_token.as_deref()).await;
+
+    Ok(json!({ "refreshed": refreshed }))
+}
+
+/// Re-queries each server's tool list via its transport, authenticating with a
+/// token resolved from `store` (then `env_token`, then empty), and persists the
+/// refreshed list. Returns the count of successfully refreshed servers.
+async fn refresh_servers(
+    ig: &smedja_ingot::IngotHandle,
+    servers: Vec<McpServer>,
+    store: &crate::mcp_oauth::TokenStore,
+    env_token: Option<&str>,
+) -> usize {
     let mut refreshed = 0usize;
     for server in servers {
-        let client = match crate::mcp_http::McpHttpClient::new(&server.url, "") {
-            Ok(c) => c,
+        let token = crate::executor::resolve_mcp_token(store, &server.url, env_token);
+        let transport = match crate::mcp_stdio::McpTransport::for_server(&server, &token) {
+            Ok(t) => t,
             Err(e) => {
-                tracing::warn!(name = %server.name, error = %e, "mcp.refresh: failed to build client");
+                tracing::warn!(name = %server.name, error = %e, "mcp.refresh: failed to build transport");
                 continue;
             }
         };
-        match client.list_tools().await {
+        match transport.list_tools().await {
             Ok(tools) => {
                 let tools_json = serde_json::to_string(&tools).unwrap_or_else(|_| "[]".to_owned());
                 let updated = McpServer {
@@ -136,6 +153,78 @@ pub(crate) async fn refresh(state: HandlerState, params: Value) -> Result<Value,
             }
         }
     }
+    refreshed
+}
 
-    Ok(json!({ "refreshed": refreshed }))
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex as TokioMutex;
+
+    use super::refresh_servers;
+
+    #[tokio::test]
+    async fn refresh_sends_stored_bearer_to_protected_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_url = format!("http://{addr}");
+
+        let seen: Arc<TokioMutex<Option<String>>> = Arc::new(TokioMutex::new(None));
+        let seen_clone = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::post(move |headers: axum::http::HeaderMap| {
+                    let seen = Arc::clone(&seen_clone);
+                    async move {
+                        *seen.lock().await = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        axum::Json(serde_json::json!({
+                            "jsonrpc": "2.0", "id": 1,
+                            "result": { "tools": [] }
+                        }))
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Stored token keyed by the server URL, in a scoped store.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::mcp_oauth::TokenStore::new(tmp.path().to_path_buf());
+        store
+            .save(
+                &server_url,
+                &crate::mcp_oauth::Token {
+                    access_token: "refresh-bearer".into(),
+                    token_type: "Bearer".into(),
+                    refresh_token: None,
+                    expires_in: Some(3600),
+                },
+            )
+            .unwrap();
+
+        let ig = smedja_ingot::IngotHandle::new(smedja_ingot::Ingot::open_in_memory().unwrap());
+        let server = smedja_ingot::McpServer {
+            id: "r1".into(),
+            name: "protected".into(),
+            url: server_url.clone(),
+            transport: "http".into(),
+            tools_json: "[]".into(),
+            last_refresh: 0.0,
+        };
+
+        let count = refresh_servers(&ig, vec![server], &store, None).await;
+        assert_eq!(count, 1, "refresh must succeed");
+        assert_eq!(
+            seen.lock().await.as_deref(),
+            Some("Bearer refresh-bearer"),
+            "refresh must send the stored token as the Bearer credential"
+        );
+    }
 }
