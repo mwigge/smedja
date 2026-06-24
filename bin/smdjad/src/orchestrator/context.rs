@@ -17,6 +17,19 @@ pub(crate) fn strata_for_tier(tier: Tier) -> (StrataConfig, usize) {
     }
 }
 
+/// Maps a routed runner tier to the number of cold-stratum results to recall.
+///
+/// `fast` favours latency with a single hit; `deep` favours recall with up to
+/// five. The orchestrator caps the assembled cold block by the tier token
+/// budget regardless of this count.
+pub(crate) fn cold_k_for_tier(tier: Tier) -> usize {
+    match tier {
+        Tier::Fast => 1,
+        Tier::Local => 3,
+        Tier::Deep => 5,
+    }
+}
+
 /// Returns the approximate context-window size (in tokens) for a model.
 ///
 /// Used to scale verbosity steering — the conciseness directive is appended once

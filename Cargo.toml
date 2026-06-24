@@ -40,6 +40,9 @@ rust-version = "1.82"
 
 [workspace.dependencies]
 
+# async trait methods (dyn-dispatched ports)
+async-trait  = "0.1"
+
 # error handling
 anyhow       = "1"
 
