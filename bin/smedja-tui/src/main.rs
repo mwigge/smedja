@@ -181,6 +181,12 @@ slash commands:
   /tdd               — set TDD mode
   /tier <t>          — set tier (local|fast|deep)
 
+inline context fragments (expanded into your message before the turn runs):
+  @file <path>       — inject a workspace file's contents (path stays inside the workspace)
+  @git               — inject `git status --short` and `git diff HEAD`
+  @branch            — inject the current branch and upstream
+  @shell <cmd>       — inject a shell command's output (gated by cowork when enabled)
+
 keybindings (input mode):
   Esc                — enter scroll/normal mode
   Up / Ctrl-P        — browse history backwards
