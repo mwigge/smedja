@@ -1,21 +1,27 @@
 //! Linux Landlock isolation backend.
 //!
 //! Builds a Landlock ruleset that grants read-write only under the confined
-//! root, read-only `.git`, and a writable `/tmp`, then applies it in the child
-//! process (via `pre_exec`) before the command's `exec`.
+//! root and read-execute across the rest of the filesystem, then applies it in
+//! the child process (via `pre_exec`) before the command's `exec`.
 //!
-//! Landlock here enforces the *filesystem* boundary — its strongest and most
-//! widely-supported guarantee (ABI v1, kernel ≥ 5.13). Network egress is not
-//! confined by Landlock (the TCP controls require ABI v4 / kernel 6.7+ and are
-//! not universally available); it is governed by the daemon's `is_blocked_ip`
-//! floor, which keeps loopback/private/IMDS ranges unreachable regardless of
-//! the requested `NetworkPolicy`.
+//! Landlock here enforces the *write* boundary — its strongest, most widely
+//! supported guarantee (ABI v1, kernel ≥ 5.13): the command can read system
+//! files and execute programs (so the shell and its shared libraries load), but
+//! it can only create or modify files beneath the confined root. Writes to any
+//! other path — including sibling directories under `/tmp` — are denied by the
+//! kernel.
+//!
+//! Read confinement and network confinement are intentionally out of scope for
+//! this backend: reads are broad (the additive ruleset cannot carve a read-only
+//! hole under the read-execute `/` grant), and network egress is governed by the
+//! daemon's `is_blocked_ip` floor, which keeps loopback/private/IMDS ranges
+//! unreachable regardless of the requested `NetworkPolicy`.
 //!
 //! Availability is detected at startup; when Landlock is unavailable (kernel <
 //! 5.13 or disabled) the backend reports `available() == false` so selection
 //! downgrades to no-backend.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use async_trait::async_trait;
 use landlock::{
@@ -47,13 +53,13 @@ impl LandlockBackend {
         Self { available }
     }
 
-    /// Applies the Landlock ruleset for `root`/`git_dir` under `policy` in the
-    /// current process. Intended to be called from `pre_exec` in the child.
+    /// Applies the filesystem ruleset confining writes to `root` in the current
+    /// process. Intended to be called from `pre_exec` in the child.
     ///
     /// # Errors
     ///
     /// Returns `std::io::Error` when the ruleset cannot be created or applied.
-    fn apply(root: &Path, git_dir: &Path, _policy: NetworkPolicy) -> std::io::Result<()> {
+    fn apply(root: &Path) -> std::io::Result<()> {
         let abi = ABI::V1;
         let map_err = |e: landlock::RulesetError| std::io::Error::other(format!("landlock: {e}"));
         // PathFd::new's error type is landlock-internal; map it to io::Error by
@@ -62,35 +68,23 @@ impl LandlockBackend {
             PathFd::new(p).map_err(|e| std::io::Error::other(format!("landlock path: {e}")))
         };
 
-        // Filesystem confinement only (ABI v1). Network egress is governed by
-        // the daemon's is_blocked_ip floor, not Landlock — see the module docs.
-        let mut created = Ruleset::default()
+        let created = Ruleset::default()
             .handle_access(AccessFs::from_all(abi))
             .map_err(map_err)?
             .create()
-            .map_err(map_err)?;
-
-        // Read-write under the confined root.
-        created = created
+            .map_err(map_err)?
+            // Read + execute across the whole filesystem so the shell and its
+            // shared libraries can load and run.
+            .add_rule(PathBeneath::new(
+                open(Path::new("/"))?,
+                AccessFs::from_read(abi),
+            ))
+            .map_err(map_err)?
+            // Read-write only beneath the confined root. Because the ruleset is
+            // additive, this widens the `/` read grant to read-write for this
+            // subtree alone; every other path stays read-only.
             .add_rule(PathBeneath::new(open(root)?, AccessFs::from_all(abi)))
             .map_err(map_err)?;
-
-        // Read-only .git (read access only; no write).
-        if git_dir.exists() {
-            created = created
-                .add_rule(PathBeneath::new(open(git_dir)?, AccessFs::from_read(abi)))
-                .map_err(map_err)?;
-        }
-
-        // Writable scratch /tmp.
-        if Path::new("/tmp").exists() {
-            created = created
-                .add_rule(PathBeneath::new(
-                    open(Path::new("/tmp"))?,
-                    AccessFs::from_all(abi),
-                ))
-                .map_err(map_err)?;
-        }
 
         let status = created.restrict_self().map_err(map_err)?;
         if matches!(status.ruleset, RulesetStatus::NotEnforced) {
@@ -116,24 +110,23 @@ impl SandboxBackend for LandlockBackend {
         &self,
         cmd: &str,
         confined_root: &Path,
-        policy: NetworkPolicy,
+        _policy: NetworkPolicy,
     ) -> Result<String, String> {
         if !self.available {
             return Err("landlock sandbox not available".into());
         }
 
-        let (root, git) = resolve_confined_root(confined_root)?;
-        let git_dir: PathBuf = git.unwrap_or_else(|| root.join(".git"));
+        let (root, _git) = resolve_confined_root(confined_root)?;
         let root_for_child = root.clone();
 
         let mut command = tokio::process::Command::new("sh");
         command.args(["-c", cmd]).current_dir(&root);
 
         // SAFETY: the closure runs in the forked child before `exec`; it only
-        // calls async-signal-safe Landlock syscalls and allocations performed
+        // calls async-signal-safe Landlock syscalls, and allocations performed
         // before fork are not freed here. Any error aborts the exec.
         unsafe {
-            command.pre_exec(move || Self::apply(&root_for_child, &git_dir, policy));
+            command.pre_exec(move || Self::apply(&root_for_child));
         }
 
         match tokio::time::timeout(
