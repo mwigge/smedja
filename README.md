@@ -151,7 +151,7 @@ Every session runs through three memory strata. Context budget is allocated per 
   <img src="assets/diagrams/readme-session-memory.png" alt="session memory strata: hot, warm, cold, and archive" width="760" />
 </div>
 
-Compaction produces structured JSON, not a free-text summary. Each compacted turn becomes a structured object that can be expanded and replayed — `smj session rollback <id> <turn>` reconstructs any point in history. (**Note:** `smj session rollback` is on the roadmap; the underlying compaction format is in place.)
+Compaction produces structured JSON, not a free-text summary. Each compacted turn becomes a structured object that can be expanded and replayed — `smj session rollback <id> <turn>` reconstructs any point in history. The CLI calls the daemon's `session.rollback` RPC end to end; the underlying compaction format records each turn as a structured object the rollback replays from.
 
 ### How Parallel Agents Share Memory
 
@@ -169,7 +169,7 @@ Both agents pull from the same cold memory — they know what was decided in pre
 
 **SmartCrusher** (`smedja-adapter`) strips JSON nulls, zero-value arrays, and repeated keys from tool results before serialisation. Tool-heavy sessions see 30–60% token reduction on tool_result content alone. Implemented and tested.
 
-**Stable-prefix / CacheAligner** (`smedja-memory`) tracks a `stable_prefix` boundary in the working window. The foundation is wired — `seal_prefix()` marks turns below the compaction line so they are never reordered or discarded. The adapter-side `BuildPrompt` integration that freezes provider cache hints is on the roadmap.
+**Stable-prefix** (`smedja-memory`) tracks a `stable_prefix` boundary in the working window. `seal_prefix()` marks turns below the compaction line so they are never reordered or discarded, and the sealed-prefix length is passed through to the provider on the live turn path: for the Anthropic runner the orchestrator derives `stable_prefix_len` from the sealed prefix and the adapter applies the corresponding KV-cache hints. Cross-provider cache alignment beyond Anthropic's stable-prefix hints is on the roadmap.
 
 **Verbosity steering** (`smedja-memory`) appends a `<conciseness>` directive to the system prompt when context exceeds 60% of the window. Implemented and tested.
 
@@ -231,6 +231,8 @@ Every span follows `gen_ai.*` semantic conventions. Every outbound HTTP request 
 
 `smj session cost` reads `smedja-ingot` and prints a per-session cost breakdown by model and runner. `prices.toml` ships bundled — no external API call required.
 
+On startup the daemon signals readiness to the service manager via `sd_notify(READY=1)` (honoured by `Type=notify` systemd units) and exposes an unauthenticated `/health` readiness probe that returns `200` once the daemon is serving — suitable for liveness checks and container orchestration.
+
 ---
 
 ## Tool Sandbox
@@ -272,6 +274,62 @@ Each sandboxed execution emits a `smedja.sandbox.exec` span carrying `backend`, 
 </div>
 
 `--no-spec-gate` disables it per session for quick patches. In normal operation the sequence is: spec → approval → test → implementation → review.
+
+---
+
+## Repo Auditor
+
+`/review` is a read-only repo, PR, or branch auditor. It runs the Review role over a selected scope, explores with only `graph_query` / `read_file` / `list_files`, and aggregates the model's output into structured findings written to a deterministic markdown report. The loop is read-only by two independent guarantees: the read-only tool allowlist (any other tool call is rejected and fed back as an error observation) and a `review`-mode session whose `role_allows_write_bash` gate denies write-arity bash — it never constructs an `edit_file` / `write_file` dispatch.
+
+Run it from the CLI with `smj audit run`:
+
+```sh
+smj audit run                       # the working-tree diff
+smj audit run src/                  # a path or whole-repo scope
+smj audit run --branch main         # a branch range, main...HEAD
+smj audit run --pr 42               # a pull-request reference
+```
+
+Findings are de-duplicated and persisted as `smedja-ingot` audit events; query them later with `smj audit`.
+
+---
+
+## Security Plane
+
+`smedja-security` is a proportionate, **advisory-by-default** security plane — it surfaces findings without blocking the loop. Three subcommands:
+
+```sh
+smj security scan [path]            # workspace posture scan; prints advisory findings
+smj security report                 # summarise recorded security_finding audit events (read-only)
+smj security sbom [--lockfile …]    # emit a CycloneDX-style SBOM from the resolved Cargo.lock
+```
+
+`scan` records its findings as `smedja-ingot` audit events, so `report` reads them back as a read-only query.
+
+---
+
+## MCP Server Mode
+
+smedja is co-mounted as an **MCP server** on the authenticated ACP HTTP listener. The `/mcp` endpoint speaks JSON-RPC 2.0 and routes `tools/call` into the executor under an effective `review`-mode (read-only) session, so the least-privilege guard rejects mutating tools. ACP turn events are forwarded over SSE.
+
+- **OAuth** — HTTP clients authenticate with OAuth 2.0 Authorization Code + PKCE (S256): code verifier/challenge, a loopback redirect listener with `state` validation, token exchange, and refresh-token grant. Tokens are persisted with `0600` filesystem permissions.
+- **stdio transport** — a registered MCP server can also be driven as a child process over newline-framed JSON-RPC 2.0; the child is spawned lazily, reused across calls, and killed on drop. All I/O is async.
+
+Manage the server registry with `smj mcp {add,list,remove,refresh}`.
+
+---
+
+## Eval Harness
+
+`smedja-eval` runs a case suite and gates on its pass-rate threshold.
+
+```sh
+smj eval run --suite evals/<suite>            # run the suite, print a report, gate on the threshold
+smj eval run --suite evals/<suite> --json     # machine-readable summary on stdout
+cargo xtask eval evals/<suite>                # the offline gate, for CI
+```
+
+Suites live under `evals/` (each a directory with `suite.toml` and case files). `cargo xtask eval` runs the gate offline (deterministic, no provider calls), so it is safe in CI; graded rubric/live-driver cases run only with `--online` through the daemon.
 
 ---
 
