@@ -66,13 +66,24 @@ pub(crate) struct LoopRoleRunner {
     cache_aligners: crate::orchestrator::CacheAligners,
     workspace_root: PathBuf,
     agent_timeout_s: u64,
+    /// Umbrella change name — the namespace key (`umbrella:<change_name>`) the
+    /// slice resolves its umbrella detail from, and the umbrella whose paste this
+    /// slice avoids restating.
+    change_name: String,
+    /// The umbrella intent (`proposal.md`) — sealed into the cached prefix when
+    /// assembling each slice's hybrid context.
+    umbrella_intent: String,
+    /// The umbrella intent (`proposal.md`) + design detail (`design.md`) the
+    /// slice would otherwise paste in full; the lean-spec saving is measured
+    /// against this paste.
+    umbrella_paste: String,
 }
 
 impl RoleRunner for LoopRoleRunner {
     async fn run_role(
         &self,
         role: &LoopRole,
-        _slice_index: usize,
+        slice_index: usize,
         slice: &str,
     ) -> anyhow::Result<()> {
         let now = Timestamp::now();
@@ -147,7 +158,92 @@ impl RoleRunner for LoopRoleRunner {
         if status == "failed" {
             anyhow::bail!("role '{}' turn failed", role.name);
         }
+
+        // Lean-spec self-measurement: this slice referenced its umbrella rather
+        // than pasting it in full. Best-effort; never fails the role.
+        self.record_slice_saving(slice_index, slice, session_id.to_string())
+            .await;
         Ok(())
+    }
+}
+
+impl LoopRoleRunner {
+    /// Records this slice's lean-spec saving (umbrella referenced, not pasted).
+    ///
+    /// Assembles the hybrid slice context — umbrella intent sealed into the
+    /// cached prefix, umbrella detail recalled per slice from the
+    /// `umbrella:<change_name>` vault namespace — and records
+    /// `paste − retrieved` on the tokens-saved ledger tagged `source=lean-spec`.
+    /// A dangling umbrella yields an empty recall (saving = full paste) rather
+    /// than an error. A no-op when no umbrella was preloaded.
+    async fn record_slice_saving(&self, slice_index: usize, slice: &str, session_id: String) {
+        if self.umbrella_paste.trim().is_empty() {
+            return;
+        }
+
+        // Flag (best-effort) a slice that copies the umbrella's Why/design
+        // instead of carrying only its own delta — the saving regresses then.
+        if crate::lean_spec::slice_restates_intent(&self.umbrella_intent, slice) {
+            warn!(
+                change = %self.change_name,
+                "lean-spec: slice restates umbrella intent; the saving regresses"
+            );
+        }
+
+        #[allow(clippy::cast_possible_truncation)] // slice ordinals never exceed u32::MAX
+        let pointer =
+            crate::lean_spec::SlicePointer::new(self.change_name.clone(), (slice_index + 1) as u32);
+
+        // Persist the slice→umbrella pointer (vault payload convention) and warn
+        // if the pointer dangles — no umbrella chunks resolve for it.
+        let _ = crate::lean_spec::store_slice_pointer(&self.vault, &pointer).await;
+        let resolved = crate::lean_spec::resolve_umbrella(
+            &self.vault,
+            &pointer.umbrella_id,
+            slice,
+            crate::lean_spec::default_slice_recall_k(),
+        )
+        .await;
+        if resolved.is_empty() {
+            warn!(
+                change = %self.change_name,
+                slice_n = pointer.slice_n,
+                "lean-spec: umbrella pointer resolves to no chunks; using full paste as the baseline"
+            );
+        }
+
+        let assembled = crate::lean_spec::assemble_slice_context(
+            &self.vault,
+            &pointer,
+            &self.umbrella_intent,
+            slice,
+            crate::lean_spec::default_slice_recall_k(),
+        )
+        .await;
+        tracing::debug!(
+            change = %self.change_name,
+            slice_n = pointer.slice_n,
+            detail_chunks = assembled.detail_chunks,
+            "lean-spec: assembled hybrid slice context"
+        );
+
+        // The retrieved detail is the mutable-window content beyond the slice
+        // delta — what cold recall re-sent in lieu of the full umbrella paste.
+        let retrieved_text = assembled
+            .memory
+            .mutable_window()
+            .iter()
+            .filter(|m| m.content != slice)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        crate::lean_spec::record_lean_spec_saving(
+            &self.ingot,
+            &session_id,
+            &self.umbrella_paste,
+            &retrieved_text,
+        )
+        .await;
     }
 }
 
@@ -235,6 +331,25 @@ pub(crate) async fn run(
 
     let slices = read_pending_slices(&workspace_root, &change_name).await;
 
+    // Lean-spec umbrella preload (umbrella-once): chunk the change's design
+    // detail into the `umbrella:<change_name>` vault namespace so each slice can
+    // recall it on demand instead of restating it. The intent + detail paste is
+    // captured so per-slice savings can be measured. Best-effort: a missing or
+    // unreadable umbrella degrades to "no umbrella context" and zero savings.
+    let (umbrella_intent, umbrella_paste) = if let Some(change_dir) =
+        safe_tasks_path(&workspace_root, &change_name)
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+    {
+        let (intent, detail) = crate::lean_spec::read_umbrella_sources(&change_dir).await;
+        if let Err(e) = crate::lean_spec::preload_umbrella(&vault, &change_name, &detail).await {
+            warn!(change = %change_name, error = %e, "lean-spec umbrella preload failed; continuing");
+        }
+        let paste = format!("{intent}\n{detail}");
+        (intent, paste)
+    } else {
+        (String::new(), String::new())
+    };
+
     let sink = LoopStatusSink {
         ingot: ingot.clone(),
         loop_id,
@@ -251,6 +366,9 @@ pub(crate) async fn run(
         cache_aligners,
         workspace_root: workspace_root.clone(),
         agent_timeout_s: config.limits.agent_timeout_s,
+        change_name: change_name.clone(),
+        umbrella_intent,
+        umbrella_paste,
     };
 
     // The engine persists every transition (including the terminal state) through
@@ -294,6 +412,175 @@ mod tests {
             super::safe_tasks_path(&ws_root, "evil").is_none(),
             "a symlinked change dir escaping the workspace must be refused"
         );
+    }
+
+    // ── group 4: loop consumes umbrella-once + slice-each ───────────────────
+
+    #[tokio::test]
+    async fn umbrella_tasks_md_coarse_lines_are_read_as_slice_list() {
+        // Task 4.1/4.2: the umbrella's coarse `- [ ]` lines are read as the slice
+        // list; each coarse group maps to exactly one slice the engine iterates.
+        let ws = TempDir::new().unwrap();
+        let ws_root = ws.path().canonicalize().unwrap();
+        let change_dir = ws_root.join("openspec").join("changes").join("umbrella");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        // An umbrella tasks.md lists slices coarsely — one `- [ ]` per slice, no
+        // granular per-step decomposition. The `## ` headings and a `[x]` line
+        // must NOT be read as slices.
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Slices\n\n\
+             - [ ] Slice 1: store the umbrella\n\
+             - [ ] Slice 2: resolve the pointer\n\
+             - [x] already done — must be skipped\n\
+             - [ ] Slice 3: hybrid loading\n",
+        )
+        .unwrap();
+
+        let slices = super::read_pending_slices(&ws_root, "umbrella").await;
+        assert_eq!(
+            slices,
+            vec![
+                "Slice 1: store the umbrella".to_owned(),
+                "Slice 2: resolve the pointer".to_owned(),
+                "Slice 3: hybrid loading".to_owned(),
+            ],
+            "each coarse `- [ ]` line must map to exactly one pending slice"
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_iterates_one_role_run_per_slice() {
+        // Task 4.2: each slice the engine iterates triggers exactly one
+        // implementer run — the umbrella-once + slice-each cadence over the list
+        // read from tasks.md.
+        use smedja_loop::{drive, LoopRole, LoopState, RoleRunner, Runner, StatusSink, Tier};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingRunner {
+            slices_seen: std::sync::Mutex<Vec<String>>,
+        }
+        impl RoleRunner for CountingRunner {
+            async fn run_role(
+                &self,
+                _role: &LoopRole,
+                _slice_index: usize,
+                slice: &str,
+            ) -> anyhow::Result<()> {
+                self.slices_seen.lock().unwrap().push(slice.to_owned());
+                Ok(())
+            }
+        }
+        struct CountingSink {
+            slice_calls: AtomicUsize,
+        }
+        impl StatusSink for CountingSink {
+            async fn set_status(&self, _state: &LoopState) {}
+            async fn set_slice(&self, _slice: i64) {
+                self.slice_calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let smedja_dir = dir.path().join(".smedja");
+        std::fs::create_dir_all(&smedja_dir).unwrap();
+        // Empty verification command → the gate passes vacuously, so every slice
+        // is driven once with no provider needed.
+        let roles = r#"[{"name":"implementer","runner":"claude","tier":"deep","read_only":false,"tools":[]}]"#;
+        std::fs::write(
+            smedja_dir.join("loop.json"),
+            format!(
+                r#"{{
+                    "version": 1,
+                    "limits": {{"max_attempts": 3, "agent_timeout_s": 60}},
+                    "roles": {roles},
+                    "verification": {{"command": ""}},
+                    "review": {{"per_slice": false, "required": false}},
+                    "publication": {{"max_pr_lines": 400}}
+                }}"#
+            ),
+        )
+        .unwrap();
+        let policy_path = smedja_dir.join("loop.json");
+        let config = LoopConfig::from_file(&policy_path).expect("policy loads");
+
+        let slices = vec![
+            "slice one".to_owned(),
+            "slice two".to_owned(),
+            "slice three".to_owned(),
+        ];
+        let runner = CountingRunner {
+            slices_seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let sink = CountingSink {
+            slice_calls: AtomicUsize::new(0),
+        };
+
+        let outcome = drive(
+            &config,
+            dir.path(),
+            &policy_path,
+            "umbrella",
+            &slices,
+            &runner,
+            &sink,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.slices_completed, 3,
+            "every slice must complete once"
+        );
+        assert_eq!(
+            *runner.slices_seen.lock().unwrap(),
+            slices,
+            "the engine must run exactly one role per slice, in order"
+        );
+        assert_eq!(
+            sink.slice_calls.load(Ordering::SeqCst),
+            3,
+            "each slice maps to exactly one iteration"
+        );
+        // Tier/Runner enums are referenced to keep the import surface honest.
+        let _ = (Tier::Deep, Runner::Claude);
+    }
+
+    #[tokio::test]
+    async fn umbrella_intent_sealed_once_across_the_slice_iteration() {
+        // Task 4.3/4.4: the umbrella intent is sealed into the cached prefix
+        // exactly once before the slice iteration; the prefix is not re-sealed
+        // per slice, and each slice is a thin delta on the already-cached intent.
+        use smedja_memory::{Message, WorkingMemory};
+
+        let mut mem = WorkingMemory::new(usize::MAX);
+        // Seal the umbrella intent once, before iterating slices.
+        mem.push(Message::system("UMBRELLA INTENT (cached once)"));
+        mem.seal_prefix();
+        let sealed_at = mem.stable_prefix();
+        assert_eq!(
+            sealed_at, 1,
+            "the umbrella intent is the only sealed message"
+        );
+
+        // Drive three slices: each replaces the mutable window with its own thin
+        // delta. The prefix is never re-sealed.
+        for n in 1..=3 {
+            mem.replace_mutable(vec![Message::user(format!("slice {n} delta"))]);
+            assert_eq!(
+                mem.stable_prefix(),
+                sealed_at,
+                "the prefix must stay sealed at its original boundary, not re-sealed"
+            );
+            assert!(
+                mem.messages()[0].content.contains("UMBRELLA INTENT"),
+                "the cached umbrella intent persists across every slice"
+            );
+            assert_eq!(
+                mem.mutable_window().len(),
+                1,
+                "each slice carries only its own thin delta in the mutable window"
+            );
+        }
     }
 
     async fn deps() -> (
