@@ -108,7 +108,7 @@ pub fn parse_apc(input: &[u8]) -> Option<ApcPayload> {
 // ─── Glyph Protocol RFC parser ────────────────────────────────────────────────
 
 /// Image format carried in a Glyph Protocol registration sequence.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlyphFormat {
     /// Scalable Vector Graphics.
     Svg,
@@ -186,8 +186,12 @@ const PUA_END: u32 = 0xF8FF;
 #[derive(Debug, Clone)]
 pub struct GlyphRegistry {
     map: HashMap<String, char>,
+    bitmaps: HashMap<char, GlyphAtlasEntry>,
     next: u32,
 }
+
+/// Fixed side length (pixels) at which SVG glyphs are rasterised on registration.
+const SVG_REGISTRATION_SIZE: u32 = 32;
 
 impl GlyphRegistry {
     /// Creates an empty [`GlyphRegistry`].
@@ -195,6 +199,7 @@ impl GlyphRegistry {
     pub fn new() -> Self {
         Self {
             map: HashMap::new(),
+            bitmaps: HashMap::new(),
             next: PUA_START,
         }
     }
@@ -245,6 +250,62 @@ impl GlyphRegistry {
     /// Returns an iterator over all registered `(id, codepoint)` pairs.
     pub fn entries(&self) -> impl Iterator<Item = (&str, char)> {
         self.map.iter().map(|(k, &v)| (k.as_str(), v))
+    }
+
+    /// Registers `id`, rasterises its shape, and caches the resulting bitmap
+    /// keyed by the assigned PUA codepoint.
+    ///
+    /// The codepoint is assigned (or reused for an already-registered `id`)
+    /// exactly as in [`Self::register`].  The `data` bytes are rasterised
+    /// according to `format` ([`rasterize_svg`] for SVG, [`decode_png`] for
+    /// PNG) and the resulting [`GlyphAtlasEntry`] — with its `codepoint` field
+    /// set to the assigned codepoint — replaces any previously-stored bitmap.
+    ///
+    /// Rasterisation failure (undecodable PNG, zero-size SVG) leaves the
+    /// id→codepoint mapping in place with **no** bitmap, so [`Self::lookup`]
+    /// still resolves and the renderer falls back to plain text or tofu.
+    ///
+    /// Returns the assigned codepoint.
+    pub fn register_shape(&mut self, id: &str, format: GlyphFormat, data: &[u8]) -> char {
+        let cp = self.register(id);
+
+        let entry = match format {
+            GlyphFormat::Svg => {
+                rasterize_svg(data, SVG_REGISTRATION_SIZE).map(|pixels| GlyphAtlasEntry {
+                    codepoint: cp,
+                    pixels,
+                    width: SVG_REGISTRATION_SIZE,
+                    height: SVG_REGISTRATION_SIZE,
+                })
+            }
+            GlyphFormat::Png => decode_png(data).map(|mut entry| {
+                entry.codepoint = cp;
+                entry
+            }),
+        };
+
+        if let Some(entry) = entry {
+            self.bitmaps.insert(cp, entry);
+        } else {
+            tracing::warn!(
+                glyph_id = id,
+                "glyph rasterisation failed; keeping mapping without a bitmap"
+            );
+            // Drop any stale bitmap so a failed re-registration does not
+            // leave the previous shape resolving under this codepoint.
+            self.bitmaps.remove(&cp);
+        }
+
+        cp
+    }
+
+    /// Looks up the rasterised bitmap for a PUA codepoint.
+    ///
+    /// Returns `None` if no shape has been registered for `cp` (id-only
+    /// registration via [`Self::register`], or a rasterisation failure).
+    #[must_use]
+    pub fn bitmap(&self, cp: char) -> Option<&GlyphAtlasEntry> {
+        self.bitmaps.get(&cp)
     }
 }
 
@@ -442,6 +503,61 @@ pub fn fallback_text(glyph_id: &str) -> &'static str {
     }
 }
 
+// ─── Tier / status badge resolution ───────────────────────────────────────────
+
+/// Maps an execution-tier string to its built-in glyph ID.
+///
+/// Recognises `"local"`, `"fast"`, and `"deep"`; any other value returns
+/// `None`.
+#[must_use]
+pub fn glyph_id_for_tier(tier: &str) -> Option<&'static str> {
+    match tier {
+        "local" => Some("smedja.tier.local"),
+        "fast" => Some("smedja.tier.fast"),
+        "deep" => Some("smedja.tier.deep"),
+        _ => None,
+    }
+}
+
+/// Maps a status string to its built-in glyph ID.
+///
+/// Recognises `"ok"`, `"fail"`, and `"pending"`; any other value returns
+/// `None`.
+#[must_use]
+pub fn glyph_id_for_status(status: &str) -> Option<&'static str> {
+    match status {
+        "ok" => Some("smedja.status.ok"),
+        "fail" => Some("smedja.status.fail"),
+        "pending" => Some("smedja.status.pending"),
+        _ => None,
+    }
+}
+
+/// How a tier/status badge should be drawn after resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadgeRender {
+    /// Render the PUA codepoint by sampling its registered glyph bitmap.
+    Glyph(char),
+    /// Render the plain-text fallback label (APC unsupported or unregistered).
+    Text(&'static str),
+}
+
+/// Resolves a glyph `id` to either its PUA codepoint or a plain-text fallback.
+///
+/// Returns [`BadgeRender::Glyph`] with the registered codepoint when `term`
+/// supports APC sequences ([`supports_apc`]) **and** `id` is registered in
+/// `registry`; otherwise returns [`BadgeRender::Text`] with
+/// [`fallback_text(id)`](fallback_text).
+#[must_use]
+pub fn resolve_badge(registry: &GlyphRegistry, id: &str, term: &str) -> BadgeRender {
+    if supports_apc(term) {
+        if let Some(cp) = registry.lookup(id) {
+            return BadgeRender::Glyph(cp);
+        }
+    }
+    BadgeRender::Text(fallback_text(id))
+}
+
 // ─── Public API for smdjad ────────────────────────────────────────────────────
 
 /// Builds the APC byte sequences that `smdjad` emits on stdout to register
@@ -561,6 +677,123 @@ mod tests {
         let first = reg.register("same");
         let second = reg.register("same");
         assert_eq!(first, second);
+    }
+
+    // register_shape / bitmap tests
+
+    /// Builds a minimal valid 1×1 RGB PNG (no alpha) for rasterisation tests.
+    fn one_by_one_png() -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, 1, 1);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            writer
+                .write_image_data(&[0x12, 0x34, 0x56])
+                .expect("png data");
+        }
+        out
+    }
+
+    #[test]
+    fn register_shape_stores_bitmap_keyed_by_codepoint() {
+        let mut reg = GlyphRegistry::new();
+        let png = one_by_one_png();
+        let cp = reg.register_shape("test.png", GlyphFormat::Png, &png);
+        let entry = reg
+            .bitmap(cp)
+            .expect("registered PNG should have a stored bitmap");
+        assert_eq!(entry.codepoint, cp);
+        assert_eq!(entry.width, 1);
+        assert_eq!(entry.height, 1);
+    }
+
+    #[test]
+    fn register_shape_is_idempotent_and_replaces_bitmap() {
+        let mut reg = GlyphRegistry::new();
+        let png = one_by_one_png();
+        let first = reg.register_shape("dup", GlyphFormat::Png, &png);
+        // Re-register the same id with an SVG shape; codepoint must be stable.
+        let svg = br##"<svg fill="#ff0000"></svg>"##;
+        let second = reg.register_shape("dup", GlyphFormat::Svg, svg);
+        assert_eq!(first, second, "re-registering an id keeps its codepoint");
+        let entry = reg.bitmap(second).expect("bitmap should be present");
+        // The SVG rasterises to a 32×32 RGBA square, replacing the 1×1 PNG.
+        assert_eq!(entry.width, 32);
+        assert_eq!(entry.height, 32);
+    }
+
+    #[test]
+    fn register_shape_rasterise_failure_keeps_mapping_without_bitmap() {
+        let mut reg = GlyphRegistry::new();
+        let cp = reg.register_shape("bad.png", GlyphFormat::Png, b"not a png");
+        assert_eq!(
+            reg.lookup("bad.png"),
+            Some(cp),
+            "mapping must survive rasterisation failure"
+        );
+        assert!(
+            reg.bitmap(cp).is_none(),
+            "undecodable PNG must leave no bitmap"
+        );
+    }
+
+    // glyph_id_for_* helper tests
+
+    #[test]
+    fn glyph_id_for_tier_maps_known_tiers() {
+        assert_eq!(glyph_id_for_tier("local"), Some("smedja.tier.local"));
+        assert_eq!(glyph_id_for_tier("fast"), Some("smedja.tier.fast"));
+        assert_eq!(glyph_id_for_tier("deep"), Some("smedja.tier.deep"));
+    }
+
+    #[test]
+    fn glyph_id_for_status_maps_known_statuses() {
+        assert_eq!(glyph_id_for_status("ok"), Some("smedja.status.ok"));
+        assert_eq!(glyph_id_for_status("fail"), Some("smedja.status.fail"));
+        assert_eq!(
+            glyph_id_for_status("pending"),
+            Some("smedja.status.pending")
+        );
+    }
+
+    #[test]
+    fn glyph_id_for_unknown_returns_none() {
+        assert_eq!(glyph_id_for_tier("cloud"), None);
+        assert_eq!(glyph_id_for_status("unknown"), None);
+    }
+
+    #[test]
+    fn badge_resolves_to_codepoint_when_registered_and_apc_supported() {
+        let mut reg = GlyphRegistry::new();
+        register_builtin_glyphs(&mut reg);
+        let resolved = resolve_badge(&reg, "smedja.tier.deep", "xterm-wezterm");
+        assert_eq!(
+            resolved,
+            BadgeRender::Glyph(reg.lookup("smedja.tier.deep").expect("deep registered"))
+        );
+    }
+
+    #[test]
+    fn badge_falls_back_to_text_when_apc_unsupported() {
+        let mut reg = GlyphRegistry::new();
+        register_builtin_glyphs(&mut reg);
+        let resolved = resolve_badge(&reg, "smedja.tier.deep", "xterm-256color");
+        assert_eq!(
+            resolved,
+            BadgeRender::Text(fallback_text("smedja.tier.deep"))
+        );
+    }
+
+    #[test]
+    fn badge_falls_back_to_text_when_unregistered() {
+        let reg = GlyphRegistry::new(); // no built-ins registered
+        let resolved = resolve_badge(&reg, "smedja.tier.deep", "xterm-wezterm");
+        assert_eq!(
+            resolved,
+            BadgeRender::Text(fallback_text("smedja.tier.deep"))
+        );
     }
 
     // Built-in glyphs test

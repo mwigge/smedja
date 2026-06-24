@@ -1293,8 +1293,13 @@ impl PtySession {
                             if let Some(payload) = apc_scanner.advance(byte) {
                                 if let Some(reg) = st_glyph::parse_glyph_registration(&payload) {
                                     let mut registry = handler.glyph_registry.lock();
-                                    registry.register(&reg.id);
-                                    debug!(glyph_id = %reg.id, "registered glyph via APC");
+                                    let cp =
+                                        registry.register_shape(&reg.id, reg.format, &reg.data);
+                                    if registry.bitmap(cp).is_some() {
+                                        debug!(glyph_id = %reg.id, "registered glyph via APC");
+                                    } else {
+                                        warn!(glyph_id = %reg.id, "glyph registered without a bitmap (rasterisation failed)");
+                                    }
                                 }
                             }
                             parser.advance(&mut handler, byte);
@@ -1348,8 +1353,13 @@ impl PtySession {
                             if let Some(payload) = apc_scanner.advance(byte) {
                                 if let Some(reg) = st_glyph::parse_glyph_registration(&payload) {
                                     let mut registry = handler.glyph_registry.lock();
-                                    registry.register(&reg.id);
-                                    debug!(glyph_id = %reg.id, "registered glyph via APC");
+                                    let cp =
+                                        registry.register_shape(&reg.id, reg.format, &reg.data);
+                                    if registry.bitmap(cp).is_some() {
+                                        debug!(glyph_id = %reg.id, "registered glyph via APC");
+                                    } else {
+                                        warn!(glyph_id = %reg.id, "glyph registered without a bitmap (rasterisation failed)");
+                                    }
                                 }
                             }
                             parser.advance(&mut handler, byte);
@@ -1997,6 +2007,42 @@ mod tests {
         assert!(
             registry.lock().lookup("test.icon").is_some(),
             "test.icon should be in the registry after APC registration"
+        );
+    }
+
+    #[test]
+    fn glyph_registration_via_apc_rasterises_and_stores_bitmap() {
+        // Hardcoded base64 of a 1×1 RGB PNG so register_shape can decode it to a
+        // bitmap without adding base64/png as a dev-dependency.
+        const PNG_B64: &str =
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGMQUDAAAACkAGE0Zn1yAAAAAElFTkSuQmCC";
+
+        let mut apc_seq = Vec::new();
+        apc_seq.extend_from_slice(b"\x1b_");
+        apc_seq.extend_from_slice(
+            format!("SMEDJA_GLYPH;id=test.png;format=png;data={PNG_B64}").as_bytes(),
+        );
+        apc_seq.extend_from_slice(b"\x1b\\");
+
+        let registry = Arc::new(Mutex::new(st_glyph::GlyphRegistry::new()));
+        let mut scanner = ApcScanner::new();
+
+        for &byte in &apc_seq {
+            if let Some(payload) = scanner.advance(byte) {
+                if let Some(reg) = st_glyph::parse_glyph_registration(&payload) {
+                    let mut r = registry.lock();
+                    r.register_shape(&reg.id, reg.format, &reg.data);
+                }
+            }
+        }
+
+        let r = registry.lock();
+        let cp = r
+            .lookup("test.png")
+            .expect("test.png should be registered after APC registration");
+        assert!(
+            r.bitmap(cp).is_some(),
+            "registered PNG should have a rasterised bitmap keyed by its codepoint"
         );
     }
 
