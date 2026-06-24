@@ -13,6 +13,8 @@ use smedja_memory::{estimate_tokens, ColdResult, ColdStore};
 use smedja_vault::Vault;
 use tokio::sync::Mutex;
 
+use crate::embedder_port::Embedder;
+
 /// Minimum relevance score a vault result must clear to be surfaced as cold
 /// context. Hybrid scores below this floor are treated as noise and dropped.
 pub(crate) const MIN_COLD_SCORE: f32 = 0.05;
@@ -25,15 +27,19 @@ pub(crate) const MIN_COLD_SCORE: f32 = 0.05;
 /// [`ColdResult`].
 pub(crate) struct VaultColdStore {
     vault: Arc<Mutex<Vault>>,
+    /// Resolved embedding backend; embeds the query and tags the comparison
+    /// space (`model_id`/`dim`) so only same-model rows are ranked.
+    embedder: Arc<dyn Embedder>,
     /// Minimum score a result must clear to be returned.
     min_score: f32,
 }
 
 impl VaultColdStore {
-    /// Creates an adapter over `vault` using the default score floor.
-    pub(crate) fn new(vault: Arc<Mutex<Vault>>) -> Self {
+    /// Creates an adapter over `vault` and `embedder` using the default score floor.
+    pub(crate) fn new(vault: Arc<Mutex<Vault>>, embedder: Arc<dyn Embedder>) -> Self {
         Self {
             vault,
+            embedder,
             min_score: MIN_COLD_SCORE,
         }
     }
@@ -47,12 +53,17 @@ impl ColdStore for VaultColdStore {
         let vault = Arc::clone(&self.vault);
         let min_score = self.min_score;
 
+        // Embed on the async path (the learned backend does network I/O here,
+        // degrading to FNV on failure) before the synchronous vault work.
+        let query_vec = self.embedder.embed_query(&query).await;
+        let model_id = self.embedder.model_id().to_owned();
+        let dim = self.embedder.dim();
+
         // `Vault` is synchronous and acquiring its mutex via `blocking_lock`
         // would stall the async executor, so run the whole search off-runtime.
         let join = tokio::task::spawn_blocking(move || {
-            let query_vec = crate::embedder::embed(&query);
             let guard = vault.blocking_lock();
-            match guard.search(&query_vec, &query, &namespace, k) {
+            match guard.search(&query_vec, &query, &namespace, k, &model_id, dim) {
                 Ok(entries) => entries
                     .into_iter()
                     .filter_map(|e| {
@@ -138,6 +149,11 @@ mod tests {
     use super::*;
     use smedja_vault::VaultEntry;
 
+    /// Default FNV embedder for the cold-store adapter tests.
+    fn test_embedder() -> Arc<dyn Embedder> {
+        Arc::new(crate::embedder_port::FnvEmbedder::new())
+    }
+
     fn insert(vault: &mut Vault, id: &str, content: &str, namespace: &str) {
         let embedding = crate::embedder::embed(content);
         let entry = VaultEntry {
@@ -151,6 +167,8 @@ mod tests {
             chunk_index: None,
             parent_id: None,
             created_at: 0.0,
+            embedder_model_id: smedja_vault::LEGACY_MODEL_ID.to_owned(),
+            dim: crate::embedder::DIM,
         };
         vault.upsert(&entry).expect("upsert must succeed");
     }
@@ -170,7 +188,7 @@ mod tests {
             "rust async tokio runtime executor scheduling tasks futures",
             "compact",
         );
-        let adapter = VaultColdStore::new(Arc::new(Mutex::new(vault)));
+        let adapter = VaultColdStore::new(Arc::new(Mutex::new(vault)), test_embedder());
 
         let results = adapter
             .retrieve("rust async tokio runtime", "compact", 5)
@@ -190,7 +208,7 @@ mod tests {
     #[tokio::test]
     async fn vault_cold_store_returns_empty_when_no_match() {
         let vault = Vault::open_in_memory().expect("in-memory vault must open");
-        let adapter = VaultColdStore::new(Arc::new(Mutex::new(vault)));
+        let adapter = VaultColdStore::new(Arc::new(Mutex::new(vault)), test_embedder());
         let results = adapter.retrieve("anything", "compact", 5).await;
         assert!(results.is_empty());
     }
@@ -212,7 +230,10 @@ mod tests {
                 "compact",
             );
         }
-        let adapter = Arc::new(VaultColdStore::new(Arc::new(Mutex::new(vault))));
+        let adapter = Arc::new(VaultColdStore::new(
+            Arc::new(Mutex::new(vault)),
+            test_embedder(),
+        ));
 
         // Tiny tier budget so the cap is exercised: only a fraction admits.
         let budget_tokens = 200usize;
@@ -283,7 +304,7 @@ mod tests {
             "python django orm migrations templating",
             "compact",
         );
-        let adapter = VaultColdStore::new(Arc::new(Mutex::new(vault)));
+        let adapter = VaultColdStore::new(Arc::new(Mutex::new(vault)), test_embedder());
         let results = adapter
             .retrieve("rust async tokio runtime", "compact", 5)
             .await;

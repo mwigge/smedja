@@ -31,6 +31,8 @@ pub struct AcpState {
     pub workspace: std::path::PathBuf,
     /// Vector store shared with MCP server-mode tool dispatch.
     pub vault: Arc<Mutex<Vault>>,
+    /// Embedding backend shared with MCP server-mode tool dispatch.
+    pub embedder: Arc<dyn crate::embedder_port::Embedder>,
 }
 
 /// Builds the ACP router with auth middleware applied to every route.
@@ -94,7 +96,8 @@ async fn mcp_server_endpoint(
     Json(request): Json<smedja_rpc::Request>,
 ) -> impl IntoResponse {
     let response =
-        crate::mcp_server::handle_request(&request, &s.workspace, &s.ingot, &s.vault).await;
+        crate::mcp_server::handle_request(&request, &s.workspace, &s.ingot, &s.vault, &s.embedder)
+            .await;
     Json(response)
 }
 
@@ -308,6 +311,7 @@ mod tests {
             vault: Arc::new(tokio::sync::Mutex::new(
                 smedja_vault::Vault::open_in_memory().expect("in-memory vault"),
             )),
+            embedder: Arc::new(crate::embedder_port::FnvEmbedder::new()),
         }
     }
 

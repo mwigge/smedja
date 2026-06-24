@@ -183,6 +183,7 @@ pub(crate) async fn build_seed(
     workspace: &Path,
     ingot: &IngotHandle,
     vault: &Arc<Mutex<Vault>>,
+    embedder: &Arc<dyn crate::embedder_port::Embedder>,
 ) -> Result<String, RpcError> {
     match scope {
         AuditScope::Diff => {
@@ -202,7 +203,7 @@ pub(crate) async fn build_seed(
                 "Pull-request diff for {reference} (git diff {range}):\n\n{diff}"
             ))
         }
-        AuditScope::Path { root } => build_path_seed(root, workspace, ingot, vault).await,
+        AuditScope::Path { root } => build_path_seed(root, workspace, ingot, vault, embedder).await,
     }
 }
 
@@ -212,14 +213,33 @@ async fn build_path_seed(
     workspace: &Path,
     ingot: &IngotHandle,
     vault: &Arc<Mutex<Vault>>,
+    embedder: &Arc<dyn crate::embedder_port::Embedder>,
 ) -> Result<String, RpcError> {
     // A broad symbol query surfaces the repository's public surface. The graph
     // tool is read-only and returns an empty set when no graph is indexed.
     let graph_input = json!({ "query": root, "depth": 1 }).to_string();
-    let symbols = execute_tool("graph_query", &graph_input, workspace, None, ingot, vault).await;
+    let symbols = execute_tool(
+        "graph_query",
+        &graph_input,
+        workspace,
+        None,
+        ingot,
+        vault,
+        embedder,
+    )
+    .await;
 
     let list_input = json!({ "path": root }).to_string();
-    let tree = execute_tool("list_files", &list_input, workspace, None, ingot, vault).await;
+    let tree = execute_tool(
+        "list_files",
+        &list_input,
+        workspace,
+        None,
+        ingot,
+        vault,
+        embedder,
+    )
+    .await;
 
     Ok(format!(
         "Path/repository audit scope: {root}\n\n\
@@ -574,6 +594,7 @@ fn audit_system_prompt() -> String {
 /// # Errors
 ///
 /// Returns an [`RpcError`] when a review turn fails.
+#[allow(clippy::too_many_arguments)] // forwards the read-only audit tool-loop dependencies
 pub(crate) async fn run_audit_loop<R: ReviewTurn>(
     runner: &R,
     seed: &str,
@@ -581,6 +602,7 @@ pub(crate) async fn run_audit_loop<R: ReviewTurn>(
     session: &Session,
     ingot: &IngotHandle,
     vault: &Arc<Mutex<Vault>>,
+    embedder: &Arc<dyn crate::embedder_port::Embedder>,
     budget: &LoopBudget,
 ) -> Result<Vec<AuditFinding>, RpcError> {
     debug_assert_eq!(
@@ -630,6 +652,7 @@ pub(crate) async fn run_audit_loop<R: ReviewTurn>(
                 Some(session),
                 ingot,
                 vault,
+                embedder,
             )
             .await
         } else {
@@ -737,7 +760,14 @@ impl ReviewTurn for ProviderReviewTurn {
 pub(crate) async fn run(state: HandlerState, params: Value) -> Result<Value, RpcError> {
     let workspace = resolve_workspace(&params);
     let scope = resolve_scope(&params);
-    let seed = build_seed(&scope, &workspace, &state.ingot, &state.vault).await?;
+    let seed = build_seed(
+        &scope,
+        &workspace,
+        &state.ingot,
+        &state.vault,
+        &state.embedder,
+    )
+    .await?;
 
     // A read-only review-mode session is the second read-only guarantee.
     let session_id = Uuid::new_v4();
@@ -786,6 +816,7 @@ pub(crate) async fn run(state: HandlerState, params: Value) -> Result<Value, Rpc
         &session,
         &state.ingot,
         &state.vault,
+        &state.embedder,
         &budget,
     )
     .await?;
@@ -866,6 +897,10 @@ mod tests {
 
     fn vault() -> Arc<Mutex<Vault>> {
         Arc::new(Mutex::new(Vault::open_in_memory().unwrap()))
+    }
+
+    fn embedder() -> Arc<dyn crate::embedder_port::Embedder> {
+        Arc::new(crate::embedder_port::FnvEmbedder::new())
     }
 
     fn review_session() -> Session {
@@ -960,9 +995,15 @@ mod tests {
     #[tokio::test]
     async fn diff_scope_seeds_from_unified_diff() {
         let repo = git_repo_with_change();
-        let seed = build_seed(&AuditScope::Diff, repo.path(), &ingot(), &vault())
-            .await
-            .unwrap();
+        let seed = build_seed(
+            &AuditScope::Diff,
+            repo.path(),
+            &ingot(),
+            &vault(),
+            &embedder(),
+        )
+        .await
+        .unwrap();
         assert!(!seed.trim().is_empty(), "seed must be non-empty");
         assert!(seed.contains("two"), "seed must contain the diff body");
     }
@@ -977,6 +1018,7 @@ mod tests {
             repo.path(),
             &ingot(),
             &vault(),
+            &embedder(),
         )
         .await
         .unwrap();
@@ -995,6 +1037,7 @@ mod tests {
             repo.path(),
             &ingot(),
             &vault(),
+            &embedder(),
         )
         .await;
         assert!(result.is_err(), "empty PR ref must error");
@@ -1236,6 +1279,7 @@ mod tests {
             &session,
             &ingot(),
             &vault(),
+            &embedder(),
             &LoopBudget::default(),
         )
         .await
@@ -1270,6 +1314,7 @@ mod tests {
             &session,
             &ingot(),
             &vault(),
+            &embedder(),
             &LoopBudget::default(),
         )
         .await
@@ -1303,6 +1348,7 @@ mod tests {
             &session,
             &ingot(),
             &vault(),
+            &embedder(),
             &budget,
         )
         .await
@@ -1404,6 +1450,7 @@ mod tests {
             &session,
             &ig,
             &vault(),
+            &embedder(),
             &LoopBudget::default(),
         )
         .await

@@ -109,6 +109,7 @@ pub(crate) struct TurnOrchestrator {
     assayer: Arc<Assayer>,
     price_table: Arc<PriceTable>,
     vault: Arc<Mutex<Vault>>,
+    embedder: Arc<dyn crate::embedder_port::Embedder>,
     provider_sessions: ProviderSessions,
     cache_aligners: CacheAligners,
 }
@@ -123,6 +124,7 @@ impl TurnOrchestrator {
         assayer: Arc<Assayer>,
         price_table: Arc<PriceTable>,
         vault: Arc<Mutex<Vault>>,
+        embedder: Arc<dyn crate::embedder_port::Embedder>,
         provider_sessions: ProviderSessions,
         cache_aligners: CacheAligners,
     ) -> Self {
@@ -134,6 +136,7 @@ impl TurnOrchestrator {
             assayer,
             price_table,
             vault,
+            embedder,
             provider_sessions,
             cache_aligners,
         }
@@ -165,6 +168,7 @@ impl TurnOrchestrator {
         let assayer = &self.assayer;
         let price_table = &self.price_table;
         let vault = &self.vault;
+        let embedder = &self.embedder;
         let provider_sessions = &self.provider_sessions;
         let cache_aligners = &self.cache_aligners;
 
@@ -484,7 +488,7 @@ impl TurnOrchestrator {
         // 4. Assemble the stable prefix (the user turn plus auto-injected graph
         //    symbols) into working memory, then seal it so the prefix survives
         //    the tool loop unchanged and drives the provider KV-cache hint.
-        let cold_adapter = Arc::new(VaultColdStore::new(Arc::clone(vault)));
+        let cold_adapter = Arc::new(VaultColdStore::new(Arc::clone(vault), Arc::clone(embedder)));
         let mut mem = WorkingMemory::new(budget_tokens).with_cold_store(cold_adapter);
         mem.set_strata(strata);
         // Cold recall scales with tier depth: fast favours latency (k=1), deep
@@ -932,6 +936,7 @@ impl TurnOrchestrator {
                             session.as_ref(),
                             ingot,
                             vault,
+                            embedder,
                         )
                         .await;
                         tool_span.set_attribute(KeyValue::new(
@@ -1457,6 +1462,7 @@ mod tests {
             Arc::new(Mutex::new(
                 Vault::open_in_memory().expect("in-memory Vault must open"),
             )),
+            Arc::new(crate::embedder_port::FnvEmbedder::new()),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
         )
@@ -1753,6 +1759,7 @@ mod tests {
             assayer,
             price_table,
             vault,
+            Arc::new(crate::embedder_port::FnvEmbedder::new()),
             provider_sessions,
             cache_aligners,
         );
