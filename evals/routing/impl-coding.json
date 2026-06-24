@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "id": "impl-coding",
+  "description": "Impl at coding complexity routes to local/local",
+  "kind": "routing",
+  "input": { "role": "impl", "complexity": "coding" },
+  "expectation": { "runner": "local", "tier": "local" }
+}

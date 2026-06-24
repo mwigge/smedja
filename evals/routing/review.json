@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "id": "review-coding",
+  "description": "Review role routes to claude/deep at any complexity",
+  "kind": "routing",
+  "input": { "role": "review", "complexity": "coding" },
+  "expectation": { "runner": "claude", "tier": "deep" }
+}

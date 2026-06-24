@@ -1,0 +1,12 @@
+# Agent eval suite — graded loop/agent outcomes.
+#
+# Agent cases are driven through an injected loop driver and scored with a
+# deterministic predicate over the loop outcome and/or a rubric judged by an
+# injected LLM judge. They are non-deterministic and may incur model cost, so
+# this suite is NOT part of the default CI gate; run it explicitly.
+#
+# Under SMEDJA_EVAL_OFFLINE=1 the rubric and live-driver cases are skipped while
+# deterministic cases against an offline driver still run and score.
+
+name = "agent"
+pass_threshold = 1.0
