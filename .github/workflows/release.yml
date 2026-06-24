@@ -43,13 +43,16 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Refuse to publish a tag whose PKGBUILD still skips checksum verification.
-      - name: guard PKGBUILD checksums
+      # Warn (don't block) when the PKGBUILD still skips checksum verification.
+      # The .deb/.rpm/.dmg/tarball artifacts do not depend on PKGBUILD checksums;
+      # only the AUR package does, and that is updated manually post-release with
+      # `updpkgsums` (the checksums can only be computed once these artifacts are
+      # published — a first-release bootstrap). So this is advisory, not a gate.
+      - name: warn on PKGBUILD SKIP checksums
         if: runner.os == 'Linux'
         run: |
           if grep -qE "^sha256sums_(x86_64|aarch64)=\('SKIP'\)" assets/PKGBUILD; then
-            echo "::error::assets/PKGBUILD still has SKIP checksums — run updpkgsums before tagging a release" >&2
-            exit 1
+            echo "::warning::assets/PKGBUILD has SKIP checksums — run updpkgsums against this release before pushing to the AUR" >&2
           fi
 
       - name: install linux deps
