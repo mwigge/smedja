@@ -10,6 +10,8 @@ pub mod local_provider;
 pub mod loop_runner;
 pub mod mcp_http;
 pub mod mcp_oauth;
+pub mod mcp_server;
+pub mod mcp_stdio;
 pub mod methodology_gate;
 pub mod orchestrator;
 pub mod price_table;
@@ -1147,6 +1149,8 @@ async fn main() -> anyhow::Result<()> {
                 ingot: ingot.clone(),
                 dispatcher: Arc::clone(&dispatcher),
                 auth_token: acp_token,
+                workspace: workspace_root.clone(),
+                vault: Arc::clone(&vault),
             };
             let acp_router = acp::build_acp_router(acp_state);
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
