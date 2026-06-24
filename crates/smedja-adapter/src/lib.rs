@@ -53,7 +53,7 @@ pub use crush::{
     code_compressor, command_compressor, compress_command_output, compress_tool_result,
     smart_crusher, trim_code_block, ContentPipeline, Transform,
 };
-pub use error::AdapterError;
+pub use error::{classify_http_error, AdapterError};
 pub use gemini::GeminiProvider;
 pub use local::{LocalCapability, LocalProvider};
 pub use openai::OpenAiProvider;
