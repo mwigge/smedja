@@ -486,6 +486,8 @@ impl ApplicationHandler<UserEvent> for App {
                         output_tokens,
                         latency_ms,
                         traceparent,
+                        tokens_saved,
+                        efficiency_ratio,
                     ) = {
                         // Non-blocking try_read: if the lock is contended (agent
                         // event writing) skip the update this frame.
@@ -498,9 +500,11 @@ impl ApplicationHandler<UserEvent> for App {
                                 s.last_output_tokens,
                                 s.last_latency_ms,
                                 s.last_traceparent.clone(),
+                                s.tokens_saved,
+                                s.efficiency_ratio,
                             )
                         } else {
-                            (None, None, None, None, None, None, None)
+                            (None, None, None, None, None, None, None, None, None)
                         }
                     };
 
@@ -543,6 +547,8 @@ impl ApplicationHandler<UserEvent> for App {
                         session_id: Some(self.pane_id.clone()),
                         cwd,
                         interface: Some("tui".to_owned()),
+                        tokens_saved,
+                        efficiency_ratio,
                     };
 
                     let git_branch_disabled = self
@@ -558,6 +564,7 @@ impl ApplicationHandler<UserEvent> for App {
                         Box::new(st_statusbar::TierModule),
                         Box::new(st_statusbar::ModelModule),
                         Box::new(st_statusbar::TokensModule),
+                        Box::new(st_statusbar::EfficiencyModule),
                         Box::new(st_statusbar::LatencyModule),
                         Box::new(st_statusbar::TraceModule),
                         Box::new(st_statusbar::ExitCodeModule),
@@ -1011,17 +1018,11 @@ fn spawn_agent_bridge(state: SharedPaneState, agent_manager: SharedAgentManager,
                             s.is_agent_turn = true;
                             current_turn_id = turn_id;
                         }
-                        st_agent::PaneEvent::TurnEnd {
-                            input_tokens,
-                            output_tokens,
-                            latency_ms,
-                            traceparent,
-                        } => {
-                            s.is_agent_turn = false;
-                            s.last_input_tokens = Some(input_tokens);
-                            s.last_output_tokens = Some(output_tokens);
-                            s.last_latency_ms = Some(latency_ms);
-                            s.last_traceparent = traceparent;
+                        ref turn_end @ st_agent::PaneEvent::TurnEnd { .. } => {
+                            // Accumulate token/latency counters and the cumulative
+                            // token-economy figures into pane state (logic lives in
+                            // st-agent so it stays unit-testable without a GPU).
+                            s.apply_turn_end(turn_end);
                             // Mark the session done.
                             if !current_turn_id.is_empty() {
                                 let mut mgr = agent_manager

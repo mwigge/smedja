@@ -245,6 +245,10 @@ struct AppState {
     metrics_view_visible: bool,
     /// Cached per-runner metrics snapshot for the latest rollup window.
     metrics_snapshot: Vec<metrics_view::MetricsRow>,
+    /// Cached token-economy savings snapshot for the latest rollup window.
+    savings_snapshot: metrics_view::SavingsSnapshot,
+    /// Timestamp of the last `savings.summary` poll.
+    last_savings_poll: Option<std::time::Instant>,
     /// Cumulative tokens used so far in this session (input + output).
     context_used: u64,
     /// Context window size in tokens for the active model.
@@ -2667,9 +2671,12 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     // split; it draws from the cached snapshot, never fetching on the hot path.
     if state.metrics_view_visible {
         let width = metrics_view::MetricsView::WIDTH.min(body_area.width);
-        let height = u16::try_from(state.metrics_snapshot.len() + 1)
+        let view = metrics_view::MetricsView::with_savings(
+            state.metrics_snapshot.clone(),
+            state.savings_snapshot.clone(),
+        );
+        let height = u16::try_from(view.lines().len())
             .unwrap_or(u16::MAX)
-            .saturating_add(1)
             .min(body_area.height);
         if width > 0 && height > 0 {
             let metrics_rect = ratatui::layout::Rect::new(
@@ -2678,7 +2685,6 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
                 width,
                 height,
             );
-            let view = metrics_view::MetricsView::new(state.metrics_snapshot.clone());
             frame.render_widget(ratatui::widgets::Clear, metrics_rect);
             frame.render_widget(view, metrics_rect);
         }
@@ -2885,6 +2891,8 @@ async fn main() -> Result<()> {
         context_rail_visible: true,
         metrics_view_visible: false,
         metrics_snapshot: Vec::new(),
+        savings_snapshot: metrics_view::SavingsSnapshot::default(),
+        last_savings_poll: None,
         context_used: 0,
         context_window: 200_000,
         main_panel: main_panel::MainPanel::new(),
@@ -3267,6 +3275,32 @@ async fn main() -> Result<()> {
                     state.pending_cowork.iter().map(|i| i.id.clone()).collect();
                 parsed.retain(|i| !existing_ids.contains(&i.id));
                 state.pending_cowork.extend(parsed);
+            }
+        }
+
+        // Minimal savings.summary fetch on the metrics panel's visible path.
+        // metrics-live-fetch is not yet applied, so the panel has no poll loop;
+        // this keeps the savings section populated on a coarse 2 s cadence and is
+        // intentionally small so metrics-live-fetch can later converge the
+        // cadence with the per-runner metrics fetch.
+        let should_poll_savings = state
+            .last_savings_poll
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(2));
+        if state.metrics_view_visible && should_poll_savings {
+            state.last_savings_poll = Some(std::time::Instant::now());
+            // Daily tier over the last 7 days, matching `smj savings` defaults.
+            let now_micros = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0i64, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX));
+            let since_micros = now_micros.saturating_sub(7 * 86_400 * 1_000_000);
+            if let Ok(resp) = client
+                .call(
+                    "savings.summary",
+                    json!({ "tier": "daily", "since": since_micros }),
+                )
+                .await
+            {
+                state.savings_snapshot = metrics_view::savings_snapshot_from_json(&resp);
             }
         }
 
@@ -4029,6 +4063,8 @@ mod tests {
             context_rail_visible: true,
             metrics_view_visible: false,
             metrics_snapshot: Vec::new(),
+            savings_snapshot: metrics_view::SavingsSnapshot::default(),
+            last_savings_poll: None,
             context_used: 0,
             context_window: 200_000,
             main_panel: main_panel::MainPanel::new(),

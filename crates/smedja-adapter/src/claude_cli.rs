@@ -199,9 +199,16 @@ fn parse_usage(usage: &serde_json::Value) -> Delta {
         .and_then(serde_json::Value::as_u64)
         .and_then(|n| u32::try_from(n).ok())
         .unwrap_or(0);
+    // The Claude CLI surfaces cache reads as `cache_read_input_tokens`.
+    let cache_read_tokens = usage
+        .get("cache_read_input_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0);
     Delta::Usage {
         input_tokens,
         output_tokens,
+        cache_read_tokens,
     }
 }
 
@@ -300,6 +307,20 @@ mod tests {
             Some(Delta::Usage {
                 input_tokens: 7,
                 output_tokens: 11,
+                cache_read_tokens: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_line_extracts_cache_read_tokens() {
+        let line = r#"{"type":"result","usage":{"input_tokens":7,"output_tokens":11,"cache_read_input_tokens":900}}"#;
+        assert_eq!(
+            parse_line(line),
+            Some(Delta::Usage {
+                input_tokens: 7,
+                output_tokens: 11,
+                cache_read_tokens: 900,
             })
         );
     }

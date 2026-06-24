@@ -155,7 +155,7 @@ pub(crate) async fn compact(state: HandlerState, params: Value) -> Result<Value,
     // subscriber here (the summary is captured from drain_stream's return value),
     // so a single-slot broadcast channel is sufficient and intentional.
     let dispatcher = Dispatcher::new(1);
-    let (summary, _, _, _) =
+    let (summary, _, _, _, _) =
         crate::common::drain_stream(stream, &dispatcher, None, &CorrelationCtx::default())
             .await
             .map_err(|e| RpcError::new(codes::INTERNAL_ERROR, format!("compaction failed: {e}")))?;

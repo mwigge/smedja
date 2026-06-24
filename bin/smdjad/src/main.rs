@@ -572,6 +572,13 @@ fn build_router(
         async move { handlers::metrics::summary(state, params).await }
     });
 
+    // ── savings.summary ───────────────────────────────────────────────────────
+    let savings_state = state.clone();
+    router.register("savings.summary", move |params: Value| {
+        let state = savings_state.clone();
+        async move { handlers::savings::summary(state, params).await }
+    });
+
     // ── session.set_model ────────────────────────────────────────────────────
     let set_model_state = state.clone();
     router.register("session.set_model", move |params: Value| {
@@ -1251,8 +1258,9 @@ async fn main() -> anyhow::Result<()> {
             }
             info!(path = %agent_sock_path.display(), "agent event server listening");
             let dp = Arc::clone(&dispatcher);
+            let agent_ingot = ingot.clone();
             tokio::spawn(async move {
-                agent_server::serve(agent_listener, dp).await;
+                agent_server::serve(agent_listener, dp, agent_ingot).await;
             });
         }
         Err(e) => {

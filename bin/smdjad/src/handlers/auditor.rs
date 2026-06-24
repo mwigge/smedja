@@ -704,7 +704,7 @@ impl ReviewTurn for ProviderReviewTurn {
             )
             .await;
             match drained {
-                Ok(Ok((text, input_tokens, output_tokens, _session))) => {
+                Ok(Ok((text, input_tokens, output_tokens, _cache_read, _session))) => {
                     return Ok(TurnOutput {
                         text,
                         input_tokens: u64::from(input_tokens),

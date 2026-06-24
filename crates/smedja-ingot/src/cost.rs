@@ -63,6 +63,10 @@ pub struct TokensSavedEntry {
     pub command: String,
     /// Estimated tokens saved by filtering (clamped at ≥ 0 by the caller).
     pub tokens_saved: i64,
+    /// The saver that produced this row: `filter`, `crusher`, `cold-context`,
+    /// `cache`, `lean-spec`, … Cache savings are provider-reported "input not
+    /// re-paid" and are kept categorically distinct from compression savings.
+    pub source: String,
     /// Timestamp when the entry was recorded (micros since the Unix epoch).
     pub created_at: Timestamp,
 }
@@ -176,14 +180,15 @@ pub(crate) fn insert_tokens_saved(
 ) -> Result<(), IngotError> {
     conn.execute(
         "INSERT INTO tokens_saved_ledger \
-         (id, session_id, turn_n, command, tokens_saved, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+         (id, session_id, turn_n, command, tokens_saved, source, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
             entry.id.to_string(),
             entry.session_id,
             entry.turn_n,
             entry.command,
             entry.tokens_saved,
+            entry.source,
             entry.created_at.as_micros(),
         ],
     )?;
@@ -208,6 +213,35 @@ pub(crate) fn session_tokens_saved(
         |row| row.get(0),
     )?;
     Ok(total)
+}
+
+/// Returns the sum of `tokens_saved` grouped by `source` for `session_id`,
+/// ordered by `source`.
+///
+/// Each tuple is `(source, summed_tokens_saved)`. This is read from the
+/// dedicated `tokens_saved_ledger`, never the billed `cost_ledger`, so cache
+/// savings (`source = 'cache'`) stay distinct from compression savings.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the query fails.
+pub(crate) fn session_tokens_saved_by_source(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Vec<(String, i64)>, IngotError> {
+    let mut stmt = conn.prepare(
+        "SELECT source, COALESCE(SUM(tokens_saved), 0) AS saved \
+         FROM tokens_saved_ledger \
+         WHERE session_id = ?1 \
+         GROUP BY source \
+         ORDER BY source",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -372,12 +406,22 @@ mod tests {
     // ── tokens-saved ledger (output-filters) ──────────────────────────────────
 
     fn make_saved(session_id: &str, command: &str, tokens_saved: i64) -> TokensSavedEntry {
+        make_saved_with(session_id, command, tokens_saved, "filter")
+    }
+
+    fn make_saved_with(
+        session_id: &str,
+        command: &str,
+        tokens_saved: i64,
+        source: &str,
+    ) -> TokensSavedEntry {
         TokensSavedEntry {
             id: Uuid::new_v4(),
             session_id: session_id.to_string(),
             turn_n: 0,
             command: command.to_string(),
             tokens_saved,
+            source: source.to_string(),
             created_at: Timestamp::from_secs_f64(1_700_000_000.0),
         }
     }
@@ -425,5 +469,74 @@ mod tests {
     fn tokens_saved_with_no_entries_returns_zero() {
         let ingot = Ingot::open_in_memory().unwrap();
         assert_eq!(ingot.session_tokens_saved("none").unwrap(), 0);
+    }
+
+    #[test]
+    fn fresh_db_has_source_column_not_null() {
+        // Migration 24 adds a NOT NULL `source` column to tokens_saved_ledger.
+        let ingot = Ingot::open_in_memory().unwrap();
+        let (name, notnull): (String, i64) = ingot
+            .conn
+            .query_row(
+                "SELECT name, \"notnull\" FROM pragma_table_info('tokens_saved_ledger') \
+                 WHERE name = 'source'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "source");
+        assert_eq!(notnull, 1, "source column must be NOT NULL");
+    }
+
+    #[test]
+    fn legacy_row_backfills_to_filter_source() {
+        // A row written through the column-list INSERT (omitting `source`) lands
+        // on the DEFAULT 'filter', matching how migration 24 backfills history.
+        let ingot = Ingot::open_in_memory().unwrap();
+        ingot
+            .conn
+            .execute(
+                "INSERT INTO tokens_saved_ledger \
+                 (id, session_id, turn_n, command, tokens_saved, created_at) \
+                 VALUES ('legacy-1', 's-legacy', 0, 'cargo build', 42, 0)",
+                [],
+            )
+            .unwrap();
+        let source: String = ingot
+            .conn
+            .query_row(
+                "SELECT source FROM tokens_saved_ledger WHERE id = 'legacy-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source, "filter");
+    }
+
+    #[test]
+    fn session_tokens_saved_by_source_returns_per_source_sums() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        ingot
+            .insert_tokens_saved(&make_saved_with("s-src", "grep", 100, "filter"))
+            .unwrap();
+        ingot
+            .insert_tokens_saved(&make_saved_with("s-src", "grep", 50, "filter"))
+            .unwrap();
+        ingot
+            .insert_tokens_saved(&make_saved_with("s-src", "tool", 30, "crusher"))
+            .unwrap();
+        // A different session must not bleed in.
+        ingot
+            .insert_tokens_saved(&make_saved_with("other", "x", 999, "filter"))
+            .unwrap();
+
+        let by_source = ingot.session_tokens_saved_by_source("s-src").unwrap();
+        // Ordered by source: crusher, filter.
+        assert_eq!(
+            by_source,
+            vec![("crusher".to_owned(), 30), ("filter".to_owned(), 150)]
+        );
+        // The all-source total still sums everything.
+        assert_eq!(ingot.session_tokens_saved("s-src").unwrap(), 180);
     }
 }

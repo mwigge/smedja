@@ -137,10 +137,16 @@ pub(crate) fn parse_gemini_line(data: &str) -> Result<Option<Delta>, AdapterErro
             .get("candidatesTokenCount")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        if raw_in > 0 || raw_out > 0 {
+        // Gemini reports cached context as `cachedContentTokenCount`.
+        let raw_cache = meta
+            .get("cachedContentTokenCount")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if raw_in > 0 || raw_out > 0 || raw_cache > 0 {
             return Ok(Some(Delta::Usage {
                 input_tokens: u32::try_from(raw_in).unwrap_or(u32::MAX),
                 output_tokens: u32::try_from(raw_out).unwrap_or(u32::MAX),
+                cache_read_tokens: u32::try_from(raw_cache).unwrap_or(u32::MAX),
             }));
         }
     }
@@ -292,7 +298,22 @@ mod tests {
             result,
             Some(Delta::Usage {
                 input_tokens: 10,
-                output_tokens: 5
+                output_tokens: 5,
+                cache_read_tokens: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_usage_metadata_with_cached_content() {
+        let data = r#"{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"cachedContentTokenCount":8}}"#;
+        let result = parse_gemini_line(data).expect("parse must not error");
+        assert_eq!(
+            result,
+            Some(Delta::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: 8,
             })
         );
     }

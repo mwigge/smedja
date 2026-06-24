@@ -161,6 +161,11 @@ pub enum Delta {
         input_tokens: u32,
         /// Number of tokens generated in the response.
         output_tokens: u32,
+        /// Provider-reported `gen_ai.usage.cache_read_input_tokens` — input
+        /// served from the provider prompt cache and therefore not re-paid.
+        /// `0` when the provider reports no cache read or does not report one
+        /// (e.g. CLI adapters that do not surface cache counts).
+        cache_read_tokens: u32,
     },
 }
 

@@ -19,7 +19,7 @@ use smedja_adapter::CallOptions;
 use smedja_assayer::{AgentRole, Assayer, Complexity, Route, Runner};
 use smedja_bellows::event::CorrelationCtx;
 use smedja_bellows::{Dispatcher, TurnEvent};
-use smedja_ingot::{Checkpoint, CostEntry, IngotHandle, TokenSnapshot};
+use smedja_ingot::{Checkpoint, CostEntry, IngotHandle, TokenSnapshot, TokensSavedEntry};
 use smedja_memory::{estimate_messages_tokens, estimate_tokens, inject_conciseness, WorkingMemory};
 use smedja_types::{Microdollars, Timestamp};
 use smedja_vault::Vault;
@@ -526,6 +526,11 @@ impl TurnOrchestrator {
         let mut full_response = String::new();
         let mut total_input_tokens = 0u32;
         let mut total_output_tokens = 0u32;
+        // Provider-reported cache reads ("input not re-paid") and the estimated
+        // cold-context tokens dropped from the prompt — both accumulated across
+        // the tool loop and recorded once per turn as source-tagged savings.
+        let mut total_cache_read_tokens = 0u32;
+        let mut total_cold_omitted_tokens = 0usize;
 
         // Correlation for streamed events: carry the turn span's trace/span ids
         // so deltas and tool events are linkable to the turn, not just Started.
@@ -633,14 +638,21 @@ impl TurnOrchestrator {
 
             'tool_loop: for _iteration in 0..crate::common::effective_max_tool_turns() {
                 // 5a. Stream LLM response with rate-limit retry.
-                let (response_text, input_tokens, output_tokens, native_session_id) = {
+                let (
+                    response_text,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    native_session_id,
+                ) = {
                     let mut backoff_secs = RATE_LIMIT_BACKOFF_BASE_SECS;
                     let mut attempt = 0u32;
                     // Assemble the budgeted prompt and apply verbosity steering for
                     // this iteration. The prompt always leads with the sealed prefix
                     // and all hot turns; warm turns are included until the budget is
                     // spent. The conciseness directive is appended above 60% fill.
-                    let prompt = mem.build_prompt(budget_tokens);
+                    let (prompt, omitted) = mem.build_prompt_with_omitted(budget_tokens);
+                    total_cold_omitted_tokens = total_cold_omitted_tokens.saturating_add(omitted);
                     let used = estimate_messages_tokens(&prompt)
                         + estimate_tokens(opts.system.as_deref().unwrap_or(""));
                     opts.system = Some(inject_conciseness(&base_system, used, context_window));
@@ -717,6 +729,7 @@ impl TurnOrchestrator {
                 }
                 total_input_tokens = total_input_tokens.saturating_add(input_tokens);
                 total_output_tokens = total_output_tokens.saturating_add(output_tokens);
+                total_cache_read_tokens = total_cache_read_tokens.saturating_add(cache_read_tokens);
 
                 // 5b. Parse tool calls from the response text.
                 let tool_call = crate::executor::parse_tool_call(&response_text);
@@ -1002,6 +1015,43 @@ impl TurnOrchestrator {
             }
         }
 
+        // 7b. Record savings, source-tagged, on the tokens-saved ledger (never
+        // the billed cost_ledger). Cache reads are provider-reported "input not
+        // re-paid" (source=cache); cold-context omission is the dropped-token
+        // estimate (source=cold-context). Both are advisory: a ledger error is
+        // logged and swallowed and must never break the turn. Zero-valued
+        // savings write no row.
+        {
+            if total_cache_read_tokens > 0 {
+                let entry = TokensSavedEntry {
+                    id: Uuid::new_v4(),
+                    session_id: session_id.clone(),
+                    turn_n,
+                    command: "cache_read".to_owned(),
+                    tokens_saved: i64::from(total_cache_read_tokens),
+                    source: "cache".to_owned(),
+                    created_at: Timestamp::now(),
+                };
+                if let Err(e) = ingot.insert_tokens_saved(entry).await {
+                    warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to record cache savings");
+                }
+            }
+            if total_cold_omitted_tokens > 0 {
+                let entry = TokensSavedEntry {
+                    id: Uuid::new_v4(),
+                    session_id: session_id.clone(),
+                    turn_n,
+                    command: "cold_context".to_owned(),
+                    tokens_saved: i64::try_from(total_cold_omitted_tokens).unwrap_or(i64::MAX),
+                    source: "cold-context".to_owned(),
+                    created_at: Timestamp::now(),
+                };
+                if let Err(e) = ingot.insert_tokens_saved(entry).await {
+                    warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to record cold-context savings");
+                }
+            }
+        }
+
         // 8. Save checkpoint.
         {
             let messages_json_value: Vec<serde_json::Value> = mem
@@ -1183,8 +1233,26 @@ mod tests {
                 Ok(Delta::Usage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    cache_read_tokens: 0,
                 }),
                 Ok(Delta::Text(text)),
+            ]))
+        }
+    }
+
+    /// A provider that reports a fixed cache-read count alongside usage.
+    struct CacheReadProvider {
+        cache_read_tokens: u32,
+    }
+    impl Provider for CacheReadProvider {
+        fn stream_chat(&self, _messages: &[AdapterMessage], _opts: &CallOptions) -> DeltaStream {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(Delta::Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read_tokens: self.cache_read_tokens,
+                }),
+                Ok(Delta::Text("done".to_owned())),
             ]))
         }
     }
@@ -1354,6 +1422,64 @@ mod tests {
         assert!(
             reason.contains("quota_exhausted"),
             "failure reason must carry the last classified kind, got: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_read_tokens_recorded_as_source_cache() {
+        let (ingot, session_id, turn_id) = seed_session_and_task("do the thing").await;
+        let dispatcher = Arc::new(Dispatcher::new(64));
+
+        // The routed entry (Claude/Fast) reports 1234 cache-read tokens.
+        let pool = ProviderPool::from_entries_for_test(vec![entry(
+            (Runner::Claude, Tier::Fast),
+            "claude-cli",
+            Box::new(CacheReadProvider {
+                cache_read_tokens: 1234,
+            }),
+        )]);
+
+        let orc = orchestrator_with_pool(ingot.clone(), Arc::clone(&dispatcher), pool);
+        orc.run(session_id.clone(), turn_id).await;
+
+        let by_source = ingot
+            .session_tokens_saved_by_source(&session_id)
+            .await
+            .unwrap();
+        let cache_total: i64 = by_source
+            .iter()
+            .filter(|(src, _)| src == "cache")
+            .map(|(_, n)| *n)
+            .sum();
+        assert_eq!(
+            cache_total, 1234,
+            "a turn reporting cache_read_input_tokens=N must write source=cache, tokens_saved=N"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_cache_reads_write_no_cache_row() {
+        let (ingot, session_id, turn_id) = seed_session_and_task("do the thing").await;
+        let dispatcher = Arc::new(Dispatcher::new(64));
+
+        let pool = ProviderPool::from_entries_for_test(vec![entry(
+            (Runner::Claude, Tier::Fast),
+            "claude-cli",
+            Box::new(CacheReadProvider {
+                cache_read_tokens: 0,
+            }),
+        )]);
+
+        let orc = orchestrator_with_pool(ingot.clone(), Arc::clone(&dispatcher), pool);
+        orc.run(session_id.clone(), turn_id).await;
+
+        let by_source = ingot
+            .session_tokens_saved_by_source(&session_id)
+            .await
+            .unwrap();
+        assert!(
+            !by_source.iter().any(|(src, _)| src == "cache"),
+            "a zero cache-read turn must write no source=cache row"
         );
     }
 
