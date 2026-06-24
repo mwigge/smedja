@@ -15,7 +15,9 @@ serde      = { workspace = true }
 smedja-types = { path = "../smedja-types" }
 serde_json = { workspace = true }
 thiserror  = { workspace = true }
-tokio      = { workspace = true }
+# Narrowed from the workspace ["full"] default: this crate only needs the
+# runtime (for spawn_blocking) and the test macros.
+tokio      = { version = "1", default-features = false, features = ["rt", "macros"] }
 tracing    = { workspace = true }
 uuid       = { workspace = true }
 

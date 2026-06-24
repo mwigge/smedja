@@ -21,7 +21,6 @@
 //! | [`BergetProvider`] | Berget AI HTTP API |
 
 pub mod anthropic;
-pub mod berget;
 pub mod claude_cli;
 pub mod codex_cli;
 pub mod copilot;
@@ -29,9 +28,8 @@ pub mod crush;
 pub mod error;
 pub mod gemini;
 pub mod local;
-pub mod minimax;
 pub mod openai;
-pub mod opencode;
+pub mod openai_compat;
 pub mod poolside;
 pub mod provider;
 pub mod subprocess;
@@ -48,20 +46,20 @@ pub(crate) mod sse;
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub use anthropic::AnthropicProvider;
-pub use berget::BergetProvider;
 pub use claude_cli::ClaudeCliProvider;
 pub use codex_cli::CodexCliProvider;
 pub use copilot::CopilotProvider;
 pub use crush::{
-    compress_command_output, compress_tool_result, trim_code_block, CodeCompressor,
-    CommandCompressor, ContentPipeline, SmartCrusher, Transform,
+    code_compressor, command_compressor, compress_command_output, compress_tool_result,
+    smart_crusher, trim_code_block, ContentPipeline, Transform,
 };
 pub use error::AdapterError;
 pub use gemini::GeminiProvider;
 pub use local::{LocalCapability, LocalProvider};
-pub use minimax::MinimaxProvider;
 pub use openai::OpenAiProvider;
-pub use opencode::OpenCodeProvider;
+pub use openai_compat::{
+    BergetProvider, MinimaxProvider, OpenAiCompatProvider, OpenAiCompatSpec, OpenCodeProvider,
+};
 pub use poolside::PoolsideProvider;
 pub use provider::{DeltaStream, Provider};
 pub use subprocess::SubprocessProvider;

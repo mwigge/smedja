@@ -7,11 +7,9 @@ license.workspace    = true
 repository.workspace = true
 
 [dependencies]
-anyhow     = { workspace = true }
-serde_json = { workspace = true }
-tokio      = { workspace = true, features = ["net", "io-util"] }
-tracing    = { workspace = true }
-uuid       = { workspace = true, features = ["v4"] }
-
-[dev-dependencies]
-smedja-bellows = { path = "../../../crates/smedja-bellows" }
+anyhow              = { workspace = true }
+serde_json          = { workspace = true }
+smedja-agent-events = { path = "../../../crates/smedja-agent-events" }
+tokio               = { workspace = true, features = ["net", "io-util", "sync"] }
+tracing             = { workspace = true }
+uuid                = { workspace = true, features = ["v4"] }

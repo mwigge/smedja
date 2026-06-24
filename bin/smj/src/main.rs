@@ -394,15 +394,6 @@ enum SandboxCmd {
 
 #[derive(Subcommand)]
 enum TermCmd {
-    /// Migrate a `WezTerm` Lua config to smedja TOML format
-    Migrate {
-        /// Path to the `WezTerm` Lua config file (e.g. ~/.wezterm.lua)
-        #[arg(long)]
-        from: std::path::PathBuf,
-        /// Output path for the generated TOML (stdout if omitted)
-        #[arg(long)]
-        out: Option<std::path::PathBuf>,
-    },
     /// Download and install smedja to ~/.local/bin
     Install {
         /// URL to download the binary from (auto-detected by OS if omitted)
@@ -768,7 +759,12 @@ async fn main() -> Result<()> {
             WorkspaceCmd::Agents {
                 action: agents_action,
             } => match agents_action {
-                AgentsCmd::Show => cmd_workspace_agents()?,
+                AgentsCmd::Show => {
+                    let mut client = Client::connect(&sock)
+                        .await
+                        .with_context(|| format!("smdjad not running ({})", sock.display()))?;
+                    cmd_workspace_agents(&mut client).await?;
+                }
                 AgentsCmd::Init => {
                     let target = std::path::Path::new(".smedja");
                     std::fs::create_dir_all(target)?;
@@ -785,18 +781,37 @@ async fn main() -> Result<()> {
                 if !target.exists() {
                     anyhow::bail!("path does not exist: {}", target.display());
                 }
+                let mut client = Client::connect(&sock)
+                    .await
+                    .with_context(|| format!("smdjad not running ({})", sock.display()))?;
+                let resp = client
+                    .call(
+                        "graph.index",
+                        json!({ "workspace": target.display().to_string() }),
+                    )
+                    .await
+                    .context("graph.index failed")?;
+                let count = resp["indexed"].as_u64().unwrap_or(0);
+                println!("Indexed {count} symbols in {}", target.display());
                 cmd_workspace_init(&target)?;
             }
             WorkspaceCmd::Index { commit_sha } => {
+                // `commit_sha` is accepted for CLI compatibility; the server-side
+                // index performs a full re-index.
+                let _ = commit_sha;
                 let workspace =
                     std::env::current_dir().context("cannot determine current directory")?;
-                let db_path = workspace.join(".smedja").join("graph.db");
-                std::fs::create_dir_all(workspace.join(".smedja"))?;
-                let mut store = smedja_graph::GraphStore::open(&db_path)
-                    .context("failed to open graph store")?;
-                let count = store
-                    .index_workspace_incremental(&workspace, "workspace", commit_sha.as_deref())
-                    .context("indexing failed")?;
+                let mut client = Client::connect(&sock)
+                    .await
+                    .with_context(|| format!("smdjad not running ({})", sock.display()))?;
+                let resp = client
+                    .call(
+                        "graph.index",
+                        json!({ "workspace": workspace.display().to_string() }),
+                    )
+                    .await
+                    .context("graph.index failed")?;
+                let count = resp["indexed"].as_u64().unwrap_or(0);
                 println!("Indexed {count} symbols in {}", workspace.display());
             }
             WorkspaceCmd::Add { path } => {
@@ -1309,30 +1324,6 @@ async fn main() -> Result<()> {
         }
         Cmd::Service { action } => service::run(&action)?,
         Cmd::Term { action } => match action {
-            TermCmd::Migrate { from, out } => {
-                let lua_source = std::fs::read_to_string(&from)
-                    .with_context(|| format!("cannot read {}", from.display()))?;
-                let result = st_config::migrate::migrate_wezterm_config(&lua_source)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-                match out {
-                    Some(out_path) => {
-                        std::fs::write(&out_path, &result.toml)
-                            .with_context(|| format!("cannot write {}", out_path.display()))?;
-                    }
-                    None => {
-                        print!("{}", result.toml);
-                    }
-                }
-
-                eprintln!("{}", result.summary);
-                if !result.unsupported.is_empty() {
-                    eprintln!("Unsupported fields:");
-                    for item in &result.unsupported {
-                        eprintln!("  - {item}");
-                    }
-                }
-            }
             TermCmd::Install { bin_path, prefix } => {
                 let prefix = prefix.unwrap_or_else(|| {
                     std::env::var("HOME").map_or_else(
@@ -1359,39 +1350,26 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn cmd_workspace_agents() -> Result<()> {
-    use smedja_assayer::{AgentRole, Complexity, Runner, Tier};
-
-    let workspace_dir = std::env::current_dir().context("cannot determine working directory")?;
-    let file_rules = smedja_assayer::load_rules(&workspace_dir).map_err(|e| anyhow::anyhow!(e))?;
-    let mut assayer = smedja_assayer::Assayer::default_rules();
-    assayer.prepend_rules(file_rules);
-
+/// Prints the resolved role→runner→tier→model routing table for the current
+/// workspace, sourcing each decision from the daemon's `agent.routing` RPC.
+///
+/// The printed format is identical to the previous in-process implementation so
+/// downstream tooling and operators see no change.
+async fn cmd_workspace_agents(client: &mut Client) -> Result<()> {
     println!("{:<15} {:<10} {:<8} MODEL", "ROLE", "RUNNER", "TIER");
     println!("{}", "-".repeat(55));
 
-    for (role_name, role) in &[
-        ("orchestrator", AgentRole::Orchestrator),
-        ("impl", AgentRole::Impl),
-        ("test", AgentRole::Test),
-        ("review", AgentRole::Review),
-        ("sre", AgentRole::Sre),
-    ] {
-        let route = assayer.route(*role, Complexity::Coding);
-        let runner = match route.runner {
-            Runner::Claude => "claude",
-            Runner::Local => "local",
-            Runner::Codex => "codex",
-            Runner::Copilot => "copilot",
-            Runner::Minimax => "minimax",
-            Runner::Berget => "berget",
-        };
-        let tier = match route.tier {
-            Tier::Fast => "fast",
-            Tier::Local => "local",
-            Tier::Deep => "deep",
-        };
-        let model = route.model.as_deref().unwrap_or("-");
+    for role_name in &["orchestrator", "impl", "test", "review", "sre"] {
+        let resp = client
+            .call(
+                "agent.routing",
+                json!({ "role": role_name, "complexity": "coding" }),
+            )
+            .await
+            .context("agent.routing failed")?;
+        let runner = resp["runner"].as_str().unwrap_or("-");
+        let tier = resp["tier"].as_str().unwrap_or("-");
+        let model = resp["model"].as_str().unwrap_or("-");
         println!("{role_name:<15} {runner:<10} {tier:<8} {model}");
     }
     Ok(())
@@ -1731,19 +1709,13 @@ fn cmd_term_install(url: &str, prefix: &std::path::Path) -> Result<()> {
 
 /// Initialises a smedja workspace at the given directory.
 ///
-/// Creates `.smedja/`, indexes the workspace into the code graph, and writes a
-/// `workspace.toml` with `auto_index = true` and the current timestamp.
+/// Creates `.smedja/` and writes a `workspace.toml` with `auto_index = true`
+/// and the current timestamp. Symbol indexing is performed separately via the
+/// daemon's `graph.index` RPC by the caller.
 fn cmd_workspace_init(dir: &std::path::Path) -> Result<()> {
     use chrono::Utc;
     let smedja_dir = dir.join(".smedja");
     std::fs::create_dir_all(&smedja_dir)?;
-    let db_path = smedja_dir.join("graph.db");
-    let mut store =
-        smedja_graph::GraphStore::open(&db_path).context("failed to open graph store")?;
-    let count = store
-        .index_workspace_incremental(dir, "workspace", None)
-        .context("indexing failed")?;
-    println!("Indexed {count} symbols in {}", dir.display());
     let toml_path = smedja_dir.join("workspace.toml");
     let ts = Utc::now().to_rfc3339();
     let content = format!("[graph]\nauto_index = true\nlast_indexed_at = \"{ts}\"\n");

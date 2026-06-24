@@ -1,5 +1,5 @@
 [package]
-name        = "smedja-loop-types"
+name        = "smedja-loop"
 description = "Loop engine — bounded multi-role pipeline over an OpenSpec work envelope"
 version.workspace    = true
 edition.workspace    = true
@@ -9,7 +9,6 @@ repository.workspace = true
 [dependencies]
 anyhow             = { workspace = true }
 opentelemetry      = { workspace = true }
-opentelemetry_sdk  = { workspace = true }
 serde              = { workspace = true }
 smedja-types       = { path = "../smedja-types" }
 serde_json         = { workspace = true }

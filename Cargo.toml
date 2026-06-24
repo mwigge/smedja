@@ -4,7 +4,9 @@ members = [
     "bin/smedja-tui",
     "bin/smj",
     "crates/smedja-adapter",
+    "crates/smedja-agent-events",
     "crates/smedja-assayer",
+    "crates/smedja-auth",
     "crates/smedja-bellows",
     "crates/smedja-graph",
     "crates/smedja-ingot",
@@ -56,7 +58,6 @@ cosmic-text  = "0.12"
 crossterm    = "0.28"
 futures-core = "0.3"
 futures-util = "0.3"
-once_cell    = "1"
 opentelemetry          = "0.27"
 opentelemetry-otlp     = { version = "0.27", features = ["grpc-tonic", "http-proto"] }
 opentelemetry-semantic-conventions = "0.27"

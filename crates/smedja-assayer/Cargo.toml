@@ -12,7 +12,9 @@ serde       = { workspace = true }
 serde_json  = { workspace = true }
 smedja-rpc   = { path = "../smedja-rpc" }
 smedja-types = { path = "../smedja-types" }
-tokio       = { workspace = true }
+# Narrowed from the workspace ["full"] default: only async process spawning
+# (git worktree management) is used, which needs the runtime + process feature.
+tokio       = { version = "1", default-features = false, features = ["rt", "process"] }
 toml        = { workspace = true }
 tracing     = { workspace = true }
 uuid        = { workspace = true }
