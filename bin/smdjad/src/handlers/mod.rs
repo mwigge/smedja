@@ -55,6 +55,7 @@ pub(crate) struct HandlerState {
     pub(crate) price_table: Arc<PriceTable>,
     pub(crate) vault: Arc<Mutex<Vault>>,
     pub(crate) provider_sessions: ProviderSessions,
+    pub(crate) cache_aligners: crate::orchestrator::CacheAligners,
     pub(crate) task_set: Arc<Mutex<JoinSet<()>>>,
     pub(crate) startup_runner: Arc<str>,
     pub(crate) startup_model: Arc<str>,
