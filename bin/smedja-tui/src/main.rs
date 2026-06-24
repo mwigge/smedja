@@ -49,6 +49,15 @@ struct Cli {
     /// Tier override (local|fast|deep)
     #[arg(long, short = 't')]
     tier: Option<String>,
+
+    /// Resume an existing session by id instead of creating a new one.
+    #[arg(long)]
+    session: Option<String>,
+
+    /// Rewind the resumed session to this turn before replaying (destructive,
+    /// mirrors `smj session rollback`). Only meaningful together with `--session`.
+    #[arg(long)]
+    turn: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -78,6 +87,46 @@ enum OutputType {
     Pptx { slug: String },
 }
 
+/// Startup routing decision derived from the `--session` flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionStart {
+    /// Attach to an existing session and replay its history.
+    Resume(String),
+    /// Create a fresh session (default behaviour).
+    Create,
+}
+
+/// Maps the `--session` flag to a startup routing decision.
+///
+/// `Some(id)` routes to [`SessionStart::Resume`]; `None` routes to
+/// [`SessionStart::Create`]. Whitespace-only ids are treated as absent.
+fn session_start_decision(flag: Option<String>) -> SessionStart {
+    match flag {
+        Some(id) if !id.trim().is_empty() => SessionStart::Resume(id.trim().to_owned()),
+        _ => SessionStart::Create,
+    }
+}
+
+/// Whether a resume should rewind the session before replaying.
+///
+/// A `Some(turn)` target is destructive (calls `session.rollback`); `None` is a
+/// non-destructive read-only replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumePlan {
+    /// Rewind to `turn_n` via `session.rollback`, then replay.
+    Rollback { turn_n: u32 },
+    /// Replay current history without rewinding.
+    ReplayOnly,
+}
+
+/// Derives the resume plan from an optional turn target.
+fn resume_plan(turn: Option<u32>) -> ResumePlan {
+    match turn {
+        Some(turn_n) => ResumePlan::Rollback { turn_n },
+        None => ResumePlan::ReplayOnly,
+    }
+}
+
 /// Available slash-command completions shown in the popup.
 const SLASH_COMPLETIONS: &[&str] = &[
     "/agent",
@@ -96,6 +145,7 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/ponytail",
     "/pptx",
     "/quota",
+    "/resume",
     "/review",
     "/spec",
     "/switch",
@@ -122,6 +172,7 @@ slash commands:
   /ponytail          — set review mode
   /pptx <slug>       — generate PowerPoint
   /quota             — show usage quota
+  /resume [id [turn]] — resume a session (omit id for interactive picker; turn rewinds)
   /review            — send git diff for review
   /spec              — browse OpenSpec changes
   /switch [runner]   — switch AI runner (omit for interactive picker)
@@ -199,6 +250,10 @@ struct AppState {
     slash_cursor: usize,
     /// True when the popup is showing a runner picker (Enter confirms runner switch).
     runner_picker_mode: bool,
+    /// True when the popup is showing a session picker (Enter resumes the highlighted session).
+    session_picker_mode: bool,
+    /// Session ids parallel to `slash_completions` while the session picker is open.
+    session_picker_ids: Vec<String>,
     /// True while a turn is awaiting a response from the daemon.
     #[allow(dead_code)] // wired at init; read path lands once streaming poll is complete
     turn_in_flight: bool,
@@ -330,6 +385,103 @@ async fn start_stream_reader(
 }
 
 // ---------------------------------------------------------------------------
+// Session bootstrap (create vs. resume)
+// ---------------------------------------------------------------------------
+
+/// The session a startup decision resolved to, plus its display metadata.
+struct ResolvedSession {
+    session_id: String,
+    runner: String,
+    model: Option<String>,
+    tier: Option<String>,
+    mode: Option<String>,
+    /// `true` when an existing session was attached (history should be replayed).
+    resumed: bool,
+}
+
+/// Resolves the startup decision into a concrete session.
+///
+/// [`SessionStart::Create`] calls `session.create` (current behaviour);
+/// [`SessionStart::Resume`] validates the id via `session.get` and attaches to
+/// it. An unknown id surfaces as an error so the caller can fail fast before
+/// any terminal setup.
+///
+/// # Errors
+///
+/// Returns an error when `session.create` fails, or when a supplied resume id is
+/// unknown (`session not found: <id>`).
+async fn resolve_session(client: &mut Client, start: SessionStart) -> Result<ResolvedSession> {
+    match start {
+        SessionStart::Create => {
+            let resp = client
+                .call("session.create", json!({ "title": "smedja" }))
+                .await
+                .map_err(|e| anyhow::anyhow!("session.create failed: {e}"))?;
+            Ok(ResolvedSession {
+                session_id: resp["id"].as_str().unwrap_or("unknown").to_owned(),
+                runner: resp
+                    .get("runner")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                model: resp
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                tier: resp.get("tier").and_then(|v| v.as_str()).map(str::to_owned),
+                mode: None,
+                resumed: false,
+            })
+        }
+        SessionStart::Resume(id) => {
+            let resp = client
+                .call("session.get", json!({ "id": id }))
+                .await
+                .map_err(|_| anyhow::anyhow!("session not found: {id}"))?;
+            Ok(ResolvedSession {
+                session_id: resp["id"].as_str().unwrap_or(&id).to_owned(),
+                runner: "unknown".to_owned(),
+                model: None,
+                tier: None,
+                mode: resp.get("mode").and_then(|v| v.as_str()).map(str::to_owned),
+                resumed: true,
+            })
+        }
+    }
+}
+
+/// Replays `session_id` into the view, optionally rewinding it first.
+///
+/// When `plan` is [`ResumePlan::Rollback`], `session.rollback` is called with
+/// `{ session_id, turn_n }` to rewind the conversation (destructive, mirroring
+/// `smj session rollback`) before history is read. [`ResumePlan::ReplayOnly`]
+/// is non-destructive: it never calls `session.rollback`. In both cases the
+/// rewound history is fetched via `session.history` and seeded into the view by
+/// [`replay_history`].
+async fn resume_into_view(state: &mut AppState, client: &mut Client, plan: ResumePlan) {
+    let session_id = state.session_id.clone();
+    if let ResumePlan::Rollback { turn_n } = plan {
+        if let Err(e) = client
+            .call(
+                "session.rollback",
+                json!({ "session_id": session_id, "turn_n": turn_n }),
+            )
+            .await
+        {
+            push_system_message(state, format!("session.rollback error: {e}"));
+            return;
+        }
+    }
+    match client
+        .call("session.history", json!({ "session_id": session_id }))
+        .await
+    {
+        Ok(history) => replay_history(state, &history),
+        Err(e) => push_system_message(state, format!("session.history error: {e}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Submit a user turn to the daemon
 // ---------------------------------------------------------------------------
 
@@ -407,6 +559,108 @@ fn push_system_message(state: &mut AppState, text: impl Into<String>) {
     };
     state.main_panel.push_line(msg.text.clone());
     state.messages.push(msg);
+}
+
+/// Seeds the view from a `session.history` response, replaying prior turns.
+///
+/// Iterates the `turns` array in ascending `turn_n`, builds a completed
+/// [`blocks::TurnBlock`] per turn via [`blocks::TurnBlock::from_history_turn`],
+/// pushes it into the [`blocks::BlockStore`], renders its lines into the
+/// [`main_panel::MainPanel`], and advances `state.turn_n` to the highest
+/// replayed turn so the next live turn continues the sequence. A missing or
+/// empty `turns` array is a no-op.
+fn replay_history(state: &mut AppState, history: &serde_json::Value) {
+    let Some(turns) = history.get("turns").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    let mut ordered: Vec<&serde_json::Value> = turns.iter().collect();
+    ordered.sort_by_key(|t| {
+        t.get("turn_n")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    });
+    let mut max_turn = state.turn_n;
+    for turn in ordered {
+        let turn_n = turn
+            .get("turn_n")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0);
+        let messages = turn
+            .get("messages")
+            .cloned()
+            .unwrap_or(serde_json::Value::Array(Vec::new()));
+        let block = blocks::TurnBlock::from_history_turn(turn_n, &messages);
+        for line in block.render_lines(80) {
+            state.main_panel.push_line(line);
+        }
+        state.block_store.push(block);
+        max_turn = max_turn.max(turn_n);
+    }
+    state.turn_n = max_turn;
+}
+
+/// Formats `session.list` rows for the `/resume` picker.
+///
+/// Each row renders as `<short-id>  <title>  <mode>  <updated_at>`, where the
+/// short id is the first 8 characters. Missing titles/modes degrade to empty
+/// or `?` placeholders rather than being dropped.
+#[must_use]
+fn format_resume_rows(list: &serde_json::Value) -> Vec<String> {
+    let Some(items) = list.as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .map(|s| {
+            let id = s
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let short = &id[..8.min(id.len())];
+            let title = s
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let mode = s
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let updated = s
+                .get("updated_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            format!("{short}  {title}  {mode}  {updated}")
+        })
+        .collect()
+}
+
+/// Parses `/resume` arguments into `(session_id, optional_turn)`.
+///
+/// `<id>` yields `(id, None)`; `<id> <turn>` yields `(id, Some(turn))`. A
+/// non-numeric turn token is ignored (no turn target). Empty input yields
+/// `None`.
+#[must_use]
+fn parse_resume_args(args: &str) -> Option<(String, Option<u32>)> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut parts = trimmed.split_whitespace();
+    let id = parts.next()?.to_owned();
+    let turn = parts.next().and_then(|t| t.parse::<u32>().ok());
+    Some((id, turn))
+}
+
+/// Returns `true` (and emits a status line) when a resume must be refused
+/// because a turn is awaiting a response.
+fn resume_blocked_by_pending_turn(state: &mut AppState) -> bool {
+    if state.pending_task_id.is_some() {
+        push_system_message(state, "cannot resume while a turn is in flight");
+        true
+    } else {
+        false
+    }
 }
 
 /// Slugify `topic` for use in output filenames.
@@ -714,6 +968,8 @@ fn clear_slash_popup(state: &mut AppState) {
     state.input.clear();
     state.input_cursor = 0;
     state.runner_picker_mode = false;
+    state.session_picker_mode = false;
+    state.session_picker_ids.clear();
 }
 
 fn apply_tier(args: &str, state: &mut AppState) -> String {
@@ -1188,6 +1444,55 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
             }
             Ok(true)
         }
+        "resume" => {
+            if resume_blocked_by_pending_turn(state) {
+                return Ok(true);
+            }
+            match parse_resume_args(args) {
+                None => {
+                    // No id: open the interactive picker from session.list.
+                    match client.call("session.list", json!({})).await {
+                        Ok(list) => {
+                            let rows = format_resume_rows(&list);
+                            let ids: Vec<String> = list
+                                .as_array()
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .map(|s| {
+                                            s.get("id")
+                                                .and_then(serde_json::Value::as_str)
+                                                .unwrap_or("")
+                                                .to_owned()
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if rows.is_empty() {
+                                push_system_message(state, "no sessions available to resume");
+                            } else {
+                                state.slash_completions = rows;
+                                state.session_picker_ids = ids;
+                                state.slash_cursor = 0;
+                                state.slash_popup_visible = true;
+                                state.session_picker_mode = true;
+                                state.input.clear();
+                                state.input_cursor = 0;
+                            }
+                        }
+                        Err(e) => push_system_message(state, format!("session.list error: {e}")),
+                    }
+                }
+                Some((id, turn)) => {
+                    // Direct resume: swap session, clear the live display, replay.
+                    state.session_id = id;
+                    state.display_start_idx = state.messages.len();
+                    state.main_panel.clear_display();
+                    resume_into_view(state, client, resume_plan(turn)).await;
+                }
+            }
+            Ok(true)
+        }
         _ => Ok(false),
     }
 }
@@ -1465,7 +1770,7 @@ async fn handle_key(
                 clear_slash_popup(state);
             }
             KeyCode::Char(' ') | KeyCode::Tab => {
-                if !state.runner_picker_mode {
+                if !state.runner_picker_mode && !state.session_picker_mode {
                     accept_slash_completion(state, true);
                 }
             }
@@ -1479,7 +1784,23 @@ async fn handle_key(
                 state.slash_cursor = state.slash_cursor.saturating_sub(1);
             }
             KeyCode::Enter => {
-                if state.runner_picker_mode {
+                if state.session_picker_mode {
+                    let chosen = state.session_picker_ids.get(state.slash_cursor).cloned();
+                    state.session_picker_mode = false;
+                    state.slash_popup_visible = false;
+                    state.slash_completions.clear();
+                    state.session_picker_ids.clear();
+                    state.slash_cursor = 0;
+                    state.input.clear();
+                    state.input_cursor = 0;
+                    if let Some(id) = chosen.filter(|id| !id.is_empty()) {
+                        // Resume in place: swap session, clear live display, replay.
+                        state.session_id = id;
+                        state.display_start_idx = state.messages.len();
+                        state.main_panel.clear_display();
+                        resume_into_view(state, client, ResumePlan::ReplayOnly).await;
+                    }
+                } else if state.runner_picker_mode {
                     if let Some(runner_name) =
                         state.slash_completions.get(state.slash_cursor).cloned()
                     {
@@ -2333,7 +2654,10 @@ fn render_slash_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, s
     // Height = number of completions + 2 border rows, capped at available space.
     #[allow(clippy::cast_possible_truncation)]
     let popup_h = (completions.len() as u16 + 2).min(area.height.saturating_sub(2));
-    let popup_w = 20u16.min(area.width);
+    // Session-picker rows (`<short-id>  <title>  <mode>  <updated_at>`) are wider
+    // than the 20-col command popup, so widen to fit when the picker is open.
+    let desired_w = if state.session_picker_mode { 60 } else { 20 };
+    let popup_w = desired_w.min(area.width);
     // Position just above the input row (bottom-left).
     let popup_y = area.y + area.height.saturating_sub(popup_h + 1);
     let popup_x = area.x;
@@ -2357,7 +2681,9 @@ fn render_slash_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, s
         })
         .collect();
 
-    let title = if state.runner_picker_mode {
+    let title = if state.session_picker_mode {
+        "sessions"
+    } else if state.runner_picker_mode {
         "runners"
     } else {
         "commands"
@@ -2431,33 +2757,25 @@ async fn main() -> Result<()> {
         )
     })?;
 
-    let session_resp = client
-        .call("session.create", json!({ "title": "smedja" }))
-        .await
-        .map_err(|e| anyhow::anyhow!("session.create failed: {e}"))?;
-    let session_id = session_resp["id"].as_str().unwrap_or("unknown").to_owned();
+    // Branch on the --session flag: resume an existing session (validated via
+    // session.get) or create a fresh one. Resume validation runs before any
+    // terminal setup so an unknown id is a clean fail-fast exit.
+    let resolved = resolve_session(&mut client, session_start_decision(cli.session)).await?;
+    let session_id = resolved.session_id;
+    let resumed = resolved.resumed;
 
-    tracing::debug!(session_id = %session_id, "session created");
+    tracing::debug!(session_id = %session_id, resumed, "session ready");
 
-    let startup_runner = session_resp
-        .get("runner")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_owned();
-    let startup_model = session_resp
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned);
-    let startup_tier = session_resp
-        .get("tier")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned);
+    let startup_runner = resolved.runner;
+    let startup_model = resolved.model;
+    let startup_tier = resolved.tier;
+    let resumed_mode = resolved.mode;
 
     let otlp_configured = std::env::var("SMEDJA_OTLP_ENDPOINT").is_ok();
     let stream_sock_path = stream_socket_path(&sock);
     let mut state = AppState {
         session_id,
-        mode: cli.mode,
+        mode: cli.mode.or(resumed_mode),
         tier: cli.tier.or(startup_tier),
         runner: startup_runner,
         model: startup_model,
@@ -2485,6 +2803,8 @@ async fn main() -> Result<()> {
         slash_popup_visible: false,
         slash_cursor: 0,
         runner_picker_mode: false,
+        session_picker_mode: false,
+        session_picker_ids: Vec::new(),
         turn_in_flight: false,
         poll_retry_count: 0,
         scroll_focus: false,
@@ -2533,6 +2853,13 @@ async fn main() -> Result<()> {
     state
         .main_panel
         .push_line("type a message or /help for commands".into());
+
+    // On resume, optionally rewind to --turn and replay history into the view
+    // before the event loop starts. Done before terminal setup so a transport
+    // failure surfaces as a normal panel line rather than mid-frame.
+    if resumed {
+        resume_into_view(&mut state, &mut client, resume_plan(cli.turn)).await;
+    }
 
     enable_raw_mode().context("enable raw mode")?;
     execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)
@@ -3312,6 +3639,161 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Session resume — startup routing, replay, picker, rollback
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resume_when_session_flag_present() {
+        let decision = session_start_decision(Some("abc-123".to_owned()));
+        assert_eq!(decision, SessionStart::Resume("abc-123".to_owned()));
+    }
+
+    #[test]
+    fn create_when_session_flag_absent() {
+        assert_eq!(session_start_decision(None), SessionStart::Create);
+    }
+
+    #[test]
+    fn resume_ignores_blank_session_flag() {
+        assert_eq!(
+            session_start_decision(Some("   ".to_owned())),
+            SessionStart::Create
+        );
+    }
+
+    #[test]
+    fn replay_seeds_blocks_and_continues_turn_n() {
+        let mut state = make_state("resume-session");
+        let history = serde_json::json!({
+            "session_id": "resume-session",
+            "turns": [
+                { "turn_n": 1, "created_at": "t1", "messages": [
+                    { "role": "user", "content": "first prompt" },
+                    { "role": "assistant", "content": "first reply" },
+                ]},
+                { "turn_n": 2, "created_at": "t2", "messages": [
+                    { "role": "user", "content": "second prompt" },
+                    { "role": "assistant", "content": "second reply" },
+                ]},
+            ],
+        });
+        replay_history(&mut state, &history);
+        assert_eq!(state.block_store.len(), 2, "one block per turn");
+        assert_eq!(
+            state.turn_n, 2,
+            "turn_n must equal the highest replayed turn"
+        );
+        let body = state.main_panel.visible_text();
+        assert!(body.contains("first reply"), "panel missing turn 1: {body}");
+        assert!(
+            body.contains("second reply"),
+            "panel missing turn 2: {body}"
+        );
+    }
+
+    #[test]
+    fn replay_empty_turns_is_noop() {
+        let mut state = make_state("fresh-session");
+        let history = serde_json::json!({ "session_id": "fresh-session", "turns": [] });
+        replay_history(&mut state, &history);
+        assert_eq!(state.block_store.len(), 0);
+        assert_eq!(state.turn_n, 0);
+    }
+
+    #[test]
+    fn replay_missing_turns_is_noop() {
+        let mut state = make_state("fresh-session");
+        let history = serde_json::json!({ "session_id": "fresh-session" });
+        replay_history(&mut state, &history);
+        assert_eq!(state.block_store.len(), 0);
+        assert_eq!(state.turn_n, 0);
+    }
+
+    #[test]
+    fn resume_list_formats_session_rows() {
+        let list = serde_json::json!([
+            {
+                "id": "0123456789abcdef",
+                "title": "fix the parser",
+                "mode": "impl",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-06-22T09:30:00Z",
+            },
+            {
+                "id": "fedcba9876543210",
+                "title": "",
+                "mode": serde_json::Value::Null,
+                "created_at": "2026-01-02T00:00:00Z",
+                "updated_at": "2026-06-21T11:00:00Z",
+            },
+        ]);
+        let rows = format_resume_rows(&list);
+        assert_eq!(rows.len(), 2, "one row per session");
+        assert!(
+            rows[0].starts_with("01234567"),
+            "short id first: {}",
+            rows[0]
+        );
+        assert!(rows[0].contains("fix the parser"), "title: {}", rows[0]);
+        assert!(rows[0].contains("impl"), "mode: {}", rows[0]);
+        assert!(
+            rows[0].contains("2026-06-22T09:30:00Z"),
+            "updated_at: {}",
+            rows[0]
+        );
+        // Missing title / null mode must still produce a usable row.
+        assert!(rows[1].starts_with("fedcba98"), "row: {}", rows[1]);
+    }
+
+    #[test]
+    fn resume_with_turn_calls_rollback_then_replays() {
+        assert_eq!(resume_plan(Some(3)), ResumePlan::Rollback { turn_n: 3 });
+        assert_eq!(resume_plan(None), ResumePlan::ReplayOnly);
+    }
+
+    #[test]
+    fn parse_resume_args_splits_id_and_turn() {
+        assert_eq!(parse_resume_args("abc"), Some(("abc".to_owned(), None)));
+        assert_eq!(
+            parse_resume_args("abc 5"),
+            Some(("abc".to_owned(), Some(5)))
+        );
+        assert_eq!(parse_resume_args(""), None);
+        // Non-numeric turn is ignored (treated as no turn target).
+        assert_eq!(parse_resume_args("abc xyz"), Some(("abc".to_owned(), None)));
+    }
+
+    #[test]
+    fn resume_in_slash_completions() {
+        assert!(
+            SLASH_COMPLETIONS.contains(&"/resume"),
+            "/resume must be in SLASH_COMPLETIONS"
+        );
+        let completions = filtered_completions("/res");
+        assert!(
+            completions.contains(&"/resume".to_owned()),
+            "/resume must match '/res' prefix; got: {completions:?}"
+        );
+    }
+
+    #[test]
+    fn help_text_mentions_resume() {
+        assert!(HELP_TEXT.contains("/resume"), "help must document /resume");
+    }
+
+    #[test]
+    fn resume_rejected_while_turn_in_flight() {
+        let mut state = make_state("busy-session");
+        state.pending_task_id = Some("task-1".to_owned());
+        assert!(resume_blocked_by_pending_turn(&mut state));
+        let body = state.main_panel.visible_text();
+        assert!(body.contains("cannot resume"), "status message: {body}");
+        // No pending turn → not blocked.
+        let mut idle = make_state("idle-session");
+        assert!(!resume_blocked_by_pending_turn(&mut idle));
+    }
+
+    // -----------------------------------------------------------------------
     // Layer 4 TUI functional tests — TestBackend (no network)
     // -----------------------------------------------------------------------
 
@@ -3350,6 +3832,8 @@ mod tests {
             slash_popup_visible: false,
             slash_cursor: 0,
             runner_picker_mode: false,
+            session_picker_mode: false,
+            session_picker_ids: Vec::new(),
             turn_in_flight: false,
             poll_retry_count: 0,
             scroll_focus: false,

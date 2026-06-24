@@ -45,6 +45,42 @@ impl TurnBlock {
         }
     }
 
+    /// Builds a completed turn block from a stored history turn.
+    ///
+    /// `messages` is the parsed checkpoint blob for the turn — a JSON array of
+    /// `{ role, content }` records. Each record is mapped by role: a `tool` role
+    /// becomes a tool entry with its content as the outcome; every other role
+    /// (including unknown or missing roles) is rendered as labelled plain text,
+    /// so malformed or legacy blobs degrade gracefully rather than panicking. A
+    /// non-array `messages` yields an empty (but complete) block.
+    #[must_use]
+    pub fn from_history_turn(turn_n: u32, messages: &serde_json::Value) -> Self {
+        let mut block = Self::new(turn_n);
+        if let Some(records) = messages.as_array() {
+            for record in records {
+                let role = record.get("role").and_then(serde_json::Value::as_str);
+                let content = record
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                match role {
+                    Some("tool") => {
+                        block.push_tool_call("tool".to_owned(), String::new());
+                        block.set_tool_outcome(content.to_owned());
+                    }
+                    Some(other) => {
+                        block.push_text(&format!("{other}: {content}\n"));
+                    }
+                    None => {
+                        block.push_text(&format!("{content}\n"));
+                    }
+                }
+            }
+        }
+        block.status = BlockStatus::Complete;
+        block
+    }
+
     /// Appends streamed text.
     pub fn push_text(&mut self, text: &str) {
         self.content.push_str(text);
@@ -193,6 +229,54 @@ mod tests {
     fn new_block_is_streaming() {
         let b = TurnBlock::new(1);
         assert_eq!(b.status, BlockStatus::Streaming);
+    }
+
+    #[test]
+    fn from_history_turn_renders_user_and_assistant() {
+        let messages = serde_json::json!([
+            { "role": "user", "content": "fix the bug" },
+            { "role": "assistant", "content": "done, here is the fix" },
+        ]);
+        let block = TurnBlock::from_history_turn(3, &messages);
+        assert_eq!(block.turn_n, 3);
+        assert_eq!(block.status, BlockStatus::Complete);
+        let lines = block.render_lines(60);
+        assert!(lines[0].starts_with("┌─ turn 3"), "header: {:?}", lines[0]);
+        let body = lines.join("\n");
+        assert!(body.contains("fix the bug"), "user content missing: {body}");
+        assert!(
+            body.contains("done, here is the fix"),
+            "assistant content missing: {body}"
+        );
+        assert!(lines.last().unwrap().contains("complete"));
+    }
+
+    #[test]
+    fn from_history_turn_treats_unknown_role_as_text() {
+        let messages = serde_json::json!([
+            { "role": "mystery", "content": "weird content" },
+            { "content": "no role at all" },
+        ]);
+        let block = TurnBlock::from_history_turn(1, &messages);
+        let body = block.render_lines(60).join("\n");
+        assert!(
+            body.contains("weird content"),
+            "unknown role must render as text: {body}"
+        );
+        assert!(
+            body.contains("no role at all"),
+            "missing role must render as text: {body}"
+        );
+    }
+
+    #[test]
+    fn from_history_turn_non_array_is_empty_block() {
+        let messages = serde_json::json!({ "not": "an array" });
+        let block = TurnBlock::from_history_turn(2, &messages);
+        assert_eq!(block.turn_n, 2);
+        assert_eq!(block.status, BlockStatus::Complete);
+        assert!(block.content.is_empty());
+        assert!(block.tool_calls.is_empty());
     }
 
     #[test]
