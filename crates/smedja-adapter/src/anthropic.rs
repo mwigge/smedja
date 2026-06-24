@@ -398,6 +398,7 @@ mod tests {
             tools: None,
             provider_session_id: None,
             stable_prefix_len: None,
+            cache_strategy: crate::types::CacheStrategy::None,
         }
     }
 

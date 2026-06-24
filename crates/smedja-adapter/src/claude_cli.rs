@@ -349,6 +349,7 @@ mod tests {
             tools: None,
             provider_session_id: Some("resume-123".into()),
             stable_prefix_len: None,
+            cache_strategy: crate::types::CacheStrategy::None,
         };
         let messages = vec![Message {
             role: crate::Role::User,

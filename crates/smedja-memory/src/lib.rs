@@ -4,6 +4,7 @@
 //! together with a stable-prefix KV-cache guard, hot/warm/cold retention strata,
 //! and a naive token-budget estimator.
 
+pub mod aligner;
 pub mod budget;
 pub mod cold;
 pub mod error;
@@ -13,6 +14,7 @@ pub mod skills;
 pub mod types;
 pub mod working;
 
+pub use aligner::{CacheAligner, CacheHint, Drift};
 pub use budget::{estimate_messages_tokens, estimate_tokens};
 pub use cold::{ColdResult, ColdStore};
 pub use error::MemoryError;

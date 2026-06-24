@@ -398,6 +398,7 @@ mod tests {
             tools: None,
             provider_session_id: session_id.map(str::to_owned),
             stable_prefix_len: None,
+            cache_strategy: crate::types::CacheStrategy::None,
         }
     }
 

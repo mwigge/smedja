@@ -64,6 +64,25 @@ impl GeminiProvider {
 fn build_contents(messages: &[Message], opts: &CallOptions) -> Vec<serde_json::Value> {
     let mut contents: Vec<serde_json::Value> = Vec::new();
 
+    // When a Gemini context-cache handle is supplied, the cached `cachedContent`
+    // resource already carries the system prompt and the leading stable-prefix
+    // turns, so they are omitted from the live `contents`. Without a handle the
+    // full conversation (system injected as the first user turn) is sent as before.
+    let cached = matches!(
+        &opts.cache_strategy,
+        crate::types::CacheStrategy::GeminiContext {
+            cached_content: Some(_)
+        }
+    );
+
+    if cached {
+        let skip = opts.stable_prefix_len.unwrap_or(0).min(messages.len());
+        for m in &messages[skip..] {
+            contents.push(message_to_content(m));
+        }
+        return contents;
+    }
+
     // Inject `opts.system` as the first user turn when present.
     if let Some(sys) = &opts.system {
         contents.push(json!({
@@ -73,17 +92,25 @@ fn build_contents(messages: &[Message], opts: &CallOptions) -> Vec<serde_json::V
     }
 
     for m in messages {
-        let role = match m.role {
-            Role::System | Role::User | Role::Tool => "user",
-            Role::Assistant => "model",
-        };
-        contents.push(json!({
-            "role": role,
-            "parts": [{ "text": m.content }]
-        }));
+        contents.push(message_to_content(m));
     }
 
     contents
+}
+
+/// Maps a single [`Message`] to a Gemini `contents` entry.
+///
+/// Gemini has only `user` and `model` roles; system and tool messages collapse
+/// to `user` and assistant messages map to `model`.
+fn message_to_content(m: &Message) -> serde_json::Value {
+    let role = match m.role {
+        Role::System | Role::User | Role::Tool => "user",
+        Role::Assistant => "model",
+    };
+    json!({
+        "role": role,
+        "parts": [{ "text": m.content }]
+    })
 }
 
 /// Parses a single Gemini SSE data payload into a [`Delta`].
@@ -148,6 +175,15 @@ impl Provider for GeminiProvider {
 
         let contents = build_contents(messages, opts);
         let mut body = json!({ "contents": contents });
+
+        // Reference an explicit context-cache resource when one was supplied; the
+        // cached leading turns are already omitted from `contents` above.
+        if let crate::types::CacheStrategy::GeminiContext {
+            cached_content: Some(name),
+        } = &opts.cache_strategy
+        {
+            body["cachedContent"] = json!(name);
+        }
 
         if let Some(mt) = opts.max_tokens {
             body["generationConfig"] = json!({ "maxOutputTokens": mt });
@@ -308,6 +344,7 @@ mod tests {
             tools: None,
             provider_session_id: None,
             stable_prefix_len: None,
+            cache_strategy: crate::types::CacheStrategy::None,
         };
         let contents = build_contents(&[], &opts);
         assert_eq!(contents.len(), 1);
@@ -326,6 +363,7 @@ mod tests {
             tools: None,
             provider_session_id: None,
             stable_prefix_len: None,
+            cache_strategy: crate::types::CacheStrategy::None,
         };
         let messages = vec![Message {
             role: Role::Assistant,
@@ -333,5 +371,80 @@ mod tests {
         }];
         let contents = build_contents(&messages, &opts);
         assert_eq!(contents[0]["role"], "model");
+    }
+
+    fn opts_with_cache(strategy: crate::types::CacheStrategy) -> CallOptions {
+        CallOptions {
+            model: "gemini-2.5-pro".into(),
+            max_tokens: None,
+            temperature: None,
+            system: Some("system prompt".to_owned()),
+            tools: None,
+            provider_session_id: None,
+            stable_prefix_len: Some(2),
+            cache_strategy: strategy,
+        }
+    }
+
+    #[test]
+    fn build_contents_omits_cached_leading_turns_with_handle() {
+        let opts = opts_with_cache(crate::types::CacheStrategy::GeminiContext {
+            cached_content: Some("cachedContents/abc123".to_owned()),
+        });
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: "cached one".to_owned(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "cached two".to_owned(),
+            },
+            Message {
+                role: Role::User,
+                content: "live turn".to_owned(),
+            },
+        ];
+        let contents = build_contents(&messages, &opts);
+        // System is not injected and the 2 leading prefix turns are omitted.
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["parts"][0]["text"], "live turn");
+    }
+
+    #[test]
+    fn build_contents_without_handle_is_unchanged() {
+        // CacheStrategy::None must yield the same body shape as before this change:
+        // system injected as the first user turn, then every message.
+        let opts = opts_with_cache(crate::types::CacheStrategy::None);
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: "one".to_owned(),
+            },
+            Message {
+                role: Role::User,
+                content: "two".to_owned(),
+            },
+        ];
+        let contents = build_contents(&messages, &opts);
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[0]["parts"][0]["text"], "system prompt");
+        assert_eq!(contents[1]["parts"][0]["text"], "one");
+        assert_eq!(contents[2]["parts"][0]["text"], "two");
+    }
+
+    #[test]
+    fn build_contents_gemini_context_without_name_is_unchanged() {
+        let opts = opts_with_cache(crate::types::CacheStrategy::GeminiContext {
+            cached_content: None,
+        });
+        let messages = vec![Message {
+            role: Role::User,
+            content: "one".to_owned(),
+        }];
+        let contents = build_contents(&messages, &opts);
+        // No handle → full contents with system injected.
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[0]["parts"][0]["text"], "system prompt");
     }
 }
