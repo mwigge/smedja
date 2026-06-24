@@ -52,6 +52,46 @@ fn role_to_str(role: &Role) -> &'static str {
     }
 }
 
+/// Builds the `OpenAI` chat-completion request body from messages and options.
+///
+/// The system prompt (when present) is prepended as a `system` message, then the
+/// conversation messages follow in their given order — the leading
+/// `stable_prefix_len` messages stay byte-identical and first so that `OpenAI`
+/// automatic prompt caching can match a shared prefix across turns. When
+/// [`CacheStrategy::OpenAiAutomatic`] carries a `cache_key`, it is emitted as the
+/// top-level `prompt_cache_key`. No per-message cache flag exists for `OpenAI`.
+fn build_body(messages: &[Message], opts: &CallOptions) -> serde_json::Value {
+    let mut msg_array: Vec<serde_json::Value> = Vec::with_capacity(messages.len() + 1);
+    if let Some(sys) = &opts.system {
+        msg_array.push(json!({"role": "system", "content": sys}));
+    }
+    for m in messages {
+        msg_array.push(json!({
+            "role": role_to_str(&m.role),
+            "content": m.content,
+        }));
+    }
+
+    let mut body = json!({
+        "model": opts.model,
+        "messages": msg_array,
+        "stream": true,
+    });
+    if let Some(mt) = opts.max_tokens {
+        body["max_tokens"] = json!(mt);
+    }
+    if let Some(temp) = opts.temperature {
+        body["temperature"] = json!(temp);
+    }
+    if let crate::types::CacheStrategy::OpenAiAutomatic {
+        cache_key: Some(key),
+    } = &opts.cache_strategy
+    {
+        body["prompt_cache_key"] = json!(key);
+    }
+    body
+}
+
 #[allow(clippy::too_many_lines)]
 impl Provider for OpenAiProvider {
     fn stream_chat(&self, messages: &[Message], opts: &CallOptions) -> DeltaStream {
@@ -59,29 +99,9 @@ impl Provider for OpenAiProvider {
         let auth = format!("Bearer {}", self.api_key);
         let client = self.client.clone();
 
-        // Build the messages array; prepend system if provided via `CallOptions`.
-        let mut msg_array: Vec<serde_json::Value> = Vec::new();
-        if let Some(sys) = &opts.system {
-            msg_array.push(json!({"role": "system", "content": sys}));
-        }
-        for m in messages {
-            msg_array.push(json!({
-                "role": role_to_str(&m.role),
-                "content": m.content,
-            }));
-        }
-
-        let mut body = json!({
-            "model": opts.model,
-            "messages": msg_array,
-            "stream": true,
-        });
-        if let Some(mt) = opts.max_tokens {
-            body["max_tokens"] = json!(mt);
-        }
-        if let Some(temp) = opts.temperature {
-            body["temperature"] = json!(temp);
-        }
+        // Build the request body; the leading stable prefix stays byte-identical
+        // and first so OpenAI automatic prompt caching can match it across turns.
+        let body = build_body(messages, opts);
 
         // Capture parent context so the LLM span is a child of the agent invoke span.
         let parent_cx = opentelemetry::Context::current();
@@ -282,5 +302,85 @@ impl Provider for OpenAiProvider {
         });
 
         Box::pin(ReceiverStream::new(rx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_body;
+    use crate::types::CacheStrategy;
+    use crate::{CallOptions, Message, Role};
+
+    fn base_opts() -> CallOptions {
+        CallOptions {
+            model: "gpt-4o".to_owned(),
+            max_tokens: None,
+            temperature: None,
+            system: None,
+            tools: None,
+            provider_session_id: None,
+            stable_prefix_len: None,
+            cache_strategy: CacheStrategy::None,
+        }
+    }
+
+    #[test]
+    fn build_body_emits_prompt_cache_key_for_openai_automatic() {
+        let mut opts = base_opts();
+        opts.system = Some("sys".to_owned());
+        opts.stable_prefix_len = Some(2);
+        opts.cache_strategy = CacheStrategy::OpenAiAutomatic {
+            cache_key: Some("session-xyz".to_owned()),
+        };
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: "stable a".to_owned(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "stable b".to_owned(),
+            },
+            Message {
+                role: Role::User,
+                content: "fresh".to_owned(),
+            },
+        ];
+        let body = build_body(&messages, &opts);
+        assert_eq!(body["prompt_cache_key"], "session-xyz");
+        // System leads, then the leading stable prefix in unchanged order.
+        let arr = body["messages"].as_array().expect("messages array");
+        assert_eq!(arr[0]["role"], "system");
+        assert_eq!(arr[1]["content"], "stable a");
+        assert_eq!(arr[2]["content"], "stable b");
+        assert_eq!(arr[3]["content"], "fresh");
+    }
+
+    #[test]
+    fn build_body_none_strategy_omits_prompt_cache_key() {
+        let mut opts = base_opts();
+        opts.system = Some("sys".to_owned());
+        let messages = vec![Message {
+            role: Role::User,
+            content: "hello".to_owned(),
+        }];
+        let body = build_body(&messages, &opts);
+        assert!(
+            body.get("prompt_cache_key").is_none(),
+            "no prompt_cache_key when strategy is None"
+        );
+        // Body shape is unchanged from the pre-cache behaviour.
+        let arr = body["messages"].as_array().expect("messages array");
+        assert_eq!(arr[0]["role"], "system");
+        assert_eq!(arr[1]["content"], "hello");
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn build_body_automatic_without_key_omits_prompt_cache_key() {
+        let mut opts = base_opts();
+        opts.cache_strategy = CacheStrategy::OpenAiAutomatic { cache_key: None };
+        let body = build_body(&[], &opts);
+        assert!(body.get("prompt_cache_key").is_none());
     }
 }

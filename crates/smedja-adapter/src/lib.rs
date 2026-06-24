@@ -63,4 +63,4 @@ pub use openai_compat::{
 pub use poolside::PoolsideProvider;
 pub use provider::{DeltaStream, Provider};
 pub use subprocess::SubprocessProvider;
-pub use types::{CallOptions, Delta, Message, Role};
+pub use types::{CacheStrategy, CallOptions, Delta, Message, Role};
