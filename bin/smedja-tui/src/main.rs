@@ -3,6 +3,7 @@ mod blocks;
 mod context_rail;
 mod cowork_widget;
 pub mod main_panel;
+mod metrics_view;
 mod staging;
 mod statusbar;
 pub mod theme;
@@ -234,6 +235,10 @@ struct AppState {
     staging_queue: staging::StagingQueue,
     /// Whether the context rail sidebar is visible.
     context_rail_visible: bool,
+    /// Whether the metrics view panel is visible.
+    metrics_view_visible: bool,
+    /// Cached per-runner metrics snapshot for the latest rollup window.
+    metrics_snapshot: Vec<metrics_view::MetricsRow>,
     /// Cumulative tokens used so far in this session (input + output).
     context_used: u64,
     /// Context window size in tokens for the active model.
@@ -2024,6 +2029,11 @@ async fn handle_key(
             }
         }
 
+        // Ctrl-T: toggle the metrics view panel (read-only rollup snapshot).
+        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.metrics_view_visible = !state.metrics_view_visible;
+        }
+
         KeyCode::Esc => {
             if state.diff_overlay.is_some() {
                 state.diff_overlay = None;
@@ -2596,6 +2606,29 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         frame.render_widget(rail, rail_rect);
     }
 
+    // -- Metrics view ---------------------------------------------------------
+    // Read-only snapshot panel, toggled via Ctrl-T. Rendered as a top-anchored
+    // overlay on the right of the body so it does not disturb the main/rail
+    // split; it draws from the cached snapshot, never fetching on the hot path.
+    if state.metrics_view_visible {
+        let width = metrics_view::MetricsView::WIDTH.min(body_area.width);
+        let height = u16::try_from(state.metrics_snapshot.len() + 1)
+            .unwrap_or(u16::MAX)
+            .saturating_add(1)
+            .min(body_area.height);
+        if width > 0 && height > 0 {
+            let metrics_rect = ratatui::layout::Rect::new(
+                body_area.x + body_area.width.saturating_sub(width),
+                body_area.y,
+                width,
+                height,
+            );
+            let view = metrics_view::MetricsView::new(state.metrics_snapshot.clone());
+            frame.render_widget(ratatui::widgets::Clear, metrics_rect);
+            frame.render_widget(view, metrics_rect);
+        }
+    }
+
     // -- Cowork gate overlay --------------------------------------------------
     if !state.pending_cowork.is_empty() {
         let cw_rect = cowork_widget::overlay_rect(body_area);
@@ -2795,6 +2828,8 @@ async fn main() -> Result<()> {
         diff_scroll: 0,
         staging_queue: staging::StagingQueue::new(),
         context_rail_visible: true,
+        metrics_view_visible: false,
+        metrics_snapshot: Vec::new(),
         context_used: 0,
         context_window: 200_000,
         main_panel: main_panel::MainPanel::new(),
@@ -3824,6 +3859,8 @@ mod tests {
             diff_scroll: 0,
             staging_queue: staging::StagingQueue::new(),
             context_rail_visible: true,
+            metrics_view_visible: false,
+            metrics_snapshot: Vec::new(),
             context_used: 0,
             context_window: 200_000,
             main_panel: main_panel::MainPanel::new(),
@@ -4923,6 +4960,47 @@ mod tests {
             !state.context_rail_visible,
             "context rail must be toggled off"
         );
+    }
+
+    #[test]
+    fn ctrl_t_toggles_metrics_view() {
+        let mut state = make_state("sess-ctrl-t");
+        assert!(!state.metrics_view_visible, "metrics view starts hidden");
+        // Simulate Ctrl-T.
+        state.metrics_view_visible = !state.metrics_view_visible;
+        assert!(state.metrics_view_visible, "Ctrl-T must show metrics view");
+        state.metrics_view_visible = !state.metrics_view_visible;
+        assert!(!state.metrics_view_visible, "Ctrl-T again must hide it");
+    }
+
+    #[test]
+    fn metrics_view_panel_renders_per_runner_snapshot() {
+        let mut state = make_state("sess-metrics-render");
+        state.metrics_view_visible = true;
+        state.metrics_snapshot = vec![
+            metrics_view::MetricsRow {
+                runner: "claude".into(),
+                tokens: 780,
+                cost_usd: 0.06,
+                errors: 2,
+            },
+            metrics_view::MetricsRow {
+                runner: "local".into(),
+                tokens: 480,
+                cost_usd: 0.0,
+                errors: 0,
+            },
+        ];
+        let buf = render_frame(&mut state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(content.contains("claude"), "claude runner must render");
+        assert!(content.contains("local"), "local runner must render");
+        assert!(content.contains("$0.0600"), "claude cost must render");
+        assert!(content.contains("780"), "claude tokens must render");
     }
 
     #[test]

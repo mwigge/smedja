@@ -14,6 +14,7 @@ pub mod handle;
 pub mod loop_state;
 pub mod mcp;
 pub mod methodology;
+pub mod metrics_rollup;
 pub mod openspec_store;
 pub mod prompt_hash;
 pub mod session;
@@ -29,6 +30,7 @@ pub use handle::IngotHandle;
 pub use loop_state::LoopRecord;
 pub use mcp::McpServer;
 pub use methodology::MethodologyState;
+pub use metrics_rollup::{MetricsBucket, RollupTier};
 pub use openspec_store::OpenSpecStore;
 pub use prompt_hash::PromptHashRecord;
 pub use session::Session;
@@ -142,6 +144,29 @@ const MIGRATIONS: &[(i64, &str)] = &[
                     CASE WHEN turn_n = -1 THEN 'legacy-compaction-' || id ELSE NULL END \
              FROM checkpoints_old; \
          DROP TABLE checkpoints_old;",
+    ),
+    // Metrics rollups: a derived cache for time-tiered aggregation of tokens,
+    // cost, turns, and error counts per runner. Keyed on (tier, bucket_start,
+    // runner). Created via IF NOT EXISTS so the migration is idempotent. The two
+    // indices accelerate the on-read aggregation over the source tables, which
+    // bound every query by created_at / ts.
+    (
+        22,
+        "CREATE TABLE IF NOT EXISTS metrics_rollups ( \
+             tier         TEXT NOT NULL, \
+             bucket_start INTEGER NOT NULL, \
+             runner       TEXT NOT NULL, \
+             turns        INTEGER NOT NULL DEFAULT 0, \
+             input_tok    INTEGER NOT NULL DEFAULT 0, \
+             output_tok   INTEGER NOT NULL DEFAULT 0, \
+             cost_usd     INTEGER NOT NULL DEFAULT 0, \
+             error_count  INTEGER NOT NULL DEFAULT 0, \
+             PRIMARY KEY (tier, bucket_start, runner) \
+         ); \
+         CREATE INDEX IF NOT EXISTS idx_cost_ledger_created_at \
+             ON cost_ledger(created_at); \
+         CREATE INDEX IF NOT EXISTS idx_audit_events_ts_status \
+             ON audit_events(ts, status);",
     ),
 ];
 
@@ -971,6 +996,54 @@ impl Ingot {
     #[must_use = "check the Result to determine the active model"]
     pub fn session_last_model(&self, session_id: &str) -> Result<Option<String>, IngotError> {
         cost::last_model(&self.conn, session_id)
+    }
+
+    // metrics_rollups --------------------------------------------------------
+
+    /// Computes time-tiered metrics buckets for `tier` over `[since, until)`.
+    ///
+    /// Aggregates tokens, cost, and turns from `cost_ledger` and error counts
+    /// from `audit_events` (`status = 'error'`) per `(bucket, runner)`, merging
+    /// the two on `(bucket_start, runner)`. Buckets are computed on read from the
+    /// source rows — there is no staleness and no background writer. Results are
+    /// ordered by `bucket_start` then `runner`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if either source query fails.
+    #[must_use = "check the Result and inspect the returned buckets"]
+    pub fn metrics_rollup(
+        &self,
+        tier: metrics_rollup::RollupTier,
+        since: smedja_types::Timestamp,
+        until: smedja_types::Timestamp,
+    ) -> Result<Vec<MetricsBucket>, IngotError> {
+        metrics_rollup::compute(&self.conn, tier, since, until)
+    }
+
+    /// Upserts the computed buckets for `tier` over `[epoch, until)` into the
+    /// `metrics_rollups` cache, keyed on `(tier, bucket_start, runner)`.
+    ///
+    /// Materialises every bucket up to (but not including) `until`. Idempotent:
+    /// re-running with the same `until` reproduces identical rows, and the stored
+    /// rows equal `metrics_rollup(tier, epoch, until)`. The returned buckets are
+    /// exactly what was stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the source queries or the upsert fail.
+    #[must_use = "check the Result to confirm the rollups were materialised"]
+    pub fn materialise_rollups(
+        &self,
+        tier: metrics_rollup::RollupTier,
+        until: smedja_types::Timestamp,
+    ) -> Result<Vec<MetricsBucket>, IngotError> {
+        metrics_rollup::materialise(
+            &self.conn,
+            tier,
+            smedja_types::Timestamp::from_micros(0),
+            until,
+        )
     }
 
     // JSONL export / import --------------------------------------------------

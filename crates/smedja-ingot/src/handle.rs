@@ -622,6 +622,40 @@ impl IngotHandle {
             .await
     }
 
+    // ── metrics_rollups ───────────────────────────────────────────────────────
+
+    /// Computes time-tiered metrics buckets for `tier` over `[since, until)`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying queries, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn metrics_rollup(
+        &self,
+        tier: crate::RollupTier,
+        since: Timestamp,
+        until: Timestamp,
+    ) -> Result<Vec<crate::MetricsBucket>, IngotError> {
+        self.run_blocking(move |ig| ig.metrics_rollup(tier, since, until))
+            .await
+    }
+
+    /// Upserts the computed buckets for `tier` over `[epoch, until)` into the
+    /// `metrics_rollups` cache. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying queries or upsert, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn materialise_rollups(
+        &self,
+        tier: crate::RollupTier,
+        until: Timestamp,
+    ) -> Result<Vec<crate::MetricsBucket>, IngotError> {
+        self.run_blocking(move |ig| ig.materialise_rollups(tier, until))
+            .await
+    }
+
     // ── token_snapshots ───────────────────────────────────────────────────────
 
     /// Saves a [`TokenSnapshot`].

@@ -563,6 +563,13 @@ fn build_router(
         async move { handlers::cost::cost(state, params).await }
     });
 
+    // ── metrics.summary ───────────────────────────────────────────────────────
+    let metrics_state = state.clone();
+    router.register("metrics.summary", move |params: Value| {
+        let state = metrics_state.clone();
+        async move { handlers::metrics::summary(state, params).await }
+    });
+
     // ── session.set_model ────────────────────────────────────────────────────
     let set_model_state = state.clone();
     router.register("session.set_model", move |params: Value| {
