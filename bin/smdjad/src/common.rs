@@ -122,11 +122,22 @@ pub(crate) fn effective_max_tool_turns() -> usize {
         .map_or(MAX_TOOL_TURNS, |n| n.min(50))
 }
 
-/// Error returned by [`drain_stream`], distinguishing rate-limit responses from
-/// other failures so callers can apply an appropriate retry strategy.
+/// Error returned by [`drain_stream`], distinguishing rate-limit responses and
+/// rotatable provider failures from other failures so callers can apply an
+/// appropriate recovery strategy.
 pub(crate) enum DrainError {
-    /// The provider returned HTTP 429; back off for `retry_after` before retrying.
+    /// The provider returned HTTP 429; back off for `retry_after` before retrying
+    /// the **same** provider.
     RateLimited {
+        retry_after: Option<std::time::Duration>,
+    },
+    /// A retryable provider failure (quota exhausted, context-length exceeded, or
+    /// provider down) that rotation to another eligible provider may recover.
+    ///
+    /// `kind` is the stable `smedja.error.kind` classification from
+    /// [`smedja_adapter::AdapterError::kind`].
+    Rotatable {
+        kind: &'static str,
         retry_after: Option<std::time::Duration>,
     },
     /// Any other stream-level error; treat as fatal for this turn.
@@ -138,6 +149,12 @@ impl std::fmt::Display for DrainError {
         match self {
             Self::RateLimited { retry_after } => {
                 write!(f, "rate limited by provider (retry after {retry_after:?})")
+            }
+            Self::Rotatable { kind, retry_after } => {
+                write!(
+                    f,
+                    "rotatable provider failure ({kind}, retry after {retry_after:?})"
+                )
             }
             Self::Other(s) => f.write_str(s),
         }
@@ -223,7 +240,18 @@ pub(crate) async fn drain_stream(
             Some(Err(smedja_adapter::AdapterError::RateLimited { retry_after })) => {
                 return Err(DrainError::RateLimited { retry_after });
             }
-            Some(Err(e)) => return Err(DrainError::Other(e.to_string())),
+            Some(Err(e)) => {
+                // Retryable quota / context-length / provider-down failures
+                // rotate to another provider; everything else is fatal for this
+                // turn. Classification lives at the adapter boundary.
+                if e.is_retryable() {
+                    return Err(DrainError::Rotatable {
+                        kind: e.kind(),
+                        retry_after: None,
+                    });
+                }
+                return Err(DrainError::Other(e.to_string()));
+            }
         }
     }
     Ok((
@@ -232,4 +260,87 @@ pub(crate) async fn drain_stream(
         output_tokens,
         provider_session_id,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use smedja_adapter::AdapterError;
+
+    use super::*;
+
+    fn error_stream(err: AdapterError) -> smedja_adapter::DeltaStream {
+        Box::pin(futures_util::stream::iter(vec![Err(err)]))
+    }
+
+    #[tokio::test]
+    async fn drain_stream_maps_quota_error_to_rotatable() {
+        let dispatcher = Dispatcher::new(8);
+        let result = drain_stream(
+            error_stream(AdapterError::QuotaExhausted(
+                "insufficient_quota".to_owned(),
+            )),
+            &dispatcher,
+            Some("turn-1"),
+            &CorrelationCtx::default(),
+        )
+        .await;
+        match result {
+            Err(DrainError::Rotatable { kind, .. }) => {
+                assert_eq!(kind, "quota_exhausted");
+            }
+            _ => panic!("quota error must map to DrainError::Rotatable"),
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_stream_maps_context_length_error_to_rotatable() {
+        let dispatcher = Dispatcher::new(8);
+        let result = drain_stream(
+            error_stream(AdapterError::ContextLengthExceeded(
+                "prompt is too long".to_owned(),
+            )),
+            &dispatcher,
+            Some("turn-1"),
+            &CorrelationCtx::default(),
+        )
+        .await;
+        match result {
+            Err(DrainError::Rotatable { kind, .. }) => {
+                assert_eq!(kind, "context_length_exceeded");
+            }
+            _ => panic!("context-length error must map to DrainError::Rotatable"),
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_stream_maps_rate_limited_to_rate_limited() {
+        let dispatcher = Dispatcher::new(8);
+        let result = drain_stream(
+            error_stream(AdapterError::RateLimited { retry_after: None }),
+            &dispatcher,
+            Some("turn-1"),
+            &CorrelationCtx::default(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(DrainError::RateLimited { .. })),
+            "429 must map to DrainError::RateLimited, not Rotatable"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_stream_maps_parse_error_to_other() {
+        let dispatcher = Dispatcher::new(8);
+        let result = drain_stream(
+            error_stream(AdapterError::Parse("bad json".to_owned())),
+            &dispatcher,
+            Some("turn-1"),
+            &CorrelationCtx::default(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(DrainError::Other(_))),
+            "non-retryable parse error must map to DrainError::Other"
+        );
+    }
 }

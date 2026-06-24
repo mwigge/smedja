@@ -274,4 +274,29 @@ mod tests {
             OpenCodeProvider::with_base_url("https://staging.opencode.ai/v1", "test-key");
         drop(provider);
     }
+
+    // OpenAI-compatible providers delegate streaming (and therefore non-success
+    // HTTP classification) to the wrapped `OpenAiProvider`, which routes through
+    // `classify_http_error`. These assertions pin the quota / context-length
+    // mappings the compat path relies on.
+
+    #[test]
+    fn compat_quota_response_maps_to_quota_exhausted() {
+        let err = crate::classify_http_error(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"type":"insufficient_quota"}}"#,
+        );
+        assert_eq!(err.kind(), "quota_exhausted");
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn compat_context_length_response_maps_to_context_length_exceeded() {
+        let err = crate::classify_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"code":"context_length_exceeded"}}"#,
+        );
+        assert_eq!(err.kind(), "context_length_exceeded");
+        assert!(err.is_retryable());
+    }
 }

@@ -150,15 +150,12 @@ impl Provider for OpenAiProvider {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
+                let err = crate::classify_http_error(status, &text);
                 llm_span.set_status(opentelemetry::trace::Status::error(format!(
                     "HTTP {status}"
                 )));
                 llm_span.end();
-                let _ = tx
-                    .send(Err(AdapterError::InvalidResponse(format!(
-                        "HTTP {status}: {text}"
-                    ))))
-                    .await;
+                let _ = tx.send(Err(err)).await;
                 return;
             }
 
