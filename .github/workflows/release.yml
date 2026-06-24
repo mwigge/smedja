@@ -99,7 +99,7 @@ jobs:
       - name: build rpm
         if: runner.os == 'Linux'
         run: |
-          cargo generate-rpm -p smdjad --target ${{ matrix.target }}
+          cargo generate-rpm -p bin/smdjad --target ${{ matrix.target }}
           RPM=$(find "target/${{ matrix.target }}/generate-rpm" -name "*.rpm" | head -1)
           cp "$RPM" "smedja-linux-${{ matrix.arch }}.rpm"
 
