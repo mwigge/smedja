@@ -27,6 +27,7 @@ pub mod copilot;
 pub mod crush;
 pub mod error;
 pub mod gemini;
+pub mod gpu;
 pub mod local;
 pub mod openai;
 pub mod openai_compat;
@@ -55,7 +56,11 @@ pub use crush::{
 };
 pub use error::{classify_http_error, AdapterError};
 pub use gemini::GeminiProvider;
-pub use local::{LocalCapability, LocalProvider};
+pub use gpu::{detect_gpu, fit_for, parse_gpu_snapshot, Fit, GpuSnapshot};
+pub use local::{
+    fetch_inventory, install_model, issue_swap_request, parse_model_inventory, record_local_swap,
+    InstallOutcome, LocalCapability, LocalModel, LocalProvider, SwapOutcome,
+};
 pub use openai::OpenAiProvider;
 pub use openai_compat::{
     BergetProvider, MinimaxProvider, OpenAiCompatProvider, OpenAiCompatSpec, OpenCodeProvider,

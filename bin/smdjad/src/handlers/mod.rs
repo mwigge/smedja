@@ -29,6 +29,7 @@ pub(crate) mod auditor;
 pub(crate) mod checkpoint;
 pub(crate) mod cost;
 pub(crate) mod graph;
+pub(crate) mod local;
 pub(crate) mod loops;
 pub(crate) mod mcp;
 pub(crate) mod metrics;
