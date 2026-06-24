@@ -5,6 +5,7 @@ pub mod common;
 pub mod cowork;
 pub mod embedder;
 pub mod executor;
+pub mod fragments;
 pub mod handlers;
 pub mod local_provider;
 pub mod loop_runner;
@@ -134,7 +135,7 @@ pub(crate) fn missing_param(name: &str) -> RpcError {
 
 /// Executes a bash command in `workspace` using `sh -c`, returning stdout or a
 /// formatted error string.
-async fn exec_bash(cmd: &str, workspace: &std::path::Path) -> String {
+pub(crate) async fn exec_bash(cmd: &str, workspace: &std::path::Path) -> String {
     match tokio::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
