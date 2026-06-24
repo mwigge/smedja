@@ -143,7 +143,6 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/login",
     "/metrics",
     "/model",
-    "/ponytail",
     "/pptx",
     "/quota",
     "/resume",
@@ -151,7 +150,6 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/spec",
     "/switch",
     "/takeover",
-    "/tdd",
     "/tier",
 ];
 
@@ -170,7 +168,6 @@ slash commands:
   /login             — authenticate with runner
   /metrics           — show token usage and cost
   /model [name]      — show or set model (local runner: lists GPU fit / hot-swaps)
-  /ponytail          — set review mode
   /pptx <slug>       — generate PowerPoint
   /quota             — show usage quota
   /resume [id [turn]] — resume a session (omit id for interactive picker; turn rewinds)
@@ -178,7 +175,6 @@ slash commands:
   /spec              — browse OpenSpec changes
   /switch [runner]   — switch AI runner (omit for interactive picker)
   /takeover <runner> — fork session to new runner
-  /tdd               — set TDD mode
   /tier <t>          — set tier (local|fast|deep)
 
 inline context fragments (expanded into your message before the turn runs):
@@ -1107,16 +1103,6 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
                 _ => "usage: /spec [list|status [name]|archive <name>]".to_owned(),
             };
             push_system_message(state, text);
-            Ok(true)
-        }
-        "tdd" => {
-            state.mode = Some("tdd".to_owned());
-            push_system_message(state, "mode set to tdd");
-            Ok(true)
-        }
-        "ponytail" => {
-            state.mode = Some("ponytail".to_owned());
-            push_system_message(state, "mode set to ponytail");
             Ok(true)
         }
         "model" => {

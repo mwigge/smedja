@@ -1,18 +1,15 @@
 /// Supported development methodology modes.
+///
+/// TDD and clean-code discipline are no longer selectable modes — they are the
+/// always-on foundational discipline (steering + backstops). The remaining modes
+/// are the selectable lifecycle/gate concerns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
-    /// Test-driven development — implementation must be accompanied by tests.
-    Tdd,
-    /// Ponytail gate — checks for over-engineering smells such as unnecessary
-    /// complexity and debug output.
-    Ponytail,
     /// Spec-first development — changes must reference a specification.
     Spec,
     /// Clean gate — hard blocker on `unwrap`/`expect` and debug output in
     /// production code.
     Clean,
-    /// SRE gate — structural reliability checks.
-    Sre,
 }
 
 /// Configuration for an active methodology session.

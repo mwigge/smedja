@@ -14,6 +14,7 @@ pub mod mcp_http;
 pub mod mcp_oauth;
 pub mod mcp_server;
 pub mod mcp_stdio;
+pub mod methodology_config;
 pub mod methodology_gate;
 pub mod orchestrator;
 pub mod price_table;

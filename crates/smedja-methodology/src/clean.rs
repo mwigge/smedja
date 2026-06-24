@@ -21,17 +21,6 @@ const PRINTLN_MARKER: &str = "println!";
 ///
 /// Returns a [`MethodologyViolation`] describing the first detected violation.
 pub fn check(diff: &str) -> GateResult {
-    check_added_lines(GATE, diff)
-}
-
-/// Shared logic for scanning added lines for clean-code violations.
-///
-/// Used by both [`check`] (`CleanGate`) and the ponytail module.
-///
-/// # Errors
-///
-/// Returns a [`MethodologyViolation`] on the first detected violation.
-pub(crate) fn check_added_lines(gate: &'static str, diff: &str) -> GateResult {
     let mut in_test_block = false;
 
     for line in diff.lines() {
@@ -53,14 +42,14 @@ pub(crate) fn check_added_lines(gate: &'static str, diff: &str) -> GateResult {
 
         if content.contains(".unwrap()") || content.contains(".expect(") {
             return Err(MethodologyViolation::new(
-                gate,
+                GATE,
                 "unwrap/expect on non-test code".to_owned(),
             ));
         }
 
         if content.contains(PRINTLN_MARKER) {
             return Err(MethodologyViolation::new(
-                gate,
+                GATE,
                 "println! in library code".to_owned(),
             ));
         }
