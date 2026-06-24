@@ -351,6 +351,23 @@ Config is TOML. A migration tool converts existing WezTerm Lua config.
 
 `smedja-tui` is a ratatui agent dashboard that runs as a normal app inside smedja (or any terminal). Launch it with `smedja-tui` from the shell.
 
+### Resuming a session
+
+By default `smedja-tui` creates a fresh session on launch. To reopen a prior conversation:
+
+```sh
+# attach to an existing session and replay its history into the view
+smedja-tui --session <id>
+
+# resume but rewind the session to a chosen turn first (destructive — prunes
+# later turns, mirroring `smj session rollback <id> <turn>`)
+smedja-tui --session <id> --turn <n>
+```
+
+An unknown `--session <id>` fails fast with `session not found: <id>` before the dashboard opens.
+
+Inside the TUI, `/resume` opens an interactive picker listing resumable sessions (short id, title, mode, last-updated); press Enter on a row to resume it in place without restarting. `/resume <id>` resumes directly, and `/resume <id> <turn>` rewinds to that turn before replaying. Plain resume (no turn) is non-destructive — it only reads history. `/resume` is refused while a turn is in flight.
+
 ---
 
 ## Install
