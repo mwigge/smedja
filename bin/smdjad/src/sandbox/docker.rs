@@ -4,6 +4,12 @@
 //! bind-mounted read-write, `.git` shadowed read-only, a dropped capability
 //! set, a read-only root filesystem, and a `/tmp` tmpfs. The network is
 //! configured per [`NetworkPolicy`].
+//!
+//! Read confinement is *structural* here: only the confined root is bind-mounted
+//! into the container, so the host home directory and its secret subpaths
+//! (`~/.ssh`, `~/.aws`, `~/.config`, `~/.gnupg`) are never present in the
+//! container's filesystem and cannot be read. This is the Docker read floor; no
+//! per-path read rules are needed because the host filesystem is simply absent.
 
 use std::path::Path;
 
@@ -76,6 +82,65 @@ impl DockerBackend {
             NetworkPolicy::Allowlist | NetworkPolicy::Open => "bridge",
         }
     }
+
+    /// Builds the full `docker run …` argument vector for a confined execution.
+    ///
+    /// Only `confined_root` is bind-mounted read-write at `/workspace` (the
+    /// structural read floor — no host home is mounted); `git_dir`, when
+    /// present, is shadowed read-only at `/workspace/.git`. Pure string logic so
+    /// the mount set and `--network` value are unit-testable without invoking
+    /// Docker.
+    #[must_use]
+    pub(crate) fn build_run_args(
+        image: &str,
+        confined_root: &str,
+        git_dir: Option<&str>,
+        cmd: &str,
+        policy: NetworkPolicy,
+    ) -> Vec<String> {
+        let network = Self::network_arg(policy);
+        let mut args: Vec<String> = [
+            "run",
+            "--rm",
+            "--network",
+            network,
+            "--cpus",
+            "0.5",
+            "--memory",
+            "256m",
+            "--pids-limit",
+            "64",
+            "--stop-timeout",
+            "30",
+            "--security-opt",
+            "no-new-privileges",
+            "--cap-drop",
+            "ALL",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:size=64m",
+            "-v",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        args.push(format!("{confined_root}:/workspace:rw"));
+        args.push("-w".to_owned());
+        args.push("/workspace".to_owned());
+
+        // Shadow .git with a read-only mount to prevent host git-hook escape.
+        if let Some(git) = git_dir {
+            args.push("-v".to_owned());
+            args.push(format!("{git}:/workspace/.git:ro"));
+        }
+
+        args.push("--".to_owned());
+        args.push(image.to_owned());
+        args.push("sh".to_owned());
+        args.push("-c".to_owned());
+        args.push(cmd.to_owned());
+        args
+    }
 }
 
 #[async_trait]
@@ -102,44 +167,16 @@ impl SandboxBackend for DockerBackend {
         let root_str = root
             .to_str()
             .ok_or("confined root contains non-UTF-8 bytes")?;
-        let root_rw = format!("{root_str}:/workspace:rw");
-        let network = Self::network_arg(policy);
+        let git_str = match git.as_ref() {
+            Some(g) => Some(
+                g.to_str()
+                    .ok_or("git dir contains non-UTF-8 bytes")?
+                    .to_owned(),
+            ),
+            None => None,
+        };
 
-        let mut args: Vec<&str> = vec![
-            "run",
-            "--rm",
-            "--network",
-            network,
-            "--cpus",
-            "0.5",
-            "--memory",
-            "256m",
-            "--pids-limit",
-            "64",
-            "--stop-timeout",
-            "30",
-            "--security-opt",
-            "no-new-privileges",
-            "--cap-drop",
-            "ALL",
-            "--read-only",
-            "--tmpfs",
-            "/tmp:size=64m",
-            "-v",
-            &root_rw,
-            "-w",
-            "/workspace",
-        ];
-
-        // Shadow .git with a read-only mount to prevent host git-hook escape.
-        let git_vol;
-        if let Some(git_dir) = git {
-            git_vol = format!("{}:/workspace/.git:ro", git_dir.display());
-            args.push("-v");
-            args.push(&git_vol);
-        }
-
-        args.extend_from_slice(&["--", &self.image, "sh", "-c", cmd]);
+        let args = Self::build_run_args(&self.image, root_str, git_str.as_deref(), cmd, policy);
 
         match tokio::time::timeout(
             std::time::Duration::from_secs(EXEC_TIMEOUT_SECS),
@@ -183,5 +220,59 @@ mod tests {
             .exec("ls", Path::new("/tmp"), NetworkPolicy::None)
             .await
             .is_err());
+    }
+
+    // ── 4.1 structural read floor: only the confined root is mounted ──────────
+
+    #[test]
+    fn docker_run_args_do_not_mount_host_home() {
+        // Assemble the run args for a confined root with no .git.
+        let args = DockerBackend::build_run_args(
+            "smedja-sandbox:latest",
+            "/work/root",
+            None,
+            "echo hi",
+            NetworkPolicy::Open,
+        );
+
+        // Exactly one read-write bind mount: the confined root → /workspace.
+        let mounts: Vec<&String> = args
+            .iter()
+            .zip(args.iter().skip(1))
+            .filter(|(flag, _)| flag.as_str() == "-v")
+            .map(|(_, val)| val)
+            .collect();
+        assert_eq!(
+            mounts,
+            vec![&"/work/root:/workspace:rw".to_owned()],
+            "only the confined root is mounted; got: {mounts:?}"
+        );
+
+        // No bind mount references the host home dir (structural read floor).
+        if let Ok(home) = std::env::var("HOME") {
+            assert!(
+                !args.iter().any(|a| a.contains(&home)),
+                "no host-home path may be mounted; got: {args:?}"
+            );
+        }
+    }
+
+    // ── 6.2 --network none under NetworkPolicy::None ──────────────────────────
+
+    #[test]
+    fn docker_run_args_isolate_network_under_none() {
+        let args = DockerBackend::build_run_args(
+            "img",
+            "/work/root",
+            None,
+            "echo hi",
+            NetworkPolicy::None,
+        );
+        let net_idx = args.iter().position(|a| a == "--network").unwrap();
+        assert_eq!(
+            args[net_idx + 1],
+            "none",
+            "NetworkPolicy::None must produce --network none; got: {args:?}"
+        );
     }
 }

@@ -286,11 +286,39 @@ Shell tools (`bash`, `run_command`) run inside a per-platform isolation boundary
 
 The writable filesystem root is the **confined root** — the active worktree when a task owns one, otherwise the session workspace — with `.git` read-only and an ephemeral `/tmp`. Writes outside the confined root are denied by the kernel boundary.
 
-**Network policy** — `SMEDJA_SANDBOX_NETWORK` (default `none`):
+**Read confinement** — a sandboxed command's filesystem *reads* are confined to a bounded allow-list of system directories plus the confined root, so host secrets (`~/.ssh`, `~/.aws/credentials`, `~/.config`, `~/.gnupg`) are unreadable. This is enforced per backend:
 
-- `none` — no egress.
+| Platform | Read mechanism |
+|----------|----------------|
+| Linux (Landlock) | read+execute granted only over the allow-listed system dirs (not all of `/`); home/secret dirs are never granted |
+| macOS (Seatbelt) | `(allow file-read*)` scoped to the allow-list plus explicit `(deny file-read*)` over the secret subpaths |
+| Docker | structural — only the confined root is bind-mounted, so the host filesystem (and secrets) are simply absent from the container |
+
+The default allow-list is `/usr /bin /sbin /lib /lib64 /etc /opt` (plus `/System /Library /private/var/db/dyld` on macOS for the dyld shared cache); non-existent paths are skipped.
+
+Widen it with **`SMEDJA_SANDBOX_READ_PATHS`** — colon-separated paths *appended* to (never replacing) the defaults. The home directory is deliberately not in the defaults; an operator who needs a toolchain under `$HOME` (for example `$HOME/.cargo`, `$HOME/.rustup`, or a Homebrew prefix under `/opt/homebrew`) opts in explicitly and accepts the wider read surface:
+
+```
+SMEDJA_SANDBOX_READ_PATHS=/Users/me/.cargo:/Users/me/.rustup
+```
+
+**Failure mode** — if a command needs to read a path that is neither in the defaults nor in `SMEDJA_SANDBOX_READ_PATHS`, it fails with a permission or not-found error (rather than silently succeeding). Add the path to `SMEDJA_SANDBOX_READ_PATHS` to allow it.
+
+**Network policy** — `SMEDJA_SANDBOX_NETWORK` (default `none`). The policy is now enforced for the sandboxed subprocess itself, per backend:
+
+| Policy | Linux (Landlock) | macOS (Seatbelt) | Docker |
+|--------|------------------|------------------|--------|
+| `none` | fresh network namespace (`unshare --net`) — no route anywhere | `(deny network*)` | `--network none` |
+| `allowlist` | host network retained¹ | `(allow network-outbound)`¹ | `--network bridge`¹ |
+| `open` | host network retained¹ | `(allow network-outbound)`¹ | `--network bridge`¹ |
+
+- `none` — no egress at all.
 - `allowlist` — egress only to destinations not rejected by the daemon's SSRF guard (`is_blocked_ip`), so private/loopback/IMDS ranges stay blocked.
 - `open` — general egress, but the same SSRF floor keeps private/loopback/IMDS ranges (including `169.254.169.254`) unreachable.
+
+¹ **Subprocess limitation (honest):** the `is_blocked_ip` SSRF floor runs inside smedja's *own* HTTP clients, not the child process's sockets. A raw subprocess cannot be per-destination IP-filtered without a filtering proxy, so for a subprocess **`allowlist` is treated as `open`-minus-blocked-ranges** — per-host allow-listing is not enforced for subprocesses in this change. Use `none` (full network isolation) or Docker for stronger guarantees.
+
+On Linux, when `none` is requested but a network namespace cannot be created (no `unshare`, no `CAP_NET_ADMIN`, no unprivileged user namespaces), the backend fails closed rather than silently granting egress: under `SMEDJA_SANDBOX_MODE=required` the tool call errors naming the missing capability; under `auto` it falls back to the host with the unconfined marker. The `smedja.sandbox.exec` span records `net_confined=false` in that case.
 
 **Fallback mode** — `SMEDJA_SANDBOX_MODE` (default `auto`) governs behaviour when no backend is available:
 
@@ -298,7 +326,7 @@ The writable filesystem root is the **confined root** — the active worktree wh
 - `required` — fail the tool call closed with a diagnostic naming the missing capability; the command does not run.
 - `off` — skip the sandbox entirely.
 
-Each sandboxed execution emits a `smedja.sandbox.exec` span carrying `backend`, `network_policy`, `mode`, and `confined_root`. Run `smj sandbox status` to see the selected backend, its availability, the active network policy, and the fallback mode.
+Each sandboxed execution emits a `smedja.sandbox.exec` span carrying `backend`, `network_policy`, `mode`, `confined_root`, `read_confined`, and `net_confined`. Run `smj sandbox status` to see the selected backend, its availability, the active network policy, and the fallback mode.
 
 ---
 
