@@ -2,10 +2,14 @@
 //!
 //! Builds a Landlock ruleset that grants read-write only under the confined
 //! root, read-only `.git`, and a writable `/tmp`, then applies it in the child
-//! process (via `pre_exec`) before the command's `exec`. Network confinement
-//! uses the Landlock TCP access controls when the kernel supports them: `none`
-//! denies all TCP connect/bind; `allowlist`/`open` permit them (the daemon's
-//! `is_blocked_ip` floor keeps private/IMDS ranges unreachable).
+//! process (via `pre_exec`) before the command's `exec`.
+//!
+//! Landlock here enforces the *filesystem* boundary — its strongest and most
+//! widely-supported guarantee (ABI v1, kernel ≥ 5.13). Network egress is not
+//! confined by Landlock (the TCP controls require ABI v4 / kernel 6.7+ and are
+//! not universally available); it is governed by the daemon's `is_blocked_ip`
+//! floor, which keeps loopback/private/IMDS ranges unreachable regardless of
+//! the requested `NetworkPolicy`.
 //!
 //! Availability is detected at startup; when Landlock is unavailable (kernel <
 //! 5.13 or disabled) the backend reports `available() == false` so selection
@@ -16,8 +20,8 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use landlock::{
-    Access, AccessFs, AccessNet, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus, ABI,
+    Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
+    ABI,
 };
 
 use super::{resolve_confined_root, NetworkPolicy, SandboxBackend, EXEC_TIMEOUT_SECS};
@@ -28,15 +32,20 @@ pub struct LandlockBackend {
 }
 
 impl LandlockBackend {
-    /// Detects Landlock support by probing the best-effort enforcement ABI.
+    /// Detects Landlock support by building (not enforcing) a minimal ruleset.
     ///
-    /// A fully-unsupported ABI (`ABI::Unsupported`) means no usable Landlock,
-    /// so the backend reports unavailable and selection downgrades.
+    /// `create()` allocates the ruleset without restricting the current process
+    /// (only `restrict_self` does that), so this probe is non-destructive. If
+    /// the kernel cannot create the ruleset, the backend reports unavailable and
+    /// selection downgrades. Runtime enforcement is still re-checked per command
+    /// via the `RulesetStatus::NotEnforced` guard in `apply`.
     #[must_use]
     pub fn detect() -> Self {
-        Self {
-            available: !matches!(ABI::new_current(), ABI::Unsupported),
-        }
+        let available = Ruleset::default()
+            .handle_access(AccessFs::from_all(ABI::V1))
+            .and_then(|ruleset| ruleset.create())
+            .is_ok();
+        Self { available }
     }
 
     /// Applies the Landlock ruleset for `root`/`git_dir` under `policy` in the
@@ -45,36 +54,29 @@ impl LandlockBackend {
     /// # Errors
     ///
     /// Returns `std::io::Error` when the ruleset cannot be created or applied.
-    fn apply(root: &Path, git_dir: &Path, policy: NetworkPolicy) -> std::io::Result<()> {
+    fn apply(root: &Path, git_dir: &Path, _policy: NetworkPolicy) -> std::io::Result<()> {
         let abi = ABI::V1;
         let map_err = |e: landlock::RulesetError| std::io::Error::other(format!("landlock: {e}"));
 
-        let mut ruleset = Ruleset::default()
+        // Filesystem confinement only (ABI v1). Network egress is governed by
+        // the daemon's is_blocked_ip floor, not Landlock — see the module docs.
+        let mut created = Ruleset::default()
             .handle_access(AccessFs::from_all(abi))
+            .map_err(map_err)?
+            .create()
             .map_err(map_err)?;
 
-        // Network handling is only meaningful when the running kernel exposes
-        // the TCP access rights (ABI::V4+). Add it best-effort; on older
-        // kernels the handled-access set is compatibility-clamped.
-        ruleset = ruleset
-            .handle_access(AccessNet::ConnectTcp | AccessNet::BindTcp)
-            .map_err(map_err)?;
-
-        let mut created = ruleset.create().map_err(map_err)?;
-
-        // Read-write under the confined root.
+        // Read-write under the confined root. PathFd::new yields std::io::Error,
+        // which propagates directly through this io::Result function.
         created = created
-            .add_rule(PathBeneath::new(
-                PathFd::new(root).map_err(map_err)?,
-                AccessFs::from_all(abi),
-            ))
+            .add_rule(PathBeneath::new(PathFd::new(root)?, AccessFs::from_all(abi)))
             .map_err(map_err)?;
 
         // Read-only .git (read access only; no write).
         if git_dir.exists() {
             created = created
                 .add_rule(PathBeneath::new(
-                    PathFd::new(git_dir).map_err(map_err)?,
+                    PathFd::new(git_dir)?,
                     AccessFs::from_read(abi),
                 ))
                 .map_err(map_err)?;
@@ -83,20 +85,7 @@ impl LandlockBackend {
         // Writable scratch /tmp.
         if Path::new("/tmp").exists() {
             created = created
-                .add_rule(PathBeneath::new(
-                    PathFd::new("/tmp").map_err(map_err)?,
-                    AccessFs::from_all(abi),
-                ))
-                .map_err(map_err)?;
-        }
-
-        // Network egress per policy. `none` adds no TCP-connect rule, so the
-        // handled ConnectTcp access stays denied. `allowlist`/`open` permit
-        // outbound connects on any port; the daemon's is_blocked_ip floor keeps
-        // private/IMDS ranges unreachable.
-        if policy.permits_public_egress() {
-            created = created
-                .add_rule(NetPort::new(0, AccessNet::ConnectTcp))
+                .add_rule(PathBeneath::new(PathFd::new("/tmp")?, AccessFs::from_all(abi)))
                 .map_err(map_err)?;
         }
 
