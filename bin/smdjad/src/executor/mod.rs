@@ -106,6 +106,135 @@ fn retrieve_store() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
     STORE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
+/// Vault namespace under which full uncompressed command output is teed for
+/// recovery via the `smedja_retrieve` tool.
+pub(crate) const FILTER_RECOVERY_NAMESPACE: &str = "filter-recovery";
+
+/// Computes the lowercase hex SHA-256 content hash used to address a teed
+/// full-output recovery entry.
+fn content_hash(content: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    format!("{:x}", Sha256::digest(content.as_bytes()))
+}
+
+/// Applies command-aware text filtering to a `bash`/`run_command` result on the
+/// return path, in-process (no shell hooks, no subprocess).
+///
+/// JSON results route to [`smedja_adapter::compress_tool_result`] (`SmartCrusher`,
+/// unchanged); text routes through the command-keyed filter registry loaded from
+/// `.smedja/filters.toml`. When filtering reduces the output (ratio < 1.0) the
+/// full uncompressed text is teed to the vault recovery namespace and registered
+/// in the `smedja_retrieve` store under its content hash, a trailing recovery
+/// marker naming that hash is appended, and the estimated tokens saved are
+/// recorded on the tokens-saved ledger. The captured success/failure contract
+/// of the result is never altered — only its body text is compressed.
+///
+/// `SMEDJA_NO_TOOL_COMPRESS=1` is honoured by the underlying compressors and
+/// returns the result verbatim.
+async fn filter_command_output(
+    cmd: &str,
+    result: String,
+    workspace: &std::path::Path,
+    session: Option<&Session>,
+    ingot: &IngotHandle,
+    vault: &Arc<Mutex<Vault>>,
+) -> String {
+    // Single branch point: JSON routes through SmartCrusher; text routes through
+    // the command filter. The bash/run_command path is text by construction.
+    if serde_json::from_str::<Value>(&result).is_ok() {
+        return smedja_adapter::compress_tool_result(&result);
+    }
+
+    let registry = crate::filters::load_filter_registry(workspace);
+    let (compressed, ratio) = smedja_adapter::compress_command_output_with(&registry, cmd, &result);
+
+    // No reduction → return verbatim; nothing to tee, no savings to record.
+    if ratio >= 1.0 {
+        return result;
+    }
+
+    // Tee the full uncompressed output to the vault recovery namespace and the
+    // in-memory retrieve store, addressed by content hash.
+    let hash = content_hash(&result);
+    {
+        let mut store = retrieve_store().lock().await;
+        store.insert(hash.clone(), result.clone());
+    }
+    tee_to_vault(&hash, &result, vault).await;
+
+    // Record tokens saved (clamped ≥ 0), separate from billed cost.
+    record_tokens_saved(cmd, &result, &compressed, session, ingot).await;
+
+    // Append the recovery marker naming the hash so the agent can expand it.
+    format!("{compressed}\n[smedja_retrieve hash={hash} to expand full output]")
+}
+
+/// Tees `full_output` to the vault recovery namespace under `hash`.
+///
+/// Vault writes are synchronous `SQLite` work; they run on a blocking thread so
+/// the async runtime is never blocked. A vault error is logged and swallowed —
+/// recovery is best-effort and must never break the tool path.
+async fn tee_to_vault(hash: &str, full_output: &str, vault: &Arc<Mutex<Vault>>) {
+    let vault = Arc::clone(vault);
+    let entry = VaultEntry {
+        id: hash.to_owned(),
+        embedding: Vec::new(),
+        payload: serde_json::json!({ "kind": "filter-recovery" }),
+        namespace: FILTER_RECOVERY_NAMESPACE.to_owned(),
+        content: full_output.to_owned(),
+        source_file: None,
+        added_by: Some("output-filter".to_owned()),
+        chunk_index: None,
+        parent_id: None,
+        created_at: 0.0,
+    };
+    let join = tokio::task::spawn_blocking(move || {
+        let mut guard = vault.blocking_lock();
+        guard.upsert(&entry)
+    })
+    .await;
+    match join {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "filter recovery vault tee failed; continuing"),
+        Err(e) => tracing::warn!(error = %e, "filter recovery vault tee task panicked; continuing"),
+    }
+}
+
+/// Records the tokens saved by filtering on the tokens-saved ledger.
+///
+/// `saved = estimate_tokens(original) - estimate_tokens(compressed)`, clamped at
+/// 0. Recorded only when positive, keyed by session (turn `0` at the executor
+/// layer, which does not thread a turn index). A ledger error is logged and
+/// swallowed — accounting is advisory and must never break the tool path.
+async fn record_tokens_saved(
+    cmd: &str,
+    original: &str,
+    compressed: &str,
+    session: Option<&Session>,
+    ingot: &IngotHandle,
+) {
+    let before = smedja_memory::estimate_tokens(original);
+    let after = smedja_memory::estimate_tokens(compressed);
+    let saved = before.saturating_sub(after);
+    if saved == 0 {
+        return;
+    }
+    let Some(session) = session else {
+        return;
+    };
+    let entry = smedja_ingot::TokensSavedEntry {
+        id: Uuid::new_v4(),
+        session_id: session.id.to_string(),
+        turn_n: 0,
+        command: cmd.to_owned(),
+        tokens_saved: i64::try_from(saved).unwrap_or(i64::MAX),
+        created_at: smedja_types::Timestamp::from_micros(0),
+    };
+    if let Err(e) = ingot.insert_tokens_saved(entry).await {
+        tracing::warn!(error = %e, "failed to record tokens-saved; continuing");
+    }
+}
+
 /// Finds the first JSON object with a `"tool"` key anywhere in `text`.
 ///
 /// Uses `serde_json` streaming deserialization: for each `{` byte position,
@@ -262,7 +391,7 @@ pub(crate) async fn execute_tool(
             // Exempt tools never reach this arm. The fallback contract
             // (auto/required/off) is enforced inside `run_confined`.
             let sandbox = SandboxExecutor::new();
-            if SandboxExecutor::is_exempt(tool_name) {
+            let raw = if SandboxExecutor::is_exempt(tool_name) {
                 super::exec_bash(cmd, workspace).await
             } else {
                 let confined_root = confined_root_for(workspace);
@@ -273,7 +402,14 @@ pub(crate) async fn execute_tool(
                         super::exec_bash(&cmd_owned, &ws).await
                     })
                     .await
-            }
+            };
+
+            // Command-aware text filtering on the return path (in-process; no
+            // shell hooks, no subprocess). Compresses verbose output before it
+            // enters working memory, tees the full text to the vault for
+            // recovery, and records tokens saved. The success/failure contract
+            // is unaffected — only the body text is compressed.
+            filter_command_output(cmd, raw, workspace, session, ingot, vault).await
         }
         "read_file" => {
             let path_str = input
@@ -638,6 +774,278 @@ pub(crate) async fn dispatch_mcp_tool_with_store(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    // ── output-filters: filter_command_output ─────────────────────────────────
+
+    fn filter_session() -> smedja_ingot::Session {
+        smedja_ingot::Session {
+            id: uuid::Uuid::new_v4(),
+            created_at: smedja_types::Timestamp::from_micros(0),
+            updated_at: smedja_types::Timestamp::from_micros(0),
+            status: "active".to_owned(),
+            task_id: None,
+            mode: None,
+            title: String::new(),
+            cowork_mode: false,
+            workspace_root: None,
+            model_override: None,
+            runner_override: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn known_command_output_is_compressed_on_return_path() {
+        use smedja_ingot::{Ingot, IngotHandle};
+        use smedja_vault::Vault;
+        use tokio::sync::Mutex;
+
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+        let ws = tempfile::tempdir().unwrap();
+        let session = filter_session();
+
+        // cargo-build-like noise: many progress lines, one real error.
+        let raw = format!(
+            "{}error[E0308]: mismatched types\n  --> src/lib.rs:1:1\n",
+            "   Compiling crate v0.1.0\n".repeat(40)
+        );
+        let out = super::filter_command_output(
+            "cargo build",
+            raw.clone(),
+            ws.path(),
+            Some(&session),
+            &ingot,
+            &vault,
+        )
+        .await;
+
+        assert!(
+            out.contains("error[E0308]"),
+            "the real error must survive filtering; got:\n{out}"
+        );
+        assert!(
+            !out.contains("Compiling"),
+            "progress noise must be filtered; got:\n{out}"
+        );
+        assert!(
+            out.len() < raw.len(),
+            "filtered output must be shorter than the original"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_command_output_passes_through_blank_removal_only() {
+        use smedja_ingot::{Ingot, IngotHandle};
+        use smedja_vault::Vault;
+        use tokio::sync::Mutex;
+
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+        let ws = tempfile::tempdir().unwrap();
+
+        // An unknown command with no blank lines is returned verbatim (ratio 1.0),
+        // preserving the captured success/failure contract.
+        let raw = "alpha\nbeta\ngamma".to_owned();
+        let out = super::filter_command_output(
+            "some-unknown-tool --flag",
+            raw.clone(),
+            ws.path(),
+            None,
+            &ingot,
+            &vault,
+        )
+        .await;
+        assert_eq!(out, raw, "unchanged content must pass through verbatim");
+    }
+
+    #[tokio::test]
+    async fn error_prefix_contract_is_preserved_through_filtering() {
+        use smedja_ingot::{Ingot, IngotHandle};
+        use smedja_vault::Vault;
+        use tokio::sync::Mutex;
+
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+        let ws = tempfile::tempdir().unwrap();
+
+        // A failed command's `error:` prefix (the success/failure contract) must
+        // never be stripped by filtering.
+        let raw = "error: command failed with exit status 1".to_owned();
+        let out = super::filter_command_output(
+            "some-unknown-tool",
+            raw.clone(),
+            ws.path(),
+            None,
+            &ingot,
+            &vault,
+        )
+        .await;
+        assert!(
+            out.starts_with("error:"),
+            "the error contract must be preserved; got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test-only: serialises a process-global env var across the await
+    async fn bypass_env_skips_executor_filtering() {
+        use smedja_ingot::{Ingot, IngotHandle};
+        use smedja_vault::Vault;
+        use tokio::sync::Mutex;
+
+        // Serialise env-var mutation so concurrent tests do not race on the
+        // process-global SMEDJA_NO_TOOL_COMPRESS bypass.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _env_guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+        let ws = tempfile::tempdir().unwrap();
+
+        std::env::set_var("SMEDJA_NO_TOOL_COMPRESS", "1");
+        let raw = format!(
+            "{}error[E0308]: mismatched\n",
+            "   Compiling crate v0.1.0\n".repeat(40)
+        );
+        let out = super::filter_command_output(
+            "cargo build",
+            raw.clone(),
+            ws.path(),
+            None,
+            &ingot,
+            &vault,
+        )
+        .await;
+        std::env::remove_var("SMEDJA_NO_TOOL_COMPRESS");
+        assert_eq!(out, raw, "bypass must return the output verbatim");
+    }
+
+    // ── output-filters: tee-to-vault recovery ─────────────────────────────────
+
+    #[tokio::test]
+    async fn reduced_output_is_teed_and_recoverable_via_marker_hash() {
+        use smedja_ingot::{Ingot, IngotHandle};
+        use smedja_vault::Vault;
+        use tokio::sync::Mutex;
+
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+        let ws = tempfile::tempdir().unwrap();
+        let session = filter_session();
+
+        let raw = format!(
+            "{}error[E0001]: boom\n",
+            "   Compiling crate v0.1.0\n".repeat(40)
+        );
+        let out = super::filter_command_output(
+            "cargo build",
+            raw.clone(),
+            ws.path(),
+            Some(&session),
+            &ingot,
+            &vault,
+        )
+        .await;
+
+        // The compressed result carries a recovery marker naming the hash.
+        let hash = super::content_hash(&raw);
+        assert!(
+            out.contains(&format!("smedja_retrieve hash={hash}")),
+            "the recovery marker must name the content hash; got:\n{out}"
+        );
+
+        // The full output is recoverable via smedja_retrieve (the in-memory store).
+        let recovered = super::execute_tool(
+            "smedja_retrieve",
+            &format!("{{\"hash\":\"{hash}\"}}"),
+            ws.path(),
+            Some(&session),
+            &ingot,
+            &vault,
+        )
+        .await;
+        assert_eq!(
+            recovered, raw,
+            "smedja_retrieve must return the full uncompressed output"
+        );
+
+        // And the full output is teed to the vault recovery namespace.
+        let count = {
+            let guard = vault.lock().await;
+            guard
+                .count_by_namespace(super::FILTER_RECOVERY_NAMESPACE)
+                .unwrap()
+        };
+        assert_eq!(count, 1, "full output must be teed to the vault");
+    }
+
+    // ── output-filters: savings accounting ────────────────────────────────────
+
+    #[tokio::test]
+    async fn filtering_records_positive_tokens_saved() {
+        use smedja_ingot::{Ingot, IngotHandle};
+        use smedja_vault::Vault;
+        use tokio::sync::Mutex;
+
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+        let ws = tempfile::tempdir().unwrap();
+        let session = filter_session();
+        let sid = session.id.to_string();
+
+        let raw = format!(
+            "{}error[E0001]: boom\n",
+            "   Compiling crate v0.1.0\n".repeat(40)
+        );
+        let _ = super::filter_command_output(
+            "cargo build",
+            raw,
+            ws.path(),
+            Some(&session),
+            &ingot,
+            &vault,
+        )
+        .await;
+
+        let saved = ingot.session_tokens_saved(&sid).await.unwrap();
+        assert!(
+            saved > 0,
+            "a filtered command must contribute a positive tokens-saved figure; got {saved}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_tool_bash_path_runs_filter_and_preserves_output() {
+        use smedja_ingot::{Ingot, IngotHandle};
+        use smedja_vault::Vault;
+        use tokio::sync::Mutex;
+
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+
+        // An unknown command emitting distinct non-blank lines passes through
+        // unchanged (ratio 1.0), confirming the wiring does not corrupt output.
+        let out = super::execute_tool(
+            "bash",
+            r#"{"command":"printf 'one\ntwo\nthree\n'"}"#,
+            &ws,
+            None,
+            &ingot,
+            &vault,
+        )
+        .await;
+        assert!(
+            out.contains("one"),
+            "command output must survive; got: {out}"
+        );
+        assert!(
+            out.contains("three"),
+            "command output must survive; got: {out}"
+        );
+    }
 
     // ── MCP_SERVER_TOOLS subset ───────────────────────────────────────────────
 
