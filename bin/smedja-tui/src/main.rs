@@ -247,8 +247,10 @@ struct AppState {
     metrics_snapshot: Vec<metrics_view::MetricsRow>,
     /// Cached token-economy savings snapshot for the latest rollup window.
     savings_snapshot: metrics_view::SavingsSnapshot,
-    /// Timestamp of the last `savings.summary` poll.
-    last_savings_poll: Option<std::time::Instant>,
+    /// Timestamp of the last metrics panel poll (drives both the `metrics.summary`
+    /// per-runner fetch and the `savings.summary` token-economy fetch on one
+    /// cadence). `None` forces an immediate fetch on the next tick.
+    last_metrics_poll: Option<std::time::Instant>,
     /// Cumulative tokens used so far in this session (input + output).
     context_used: u64,
     /// Context window size in tokens for the active model.
@@ -2089,8 +2091,9 @@ async fn handle_key(
         }
 
         // Ctrl-T: toggle the metrics view panel (read-only rollup snapshot).
+        // Toggling on clears the poll cadence so the next tick fetches at once.
         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.metrics_view_visible = !state.metrics_view_visible;
+            toggle_metrics_view(state);
         }
 
         KeyCode::Esc => {
@@ -2892,7 +2895,7 @@ async fn main() -> Result<()> {
         metrics_view_visible: false,
         metrics_snapshot: Vec::new(),
         savings_snapshot: metrics_view::SavingsSnapshot::default(),
-        last_savings_poll: None,
+        last_metrics_poll: None,
         context_used: 0,
         context_window: 200_000,
         main_panel: main_panel::MainPanel::new(),
@@ -3278,25 +3281,41 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Minimal savings.summary fetch on the metrics panel's visible path.
-        // metrics-live-fetch is not yet applied, so the panel has no poll loop;
-        // this keeps the savings section populated on a coarse 2 s cadence and is
-        // intentionally small so metrics-live-fetch can later converge the
-        // cadence with the per-runner metrics fetch.
-        let should_poll_savings = state
-            .last_savings_poll
-            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(2));
-        if state.metrics_view_visible && should_poll_savings {
-            state.last_savings_poll = Some(std::time::Instant::now());
-            // Daily tier over the last 7 days, matching `smj savings` defaults.
+        // Metrics panel poll: a single slow (~3 s) cadence drives BOTH the
+        // per-runner `metrics.summary` fetch (cost/usage rows) and the
+        // token-economy `savings.summary` fetch (savings/efficiency section).
+        // Gated on the panel being visible; never fetched while hidden. The
+        // fetch only mutates the cached snapshots — it never blocks the render,
+        // mirroring the cowork poll's tolerant `if let Ok(...)` handling.
+        if metrics_poll_due(
+            state.metrics_view_visible,
+            state.last_metrics_poll,
+            std::time::Instant::now(),
+        ) {
+            state.last_metrics_poll = Some(std::time::Instant::now());
             let now_micros = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0i64, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX));
-            let since_micros = now_micros.saturating_sub(7 * 86_400 * 1_000_000);
+
+            // Per-runner rollups: hourly tier over the last 24h.
+            let metrics_since = now_micros.saturating_sub(METRICS_SINCE_WINDOW_MICROS);
+            if let Ok(resp) = client
+                .call(
+                    "metrics.summary",
+                    json!({ "tier": "hourly", "since": metrics_since }),
+                )
+                .await
+            {
+                state.metrics_snapshot = metrics_rows_from_summary(&resp);
+            }
+
+            // Token-economy savings: daily tier over the last 7 days, matching
+            // `smj savings` defaults.
+            let savings_since = now_micros.saturating_sub(7 * 86_400 * 1_000_000);
             if let Ok(resp) = client
                 .call(
                     "savings.summary",
-                    json!({ "tier": "daily", "since": since_micros }),
+                    json!({ "tier": "daily", "since": savings_since }),
                 )
                 .await
             {
@@ -3316,12 +3335,203 @@ async fn main() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// metrics-live-fetch: pure helpers (off the render hot path, unit-testable)
+// ---------------------------------------------------------------------------
+
+/// Refresh interval for the metrics panel poll. Metrics are aggregates, not live
+/// deltas, so a slow cadence is correct and cheap.
+const METRICS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Window covered by the metrics fetch: the last 24h, in microseconds.
+const METRICS_SINCE_WINDOW_MICROS: i64 = 24 * 3_600 * 1_000_000;
+
+/// Folds a `metrics.summary` response into one [`metrics_view::MetricsRow`] per
+/// runner, in first-seen runner order.
+///
+/// Reads `resp["buckets"]`, summing `input_tok + output_tok` into `tokens` and
+/// accumulating `cost_usd` and `error_count`. An hourly 24h window can return
+/// several buckets per runner, which collapse to a single row. Missing or
+/// non-array `buckets`, and missing per-bucket fields, are treated as
+/// empty / zero — never a panic — so a malformed response yields an empty `Vec`.
+#[must_use]
+fn metrics_rows_from_summary(resp: &serde_json::Value) -> Vec<metrics_view::MetricsRow> {
+    let Some(buckets) = resp["buckets"].as_array() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<metrics_view::MetricsRow> = Vec::new();
+    for bucket in buckets {
+        let runner = bucket["runner"].as_str().unwrap_or("-");
+        let tokens =
+            bucket["input_tok"].as_i64().unwrap_or(0) + bucket["output_tok"].as_i64().unwrap_or(0);
+        let cost_usd = bucket["cost_usd"].as_f64().unwrap_or(0.0);
+        let errors = bucket["error_count"].as_i64().unwrap_or(0);
+        if let Some(row) = rows.iter_mut().find(|r| r.runner == runner) {
+            row.tokens += tokens;
+            row.cost_usd += cost_usd;
+            row.errors += errors;
+        } else {
+            rows.push(metrics_view::MetricsRow {
+                runner: runner.to_owned(),
+                tokens,
+                cost_usd,
+                errors,
+            });
+        }
+    }
+    rows
+}
+
+/// Returns whether the metrics panel poll is due: true only when the panel is
+/// `visible` and `last` is unset or [`METRICS_POLL_INTERVAL`] has elapsed by
+/// `now`. The panel is never polled while hidden.
+#[must_use]
+fn metrics_poll_due(
+    visible: bool,
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    visible && last.is_none_or(|t| now.saturating_duration_since(t) >= METRICS_POLL_INTERVAL)
+}
+
+/// Toggles the metrics panel visibility. When the toggle makes the panel
+/// visible, clears `last_metrics_poll` so the next event-loop tick fetches
+/// immediately rather than waiting a full interval for the first paint.
+fn toggle_metrics_view(state: &mut AppState) {
+    state.metrics_view_visible = !state.metrics_view_visible;
+    if state.metrics_view_visible {
+        state.last_metrics_poll = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests (L128, L129)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- metrics-live-fetch: pure JSON→rows mapper ---
+
+    #[test]
+    fn metrics_rows_from_summary_folds_buckets_per_runner() {
+        let resp = json!({
+            "tier": "hourly",
+            "buckets": [
+                { "bucket_start": 0, "runner": "claude", "turns": 1,
+                  "input_tok": 100, "output_tok": 50, "cost_usd": 0.01, "error_count": 1 },
+                { "bucket_start": 3_600_000_000_i64, "runner": "claude", "turns": 1,
+                  "input_tok": 200, "output_tok": 80, "cost_usd": 0.02, "error_count": 2 },
+                { "bucket_start": 0, "runner": "local", "turns": 1,
+                  "input_tok": 480, "output_tok": 0, "cost_usd": 0.0, "error_count": 0 },
+            ],
+        });
+        let rows = metrics_rows_from_summary(&resp);
+        assert_eq!(rows.len(), 2, "one row per runner");
+        // First-seen runner order: claude then local.
+        assert_eq!(rows[0].runner, "claude");
+        assert_eq!(
+            rows[0].tokens,
+            100 + 50 + 200 + 80,
+            "tokens summed across buckets"
+        );
+        assert!((rows[0].cost_usd - 0.03).abs() < 1e-9, "cost accumulated");
+        assert_eq!(rows[0].errors, 3, "errors accumulated");
+        assert_eq!(rows[1].runner, "local");
+        assert_eq!(rows[1].tokens, 480);
+    }
+
+    #[test]
+    fn metrics_rows_from_summary_empty_buckets_yields_no_rows() {
+        let empty = json!({ "tier": "hourly", "buckets": [] });
+        assert!(metrics_rows_from_summary(&empty).is_empty());
+        let missing = json!({ "tier": "hourly" });
+        assert!(metrics_rows_from_summary(&missing).is_empty());
+    }
+
+    #[test]
+    fn metrics_rows_from_summary_tolerates_missing_fields() {
+        let resp = json!({
+            "buckets": [
+                { "runner": "claude" },
+            ],
+        });
+        let rows = metrics_rows_from_summary(&resp);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].runner, "claude");
+        assert_eq!(rows[0].tokens, 0);
+        assert!((rows[0].cost_usd - 0.0).abs() < 1e-9);
+        assert_eq!(rows[0].errors, 0);
+    }
+
+    // --- metrics-live-fetch: poll-due predicate ---
+
+    #[test]
+    fn metrics_poll_due_when_visible_and_unset_or_elapsed() {
+        let now = std::time::Instant::now();
+        // Visible and never polled → due.
+        assert!(metrics_poll_due(true, None, now));
+        // Visible and the interval has elapsed → due.
+        let stale = now.checked_sub(std::time::Duration::from_secs(4)).unwrap();
+        assert!(metrics_poll_due(true, Some(stale), now));
+        // Visible but within the interval → not due.
+        let fresh = now.checked_sub(std::time::Duration::from_secs(1)).unwrap();
+        assert!(!metrics_poll_due(true, Some(fresh), now));
+        // Hidden → never due, regardless of timing.
+        assert!(!metrics_poll_due(false, None, now));
+        assert!(!metrics_poll_due(false, Some(stale), now));
+    }
+
+    // --- metrics-live-fetch: toggle resets the poll cadence ---
+
+    #[test]
+    fn toggling_metrics_view_on_resets_last_metrics_poll() {
+        let mut state = make_state("sess-metrics-toggle");
+        state.last_metrics_poll = Some(std::time::Instant::now());
+        assert!(!state.metrics_view_visible);
+        // Toggle on → visible and the poll is cleared for an immediate fetch.
+        toggle_metrics_view(&mut state);
+        assert!(state.metrics_view_visible, "toggle makes the panel visible");
+        assert!(
+            state.last_metrics_poll.is_none(),
+            "toggle-on clears last_metrics_poll for an immediate fetch"
+        );
+        // Toggle off → hidden again.
+        toggle_metrics_view(&mut state);
+        assert!(!state.metrics_view_visible, "second toggle hides the panel");
+    }
+
+    // --- metrics-live-fetch: live fetch populates/clears the snapshot ---
+
+    #[test]
+    fn live_metrics_response_populates_then_clears_snapshot() {
+        let mut state = make_state("sess-metrics-populate");
+        assert!(
+            state.metrics_snapshot.is_empty(),
+            "snapshot starts empty (the previously-blank panel)"
+        );
+        let resp = json!({
+            "tier": "hourly",
+            "buckets": [
+                { "runner": "claude", "input_tok": 700, "output_tok": 80,
+                  "cost_usd": 0.06, "error_count": 1 },
+            ],
+        });
+        state.metrics_snapshot = metrics_rows_from_summary(&resp);
+        assert_eq!(
+            state.metrics_snapshot.len(),
+            1,
+            "live fetch fills the snapshot"
+        );
+        assert_eq!(state.metrics_snapshot[0].runner, "claude");
+        // An empty window replaces the snapshot wholesale — no stale rows.
+        let empty = json!({ "tier": "hourly", "buckets": [] });
+        state.metrics_snapshot = metrics_rows_from_summary(&empty);
+        assert!(
+            state.metrics_snapshot.is_empty(),
+            "empty window clears the snapshot rather than leaving stale rows"
+        );
+    }
 
     // --- /review scope-flag parsing ---
 
@@ -4064,7 +4274,7 @@ mod tests {
             metrics_view_visible: false,
             metrics_snapshot: Vec::new(),
             savings_snapshot: metrics_view::SavingsSnapshot::default(),
-            last_savings_poll: None,
+            last_metrics_poll: None,
             context_used: 0,
             context_window: 200_000,
             main_panel: main_panel::MainPanel::new(),
