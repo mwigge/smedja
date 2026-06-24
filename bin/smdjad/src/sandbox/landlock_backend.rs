@@ -15,7 +15,6 @@
 //! 5.13 or disabled) the backend reports `available() == false` so selection
 //! downgrades to no-backend.
 
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -43,7 +42,7 @@ impl LandlockBackend {
     pub fn detect() -> Self {
         let available = Ruleset::default()
             .handle_access(AccessFs::from_all(ABI::V1))
-            .and_then(|ruleset| ruleset.create())
+            .and_then(Ruleset::create)
             .is_ok();
         Self { available }
     }
