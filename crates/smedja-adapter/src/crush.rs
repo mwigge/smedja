@@ -10,8 +10,8 @@
 //! Each function honours the `SMEDJA_NO_TOOL_COMPRESS=1` environment variable
 //! as a bypass.
 //!
-//! The [`ContentPipeline`] struct chains arbitrary [`Transform`] implementations
-//! and applies them in sequence.
+//! The [`ContentPipeline`] struct chains arbitrary transform closures and
+//! applies them in sequence.
 
 use std::fmt::Write as _;
 
@@ -210,18 +210,18 @@ pub fn trim_code_block(lang: &str, body: &str) -> String {
 
 // ── Task 57 — ContentPipeline ────────────────────────────────────────────────
 
-/// A transform applied to content strings inside the pipeline.
-pub trait Transform: Send + Sync {
-    /// Applies the transform to `content` and returns the result.
-    fn apply(&self, content: &str) -> String;
-}
+/// A single content transform: a boxed function from content to content.
+///
+/// Transforms are plain function values rather than trait objects, so callers
+/// can register closures directly via [`ContentPipeline::push`].
+pub type Transform = Box<dyn Fn(&str) -> String + Send + Sync>;
 
-/// Ordered pipeline of [`Transform`] implementations.
+/// Ordered pipeline of [`Transform`] closures.
 ///
 /// Transforms are applied in the order they were registered via
 /// [`ContentPipeline::push`].  An empty pipeline returns the content unchanged.
 pub struct ContentPipeline {
-    transforms: Vec<Box<dyn Transform>>,
+    transforms: Vec<Transform>,
 }
 
 impl ContentPipeline {
@@ -233,12 +233,12 @@ impl ContentPipeline {
         }
     }
 
-    /// Appends a transform to the end of the pipeline.
+    /// Appends a transform closure to the end of the pipeline.
     ///
     /// Returns `self` to allow method chaining.
     #[must_use]
-    pub fn push(mut self, t: impl Transform + 'static) -> Self {
-        self.transforms.push(Box::new(t));
+    pub fn push(mut self, transform: impl Fn(&str) -> String + Send + Sync + 'static) -> Self {
+        self.transforms.push(Box::new(transform));
         self
     }
 
@@ -247,7 +247,7 @@ impl ContentPipeline {
     pub fn run(&self, content: &str) -> String {
         self.transforms
             .iter()
-            .fold(content.to_owned(), |acc, t| t.apply(&acc))
+            .fold(content.to_owned(), |acc, transform| transform(&acc))
     }
 }
 
@@ -257,46 +257,32 @@ impl Default for ContentPipeline {
     }
 }
 
-// ── Transform wrappers ────────────────────────────────────────────────────────
+// ── Transform constructors ────────────────────────────────────────────────────
 
-/// [`Transform`] wrapper around [`compress_tool_result`].
-///
-/// Strips JSON null fields recursively from tool-result content.
-pub struct SmartCrusher;
-
-impl Transform for SmartCrusher {
-    fn apply(&self, content: &str) -> String {
-        compress_tool_result(content)
-    }
+/// Builds a transform that strips JSON null fields recursively from tool-result
+/// content (wraps [`compress_tool_result`]).
+#[must_use]
+pub fn smart_crusher() -> Transform {
+    Box::new(|content: &str| compress_tool_result(content))
 }
 
-/// [`Transform`] wrapper around [`compress_command_output`].
-///
-/// Removes known-noisy lines for a fixed command set.
-pub struct CommandCompressor {
-    /// The command string used to select the compression strategy.
-    pub cmd: String,
-}
-
-impl Transform for CommandCompressor {
-    fn apply(&self, content: &str) -> String {
-        let (compressed, _ratio) = compress_command_output(&self.cmd, content);
+/// Builds a transform that removes known-noisy lines for `cmd`
+/// (wraps [`compress_command_output`]).
+#[must_use]
+pub fn command_compressor(cmd: impl Into<String>) -> Transform {
+    let cmd = cmd.into();
+    Box::new(move |content: &str| {
+        let (compressed, _ratio) = compress_command_output(&cmd, content);
         compressed
-    }
+    })
 }
 
-/// [`Transform`] wrapper around [`trim_code_block`].
-///
-/// Truncates code blocks that exceed 80 lines.
-pub struct CodeCompressor {
-    /// The language tag of the code block (e.g. `"rust"`, `"python"`).
-    pub lang: String,
-}
-
-impl Transform for CodeCompressor {
-    fn apply(&self, content: &str) -> String {
-        trim_code_block(&self.lang, content)
-    }
+/// Builds a transform that truncates code blocks of language `lang` exceeding
+/// 80 lines (wraps [`trim_code_block`]).
+#[must_use]
+pub fn code_compressor(lang: impl Into<String>) -> Transform {
+    let lang = lang.into();
+    Box::new(move |content: &str| trim_code_block(&lang, content))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -309,6 +295,7 @@ mod tests {
 
     #[test]
     fn strips_top_level_null_fields() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         let input = r#"{"a":1,"b":null,"c":"hello"}"#;
         let output = compress_tool_result(input);
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -319,6 +306,7 @@ mod tests {
 
     #[test]
     fn strips_nested_null_fields() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         let input = r#"{"outer":{"x":null,"y":42},"arr":[{"z":null,"w":1}]}"#;
         let output = compress_tool_result(input);
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -330,6 +318,7 @@ mod tests {
 
     #[test]
     fn non_json_input_returned_unchanged() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         let input = "not json at all";
         let output = compress_tool_result(input);
         assert_eq!(output, input);
@@ -350,6 +339,7 @@ mod tests {
 
     #[test]
     fn cargo_test_noisy_output_compressed_below_threshold() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         let noisy = "\
 running 42 tests\n\
 test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured\n\
@@ -377,6 +367,7 @@ error[E0001]: something went wrong\n\
 
     #[test]
     fn git_status_boilerplate_removed() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         let input = "On branch main\n\
 Your branch is up to date with 'origin/main'.\n\
 \n\
@@ -395,6 +386,7 @@ Changes not staged for commit:\n\
 
     #[test]
     fn unknown_command_passthrough_except_blanks() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         let input = "line one\n\nline two\n\nline three\n";
         let (compressed, _) = compress_command_output("grep pattern file.txt", input);
         assert!(!compressed.contains("\n\n"), "blank lines must be removed");
@@ -415,6 +407,7 @@ Changes not staged for commit:\n\
 
     #[test]
     fn ratio_below_one_for_compressed_output() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
         let noisy = "running 100 tests\n".repeat(20)
             + "error[E0001]: the actual error\n  --> src/lib.rs:1:1\n";
         let (_, ratio) = compress_command_output("cargo test", &noisy);
@@ -498,17 +491,12 @@ Changes not staged for commit:\n\
 
     #[test]
     fn pipeline_applies_transforms_in_order() {
-        struct Appender(String);
-        impl Transform for Appender {
-            fn apply(&self, content: &str) -> String {
-                format!("{}{}", content, self.0)
-            }
-        }
+        let append = |suffix: &'static str| move |content: &str| format!("{content}{suffix}");
 
         let pipeline = ContentPipeline::new()
-            .push(Appender(" A".to_owned()))
-            .push(Appender(" B".to_owned()))
-            .push(Appender(" C".to_owned()));
+            .push(append(" A"))
+            .push(append(" B"))
+            .push(append(" C"));
 
         let result = pipeline.run("start");
         assert_eq!(result, "start A B C");
@@ -516,7 +504,8 @@ Changes not staged for commit:\n\
 
     #[test]
     fn smart_crusher_transform_strips_nulls() {
-        let pipeline = ContentPipeline::new().push(SmartCrusher);
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let pipeline = ContentPipeline::new().push(|c: &str| compress_tool_result(c));
         let input = r#"{"keep":1,"drop":null}"#;
         let output = pipeline.run(input);
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -526,18 +515,15 @@ Changes not staged for commit:\n\
 
     #[test]
     fn command_compressor_transform_removes_blanks() {
-        let pipeline = ContentPipeline::new().push(CommandCompressor {
-            cmd: "echo hello".to_owned(),
-        });
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let pipeline = ContentPipeline::new().push(command_compressor("echo hello"));
         let result = pipeline.run("line one\n\nline two\n");
         assert!(!result.contains("\n\n"), "blank lines must be removed");
     }
 
     #[test]
     fn code_compressor_transform_truncates_long_block() {
-        let pipeline = ContentPipeline::new().push(CodeCompressor {
-            lang: "python".to_owned(),
-        });
+        let pipeline = ContentPipeline::new().push(code_compressor("python"));
         let body = (1..=90)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()

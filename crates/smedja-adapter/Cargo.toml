@@ -11,18 +11,15 @@ anyhow       = { workspace = true }
 futures-core = { workspace = true }
 opentelemetry          = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
-opentelemetry_sdk      = { workspace = true }
 reqwest      = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
-smedja-rpc       = { path = "../smedja-rpc" }
 smedja-telemetry = { path = "../smedja-telemetry" }
 thiserror    = { workspace = true }
-tokio        = { workspace = true }
+tokio        = { version = "1", default-features = false, features = ["io-util", "macros", "process", "rt", "sync"] }
 tokio-stream = { workspace = true }
 tracing      = { workspace = true }
 which        = { workspace = true }
 
 [dev-dependencies]
 futures-util    = { workspace = true }
-opentelemetry_sdk = { workspace = true }

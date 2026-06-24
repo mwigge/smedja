@@ -17,7 +17,6 @@ use serde_json::json;
 use smedja_bellows::{Dispatcher, TurnHandle};
 use smedja_ingot::{IngotHandle, Session, Task};
 use smedja_types::Timestamp;
-use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 /// Shared state for ACP route handlers.
@@ -63,7 +62,7 @@ async fn require_auth(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "));
-    if auth.is_some_and(|t| t.as_bytes().ct_eq(state.auth_token.as_bytes()).into()) {
+    if auth.is_some_and(|t| smedja_auth::tokens_match(t, &state.auth_token)) {
         next.run(request).await.into_response()
     } else {
         (

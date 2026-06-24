@@ -8,6 +8,7 @@ pub mod budget;
 pub mod error;
 pub mod guides;
 pub mod memory;
+pub mod skills;
 pub mod types;
 pub mod working;
 

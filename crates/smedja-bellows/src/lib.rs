@@ -9,17 +9,8 @@ pub mod event;
 pub mod handle;
 
 pub use dispatcher::Dispatcher;
-pub use event::{ControlEvent, DeltaEvent, TurnEvent};
+pub use event::TurnEvent;
 pub use handle::TurnHandle;
-
-/// Sender half of the control-event broadcast channel.
-pub type ControlSender = tokio::sync::broadcast::Sender<ControlEvent>;
-/// Receiver half of the control-event broadcast channel.
-pub type ControlReceiver = tokio::sync::broadcast::Receiver<ControlEvent>;
-/// Sender half of the delta-event broadcast channel.
-pub type DeltaSender = tokio::sync::broadcast::Sender<DeltaEvent>;
-/// Receiver half of the delta-event broadcast channel.
-pub type DeltaReceiver = tokio::sync::broadcast::Receiver<DeltaEvent>;
 
 /// Drains all immediately-available events from `rx` without blocking.
 ///

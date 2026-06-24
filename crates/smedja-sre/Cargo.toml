@@ -10,9 +10,11 @@ repository.workspace = true
 reqwest    = { workspace = true }
 serde_json = { workspace = true }
 thiserror  = { workspace = true }
-tokio      = { workspace = true }
+# Narrowed from the workspace ["full"] default: only the test macros + a
+# current-thread runtime are needed (no production tokio APIs are used).
+tokio      = { version = "1", default-features = false, features = ["rt", "macros"] }
 tracing    = { workspace = true }
 
 [dev-dependencies]
 mockito = "1"
-tokio   = { workspace = true }
+tokio   = { version = "1", default-features = false, features = ["rt", "macros"] }
