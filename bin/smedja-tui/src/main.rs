@@ -169,7 +169,7 @@ slash commands:
   /help              — show this message
   /login             — authenticate with runner
   /metrics           — show token usage and cost
-  /model [name]      — show or set model
+  /model [name]      — show or set model (local runner: lists GPU fit / hot-swaps)
   /ponytail          — set review mode
   /pptx <slug>       — generate PowerPoint
   /quota             — show usage quota
@@ -1109,13 +1109,38 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
         }
         "model" => {
             let session_id = state.session_id.clone();
+            let is_local = state.runner == "local";
             if args.is_empty() || args == "reset" {
-                let result = client.call("runner.list", json!({})).await;
-                let text = match result {
-                    Ok(v) => format_model_list(&v),
-                    Err(e) => format!("runner.list error: {e}"),
+                // For the local runner, list the GPU-annotated inventory via
+                // local.models; for hosted runners keep the runner.list view.
+                let text = if is_local {
+                    match client.call("local.models", json!({})).await {
+                        Ok(v) => format_local_model_list(&v),
+                        Err(e) => format!("local.models error: {e}"),
+                    }
+                } else {
+                    match client.call("runner.list", json!({})).await {
+                        Ok(v) => format_model_list(&v),
+                        Err(e) => format!("runner.list error: {e}"),
+                    }
                 };
                 push_system_message(state, text);
+            } else if is_local {
+                // Local runner: a model name hot-swaps the active local model via
+                // local.swap (not the relabel-only session.set_model).
+                let model = args.to_owned();
+                let result = client.call("local.swap", json!({ "model": model })).await;
+                match result {
+                    Ok(v) => {
+                        let latency = v["swap_latency_ms"].as_u64().unwrap_or(0);
+                        state.model = Some(model.clone());
+                        push_system_message(
+                            state,
+                            format!("local model swapped to {model} ({latency} ms)"),
+                        );
+                    }
+                    Err(e) => push_system_message(state, format!("local.swap error: {e}")),
+                }
             } else {
                 let model = args.to_owned();
                 let result = client
@@ -1513,6 +1538,30 @@ fn format_model_list(v: &serde_json::Value) -> String {
         let tier = r.get("tier").and_then(|v| v.as_str()).unwrap_or("?");
         let model = r.get("model").and_then(|v| v.as_str()).unwrap_or("?");
         lines.push(format!("  {runner} ({tier}): {model}"));
+    }
+    lines.join("\n")
+}
+
+/// Renders the `local.models` response: the GPU-annotated local-model inventory.
+///
+/// Each line shows the model id, its advisory GPU fit, and an active marker.
+fn format_local_model_list(v: &serde_json::Value) -> String {
+    let Some(models) = v.get("models").and_then(|m| m.as_array()) else {
+        return "no local models".to_owned();
+    };
+    if models.is_empty() {
+        return "no local models".to_owned();
+    }
+    let mut lines = vec!["local models:".to_owned()];
+    for m in models {
+        let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        let fit = m.get("fit").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let marker = if m.get("active").and_then(serde_json::Value::as_bool) == Some(true) {
+            " *"
+        } else {
+            ""
+        };
+        lines.push(format!("  {id} [{fit}]{marker}"));
     }
     lines.join("\n")
 }
@@ -3548,6 +3597,119 @@ mod tests {
         assert!(
             out.contains("claude-haiku-4-5-20251001"),
             "must include model"
+        );
+    }
+
+    #[test]
+    fn format_local_model_list_renders_fit_and_active() {
+        let v = serde_json::json!({
+            "active_model_id": "qwen3-14b",
+            "models": [
+                { "id": "qwen3-14b", "fit": "fits", "active": true },
+                { "id": "huge-70b", "fit": "exceeds", "active": false }
+            ]
+        });
+        let out = format_local_model_list(&v);
+        assert!(out.contains("qwen3-14b") && out.contains("[fits]"));
+        assert!(out.contains('*'), "active model must be marked");
+        assert!(out.contains("huge-70b") && out.contains("[exceeds]"));
+    }
+
+    /// Spawns a one-shot mock daemon that records the requested method into the
+    /// returned channel and replies with `reply`. Returns the socket path.
+    fn spawn_method_capture(
+        reply: serde_json::Value,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        tokio::sync::oneshot::Receiver<String>,
+    ) {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader as TokioBufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("local-test.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let mut reader = TokioBufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let req: serde_json::Value =
+                    serde_json::from_str(line.trim_end()).unwrap_or(serde_json::Value::Null);
+                let method = req["method"].as_str().unwrap_or("").to_owned();
+                let _ = tx.send(method);
+                let resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req["id"].clone(),
+                    "result": reply,
+                });
+                let mut bytes = serde_json::to_vec(&resp).unwrap();
+                bytes.push(b'\n');
+                let _ = reader.get_mut().write_all(&bytes).await;
+            }
+        });
+
+        (dir, sock_path, rx)
+    }
+
+    /// For the local runner, `/model <name>` dispatches `local.swap` (not the
+    /// relabel-only `session.set_model`).
+    #[tokio::test]
+    async fn model_command_local_runner_dispatches_local_swap() {
+        let (_dir, sock_path, rx) = spawn_method_capture(serde_json::json!({
+            "from_model": "qwen3-14b",
+            "active_model_id": "llama3-8b",
+            "explicit_swap": true,
+            "swap_latency_ms": 12
+        }));
+
+        let mut client = Client::connect(&sock_path).await.unwrap();
+        let mut state = make_state("sess-local");
+        state.runner = "local".to_owned();
+
+        dispatch_slash("/model llama3-8b", &mut state, &mut client)
+            .await
+            .unwrap();
+
+        let method = rx.await.unwrap();
+        assert_eq!(
+            method, "local.swap",
+            "local runner /model <name> must dispatch local.swap, not session.set_model"
+        );
+        assert_eq!(
+            state.model.as_deref(),
+            Some("llama3-8b"),
+            "the active model label must update after a local swap"
+        );
+    }
+
+    /// For the local runner, `/model` with no args lists the GPU-annotated
+    /// inventory via `local.models`.
+    #[tokio::test]
+    async fn model_command_local_runner_lists_via_local_models() {
+        let (_dir, sock_path, rx) = spawn_method_capture(serde_json::json!({
+            "active_model_id": "qwen3-14b",
+            "models": [ { "id": "qwen3-14b", "fit": "fits", "active": true } ],
+            "gpu": { "detected": false }
+        }));
+
+        let mut client = Client::connect(&sock_path).await.unwrap();
+        let mut state = make_state("sess-local");
+        state.runner = "local".to_owned();
+
+        dispatch_slash("/model", &mut state, &mut client)
+            .await
+            .unwrap();
+
+        let method = rx.await.unwrap();
+        assert_eq!(
+            method, "local.models",
+            "local runner bare /model must list via local.models"
         );
     }
 

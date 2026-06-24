@@ -1,13 +1,86 @@
 //! Runtime pool of available LLM providers, indexed by (Runner, Tier).
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use smedja_adapter::{
     AnthropicProvider, BergetProvider, ClaudeCliProvider, CodexCliProvider, CopilotProvider,
-    LocalProvider, MinimaxProvider, OpenAiProvider, PoolsideProvider, Provider, SubprocessProvider,
+    GpuSnapshot, LocalModel, LocalProvider, MinimaxProvider, OpenAiProvider, PoolsideProvider,
+    Provider, SubprocessProvider,
 };
 use smedja_assayer::{Runner, Tier};
 use tracing::{error, info, warn};
+
+/// Control-plane state for the `local` runner: the swap-proxy endpoint, the full
+/// model inventory, the cached GPU snapshot, and the active-model selection.
+///
+/// The active-model id lives behind a [`Mutex`] so `local.swap` can update it in
+/// place — atomically, without rebuilding the pool's `stream_chat` provider —
+/// while concurrent turns keep the model they started with.
+pub struct LocalControl {
+    /// OpenAI-compatible base endpoint (`SMEDJA_LOCAL_ENDPOINT`); re-queried for
+    /// `/v1/models` after an install to verify the model is servable.
+    pub endpoint: String,
+    /// Swap-proxy endpoint (`SMEDJA_LOCAL_SWAP_ENDPOINT`) the hot-swap targets.
+    pub swap_endpoint: String,
+    /// Full `/v1/models` inventory captured at connect time.
+    pub inventory: Vec<LocalModel>,
+    /// Advisory GPU snapshot captured at startup; refreshed on demand by `local.gpu`.
+    pub gpu: GpuSnapshot,
+    /// The active local model id, mutated in place by a hot-swap.
+    active_model_id: Mutex<Option<String>>,
+}
+
+impl LocalControl {
+    /// Builds a control plane from its captured parts.
+    #[must_use]
+    pub fn new(
+        endpoint: String,
+        swap_endpoint: String,
+        inventory: Vec<LocalModel>,
+        gpu: GpuSnapshot,
+        active_model_id: Option<String>,
+    ) -> Self {
+        Self {
+            endpoint,
+            swap_endpoint,
+            inventory,
+            gpu,
+            active_model_id: Mutex::new(active_model_id),
+        }
+    }
+
+    /// Returns the currently-active local model id, if any.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the active-model lock was poisoned by a prior panic while
+    /// holding it — a non-recoverable invariant violation.
+    #[must_use]
+    pub fn active_model_id(&self) -> Option<String> {
+        self.active_model_id
+            .lock()
+            .expect("local active-model lock poisoned")
+            .clone()
+    }
+
+    /// Atomically sets the active local model id, returning the previous value.
+    ///
+    /// Called by `local.swap` after the swap proxy accepts the request; no
+    /// provider object is rebuilt.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the active-model lock was poisoned by a prior panic while
+    /// holding it — a non-recoverable invariant violation.
+    pub fn set_active_model_id(&self, model_id: &str) -> Option<String> {
+        let mut guard = self
+            .active_model_id
+            .lock()
+            .expect("local active-model lock poisoned");
+        guard.replace(model_id.to_owned())
+    }
+}
 
 /// A single pool entry: the provider plus the strings needed for logging and
 /// session-store keying.
@@ -37,6 +110,19 @@ pub struct ProviderPool {
     /// The `(Runner, Tier)` used when the assayer selects a route that has no
     /// entry in the pool.
     pub default: Option<(Runner, Tier)>,
+    /// Control-plane state for the `local` runner, present only when a healthy
+    /// local endpoint was detected at startup. `None` means the `local.*` RPCs
+    /// report "local tooling unavailable".
+    pub local: Option<LocalControl>,
+}
+
+impl ProviderPool {
+    /// Returns the `local` runner control plane, or `None` when no healthy local
+    /// endpoint was detected at startup.
+    #[must_use]
+    pub fn local_control(&self) -> Option<&LocalControl> {
+        self.local.as_ref()
+    }
 }
 
 impl ProviderPool {
@@ -62,6 +148,7 @@ impl ProviderPool {
             entries: map,
             order,
             default,
+            local: None,
         }
     }
 
@@ -362,12 +449,24 @@ pub async fn build_provider_pool() -> ProviderPool {
 
     // 7. Local rs-llmctl
     let local = LocalProvider::connect().await;
+    let mut local_control: Option<LocalControl> = None;
     if local.capability.healthy {
+        let active = local.capability.active_model_id.clone();
         info!(
             runner = "local",
-            model_id = %local.capability.model_id,
+            model_id = active.as_deref().unwrap_or(""),
+            model_count = local.capability.inventory.len(),
             "provider ready",
         );
+        // Capture the swap-proxy endpoint, full inventory, and a GPU snapshot for
+        // the local control plane before the provider is boxed into the pool.
+        local_control = Some(LocalControl::new(
+            local.endpoint().to_owned(),
+            local.swap_endpoint().to_owned(),
+            local.capability.inventory.clone(),
+            smedja_adapter::detect_gpu().await,
+            active,
+        ));
         add!(Runner::Local, Tier::Local, local, "local", "local");
     } else {
         warn!(runner = "local", "UNAVAILABLE — no local endpoint");
@@ -390,6 +489,7 @@ pub async fn build_provider_pool() -> ProviderPool {
         entries,
         order,
         default,
+        local: local_control,
     }
 }
 
@@ -436,7 +536,48 @@ mod tests {
             entries: map,
             order,
             default,
+            local: None,
         }
+    }
+
+    #[test]
+    fn local_control_exposes_inventory_and_mutable_active_model() {
+        let control = LocalControl::new(
+            "http://127.0.0.1:9090".to_owned(),
+            "http://127.0.0.1:9090".to_owned(),
+            vec![
+                LocalModel {
+                    id: "qwen3-14b".to_owned(),
+                    est_vram_mb: Some(9000),
+                },
+                LocalModel {
+                    id: "llama3-8b".to_owned(),
+                    est_vram_mb: None,
+                },
+            ],
+            GpuSnapshot::none(),
+            Some("qwen3-14b".to_owned()),
+        );
+        let pool = ProviderPool {
+            entries: HashMap::new(),
+            order: Vec::new(),
+            default: None,
+            local: Some(control),
+        };
+
+        let local = pool.local_control().expect("local control present");
+        let ids: Vec<&str> = local.inventory.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["qwen3-14b", "llama3-8b"],
+            "pool entry must expose the full local inventory"
+        );
+        assert_eq!(local.active_model_id().as_deref(), Some("qwen3-14b"));
+
+        // The active model must be mutable in place without rebuilding the pool.
+        let previous = local.set_active_model_id("llama3-8b");
+        assert_eq!(previous.as_deref(), Some("qwen3-14b"));
+        assert_eq!(local.active_model_id().as_deref(), Some("llama3-8b"));
     }
 
     #[test]
@@ -471,6 +612,7 @@ mod tests {
             entries: HashMap::new(),
             order: Vec::new(),
             default: None,
+            local: None,
         };
         assert!(pool.get(Runner::Claude, Tier::Fast).is_none());
     }
@@ -481,6 +623,7 @@ mod tests {
             entries: std::collections::HashMap::new(),
             order: Vec::new(),
             default: None,
+            local: None,
         };
         assert!(
             pool.is_empty(),
