@@ -267,6 +267,7 @@ async fn run_turn(
     price_table: Arc<PriceTable>,
     vault: Arc<Mutex<Vault>>,
     provider_sessions: orchestrator::ProviderSessions,
+    cache_aligners: orchestrator::CacheAligners,
 ) {
     orchestrator::TurnOrchestrator::new(
         ingot,
@@ -277,6 +278,7 @@ async fn run_turn(
         price_table,
         vault,
         provider_sessions,
+        cache_aligners,
     )
     .run(session_id, turn_id)
     .await;
@@ -298,6 +300,7 @@ fn spawn_worker(
     price_table: Arc<PriceTable>,
     vault: Arc<Mutex<Vault>>,
     provider_sessions: orchestrator::ProviderSessions,
+    cache_aligners: orchestrator::CacheAligners,
     task_set: Arc<Mutex<tokio::task::JoinSet<()>>>,
 ) {
     tokio::spawn(async move {
@@ -333,9 +336,10 @@ fn spawn_worker(
                     let pt = Arc::clone(&price_table);
                     let vt = Arc::clone(&vault);
                     let ps = Arc::clone(&provider_sessions);
+                    let ca = Arc::clone(&cache_aligners);
                     let mut set = task_set.lock().await;
                     set.spawn(run_turn(
-                        ig, dp, session_id, turn_id, g, pl, as_, pt, vt, ps,
+                        ig, dp, session_id, turn_id, g, pl, as_, pt, vt, ps, ca,
                     ));
                     // Reap finished tasks so the set tracks only in-flight work.
                     while set.try_join_next().is_some() {}
@@ -424,6 +428,7 @@ fn build_router(
     price_table: &Arc<PriceTable>,
     vault: &Arc<Mutex<Vault>>,
     provider_sessions: &orchestrator::ProviderSessions,
+    cache_aligners: &orchestrator::CacheAligners,
     task_set: &Arc<Mutex<tokio::task::JoinSet<()>>>,
 ) -> Router {
     let mut router = Router::new();
@@ -442,6 +447,7 @@ fn build_router(
         price_table: Arc::clone(price_table),
         vault: Arc::clone(vault),
         provider_sessions: Arc::clone(provider_sessions),
+        cache_aligners: Arc::clone(cache_aligners),
         task_set: Arc::clone(task_set),
         startup_runner: Arc::clone(startup_runner),
         startup_model: Arc::clone(startup_model),
@@ -1152,6 +1158,11 @@ async fn main() -> anyhow::Result<()> {
     // handler and the orchestrator (replaces the former OnceLock singleton).
     let provider_sessions: orchestrator::ProviderSessions = Arc::new(Mutex::new(HashMap::new()));
 
+    // Single cross-turn cache-aligner map, keyed by `(session_id, runner)` and
+    // threaded exactly like `provider_sessions`, so each persisted aligner
+    // outlives a turn and reports real `Grown`/`Mutated` drift.
+    let cache_aligners: orchestrator::CacheAligners = Arc::new(Mutex::new(HashMap::new()));
+
     // Shared set tracking in-flight turn tasks and loop.run background tasks, so
     // both are drained together at shutdown and completed tasks are reaped.
     let task_set: Arc<Mutex<tokio::task::JoinSet<()>>> =
@@ -1168,6 +1179,7 @@ async fn main() -> anyhow::Result<()> {
         &price_table,
         &vault,
         &provider_sessions,
+        &cache_aligners,
         &task_set,
     );
 
@@ -1180,6 +1192,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&price_table),
         Arc::clone(&vault),
         Arc::clone(&provider_sessions),
+        Arc::clone(&cache_aligners),
         Arc::clone(&task_set),
     );
 
