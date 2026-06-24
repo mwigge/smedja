@@ -15,6 +15,7 @@ pub mod orchestrator;
 pub mod price_table;
 pub mod provider_pool;
 pub mod sandbox;
+pub mod security;
 pub mod stream_server;
 
 use std::collections::HashMap;
@@ -1072,6 +1073,22 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let assayer = Arc::new(assayer);
+
+    // Advisory security plane: read the [security] config and run the workspace
+    // posture scan once. Findings are recorded as advisory AuditEvents; the scan
+    // is non-blocking by design and never aborts startup.
+    {
+        let security_config = security::load_security_config(&workspace_root);
+        let n = security::run_startup_posture_scan(&ingot, &workspace_root, &security_config).await;
+        if n > 0 {
+            info!(
+                count = n,
+                enforce = security_config.enforce,
+                "recorded advisory security posture findings"
+            );
+        }
+    }
+
     let price_table = Arc::new(PriceTable::embedded());
 
     let vault = Arc::new(Mutex::new(open_vault()));
