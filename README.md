@@ -302,15 +302,27 @@ Each sandboxed execution emits a `smedja.sandbox.exec` span carrying `backend`, 
 
 ---
 
-## Spec-First Methodology
+## Methodology
 
-`smedja-methodology` enforces a workflow before the agent can touch files. The gate is a compile-time `Mode` enum — not a runtime plugin, not optional in CI.
+Test-driven development and clean-code discipline are **foundational**, not selectable modes. They are enforced **steer-first**: on every code-writing turn the orchestrator folds an always-on discipline directive (write a failing test first; no `unwrap`/`expect`/`println!` in library code; small focused functions; early-return over `else`) into the sealed, cacheable system prefix — so the agent is reminded of the discipline every turn. A diff backstop is the secondary check, not a blunt always-reject: the TDD backstop is advisory and fires only on substantial test-free implementation, while the clean-code backstop hard-blocks `unwrap`/`expect`/`println!` outside `#[cfg(test)]`.
+
+The discipline is **on by default with a per-workspace escape**, mirroring the security plane. A `[methodology]` block in `.smedja/config.toml` with boolean `tdd` and `clean` fields (both defaulting to `true`) opts a workspace out of either discipline:
+
+```toml
+[methodology]
+tdd = false      # drop the TDD steering clause and its advisory backstop
+clean = true     # keep the clean-code discipline
+```
+
+A missing or unparseable config resolves to the all-on default and never blocks startup.
+
+The spec-first lifecycle (`Mode::Spec`) and the clean gate (`Mode::Clean`) remain the selectable methodology concerns. `--no-spec-gate` disables the spec-first gate per session for quick patches. In normal operation the sequence is: spec → approval → test → implementation → review.
+
+The on-demand **ponytail** review lens (YAGNI / delete-over-add) ships as a workspace skill (`.smedja/skills/ponytail.md`) loaded through the skill-injection path — an advisory lens, not a gate.
 
 <div align="center">
   <img src="assets/diagrams/readme-spec-first-methodology.png" alt="spec-first methodology gate from OpenSpec through review" width="760" />
 </div>
-
-`--no-spec-gate` disables it per session for quick patches. In normal operation the sequence is: spec → approval → test → implementation → review.
 
 ---
 
