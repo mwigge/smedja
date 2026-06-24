@@ -34,7 +34,7 @@ use crate::executor::execute_tool;
 use crate::price_table::PriceTable;
 use crate::provider_pool::ProviderPool;
 
-mod cold;
+pub(crate) mod cold;
 use cold::VaultColdStore;
 
 mod context;

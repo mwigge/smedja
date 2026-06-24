@@ -8,6 +8,7 @@ pub mod executor;
 pub mod filters;
 pub mod fragments;
 pub mod handlers;
+pub mod lean_spec;
 pub mod local_provider;
 pub mod loop_runner;
 pub mod mcp_http;
