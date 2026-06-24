@@ -69,7 +69,10 @@ impl LandlockBackend {
         // Read-write under the confined root. PathFd::new yields std::io::Error,
         // which propagates directly through this io::Result function.
         created = created
-            .add_rule(PathBeneath::new(PathFd::new(root)?, AccessFs::from_all(abi)))
+            .add_rule(PathBeneath::new(
+                PathFd::new(root)?,
+                AccessFs::from_all(abi),
+            ))
             .map_err(map_err)?;
 
         // Read-only .git (read access only; no write).
@@ -85,7 +88,10 @@ impl LandlockBackend {
         // Writable scratch /tmp.
         if Path::new("/tmp").exists() {
             created = created
-                .add_rule(PathBeneath::new(PathFd::new("/tmp")?, AccessFs::from_all(abi)))
+                .add_rule(PathBeneath::new(
+                    PathFd::new("/tmp")?,
+                    AccessFs::from_all(abi),
+                ))
                 .map_err(map_err)?;
         }
 
