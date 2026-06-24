@@ -450,6 +450,7 @@ pub(crate) async fn set_mode(state: HandlerState, params: Value) -> Result<Value
 pub(crate) async fn takeover(state: HandlerState, params: Value) -> Result<Value, RpcError> {
     let ig = state.ingot;
     let vt = state.vault;
+    let embedder = state.embedder;
     let session_id = params["session_id"]
         .as_str()
         .ok_or_else(|| missing_param("session_id"))?
@@ -529,10 +530,13 @@ pub(crate) async fn takeover(state: HandlerState, params: Value) -> Result<Value
         let to_sid = new_id.clone();
         let runner_str = canonical.to_owned();
         let messages = cp.messages_json.clone();
+        let embedding = embedder.embed_query(&messages).await;
+        let model_id = embedder.model_id().to_owned();
+        let dim = embedder.dim();
         tokio::task::spawn_blocking(move || {
             let entry = VaultEntry {
                 id: hid.clone(),
-                embedding: crate::embedder::embed(&messages),
+                embedding,
                 payload: serde_json::json!({
                     "from_session_id": from_sid,
                     "to_session_id": to_sid,
@@ -545,6 +549,8 @@ pub(crate) async fn takeover(state: HandlerState, params: Value) -> Result<Value
                 chunk_index: None,
                 parent_id: None,
                 created_at: 0.0,
+                embedder_model_id: model_id,
+                dim,
             };
             let mut guard = vt.blocking_lock();
             let _ = guard.upsert(&entry);

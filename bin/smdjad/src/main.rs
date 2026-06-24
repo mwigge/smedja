@@ -4,6 +4,8 @@ pub mod alert;
 pub mod common;
 pub mod cowork;
 pub mod embedder;
+pub mod embedder_config;
+pub mod embedder_port;
 pub mod executor;
 pub mod filters;
 pub mod fragments;
@@ -268,6 +270,7 @@ async fn run_turn(
     assayer: Arc<Assayer>,
     price_table: Arc<PriceTable>,
     vault: Arc<Mutex<Vault>>,
+    embedder: Arc<dyn embedder_port::Embedder>,
     provider_sessions: orchestrator::ProviderSessions,
     cache_aligners: orchestrator::CacheAligners,
 ) {
@@ -279,6 +282,7 @@ async fn run_turn(
         assayer,
         price_table,
         vault,
+        embedder,
         provider_sessions,
         cache_aligners,
     )
@@ -301,6 +305,7 @@ fn spawn_worker(
     assayer: Arc<Assayer>,
     price_table: Arc<PriceTable>,
     vault: Arc<Mutex<Vault>>,
+    embedder: Arc<dyn embedder_port::Embedder>,
     provider_sessions: orchestrator::ProviderSessions,
     cache_aligners: orchestrator::CacheAligners,
     task_set: Arc<Mutex<tokio::task::JoinSet<()>>>,
@@ -337,11 +342,12 @@ fn spawn_worker(
                     let as_ = Arc::clone(&assayer);
                     let pt = Arc::clone(&price_table);
                     let vt = Arc::clone(&vault);
+                    let em = Arc::clone(&embedder);
                     let ps = Arc::clone(&provider_sessions);
                     let ca = Arc::clone(&cache_aligners);
                     let mut set = task_set.lock().await;
                     set.spawn(run_turn(
-                        ig, dp, session_id, turn_id, g, pl, as_, pt, vt, ps, ca,
+                        ig, dp, session_id, turn_id, g, pl, as_, pt, vt, em, ps, ca,
                     ));
                     // Reap finished tasks so the set tracks only in-flight work.
                     while set.try_join_next().is_some() {}
@@ -429,6 +435,7 @@ fn build_router(
     startup_model: &Arc<str>,
     price_table: &Arc<PriceTable>,
     vault: &Arc<Mutex<Vault>>,
+    embedder: &Arc<dyn embedder_port::Embedder>,
     provider_sessions: &orchestrator::ProviderSessions,
     cache_aligners: &orchestrator::CacheAligners,
     task_set: &Arc<Mutex<tokio::task::JoinSet<()>>>,
@@ -448,6 +455,7 @@ fn build_router(
         assayer: Arc::clone(assayer),
         price_table: Arc::clone(price_table),
         vault: Arc::clone(vault),
+        embedder: Arc::clone(embedder),
         provider_sessions: Arc::clone(provider_sessions),
         cache_aligners: Arc::clone(cache_aligners),
         task_set: Arc::clone(task_set),
@@ -839,6 +847,14 @@ fn build_router(
         async move { handlers::session::history(state, params).await }
     });
 
+    // ── vault.reembed ─────────────────────────────────────────────────────────
+    // Re-embeds existing vault rows under the active embedder (backfill/upgrade).
+    let vault_reembed_state = state.clone();
+    router.register("vault.reembed", move |params: Value| {
+        let state = vault_reembed_state.clone();
+        async move { handlers::vault::reembed(state, params).await }
+    });
+
     router
 }
 
@@ -1156,6 +1172,23 @@ async fn main() -> anyhow::Result<()> {
 
     let vault = Arc::new(Mutex::new(open_vault()));
 
+    // Resolve the embedding backend from `[embedder]` config + runtime
+    // availability. An absent/unparseable config or unreachable learned endpoint
+    // resolves to the FNV default; this never blocks startup.
+    let embedder_config = embedder_config::load_embedder_config(&workspace_root);
+    let embedder = embedder_config::resolve_embedder(&embedder_config).await;
+    // Record the active model as the vault's coarse identity marker so a future
+    // open knows what the database mostly holds.
+    {
+        let identity = smedja_vault::EmbedderIdentity {
+            model: embedder.model_id().to_owned(),
+            dimensions: embedder.dim(),
+        };
+        if let Err(e) = vault.lock().await.set_embedder_identity(&identity) {
+            tracing::warn!(error = %e, "failed to set vault embedder identity; continuing");
+        }
+    }
+
     // Single provider-session map, constructed once and threaded to every
     // handler and the orchestrator (replaces the former OnceLock singleton).
     let provider_sessions: orchestrator::ProviderSessions = Arc::new(Mutex::new(HashMap::new()));
@@ -1180,6 +1213,7 @@ async fn main() -> anyhow::Result<()> {
         &startup_model,
         &price_table,
         &vault,
+        &embedder,
         &provider_sessions,
         &cache_aligners,
         &task_set,
@@ -1193,6 +1227,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&assayer),
         Arc::clone(&price_table),
         Arc::clone(&vault),
+        Arc::clone(&embedder),
         Arc::clone(&provider_sessions),
         Arc::clone(&cache_aligners),
         Arc::clone(&task_set),
@@ -1210,6 +1245,7 @@ async fn main() -> anyhow::Result<()> {
                 auth_token: acp_token,
                 workspace: workspace_root.clone(),
                 vault: Arc::clone(&vault),
+                embedder: Arc::clone(&embedder),
             };
             let acp_router = acp::build_acp_router(acp_state);
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -1928,6 +1964,8 @@ mod tests {
                     chunk_index: None,
                     parent_id: None,
                     created_at: 0.0,
+                    embedder_model_id: smedja_vault::LEGACY_MODEL_ID.to_owned(),
+                    dim: crate::embedder::DIM,
                 };
                 guard.upsert(&entry).unwrap();
             }
@@ -1941,7 +1979,16 @@ mod tests {
         let results = {
             let guard = vault.lock().await;
             let qv = crate::embedder::embed("async rust");
-            guard.search(&qv, "async rust", "warm", 5).unwrap()
+            guard
+                .search(
+                    &qv,
+                    "async rust",
+                    "warm",
+                    5,
+                    smedja_vault::LEGACY_MODEL_ID,
+                    crate::embedder::DIM,
+                )
+                .unwrap()
         };
         assert!(
             !results.is_empty(),
@@ -1982,6 +2029,8 @@ mod tests {
                 chunk_index: None,
                 parent_id: None,
                 created_at: 0.0,
+                embedder_model_id: smedja_vault::LEGACY_MODEL_ID.to_owned(),
+                dim: crate::embedder::DIM,
             };
             let mut guard = vt.blocking_lock();
             guard.upsert(&entry).unwrap();
@@ -2046,6 +2095,8 @@ mod tests {
                 chunk_index: None,
                 parent_id: None,
                 created_at: 0.0,
+                embedder_model_id: smedja_vault::LEGACY_MODEL_ID.to_owned(),
+                dim: crate::embedder::DIM,
             };
             let mut guard = vt.blocking_lock();
             guard.upsert(&entry).unwrap();
@@ -2059,7 +2110,16 @@ mod tests {
         let results = {
             let guard = vault.lock().await;
             let qv = crate::embedder::embed("auth tests");
-            guard.search(&qv, "auth tests", "compact", 5).unwrap()
+            guard
+                .search(
+                    &qv,
+                    "auth tests",
+                    "compact",
+                    5,
+                    smedja_vault::LEGACY_MODEL_ID,
+                    crate::embedder::DIM,
+                )
+                .unwrap()
         };
         assert!(
             !results.is_empty(),
@@ -2087,6 +2147,8 @@ mod tests {
                 chunk_index: None,
                 parent_id: None,
                 created_at: 0.0,
+                embedder_model_id: smedja_vault::LEGACY_MODEL_ID.to_owned(),
+                dim: crate::embedder::DIM,
             };
             guard.upsert(&make_entry("w1", "warm")).unwrap();
             guard.upsert(&make_entry("c1", "default")).unwrap();

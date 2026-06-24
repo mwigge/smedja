@@ -20,6 +20,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 use crate::cowork::CoworkGate;
+use crate::embedder_port::Embedder;
 use crate::orchestrator::ProviderSessions;
 use crate::price_table::PriceTable;
 use crate::provider_pool::ProviderPool;
@@ -54,6 +55,8 @@ pub(crate) struct HandlerState {
     pub(crate) assayer: Arc<Assayer>,
     pub(crate) price_table: Arc<PriceTable>,
     pub(crate) vault: Arc<Mutex<Vault>>,
+    /// Resolved embedding backend shared by every vault-embedding handler.
+    pub(crate) embedder: Arc<dyn Embedder>,
     pub(crate) provider_sessions: ProviderSessions,
     pub(crate) cache_aligners: crate::orchestrator::CacheAligners,
     pub(crate) task_set: Arc<Mutex<JoinSet<()>>>,

@@ -191,6 +191,10 @@ async fn tee_to_vault(hash: &str, full_output: &str, vault: &Arc<Mutex<Vault>>) 
         chunk_index: None,
         parent_id: None,
         created_at: 0.0,
+        // Recovery rows hold the raw output for hash retrieval, never a semantic
+        // embedding, so they carry an empty vector tagged dim 0.
+        embedder_model_id: smedja_vault::LEGACY_MODEL_ID.to_owned(),
+        dim: 0,
     };
     let join = tokio::task::spawn_blocking(move || {
         let mut guard = vault.blocking_lock();
@@ -287,6 +291,7 @@ pub(crate) async fn execute_tool(
     session: Option<&Session>,
     ingot: &IngotHandle,
     vault: &Arc<Mutex<Vault>>,
+    embedder: &Arc<dyn crate::embedder_port::Embedder>,
 ) -> String {
     let input: Value = serde_json::from_str(tool_input).unwrap_or(Value::Null);
 
@@ -462,10 +467,12 @@ pub(crate) async fn execute_tool(
                 .unwrap_or("default")
                 .to_owned();
             let vault = Arc::clone(vault);
+            let query_vec = embedder.embed_query(&query_text).await;
+            let model_id = embedder.model_id().to_owned();
+            let dim = embedder.dim();
             tokio::task::spawn_blocking(move || {
-                let query_vec = crate::embedder::embed(&query_text);
                 let guard = vault.blocking_lock();
-                match guard.search(&query_vec, &query_text, &ns, k) {
+                match guard.search(&query_vec, &query_text, &ns, k, &model_id, dim) {
                     Ok(entries) => {
                         let results: Vec<serde_json::Value> = entries
                             .into_iter()
@@ -514,8 +521,10 @@ pub(crate) async fn execute_tool(
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
             let vault = Arc::clone(vault);
+            let embedding = embedder.embed_query(&content).await;
+            let model_id = embedder.model_id().to_owned();
+            let dim = embedder.dim();
             tokio::task::spawn_blocking(move || {
-                let embedding = crate::embedder::embed(&content);
                 let entry = VaultEntry {
                     id: entry_id,
                     embedding,
@@ -527,6 +536,8 @@ pub(crate) async fn execute_tool(
                     chunk_index: None,
                     parent_id: None,
                     created_at: 0.0,
+                    embedder_model_id: model_id,
+                    dim,
                 };
                 let mut guard = vault.blocking_lock();
                 match guard.upsert(&entry) {
@@ -780,6 +791,11 @@ pub(crate) async fn dispatch_mcp_tool_with_store(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    /// Default FNV embedder for tests that drive `execute_tool`.
+    fn test_embedder() -> Arc<dyn crate::embedder_port::Embedder> {
+        Arc::new(crate::embedder_port::FnvEmbedder::new())
+    }
 
     // ── output-filters: filter_command_output ─────────────────────────────────
 
@@ -1041,6 +1057,7 @@ mod tests {
             Some(&session),
             &ingot,
             &vault,
+            &test_embedder(),
         )
         .await;
         assert_eq!(
@@ -1113,6 +1130,7 @@ mod tests {
             None,
             &ingot,
             &vault,
+            &test_embedder(),
         )
         .await;
         assert!(
@@ -1253,6 +1271,7 @@ mod tests {
             None,
             &ingot,
             &vault,
+            &test_embedder(),
         )
         .await;
 
@@ -1297,6 +1316,7 @@ mod tests {
             Some(session),
             ingot,
             &vault,
+            &test_embedder(),
         )
         .await
     }
@@ -1596,6 +1616,7 @@ mod tests {
             Some(&session),
             &ingot,
             &vault,
+            &test_embedder(),
         )
         .await;
 
@@ -1648,6 +1669,7 @@ mod tests {
             Some(&session),
             &ingot,
             &vault,
+            &test_embedder(),
         )
         .await;
         assert_eq!(result, "nothing secret here");
@@ -1677,6 +1699,7 @@ mod tests {
             None,
             &ingot,
             &vault,
+            &test_embedder(),
         )
         .await;
 
@@ -1700,6 +1723,7 @@ mod tests {
             None,
             &ingot,
             &vault,
+            &test_embedder(),
         )
         .await;
         let stored: serde_json::Value = serde_json::from_str(&store_result).unwrap();
@@ -1712,6 +1736,7 @@ mod tests {
             None,
             &ingot,
             &vault,
+            &test_embedder(),
         )
         .await;
         let v: serde_json::Value = serde_json::from_str(&search_result).unwrap();
@@ -1737,6 +1762,7 @@ mod tests {
                 None,
                 &ingot,
                 &vault,
+                &test_embedder(),
             )
             .await;
         }
@@ -1748,6 +1774,7 @@ mod tests {
             None,
             &ingot,
             &vault,
+            &test_embedder(),
         )
         .await;
         let v: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -1774,6 +1801,7 @@ mod tests {
             None,
             &ingot,
             &vault,
+        &test_embedder(),
         )
         .await;
         let stored: serde_json::Value = serde_json::from_str(&store_result).unwrap();
@@ -1790,6 +1818,7 @@ mod tests {
             None,
             &ingot,
             &vault,
+            &test_embedder(),
         )
         .await;
 
@@ -1806,7 +1835,14 @@ mod tests {
             let guard = vault.lock().await;
             let qv = crate::embedder::embed("Rust ownership borrow checker");
             let entries = guard
-                .search(&qv, "Rust ownership borrow checker", "search-test", 1)
+                .search(
+                    &qv,
+                    "Rust ownership borrow checker",
+                    "search-test",
+                    1,
+                    smedja_vault::LEGACY_MODEL_ID,
+                    crate::embedder::DIM,
+                )
                 .unwrap();
             if entries.is_empty() {
                 return;

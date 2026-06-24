@@ -199,6 +199,7 @@ pub(crate) async fn run(state: HandlerState, params: Value) -> Result<Value, Rpc
         Arc::clone(&state.assayer),
         Arc::clone(&state.price_table),
         Arc::clone(&state.vault),
+        Arc::clone(&state.embedder),
         Arc::clone(&state.provider_sessions),
         Arc::clone(&state.cache_aligners),
         bg_loop_id,
