@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::sandbox::SandboxExecutor;
 
-mod fs_tools;
+pub(crate) mod fs_tools;
 use fs_tools::{
     assert_within_workspace, extract_proposed_content, read_current_content, role_allows_write_bash,
 };
