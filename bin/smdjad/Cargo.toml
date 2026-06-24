@@ -49,6 +49,11 @@ tracing-subscriber = { workspace = true }
 uuid               = { workspace = true }
 which              = { workspace = true }
 
+# Linux-only Landlock LSM bindings for the native sandbox backend. Target-gated
+# so the macOS build never pulls it in.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+
 [dev-dependencies]
 tempfile = "3"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "testing"] }

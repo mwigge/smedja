@@ -40,6 +40,17 @@ pub(crate) fn audit_report_path(
     assert_within_workspace(workspace, path_str)
 }
 
+/// Resolves the sandbox confined root for a tool execution.
+///
+/// `workspace` is the resolved task workspace — the active worktree path when a
+/// task owns one, otherwise the session workspace (the orchestrator threads the
+/// worktree path through as `workspace_root`). The root is canonicalised using
+/// the same contract as [`assert_within_workspace`] (`.` against the workspace
+/// itself), so the kernel boundary is rooted exactly where the path checks are.
+pub(crate) fn confined_root_for(workspace: &std::path::Path) -> std::path::PathBuf {
+    assert_within_workspace(workspace, ".").unwrap_or_else(|_| workspace.to_owned())
+}
+
 /// Test accessor for the read-only bash gate, exposing the `fs_tools` predicate
 /// to sibling modules' tests.
 #[cfg(test)]
@@ -246,15 +257,22 @@ pub(crate) async fn execute_tool(
                 }
             }
 
-            // SandboxExecutor: use Docker sandbox when configured and tool is not exempt.
+            // SandboxExecutor: confine execution to the resolved confined root
+            // (the active worktree when a task owns one, else the workspace).
+            // Exempt tools never reach this arm. The fallback contract
+            // (auto/required/off) is enforced inside `run_confined`.
             let sandbox = SandboxExecutor::new();
-            if sandbox.available && !SandboxExecutor::is_exempt(tool_name) {
-                match sandbox.exec(cmd, workspace).await {
-                    Ok(out) => out,
-                    Err(e) => format!("error: {e}"),
-                }
-            } else {
+            if SandboxExecutor::is_exempt(tool_name) {
                 super::exec_bash(cmd, workspace).await
+            } else {
+                let confined_root = confined_root_for(workspace);
+                let cmd_owned = cmd.to_owned();
+                let ws = workspace.to_owned();
+                sandbox
+                    .run_confined(cmd, &confined_root, || async move {
+                        super::exec_bash(&cmd_owned, &ws).await
+                    })
+                    .await
             }
         }
         "read_file" => {
@@ -666,6 +684,26 @@ mod tests {
                 "MCP_SERVER_TOOLS entry '{tool}' must also be in LOCAL_TOOLS"
             );
         }
+    }
+
+    // ── confined root resolution (worktree-aware) ─────────────────────────────
+
+    #[test]
+    fn confined_root_is_worktree_when_task_owns_one() {
+        // The orchestrator threads the active worktree path through as the
+        // tool-execution workspace when a task owns one, else the session
+        // workspace. `confined_root_for` must canonicalise that subtree.
+        let session_ws = tempfile::tempdir().unwrap();
+        let worktree = session_ws.path().join("worktrees").join("task-1");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        // Task owns a worktree → confined root is the worktree.
+        let resolved = super::confined_root_for(&worktree);
+        assert_eq!(resolved, worktree.canonicalize().unwrap());
+
+        // No worktree → confined root is the session workspace.
+        let resolved = super::confined_root_for(session_ws.path());
+        assert_eq!(resolved, session_ws.path().canonicalize().unwrap());
     }
 
     // ── find_tool_call_json / parse_tool_call ─────────────────────────────────
