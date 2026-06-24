@@ -422,6 +422,51 @@ fn slugify(topic: &str) -> String {
         .join("-")
 }
 
+/// Parses `/review` argument flags into the `audit.run` RPC scope params.
+///
+/// No args → working-tree diff (`{}`); `<path>` → `{ "path": <path> }`;
+/// `--branch <base>` → `{ "branch": <base> }`; `--pr <ref>` → `{ "pr": <ref> }`.
+/// Unknown leading tokens are treated as a path argument.
+fn parse_review_scope(args: &str) -> serde_json::Value {
+    let args = args.trim();
+    if args.is_empty() {
+        return json!({});
+    }
+    let mut parts = args.splitn(2, char::is_whitespace);
+    let head = parts.next().unwrap_or_default();
+    let rest = parts.next().unwrap_or_default().trim();
+    match head {
+        "--branch" => json!({ "branch": rest }),
+        "--pr" => json!({ "pr": rest }),
+        "--diff" => json!({ "diff": true }),
+        path => json!({ "path": path }),
+    }
+}
+
+/// Renders a per-severity findings summary plus the report location.
+///
+/// `counts` is the `audit.run` response's `counts` object; `report_path` is the
+/// written path when present, otherwise the report was returned inline.
+fn render_findings_summary(counts: &serde_json::Value, report_path: Option<&str>) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::from("audit complete — findings:");
+    for severity in ["critical", "high", "medium", "low", "info"] {
+        let n = counts
+            .get(severity)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let _ = write!(out, " {severity}={n}");
+    }
+    match report_path {
+        Some(path) => {
+            let _ = write!(out, "\nreport: {path}");
+        }
+        None => out.push_str("\nreport: (inline)"),
+    }
+    out
+}
+
 /// Extract the first fenced code block of the given `lang` from `text`.
 ///
 /// Returns the content inside the delimiters (without the fence lines).
@@ -924,27 +969,44 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
             Ok(true)
         }
         "review" => {
-            let focus = if args.is_empty() {
-                String::new()
-            } else {
-                format!("\n\nFocus on: {args}")
-            };
-            let diff = match std::process::Command::new("git")
-                .args(["diff", "HEAD"])
-                .output()
-            {
-                Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
-                Err(e) => {
-                    push_system_message(state, format!("git diff failed: {e}"));
-                    return Ok(true);
+            let mut params = parse_review_scope(args);
+
+            // Empty working-tree diff (everything committed) no longer hard-refuses:
+            // fall back to a repository path scope instead.
+            let is_diff_scope = params.get("path").is_none()
+                && params.get("branch").is_none()
+                && params.get("pr").is_none();
+            if is_diff_scope {
+                let empty_diff = std::process::Command::new("git")
+                    .args(["diff", "HEAD"])
+                    .output()
+                    .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim().is_empty());
+                if empty_diff {
+                    params = json!({ "path": "." });
+                    push_system_message(
+                        state,
+                        "working tree clean; auditing the repository path scope",
+                    );
                 }
-            };
-            if diff.trim().is_empty() {
-                push_system_message(state, "no unstaged changes to review (diff HEAD is empty)");
-                return Ok(true);
             }
-            let message = format!("Review the following git diff:{focus}\n\n```diff\n{diff}```");
-            submit(&message, state, client).await?;
+
+            // The audit runs under the read-only Review role; set review mode.
+            let session_id = state.session_id.clone();
+            let _ = client
+                .call(
+                    "session.set_mode",
+                    json!({ "session_id": session_id, "mode": "review" }),
+                )
+                .await;
+
+            match client.call("audit.run", params).await {
+                Ok(resp) => {
+                    let counts = resp.get("counts").cloned().unwrap_or_else(|| json!({}));
+                    let report_path = resp.get("report_path").and_then(serde_json::Value::as_str);
+                    push_system_message(state, render_findings_summary(&counts, report_path));
+                }
+                Err(e) => push_system_message(state, format!("audit.run error: {e}")),
+            }
             Ok(true)
         }
         "drawio" => {
@@ -2724,6 +2786,54 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- /review scope-flag parsing ---
+
+    #[test]
+    fn review_no_args_is_diff_scope() {
+        let params = parse_review_scope("");
+        assert_eq!(params, json!({}), "no args → working-tree diff");
+    }
+
+    #[test]
+    fn review_path_arg_is_path_scope() {
+        assert_eq!(
+            parse_review_scope("src/lib.rs"),
+            json!({ "path": "src/lib.rs" })
+        );
+    }
+
+    #[test]
+    fn review_branch_flag_is_branch_scope() {
+        assert_eq!(
+            parse_review_scope("--branch main"),
+            json!({ "branch": "main" })
+        );
+    }
+
+    #[test]
+    fn review_pr_flag_is_pr_scope() {
+        assert_eq!(parse_review_scope("--pr 42"), json!({ "pr": "42" }));
+    }
+
+    // --- /review findings summary rendering ---
+
+    #[test]
+    fn findings_summary_lists_counts_and_report_path() {
+        let counts = json!({ "critical": 1, "high": 0, "medium": 2, "low": 3, "info": 0 });
+        let summary = render_findings_summary(&counts, Some("/tmp/report.md"));
+        assert!(summary.contains("critical=1"), "got: {summary}");
+        assert!(summary.contains("medium=2"), "got: {summary}");
+        assert!(summary.contains("low=3"), "got: {summary}");
+        assert!(summary.contains("report: /tmp/report.md"), "got: {summary}");
+    }
+
+    #[test]
+    fn findings_summary_marks_inline_when_no_path() {
+        let counts = json!({ "critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0 });
+        let summary = render_findings_summary(&counts, None);
+        assert!(summary.contains("report: (inline)"), "got: {summary}");
+    }
 
     // L128: trailing backslash appends newline continuation, does not submit.
     #[test]

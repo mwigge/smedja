@@ -742,6 +742,15 @@ fn build_router(
         async move { handlers::loops::run(state, params).await }
     });
 
+    // ── audit.run ─────────────────────────────────────────────────────────────
+    // Runs the bounded, read-only repo/PR/branch audit loop under the Review
+    // role and returns { findings, counts, report | report_path }.
+    let audit_run_state = state.clone();
+    router.register("audit.run", move |params: Value| {
+        let state = audit_run_state.clone();
+        async move { handlers::auditor::run(state, params).await }
+    });
+
     // ── agent.routing ────────────────────────────────────────────────────────
     // Resolves a (role, complexity?) pair through the daemon's assayer and
     // returns { runner, tier, model, complexity, rationale }.

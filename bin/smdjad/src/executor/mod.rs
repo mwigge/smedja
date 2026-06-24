@@ -24,6 +24,30 @@ use fs_tools::{
     assert_within_workspace, extract_proposed_content, read_current_content, role_allows_write_bash,
 };
 
+/// Resolves a caller-supplied report path against `workspace`, asserting it
+/// stays within the workspace root.
+///
+/// Used by the auditor to write its markdown report through the same
+/// boundary check the write tools enforce.
+///
+/// # Errors
+///
+/// Returns the workspace-boundary error string when the path escapes `workspace`.
+pub(crate) fn audit_report_path(
+    workspace: &std::path::Path,
+    path_str: &str,
+) -> Result<std::path::PathBuf, String> {
+    assert_within_workspace(workspace, path_str)
+}
+
+/// Test accessor for the read-only bash gate, exposing the `fs_tools` predicate
+/// to sibling modules' tests.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn role_allows_write_bash_for_test(session: &smedja_ingot::Session) -> bool {
+    role_allows_write_bash(session)
+}
+
 /// Local-tool allowlist shared with the `OTel` classification logic in `run_turn`.
 ///
 /// Every tool whose dispatch is handled natively inside [`execute_tool`] must
