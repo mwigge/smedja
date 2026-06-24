@@ -25,6 +25,7 @@ use crate::price_table::PriceTable;
 use crate::provider_pool::ProviderPool;
 
 pub(crate) mod audit;
+pub(crate) mod auditor;
 pub(crate) mod checkpoint;
 pub(crate) mod cost;
 pub(crate) mod graph;

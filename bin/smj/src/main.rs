@@ -148,6 +148,26 @@ enum DaemonCmd {
 
 #[derive(Subcommand)]
 enum AuditCmd {
+    /// Run a read-only repo/PR/branch audit and write a markdown report
+    Run {
+        /// Path or whole-repo scope (omit for the working-tree diff)
+        path: Option<String>,
+        /// Audit a branch range against this base (`<base>...HEAD`)
+        #[arg(long)]
+        branch: Option<String>,
+        /// Audit a pull-request reference resolved to a branch range
+        #[arg(long)]
+        pr: Option<String>,
+        /// Force the working-tree diff scope (`git diff HEAD`)
+        #[arg(long)]
+        diff: bool,
+        /// Write the markdown report to this path instead of stdout
+        #[arg(long)]
+        report: Option<String>,
+        /// Output format: `md` (default) or `json`
+        #[arg(long, default_value = "md")]
+        format: String,
+    },
     /// Query audit log events
     Query {
         /// Filter by session ID
@@ -862,6 +882,43 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Audit { action } => match action {
+            AuditCmd::Run {
+                path,
+                branch,
+                pr,
+                diff,
+                report,
+                format,
+            } => {
+                let workspace = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .ok();
+                let params = build_audit_params(
+                    path.as_deref(),
+                    branch.as_deref(),
+                    pr.as_deref(),
+                    diff,
+                    report.as_deref(),
+                    &format,
+                    workspace.as_deref(),
+                );
+                let mut client = Client::connect(&sock)
+                    .await
+                    .with_context(|| format!("smdjad not running ({})", sock.display()))?;
+                let resp = client
+                    .call("audit.run", params)
+                    .await
+                    .context("audit.run failed")?;
+                if format == "json" {
+                    println!("{}", serde_json::to_string_pretty(&resp)?);
+                } else if let Some(report_path) = resp.get("report_path").and_then(|v| v.as_str()) {
+                    println!("Report written to {report_path}");
+                } else if let Some(body) = resp.get("report").and_then(|v| v.as_str()) {
+                    println!("{body}");
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&resp)?);
+                }
+            }
             AuditCmd::Query {
                 session,
                 since,
@@ -1825,6 +1882,38 @@ fn cmd_security_sbom(lockfile: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Builds the `audit.run` RPC params from the parsed `smj audit run` flags.
+///
+/// Scope precedence mirrors the daemon's `resolve_scope`: `--pr` → `--branch` →
+/// `--diff`/no-path → a positional `<path>`.
+fn build_audit_params(
+    path: Option<&str>,
+    branch: Option<&str>,
+    pr: Option<&str>,
+    diff: bool,
+    report: Option<&str>,
+    format: &str,
+    workspace: Option<&str>,
+) -> serde_json::Value {
+    let mut params = json!({ "format": format });
+    if let Some(pr) = pr {
+        params["pr"] = json!(pr);
+    } else if let Some(base) = branch {
+        params["branch"] = json!(base);
+    } else if diff {
+        params["diff"] = json!(true);
+    } else if let Some(path) = path {
+        params["path"] = json!(path);
+    }
+    if let Some(report) = report {
+        params["report"] = json!(report);
+    }
+    if let Some(ws) = workspace {
+        params["workspace"] = json!(ws);
+    }
+    params
+}
+
 /// Resolves a path to its SKILL.md content and the skill name from frontmatter.
 fn read_skill_file(path: &std::path::Path) -> Result<(String, String)> {
     let skill_md = if path.is_dir() {
@@ -1842,6 +1931,98 @@ fn read_skill_file(path: &std::path::Path) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- smj audit run parsing + params ---
+
+    #[test]
+    fn audit_run_parses_path_branch_pr_diff_report_format() {
+        let cli = Cli::try_parse_from([
+            "smj",
+            "audit",
+            "run",
+            "src/lib.rs",
+            "--report",
+            "out.md",
+            "--format",
+            "json",
+        ])
+        .expect("audit run with a path must parse");
+        let Cmd::Audit {
+            action:
+                AuditCmd::Run {
+                    path,
+                    branch,
+                    pr,
+                    diff,
+                    report,
+                    format,
+                },
+        } = cli.command
+        else {
+            panic!("expected an audit run command");
+        };
+        assert_eq!(path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(branch, None);
+        assert_eq!(pr, None);
+        assert!(!diff);
+        assert_eq!(report.as_deref(), Some("out.md"));
+        assert_eq!(format, "json");
+    }
+
+    #[test]
+    fn audit_run_parses_branch_and_pr_flags() {
+        let branch = Cli::try_parse_from(["smj", "audit", "run", "--branch", "main"]).unwrap();
+        assert!(matches!(
+            branch.command,
+            Cmd::Audit {
+                action: AuditCmd::Run { branch: Some(b), .. }
+            } if b == "main"
+        ));
+        let pr = Cli::try_parse_from(["smj", "audit", "run", "--pr", "42"]).unwrap();
+        assert!(matches!(
+            pr.command,
+            Cmd::Audit {
+                action: AuditCmd::Run { pr: Some(p), .. }
+            } if p == "42"
+        ));
+    }
+
+    #[test]
+    fn build_audit_params_respects_scope_precedence() {
+        // pr wins over branch/path
+        let params = build_audit_params(
+            Some("src"),
+            Some("main"),
+            Some("7"),
+            false,
+            None,
+            "md",
+            None,
+        );
+        assert_eq!(params["pr"], "7");
+        assert!(params.get("branch").is_none());
+        assert!(params.get("path").is_none());
+
+        // path scope with report + workspace
+        let params = build_audit_params(
+            Some("src"),
+            None,
+            None,
+            false,
+            Some("r.md"),
+            "json",
+            Some("/ws"),
+        );
+        assert_eq!(params["path"], "src");
+        assert_eq!(params["report"], "r.md");
+        assert_eq!(params["format"], "json");
+        assert_eq!(params["workspace"], "/ws");
+
+        // diff flag overrides a path
+        let params = build_audit_params(Some("src"), None, None, true, None, "md", None);
+        assert_eq!(params["diff"], true);
+        assert!(params.get("path").is_none());
+    }
 
     #[test]
     fn workspace_init_creates_dir_and_toml() {
