@@ -601,6 +601,34 @@ fn build_router(
         async move { handlers::session::runner_list(state, params).await }
     });
 
+    // ── local.models ─────────────────────────────────────────────────────────
+    let local_models_state = state.clone();
+    router.register("local.models", move |params: Value| {
+        let state = local_models_state.clone();
+        async move { handlers::local::models(state, params).await }
+    });
+
+    // ── local.gpu ────────────────────────────────────────────────────────────
+    let local_gpu_state = state.clone();
+    router.register("local.gpu", move |params: Value| {
+        let state = local_gpu_state.clone();
+        async move { handlers::local::gpu(state, params).await }
+    });
+
+    // ── local.swap ───────────────────────────────────────────────────────────
+    let local_swap_state = state.clone();
+    router.register("local.swap", move |params: Value| {
+        let state = local_swap_state.clone();
+        async move { handlers::local::swap(state, params).await }
+    });
+
+    // ── local.install ────────────────────────────────────────────────────────
+    let local_install_state = state.clone();
+    router.register("local.install", move |params: Value| {
+        let state = local_install_state.clone();
+        async move { handlers::local::install(state, params).await }
+    });
+
     // ── session.context ─────────────────────────────────────────────────────
     let context_state = state.clone();
     router.register("session.context", move |params: Value| {

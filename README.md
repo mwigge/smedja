@@ -69,6 +69,24 @@ tools  = ["read_file", "otel_query", "metric_query", "log_tail"]
 
 The assayer routes by **role + complexity**, not just complexity. A simple fix stays local; an architecture review goes to claude deep. No manual model selection per task.
 
+### Local model lifecycle
+
+The `local` runner is a control plane over external local-serving tools — smedja **orchestrates**, it does not serve. Inference, weight downloads, quantisation, and GPU placement stay in those tools; smedja drives install via shell-out, reads the model inventory and a GPU snapshot, and issues hot-swap requests over HTTP.
+
+- **rs-llmctl** — the installer/inventory surface. `local.install` shells out to it (`SMEDJA_LOCAL_INSTALLER`, default `rs-llmctl`) to pull a model, then re-queries `/v1/models` and reports success **only** when the model actually appears in the inventory.
+- **llama-swap** (or any llama-swap-compatible proxy) — fronts many loaded models behind one OpenAI-compatible endpoint and hot-swaps the active model on request. smedja issues the swap to `SMEDJA_LOCAL_SWAP_ENDPOINT`; if the proxy has no explicit swap endpoint, smedja falls back to setting the active-model label so a model-routing proxy honours the chosen `model`.
+
+```sh
+smj local list            # GPU-annotated inventory: each model flagged fits | tight | exceeds | unknown
+smj local gpu             # cached GPU snapshot (device, VRAM total/free); "no GPU detected" on CPU-only hosts
+smj local swap qwen3-14b  # hot-swap the active local model — no daemon restart, reports round-trip latency
+smj local install llama3-8b
+```
+
+In the TUI, `/model` is local-aware: with the `local` runner active, bare `/model` lists the GPU-annotated inventory and `/model <name>` hot-swaps via `local.swap` (not the relabel-only `session.set_model`). The picker's fit annotation is **advisory** — VRAM placement is llama-swap's job, so an "exceeds" model can still be selected.
+
+Configuration: `SMEDJA_LOCAL_ENDPOINT` (default `http://127.0.0.1:9090`) is the OpenAI-compatible base; `SMEDJA_LOCAL_SWAP_ENDPOINT` defaults to the same base; GPU detection shells out to `nvidia-smi` and degrades cleanly to "no GPU detected" when absent. When no healthy local endpoint is detected at startup, the `local.*` RPCs return a structured "local tooling unavailable" error and the daemon still starts — other runners are unaffected.
+
 ---
 
 ## Loop Pipeline
