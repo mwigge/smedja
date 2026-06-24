@@ -98,6 +98,7 @@ pub(crate) async fn compact(state: HandlerState, params: Value) -> Result<Value,
     let ig = state.ingot;
     let pool = state.provider_pool;
     let vt = state.vault;
+    let embedder = state.embedder;
     let session_id = params
         .get("session_id")
         .and_then(Value::as_str)
@@ -184,10 +185,13 @@ pub(crate) async fn compact(state: HandlerState, params: Value) -> Result<Value,
     // Fire-and-forget: index compaction summary into vault cold storage.
     let compact_sid = session_id.clone();
     let compact_summary = summary.clone();
+    let embedding = embedder.embed_query(&compact_summary).await;
+    let model_id = embedder.model_id().to_owned();
+    let dim = embedder.dim();
     tokio::task::spawn_blocking(move || {
         let entry = VaultEntry {
             id: format!("compact:{compact_sid}:{turn_count}"),
-            embedding: crate::embedder::embed(&compact_summary),
+            embedding,
             payload: serde_json::json!({
                 "session_id": compact_sid,
                 "turn_count": turn_count,
@@ -199,6 +203,8 @@ pub(crate) async fn compact(state: HandlerState, params: Value) -> Result<Value,
             chunk_index: None,
             parent_id: None,
             created_at: 0.0,
+            embedder_model_id: model_id,
+            dim,
         };
         let mut guard = vt.blocking_lock();
         if let Err(e) = guard.upsert(&entry) {

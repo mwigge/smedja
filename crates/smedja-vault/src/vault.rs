@@ -3,6 +3,12 @@
 use crate::error::VaultError;
 use crate::similarity::cosine_sim;
 
+/// Default model identifier assumed for rows that predate per-row model tagging.
+///
+/// Legacy rows were all produced by the FNV-1a bag-of-words embedder, so a row
+/// whose `embedder_model_id` column is absent or NULL reads back as this id.
+pub const LEGACY_MODEL_ID: &str = "fnv-bow-128";
+
 /// A single entry stored in the vault.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VaultEntry {
@@ -29,6 +35,17 @@ pub struct VaultEntry {
     /// Set to `0.0` on construction; [`Vault::insert`] fills in the current
     /// wall-clock time when the stored value is `0.0`.
     pub created_at: f64,
+    /// Identifier of the embedding model that produced [`VaultEntry::embedding`].
+    ///
+    /// Persisted alongside the embedding so [`Vault::search`]/[`Vault::query`]
+    /// compare only same-model vectors. Legacy rows lacking this column read
+    /// back as [`LEGACY_MODEL_ID`].
+    pub embedder_model_id: String,
+    /// Dimension of [`VaultEntry::embedding`] as reported by its producing model.
+    ///
+    /// Legacy rows lacking this column derive it from the stored BLOB length
+    /// divided by four (the byte width of an `f32`).
+    pub dim: usize,
 }
 
 /// A single result returned by [`Vault::query`].
@@ -85,12 +102,57 @@ struct DedupeRow {
     content_len: usize,
 }
 
+/// A row read during [`Vault::query`] before same-model filtering and scoring.
+struct QueryRow {
+    id: String,
+    bytes: Vec<u8>,
+    payload_str: String,
+    model_id: Option<String>,
+    dim: Option<i64>,
+}
+
+/// A fully-hydrated row read during [`Vault::search`].
+///
+/// The whole row set is materialised before scoring so the prepared statement is
+/// dropped before the same-model filter and cosine math run.
+struct SearchRow {
+    id: String,
+    bytes: Vec<u8>,
+    payload_str: String,
+    ns: String,
+    content: String,
+    source_file: Option<String>,
+    added_by: Option<String>,
+    chunk_index: Option<i64>,
+    parent_id: Option<String>,
+    created_at: f64,
+    model_id: Option<String>,
+    dim: Option<i64>,
+}
+
 /// Returns the current Unix time as a floating-point number of seconds.
 fn now_secs() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+/// Resolves the stored `embedder_model_id`, defaulting a legacy NULL to
+/// [`LEGACY_MODEL_ID`].
+fn resolve_model_id(stored: Option<String>) -> String {
+    stored.unwrap_or_else(|| LEGACY_MODEL_ID.to_owned())
+}
+
+/// Resolves the stored `dim`, deriving a legacy NULL from the BLOB byte length.
+///
+/// Embeddings are written as little-endian `f32` BLOBs, so a legacy row's
+/// dimension is its byte length divided by four.
+fn resolve_dim(stored: Option<i64>, embedding_bytes_len: usize) -> usize {
+    match stored {
+        Some(d) if d >= 0 => usize::try_from(d).unwrap_or(embedding_bytes_len / 4),
+        _ => embedding_bytes_len / 4,
+    }
 }
 
 impl Vault {
@@ -214,8 +276,8 @@ impl Vault {
 
         self.conn.execute(
             "INSERT OR REPLACE INTO vault_entries \
-             (id, embedding, payload, namespace, content, source_file, added_by, chunk_index, parent_id, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (id, embedding, payload, namespace, content, source_file, added_by, chunk_index, parent_id, created_at, embedder_model_id, dim) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 entry.id,
                 embedding_bytes,
@@ -227,6 +289,8 @@ impl Vault {
                 entry.chunk_index,
                 entry.parent_id,
                 created_at,
+                entry.embedder_model_id,
+                i64::try_from(entry.dim).unwrap_or(i64::MAX),
             ],
         )?;
         Ok(())
@@ -252,8 +316,8 @@ impl Vault {
         };
         self.conn.execute(
             "INSERT OR REPLACE INTO vault_entries \
-             (id, embedding, payload, namespace, content, source_file, added_by, chunk_index, parent_id, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (id, embedding, payload, namespace, content, source_file, added_by, chunk_index, parent_id, created_at, embedder_model_id, dim) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 entry.id,
                 embedding_bytes,
@@ -265,6 +329,8 @@ impl Vault {
                 entry.chunk_index,
                 entry.parent_id,
                 entry.created_at,
+                entry.embedder_model_id,
+                i64::try_from(entry.dim).unwrap_or(i64::MAX),
             ],
         )?;
         Ok(())
@@ -272,7 +338,13 @@ impl Vault {
 
     /// Performs a hybrid search: cosine similarity + keyword boost + recency boost.
     ///
-    /// For each entry in `namespace`:
+    /// Only rows produced by the same model as the query participate: a row whose
+    /// resolved `embedder_model_id` ≠ `query_model_id` or resolved `dim` ≠
+    /// `query_dim` is skipped before any cosine comparison — never an error.
+    /// Comparing vectors from different models is meaningless, so mismatched rows
+    /// are excluded from ranking rather than silently compared (or crashed).
+    ///
+    /// For each surviving entry in `namespace`:
     /// - Compute cosine similarity with `query_vec`.
     /// - Add a keyword boost: for each whitespace-split token in `query_text`,
     ///   count case-insensitive occurrences in `entry.content` and add `0.01` per
@@ -286,12 +358,15 @@ impl Vault {
     /// Returns [`VaultError::Db`] on a database failure or [`VaultError::Json`] if
     /// a stored payload cannot be deserialised.
     #[must_use = "the search result is the entire purpose of calling this function"]
+    #[allow(clippy::too_many_lines)] // single hybrid-scoring scan; splitting it would obscure the flow
     pub fn search(
         &self,
         query_vec: &[f32],
         query_text: &str,
         namespace: &str,
         k: usize,
+        query_model_id: &str,
+        query_dim: usize,
     ) -> Result<Vec<VaultEntry>, VaultError> {
         let namespace = if namespace.is_empty() {
             "default"
@@ -301,7 +376,7 @@ impl Vault {
 
         let mut stmt = self.conn.prepare(
             "SELECT id, embedding, payload, namespace, content, source_file, added_by, \
-             chunk_index, parent_id, created_at \
+             chunk_index, parent_id, created_at, embedder_model_id, dim \
              FROM vault_entries WHERE namespace = ?1",
         )?;
 
@@ -311,33 +386,35 @@ impl Vault {
             .map(str::to_lowercase)
             .collect();
 
-        let mut scored: Vec<(f32, VaultEntry)> = stmt
+        let rows: Vec<SearchRow> = stmt
             .query_map(rusqlite::params![namespace], |row| {
-                let id: String = row.get(0)?;
-                let bytes: Vec<u8> = row.get(1)?;
-                let payload_str: String = row.get(2)?;
-                let ns: String = row.get(3)?;
-                let content: String = row.get(4)?;
-                let source_file: Option<String> = row.get(5)?;
-                let added_by: Option<String> = row.get(6)?;
-                let chunk_index: Option<i64> = row.get(7)?;
-                let parent_id: Option<String> = row.get(8)?;
-                let created_at: f64 = row.get(9)?;
-                Ok((
-                    id,
-                    bytes,
-                    payload_str,
-                    ns,
-                    content,
-                    source_file,
-                    added_by,
-                    chunk_index,
-                    parent_id,
-                    created_at,
-                ))
+                Ok(SearchRow {
+                    id: row.get(0)?,
+                    bytes: row.get(1)?,
+                    payload_str: row.get(2)?,
+                    ns: row.get(3)?,
+                    content: row.get(4)?,
+                    source_file: row.get(5)?,
+                    added_by: row.get(6)?,
+                    chunk_index: row.get(7)?,
+                    parent_id: row.get(8)?,
+                    created_at: row.get(9)?,
+                    model_id: row.get(10)?,
+                    dim: row.get(11)?,
+                })
             })?
-            .map(|result| {
-                let (
+            .collect::<Result<_, rusqlite::Error>>()?;
+
+        let mut scored: Vec<(f32, VaultEntry)> = rows
+            .into_iter()
+            // Same-model-only: skip any row whose resolved model/dim differs from
+            // the query's before it ever reaches `cosine_sim`.
+            .filter(|row| {
+                resolve_model_id(row.model_id.clone()) == query_model_id
+                    && resolve_dim(row.dim, row.bytes.len()) == query_dim
+            })
+            .map(|row| {
+                let SearchRow {
                     id,
                     bytes,
                     payload_str,
@@ -348,8 +425,12 @@ impl Vault {
                     chunk_index,
                     parent_id,
                     created_at,
-                ) = result?;
+                    model_id,
+                    dim,
+                } = row;
 
+                let embedder_model_id = resolve_model_id(model_id);
+                let resolved_dim = resolve_dim(dim, bytes.len());
                 let stored: &[f32] = bytemuck::cast_slice::<u8, f32>(&bytes);
                 let cosine_score = cosine_sim(query_vec, stored);
 
@@ -392,6 +473,8 @@ impl Vault {
                     chunk_index,
                     parent_id,
                     created_at,
+                    embedder_model_id,
+                    dim: resolved_dim,
                 };
 
                 Ok((total_score, entry))
@@ -494,46 +577,64 @@ impl Vault {
     /// ~10,000 entries. Returns fewer than `k` results when the vault contains
     /// fewer entries. Returns an empty `Vec` when the vault is empty.
     ///
+    /// Only rows produced by the same model as the query participate: a row whose
+    /// resolved `embedder_model_id` ≠ `query_model_id` or resolved `dim` ≠
+    /// `query_dim` is skipped before any cosine comparison. A mismatched-dimension
+    /// row is therefore excluded from ranking rather than raising an error — a
+    /// vault mid-migration keeps returning correct same-model results.
+    ///
     /// # Errors
     ///
-    /// Returns [`VaultError::Db`] if reading any row fails, [`VaultError::Json`]
-    /// if a stored payload cannot be deserialised, or
-    /// [`VaultError::DimensionMismatch`] if any stored embedding has a different
-    /// number of components than `query_embedding`.
+    /// Returns [`VaultError::Db`] if reading any row fails or [`VaultError::Json`]
+    /// if a stored payload cannot be deserialised.
     #[must_use = "the query result is the entire purpose of calling this function"]
-    pub fn query(&self, query_embedding: &[f32], k: usize) -> Result<Vec<QueryResult>, VaultError> {
+    pub fn query(
+        &self,
+        query_embedding: &[f32],
+        k: usize,
+        query_model_id: &str,
+        query_dim: usize,
+    ) -> Result<Vec<QueryResult>, VaultError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, embedding, payload FROM vault_entries")?;
+            .prepare("SELECT id, embedding, payload, embedder_model_id, dim FROM vault_entries")?;
 
-        let mut scored: Vec<(f32, String, serde_json::Value)> = stmt
+        let rows: Vec<QueryRow> = stmt
             .query_map([], |row| {
-                let id: String = row.get(0)?;
-                let bytes: Vec<u8> = row.get(1)?;
-                let payload_str: String = row.get(2)?;
-                Ok((id, bytes, payload_str))
+                Ok(QueryRow {
+                    id: row.get(0)?,
+                    bytes: row.get(1)?,
+                    payload_str: row.get(2)?,
+                    model_id: row.get(3)?,
+                    dim: row.get(4)?,
+                })
             })?
-            .map(|result| {
-                let (id, bytes, payload_str) = result?;
+            .collect::<Result<_, rusqlite::Error>>()?;
 
-                // bytes were written by `bytemuck::cast_slice::<f32, u8>`,
-                // so the length is always a multiple of 4.
-                let stored: &[f32] = bytemuck::cast_slice::<u8, f32>(&bytes);
-
-                if !query_embedding.is_empty()
-                    && !stored.is_empty()
-                    && stored.len() != query_embedding.len()
-                {
-                    return Err(VaultError::DimensionMismatch {
-                        expected: query_embedding.len(),
-                        got: stored.len(),
-                    });
-                }
-
-                let score = cosine_sim(query_embedding, stored);
-                let payload: serde_json::Value = serde_json::from_str(&payload_str)?;
-                Ok((score, id, payload))
+        let mut scored: Vec<(f32, String, serde_json::Value)> = rows
+            .into_iter()
+            // Same-model-only: a row from a different model or dimension is never
+            // fed to `cosine_sim` and never raises an error — it is simply not a
+            // candidate.
+            .filter(|row| {
+                resolve_model_id(row.model_id.clone()) == query_model_id
+                    && resolve_dim(row.dim, row.bytes.len()) == query_dim
             })
+            .map(
+                |QueryRow {
+                     id,
+                     bytes,
+                     payload_str,
+                     ..
+                 }| {
+                    // bytes were written by `bytemuck::cast_slice::<f32, u8>`,
+                    // so the length is always a multiple of 4.
+                    let stored: &[f32] = bytemuck::cast_slice::<u8, f32>(&bytes);
+                    let score = cosine_sim(query_embedding, stored);
+                    let payload: serde_json::Value = serde_json::from_str(&payload_str)?;
+                    Ok((score, id, payload))
+                },
+            )
             .collect::<Result<_, VaultError>>()?;
 
         // Sort descending by score, then take the top K.
@@ -545,6 +646,93 @@ impl Vault {
             .map(|(score, id, payload)| QueryResult { id, score, payload })
             .collect();
         Ok(results)
+    }
+
+    /// Returns every entry in `namespace` as a [`VaultEntry`], unranked.
+    ///
+    /// Unlike [`Vault::search`] this applies no scoring, no `k` limit, and no
+    /// same-model filter — it is the read half of the re-embed/backfill path,
+    /// which must visit every row regardless of its current model. An empty
+    /// `namespace` is normalised to `"default"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::Db`] on a database failure or [`VaultError::Json`]
+    /// if a stored payload cannot be deserialised.
+    #[must_use = "the listed entries are the input to a re-embed pass"]
+    pub fn list_namespace(&self, namespace: &str) -> Result<Vec<VaultEntry>, VaultError> {
+        let namespace = if namespace.is_empty() {
+            "default"
+        } else {
+            namespace
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, embedding, payload, namespace, content, source_file, added_by, \
+             chunk_index, parent_id, created_at, embedder_model_id, dim \
+             FROM vault_entries WHERE namespace = ?1",
+        )?;
+
+        let rows: Vec<SearchRow> = stmt
+            .query_map(rusqlite::params![namespace], |row| {
+                Ok(SearchRow {
+                    id: row.get(0)?,
+                    bytes: row.get(1)?,
+                    payload_str: row.get(2)?,
+                    ns: row.get(3)?,
+                    content: row.get(4)?,
+                    source_file: row.get(5)?,
+                    added_by: row.get(6)?,
+                    chunk_index: row.get(7)?,
+                    parent_id: row.get(8)?,
+                    created_at: row.get(9)?,
+                    model_id: row.get(10)?,
+                    dim: row.get(11)?,
+                })
+            })?
+            .collect::<Result<_, rusqlite::Error>>()?;
+
+        rows.into_iter()
+            .map(|row| {
+                let embedder_model_id = resolve_model_id(row.model_id);
+                let dim = resolve_dim(row.dim, row.bytes.len());
+                let embedding = bytemuck::cast_slice::<u8, f32>(&row.bytes).to_vec();
+                let payload: serde_json::Value = serde_json::from_str(&row.payload_str)?;
+                Ok(VaultEntry {
+                    id: row.id,
+                    embedding,
+                    payload,
+                    namespace: row.ns,
+                    content: row.content,
+                    source_file: row.source_file,
+                    added_by: row.added_by,
+                    chunk_index: row.chunk_index,
+                    parent_id: row.parent_id,
+                    created_at: row.created_at,
+                    embedder_model_id,
+                    dim,
+                })
+            })
+            .collect()
+    }
+
+    /// Returns every distinct namespace present in the vault.
+    ///
+    /// Used by the re-embed/backfill path to walk the whole vault when no single
+    /// namespace is specified.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::Db`] if the query fails.
+    #[must_use = "the namespace list is the input to a whole-vault re-embed"]
+    pub fn distinct_namespaces(&self) -> Result<Vec<String>, VaultError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT namespace FROM vault_entries")?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(names)
     }
 
     /// Removes the entry identified by `id`.
@@ -613,7 +801,9 @@ impl Vault {
                 added_by     TEXT,
                 chunk_index  INTEGER,
                 parent_id    TEXT,
-                created_at   REAL NOT NULL DEFAULT 0.0
+                created_at   REAL NOT NULL DEFAULT 0.0,
+                embedder_model_id TEXT,
+                dim          INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS diary (
@@ -642,6 +832,11 @@ impl Vault {
             "ALTER TABLE vault_entries ADD COLUMN chunk_index INTEGER",
             "ALTER TABLE vault_entries ADD COLUMN parent_id TEXT",
             "ALTER TABLE vault_entries ADD COLUMN created_at REAL NOT NULL DEFAULT 0.0",
+            // Per-row model tagging. Nullable on purpose: a NULL marks a legacy
+            // row that predates tagging, which reads back as `LEGACY_MODEL_ID`
+            // with `dim` derived from the stored BLOB length.
+            "ALTER TABLE vault_entries ADD COLUMN embedder_model_id TEXT",
+            "ALTER TABLE vault_entries ADD COLUMN dim INTEGER",
         ] {
             let _ = self.conn.execute(col_def, []); // "duplicate column" errors are expected
         }
@@ -656,6 +851,7 @@ mod tests {
     use serde_json::json;
 
     fn entry(id: &str, embedding: Vec<f32>) -> VaultEntry {
+        let dim = embedding.len();
         VaultEntry {
             id: id.to_string(),
             embedding,
@@ -667,6 +863,8 @@ mod tests {
             chunk_index: None,
             parent_id: None,
             created_at: 0.0,
+            embedder_model_id: LEGACY_MODEL_ID.to_string(),
+            dim,
         }
     }
 
@@ -715,7 +913,7 @@ mod tests {
         vault.upsert(&entry("ortho", vec![0.0_f32, 1.0])).unwrap();
         vault.upsert(&entry("close", vec![0.6_f32, 0.8])).unwrap();
 
-        let results = vault.query(&[1.0_f32, 0.0], 3).unwrap();
+        let results = vault.query(&[1.0_f32, 0.0], 3, LEGACY_MODEL_ID, 2).unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(
             results[0].id, "exact",
@@ -734,14 +932,16 @@ mod tests {
         vault.upsert(&entry("b", vec![0.0, 1.0])).unwrap();
         vault.upsert(&entry("c", vec![0.5, 0.5])).unwrap();
 
-        let results = vault.query(&[1.0_f32, 0.0], 10).unwrap();
+        let results = vault
+            .query(&[1.0_f32, 0.0], 10, LEGACY_MODEL_ID, 2)
+            .unwrap();
         assert_eq!(results.len(), 3, "must return all entries when k > count");
     }
 
     #[test]
     fn query_empty_vault() {
         let vault = Vault::open_in_memory().unwrap();
-        let results = vault.query(&[1.0_f32, 0.0], 5).unwrap();
+        let results = vault.query(&[1.0_f32, 0.0], 5, LEGACY_MODEL_ID, 2).unwrap();
         assert!(
             results.is_empty(),
             "query on empty vault must return empty vec"
@@ -758,7 +958,9 @@ mod tests {
         e.content = "agent context".to_string();
         vault.insert(&e).unwrap();
 
-        let results = vault.search(&[1.0_f32, 0.0], "agent", "agents", 5).unwrap();
+        let results = vault
+            .search(&[1.0_f32, 0.0], "agent", "agents", 5, LEGACY_MODEL_ID, 2)
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "ns-entry");
         assert_eq!(results[0].namespace, "agents");
@@ -822,7 +1024,9 @@ mod tests {
         recent.created_at = now_secs();
         vault.upsert(&recent).unwrap();
 
-        let results = vault.search(&[1.0_f32, 0.0], "", "default", 2).unwrap();
+        let results = vault
+            .search(&[1.0_f32, 0.0], "", "default", 2, LEGACY_MODEL_ID, 2)
+            .unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(
             results[0].id, "recent",
@@ -888,5 +1092,128 @@ mod tests {
         assert_eq!(vault.count_by_namespace("default").unwrap(), 1);
         assert_eq!(vault.count_by_namespace("missing").unwrap(), 0);
         assert_eq!(vault.count().unwrap(), 3);
+    }
+
+    // ── per-row model/dim tagging ─────────────────────────────────────────────
+
+    #[test]
+    fn model_id_and_dim_round_trip_through_insert_and_search() {
+        let mut vault = Vault::open_in_memory().unwrap();
+        let mut e = entry("tagged", vec![1.0_f32, 0.0, 0.0]);
+        e.namespace = "ns".to_string();
+        e.content = "tagged content".to_string();
+        e.embedder_model_id = "minilm-l6-v2".to_string();
+        e.dim = 3;
+        vault.insert(&e).unwrap();
+
+        let results = vault
+            .search(&[1.0_f32, 0.0, 0.0], "tagged", "ns", 5, "minilm-l6-v2", 3)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].embedder_model_id, "minilm-l6-v2");
+        assert_eq!(results[0].dim, 3);
+    }
+
+    #[test]
+    fn legacy_row_reads_back_with_fnv_default_and_blob_derived_dim() {
+        let vault = Vault::open_in_memory().unwrap();
+        // Insert a row the legacy way: explicit SQL that leaves the new columns
+        // NULL, exactly as a pre-migration database would have stored it.
+        let embedding = vec![0.5_f32; 128];
+        let bytes = bytemuck::cast_slice::<f32, u8>(&embedding);
+        vault
+            .conn
+            .execute(
+                "INSERT INTO vault_entries (id, embedding, payload, namespace, content) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params!["legacy", bytes, "{}", "default", "legacy content"],
+            )
+            .unwrap();
+
+        let results = vault
+            .search(&embedding, "legacy", "default", 5, LEGACY_MODEL_ID, 128)
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "legacy row must be same-model with FNV id"
+        );
+        assert_eq!(results[0].embedder_model_id, LEGACY_MODEL_ID);
+        assert_eq!(
+            results[0].dim, 128,
+            "legacy dim must derive from BLOB length / 4"
+        );
+    }
+
+    // ── same-model-only comparison ────────────────────────────────────────────
+
+    #[test]
+    fn search_returns_only_same_model_rows() {
+        let mut vault = Vault::open_in_memory().unwrap();
+
+        let mut fnv = entry("fnv", vec![1.0_f32, 0.0]);
+        fnv.namespace = "mixed".to_string();
+        fnv.content = "shared".to_string();
+        fnv.embedder_model_id = LEGACY_MODEL_ID.to_string();
+        fnv.dim = 2;
+        vault.upsert(&fnv).unwrap();
+
+        // A learned row of a different model AND a different dimension.
+        let mut learned = entry("learned", vec![1.0_f32, 0.0, 0.0]);
+        learned.namespace = "mixed".to_string();
+        learned.content = "shared".to_string();
+        learned.embedder_model_id = "minilm".to_string();
+        learned.dim = 3;
+        vault.upsert(&learned).unwrap();
+
+        // Query under the FNV model: only the FNV row is a candidate; the
+        // mismatched-dim learned row is excluded, never compared, never errors.
+        let results = vault
+            .search(&[1.0_f32, 0.0], "shared", "mixed", 5, LEGACY_MODEL_ID, 2)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "fnv");
+
+        // Query under the learned model: only the learned row is returned.
+        let results = vault
+            .search(&[1.0_f32, 0.0, 0.0], "shared", "mixed", 5, "minilm", 3)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "learned");
+    }
+
+    #[test]
+    fn query_excludes_mismatched_dimension_without_error() {
+        let mut vault = Vault::open_in_memory().unwrap();
+
+        let mut a = entry("a", vec![1.0_f32, 0.0]);
+        a.dim = 2;
+        vault.upsert(&a).unwrap();
+
+        let mut b = entry("b", vec![1.0_f32, 0.0, 0.0]);
+        b.embedder_model_id = "other".to_string();
+        b.dim = 3;
+        vault.upsert(&b).unwrap();
+
+        // Querying with a dim-2 FNV vector must NOT raise DimensionMismatch.
+        let results = vault.query(&[1.0_f32, 0.0], 5, LEGACY_MODEL_ID, 2).unwrap();
+        assert_eq!(results.len(), 1, "only the same-model row is a candidate");
+        assert_eq!(results[0].id, "a");
+    }
+
+    #[test]
+    fn same_model_results_rank_by_descending_hybrid_score() {
+        let mut vault = Vault::open_in_memory().unwrap();
+        // Regression guard: unchanged hybrid scoring for same-model rows.
+        vault.upsert(&entry("exact", vec![1.0_f32, 0.0])).unwrap();
+        vault.upsert(&entry("ortho", vec![0.0_f32, 1.0])).unwrap();
+        vault.upsert(&entry("close", vec![0.6_f32, 0.8])).unwrap();
+
+        let results = vault
+            .search(&[1.0_f32, 0.0], "", "default", 3, LEGACY_MODEL_ID, 2)
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].id, "exact", "highest cosine must rank first");
+        assert_eq!(results[2].id, "ortho", "orthogonal must rank last");
     }
 }

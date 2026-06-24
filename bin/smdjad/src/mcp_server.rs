@@ -102,6 +102,7 @@ pub(crate) async fn handle_request(
     workspace: &std::path::Path,
     ingot: &IngotHandle,
     vault: &Arc<Mutex<Vault>>,
+    embedder: &Arc<dyn crate::embedder_port::Embedder>,
 ) -> Response {
     let id = request.id.clone();
     match request.method.as_str() {
@@ -114,7 +115,9 @@ pub(crate) async fn handle_request(
             }),
         ),
         "tools/list" => Response::ok(id, tools_list_result()),
-        "tools/call" => handle_tools_call(id, &request.params, workspace, ingot, vault).await,
+        "tools/call" => {
+            handle_tools_call(id, &request.params, workspace, ingot, vault, embedder).await
+        }
         other => Response::err(
             id,
             RpcError::new(
@@ -133,6 +136,7 @@ async fn handle_tools_call(
     workspace: &std::path::Path,
     ingot: &IngotHandle,
     vault: &Arc<Mutex<Vault>>,
+    embedder: &Arc<dyn crate::embedder_port::Embedder>,
 ) -> Response {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return Response::err(
@@ -154,7 +158,16 @@ async fn handle_tools_call(
         .unwrap_or_else(|| json!({}));
     let input = arguments.to_string();
     let session = review_session();
-    let output = execute_tool(name, &input, workspace, Some(&session), ingot, vault).await;
+    let output = execute_tool(
+        name,
+        &input,
+        workspace,
+        Some(&session),
+        ingot,
+        vault,
+        embedder,
+    )
+    .await;
 
     // A native tool surfaces failures as an `error:`-prefixed string. Map those
     // to an MCP error result so clients see `isError: true` rather than a 200
@@ -190,11 +203,22 @@ mod tests {
         (ingot, vault)
     }
 
+    fn embedder() -> Arc<dyn crate::embedder_port::Embedder> {
+        Arc::new(crate::embedder_port::FnvEmbedder::new())
+    }
+
     #[tokio::test]
     async fn tools_list_advertises_the_read_safe_subset_with_schemas() {
         let (ingot, vault) = deps();
         let req = Request::new(1, "tools/list", json!({}));
-        let resp = handle_request(&req, std::path::Path::new("/tmp"), &ingot, &vault).await;
+        let resp = handle_request(
+            &req,
+            std::path::Path::new("/tmp"),
+            &ingot,
+            &vault,
+            &embedder(),
+        )
+        .await;
 
         assert!(resp.error.is_none(), "tools/list must succeed");
         let result = resp.result.expect("result present");
@@ -225,7 +249,7 @@ mod tests {
             "tools/call",
             json!({ "name": "read_file", "arguments": { "path": "hello.txt" } }),
         );
-        let resp = handle_request(&req, ws.path(), &ingot, &vault).await;
+        let resp = handle_request(&req, ws.path(), &ingot, &vault, &embedder()).await;
 
         assert!(resp.error.is_none(), "tools/call must succeed");
         let result = resp.result.expect("result present");
@@ -248,7 +272,7 @@ mod tests {
                 "arguments": { "path": "should_not_exist.txt", "content": "nope" }
             }),
         );
-        let resp = handle_request(&req, ws.path(), &ingot, &vault).await;
+        let resp = handle_request(&req, ws.path(), &ingot, &vault, &embedder()).await;
 
         // write_file is absent from MCP_SERVER_TOOLS → method-not-found error,
         // and the read-only guard would also reject it had the subset drifted.
@@ -270,7 +294,14 @@ mod tests {
             "tools/call",
             json!({ "name": "definitely_not_a_tool", "arguments": {} }),
         );
-        let resp = handle_request(&req, std::path::Path::new("/tmp"), &ingot, &vault).await;
+        let resp = handle_request(
+            &req,
+            std::path::Path::new("/tmp"),
+            &ingot,
+            &vault,
+            &embedder(),
+        )
+        .await;
 
         let err = resp.error.expect("unknown tool must error");
         assert_eq!(err.code, smedja_rpc::codes::METHOD_NOT_FOUND);
@@ -291,6 +322,7 @@ mod tests {
             Some(&session),
             &ingot,
             &vault,
+            &embedder(),
         )
         .await;
         assert!(
@@ -311,7 +343,14 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let (ingot, vault) = deps();
-            let resp = handle_request(&req, std::path::Path::new("/tmp"), &ingot, &vault).await;
+            let resp = handle_request(
+                &req,
+                std::path::Path::new("/tmp"),
+                &ingot,
+                &vault,
+                &embedder(),
+            )
+            .await;
             let err = resp.error.expect("unsupported method must error");
             assert_eq!(err.code, smedja_rpc::codes::METHOD_NOT_FOUND);
         });

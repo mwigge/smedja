@@ -130,6 +130,7 @@ pub(crate) async fn parallel(state: HandlerState, params: Value) -> Result<Value
     let ig = state.ingot;
     let pool = state.worktree_pool;
     let vt = state.vault;
+    let embedder = state.embedder;
     let session_id = params["session_id"].as_str().map(str::to_owned);
     let goal = params["goal"]
         .as_str()
@@ -229,12 +230,19 @@ pub(crate) async fn parallel(state: HandlerState, params: Value) -> Result<Value
             let fid = fan_out_id.clone();
             let parent_sid = sid.clone();
             let vt2 = Arc::clone(&vt);
+            let model_id = embedder.model_id().to_owned();
+            let dim = embedder.dim();
+            // Embed every checkpoint on the async path before the blocking write.
+            let mut warm_rows = Vec::with_capacity(recent.len());
+            for cp in &recent {
+                warm_rows.push((embedder.embed_query(&cp.messages_json).await, cp.clone()));
+            }
             tokio::task::spawn_blocking(move || {
                 let mut guard = vt2.blocking_lock();
-                for cp in &recent {
+                for (embedding, cp) in warm_rows {
                     let entry = VaultEntry {
                         id: format!("warm:{}:{}", fid, cp.id),
-                        embedding: crate::embedder::embed(&cp.messages_json),
+                        embedding,
                         payload: serde_json::json!({
                             "fan_out_id": fid,
                             "session_id": parent_sid,
@@ -247,6 +255,8 @@ pub(crate) async fn parallel(state: HandlerState, params: Value) -> Result<Value
                         chunk_index: None,
                         parent_id: None,
                         created_at: 0.0,
+                        embedder_model_id: model_id.clone(),
+                        dim,
                     };
                     let _ = guard.upsert(&entry);
                 }

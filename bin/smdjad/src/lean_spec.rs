@@ -33,6 +33,8 @@ use smedja_vault::{Vault, VaultEntry};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::embedder_port::Embedder;
+
 /// Ledger `source` tag attributed to the lean-spec saving so the token-economy
 /// sibling proposal can separate it from `filter`/`crusher`/`cold-context`.
 pub(crate) const LEAN_SPEC_SOURCE: &str = "lean-spec";
@@ -142,6 +144,7 @@ pub(crate) fn chunk_detail(detail: &str, max_chars: usize) -> Vec<String> {
 /// Returns the [`smedja_vault::VaultError`] from the first failing insert.
 pub(crate) async fn store_umbrella_detail(
     vault: &Arc<Mutex<Vault>>,
+    embedder: &Arc<dyn Embedder>,
     umbrella_id: &str,
     detail: &str,
     max_chars: usize,
@@ -155,19 +158,28 @@ pub(crate) async fn store_umbrella_detail(
     let umbrella_id = umbrella_id.to_owned();
     let vault = Arc::clone(vault);
 
-    // `Vault` is synchronous `SQLite`; do all the embedding + inserts on a
-    // blocking thread so the async runtime is never stalled. A `JoinError` only
-    // occurs if the blocking closure panics — an unrecoverable bug — so the panic
-    // is resumed rather than masked behind a fabricated vault error.
+    // Embed every chunk on the async path first (the learned backend does network
+    // I/O here, degrading to FNV on failure), then persist on a blocking thread.
+    let model_id = embedder.model_id().to_owned();
+    let dim = embedder.dim();
+    let mut embeddings = Vec::with_capacity(chunks.len());
+    for chunk in &chunks {
+        embeddings.push(embedder.embed_query(chunk).await);
+    }
+
+    // `Vault` is synchronous `SQLite`; do all the inserts on a blocking thread so
+    // the async runtime is never stalled. A `JoinError` only occurs if the
+    // blocking closure panics — an unrecoverable bug — so the panic is resumed
+    // rather than masked behind a fabricated vault error.
     let join = tokio::task::spawn_blocking(move || -> Result<usize, smedja_vault::VaultError> {
         let mut guard = vault.blocking_lock();
-        for (index, chunk) in chunks.iter().enumerate() {
+        for (index, (chunk, embedding)) in chunks.iter().zip(embeddings).enumerate() {
             // Legacy `upsert` (not `insert`) is used on purpose: `insert`'s
             // >0.85-cosine dedup would silently drop near-identical chunks, and
             // every umbrella chunk must persist so cold recall can reach it.
             let entry = VaultEntry {
                 id: format!("umbrella:{umbrella_id}:{index}"),
-                embedding: crate::embedder::embed(chunk),
+                embedding,
                 payload: payload.clone(),
                 namespace: namespace.clone(),
                 content: chunk.clone(),
@@ -177,6 +189,8 @@ pub(crate) async fn store_umbrella_detail(
                 chunk_index: Some(index as i64),
                 parent_id: Some(umbrella_id.clone()),
                 created_at: 0.0,
+                embedder_model_id: model_id.clone(),
+                dim,
             };
             guard.upsert(&entry)?;
         }
@@ -198,6 +212,7 @@ pub(crate) async fn store_umbrella_detail(
 /// embedded `query` text, which the hybrid keyword boost favours.
 pub(crate) async fn resolve_umbrella(
     vault: &Arc<Mutex<Vault>>,
+    embedder: &Arc<dyn Embedder>,
     umbrella_id: &str,
     query: &str,
     k: usize,
@@ -205,10 +220,12 @@ pub(crate) async fn resolve_umbrella(
     let namespace = umbrella_namespace(umbrella_id);
     let query = query.to_owned();
     let vault = Arc::clone(vault);
+    let query_vec = embedder.embed_query(&query).await;
+    let model_id = embedder.model_id().to_owned();
+    let dim = embedder.dim();
     let join = tokio::task::spawn_blocking(move || {
-        let query_vec = crate::embedder::embed(&query);
         let guard = vault.blocking_lock();
-        guard.search(&query_vec, &query, &namespace, k)
+        guard.search(&query_vec, &query, &namespace, k, &model_id, dim)
     })
     .await;
 
@@ -234,12 +251,14 @@ pub(crate) async fn resolve_umbrella(
 /// error is logged and swallowed, and the slice still proceeds on its delta.
 pub(crate) async fn store_slice_pointer(
     vault: &Arc<Mutex<Vault>>,
+    embedder: &Arc<dyn Embedder>,
     pointer: &SlicePointer,
 ) -> String {
     let id = format!("slice:{}:{}", pointer.umbrella_id, pointer.slice_n);
+    let embedding = embedder.embed_query(&id).await;
     let entry = VaultEntry {
         id: id.clone(),
-        embedding: crate::embedder::embed(&id),
+        embedding,
         payload: pointer.to_payload(),
         namespace: pointer.umbrella_namespace(),
         content: format!(
@@ -251,6 +270,8 @@ pub(crate) async fn store_slice_pointer(
         chunk_index: None,
         parent_id: Some(pointer.umbrella_id.clone()),
         created_at: 0.0,
+        embedder_model_id: embedder.model_id().to_owned(),
+        dim: embedder.dim(),
     };
     let vault = Arc::clone(vault);
     let join = tokio::task::spawn_blocking(move || {
@@ -300,6 +321,7 @@ pub(crate) struct SliceContext {
 /// and MUST NOT restate the umbrella's Why/design (see [`slice_restates_intent`]).
 pub(crate) async fn assemble_slice_context(
     vault: &Arc<Mutex<Vault>>,
+    embedder: &Arc<dyn Embedder>,
     pointer: &SlicePointer,
     intent: &str,
     slice_delta: &str,
@@ -307,9 +329,10 @@ pub(crate) async fn assemble_slice_context(
 ) -> SliceContext {
     use smedja_memory::{Message, WorkingMemory};
 
-    let cold_store = Arc::new(crate::orchestrator::cold::VaultColdStore::new(Arc::clone(
-        vault,
-    )));
+    let cold_store = Arc::new(crate::orchestrator::cold::VaultColdStore::new(
+        Arc::clone(vault),
+        Arc::clone(embedder),
+    ));
     let mut memory = WorkingMemory::new(usize::MAX).with_cold_store(cold_store);
 
     // 1. Umbrella intent → sealed cached prefix (KV-cached, re-sent per slice).
@@ -405,13 +428,14 @@ pub(crate) async fn read_umbrella_sources(change_dir: &std::path::Path) -> (Stri
 /// Propagates the [`smedja_vault::VaultError`] from [`store_umbrella_detail`].
 pub(crate) async fn preload_umbrella(
     vault: &Arc<Mutex<Vault>>,
+    embedder: &Arc<dyn Embedder>,
     umbrella_id: &str,
     detail: &str,
 ) -> Result<usize, smedja_vault::VaultError> {
     if detail.trim().is_empty() {
         return Ok(0);
     }
-    store_umbrella_detail(vault, umbrella_id, detail, UMBRELLA_CHUNK_CHARS).await
+    store_umbrella_detail(vault, embedder, umbrella_id, detail, UMBRELLA_CHUNK_CHARS).await
 }
 
 /// Records the lean-spec saving on the tokens-saved ledger.
@@ -465,6 +489,11 @@ mod tests {
         ))
     }
 
+    /// Default FNV embedder shared by the lean-spec tests.
+    fn test_embedder() -> Arc<dyn Embedder> {
+        Arc::new(crate::embedder_port::FnvEmbedder::new())
+    }
+
     async fn entries_in(vault: &Arc<Mutex<Vault>>, namespace: &str) -> Vec<VaultEntry> {
         let query_vec = crate::embedder::embed("");
         let ns = namespace.to_owned();
@@ -472,7 +501,14 @@ mod tests {
         tokio::task::spawn_blocking(move || {
             let guard = v.blocking_lock();
             guard
-                .search(&query_vec, "", &ns, 1000)
+                .search(
+                    &query_vec,
+                    "",
+                    &ns,
+                    1000,
+                    smedja_vault::LEGACY_MODEL_ID,
+                    crate::embedder::DIM,
+                )
                 .expect("search must succeed")
         })
         .await
@@ -489,7 +525,7 @@ mod tests {
         let detail = "First paragraph of design rationale.\n\n\
              Second paragraph carrying more of the umbrella's durable detail.";
 
-        let chunks = store_umbrella_detail(&vault, "alpha", detail, 64)
+        let chunks = store_umbrella_detail(&vault, &test_embedder(), "alpha", detail, 64)
             .await
             .expect("store must succeed");
         assert!(
@@ -541,12 +577,25 @@ mod tests {
         // Task 2.3/2.4: given a slice carrying umbrella_id, the umbrella's chunks
         // are retrieved from the umbrella:<id> namespace by the matching id.
         let vault = in_memory_vault();
-        store_umbrella_detail(&vault, "alpha", "alpha umbrella design detail body", 256)
-            .await
-            .expect("store alpha");
+        store_umbrella_detail(
+            &vault,
+            &test_embedder(),
+            "alpha",
+            "alpha umbrella design detail body",
+            256,
+        )
+        .await
+        .expect("store alpha");
         let pointer = SlicePointer::new("alpha", 1);
 
-        let chunks = resolve_umbrella(&vault, &pointer.umbrella_id, "design detail", 5).await;
+        let chunks = resolve_umbrella(
+            &vault,
+            &test_embedder(),
+            &pointer.umbrella_id,
+            "design detail",
+            5,
+        )
+        .await;
         assert!(!chunks.is_empty(), "the pointer must resolve to chunks");
         assert!(
             chunks
@@ -562,7 +611,14 @@ mod tests {
         // result, never an error — matching cold_context's contract.
         let vault = in_memory_vault();
         let pointer = SlicePointer::new("ghost", 1);
-        let chunks = resolve_umbrella(&vault, &pointer.umbrella_id, "anything", 5).await;
+        let chunks = resolve_umbrella(
+            &vault,
+            &test_embedder(),
+            &pointer.umbrella_id,
+            "anything",
+            5,
+        )
+        .await;
         assert!(
             chunks.is_empty(),
             "an unstored umbrella must degrade to an empty result"
@@ -576,13 +632,26 @@ mod tests {
         // Task 3.1/3.2: umbrella intent is pushed before seal_prefix() so it
         // falls inside stable_prefix(); the slice delta is in the mutable window.
         let vault = in_memory_vault();
-        store_umbrella_detail(&vault, "alpha", "alpha design detail body text", 256)
-            .await
-            .expect("store alpha");
+        store_umbrella_detail(
+            &vault,
+            &test_embedder(),
+            "alpha",
+            "alpha design detail body text",
+            256,
+        )
+        .await
+        .expect("store alpha");
         let pointer = SlicePointer::new("alpha", 1);
 
-        let assembled =
-            assemble_slice_context(&vault, &pointer, "UMBRELLA INTENT", "SLICE DELTA", 5).await;
+        let assembled = assemble_slice_context(
+            &vault,
+            &test_embedder(),
+            &pointer,
+            "UMBRELLA INTENT",
+            "SLICE DELTA",
+            5,
+        )
+        .await;
         let mem = &assembled.memory;
 
         // The intent is within the sealed prefix.
@@ -612,6 +681,7 @@ mod tests {
         let vault = in_memory_vault();
         store_umbrella_detail(
             &vault,
+            &test_embedder(),
             "alpha",
             "rust async tokio runtime scheduling executor design detail",
             512,
@@ -622,6 +692,7 @@ mod tests {
 
         let assembled = assemble_slice_context(
             &vault,
+            &test_embedder(),
             &pointer,
             "intent: rust async tokio",
             "slice: add executor metric",
@@ -739,12 +810,24 @@ mod tests {
         // Task 1.3/1.4: a search over `umbrella:<id>` returns only that
         // umbrella's chunks; no other namespace leaks in.
         let vault = in_memory_vault();
-        store_umbrella_detail(&vault, "alpha", "alpha design detail body", 256)
-            .await
-            .expect("store alpha");
-        store_umbrella_detail(&vault, "beta", "beta design detail body", 256)
-            .await
-            .expect("store beta");
+        store_umbrella_detail(
+            &vault,
+            &test_embedder(),
+            "alpha",
+            "alpha design detail body",
+            256,
+        )
+        .await
+        .expect("store alpha");
+        store_umbrella_detail(
+            &vault,
+            &test_embedder(),
+            "beta",
+            "beta design detail body",
+            256,
+        )
+        .await
+        .expect("store beta");
 
         let alpha = entries_in(&vault, &umbrella_namespace("alpha")).await;
         assert!(!alpha.is_empty(), "alpha chunks must exist");

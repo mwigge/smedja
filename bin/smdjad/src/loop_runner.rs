@@ -62,6 +62,7 @@ pub(crate) struct LoopRoleRunner {
     assayer: Arc<Assayer>,
     price_table: Arc<PriceTable>,
     vault: Arc<Mutex<Vault>>,
+    embedder: Arc<dyn crate::embedder_port::Embedder>,
     provider_sessions: crate::orchestrator::ProviderSessions,
     cache_aligners: crate::orchestrator::CacheAligners,
     workspace_root: PathBuf,
@@ -132,6 +133,7 @@ impl RoleRunner for LoopRoleRunner {
             Arc::clone(&self.assayer),
             Arc::clone(&self.price_table),
             Arc::clone(&self.vault),
+            Arc::clone(&self.embedder),
             Arc::clone(&self.provider_sessions),
             Arc::clone(&self.cache_aligners),
         );
@@ -196,9 +198,10 @@ impl LoopRoleRunner {
 
         // Persist the slice→umbrella pointer (vault payload convention) and warn
         // if the pointer dangles — no umbrella chunks resolve for it.
-        let _ = crate::lean_spec::store_slice_pointer(&self.vault, &pointer).await;
+        let _ = crate::lean_spec::store_slice_pointer(&self.vault, &self.embedder, &pointer).await;
         let resolved = crate::lean_spec::resolve_umbrella(
             &self.vault,
+            &self.embedder,
             &pointer.umbrella_id,
             slice,
             crate::lean_spec::default_slice_recall_k(),
@@ -214,6 +217,7 @@ impl LoopRoleRunner {
 
         let assembled = crate::lean_spec::assemble_slice_context(
             &self.vault,
+            &self.embedder,
             &pointer,
             &self.umbrella_intent,
             slice,
@@ -296,7 +300,7 @@ async fn read_pending_slices(workspace_root: &Path, change_name: &str) -> Vec<St
 /// verification gate and bounded fix retries — persisting status through the
 /// ingot as it goes.
 #[allow(clippy::too_many_arguments)] // forwards the turn-orchestrator dependencies
-#[tracing::instrument(skip(ingot, dispatcher, gates, pool, assayer, price_table, vault, provider_sessions, cache_aligners, workspace_root), fields(loop_id = %loop_id, change = %change_name))]
+#[tracing::instrument(skip(ingot, dispatcher, gates, pool, assayer, price_table, vault, embedder, provider_sessions, cache_aligners, workspace_root), fields(loop_id = %loop_id, change = %change_name))]
 pub(crate) async fn run(
     ingot: IngotHandle,
     dispatcher: Arc<Dispatcher>,
@@ -305,6 +309,7 @@ pub(crate) async fn run(
     assayer: Arc<Assayer>,
     price_table: Arc<PriceTable>,
     vault: Arc<Mutex<Vault>>,
+    embedder: Arc<dyn crate::embedder_port::Embedder>,
     provider_sessions: crate::orchestrator::ProviderSessions,
     cache_aligners: crate::orchestrator::CacheAligners,
     loop_id: String,
@@ -341,7 +346,9 @@ pub(crate) async fn run(
             .and_then(|p| p.parent().map(Path::to_path_buf))
     {
         let (intent, detail) = crate::lean_spec::read_umbrella_sources(&change_dir).await;
-        if let Err(e) = crate::lean_spec::preload_umbrella(&vault, &change_name, &detail).await {
+        if let Err(e) =
+            crate::lean_spec::preload_umbrella(&vault, &embedder, &change_name, &detail).await
+        {
             warn!(change = %change_name, error = %e, "lean-spec umbrella preload failed; continuing");
         }
         let paste = format!("{intent}\n{detail}");
@@ -362,6 +369,7 @@ pub(crate) async fn run(
         assayer,
         price_table,
         vault,
+        embedder,
         provider_sessions,
         cache_aligners,
         workspace_root: workspace_root.clone(),
@@ -633,6 +641,7 @@ mod tests {
             assayer,
             price_table,
             vault,
+            Arc::new(crate::embedder_port::FnvEmbedder::new()),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             "loop-missing".to_owned(),
@@ -682,6 +691,7 @@ mod tests {
             assayer,
             price_table,
             vault,
+            Arc::new(crate::embedder_port::FnvEmbedder::new()),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             "loop-empty".to_owned(),
