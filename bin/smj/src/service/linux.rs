@@ -140,7 +140,7 @@ mod tests {
 
         let content = std::fs::read_to_string(&unit_dest).unwrap();
         assert!(content.contains(fake_bin.to_str().unwrap()));
-        assert!(content.contains("smdjad agent daemon"));
+        assert!(content.contains("smedja agent daemon"));
         assert!(content.contains("Restart=on-failure"));
     }
 
