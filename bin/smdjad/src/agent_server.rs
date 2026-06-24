@@ -29,6 +29,8 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 
 use smedja_agent_events::{AgentEvent, AgentEventEnvelope};
 use smedja_bellows::{Dispatcher, TurnEvent};
+use smedja_ingot::{IngotHandle, RollupTier};
+use smedja_types::Timestamp;
 
 type SubList = Arc<Mutex<Vec<mpsc::Sender<String>>>>;
 
@@ -49,7 +51,7 @@ pub fn agent_socket_path(rpc_path: &Path) -> PathBuf {
 ///
 /// Each connected pane receives every event; panes that disconnect are silently
 /// removed from the subscriber list.
-pub async fn serve(listener: UnixListener, dispatcher: Arc<Dispatcher>) {
+pub async fn serve(listener: UnixListener, dispatcher: Arc<Dispatcher>, ingot: IngotHandle) {
     let subs: SubList = Arc::new(Mutex::new(Vec::new()));
 
     // Subscribe before spawning to avoid losing events published between
@@ -66,7 +68,13 @@ pub async fn serve(listener: UnixListener, dispatcher: Arc<Dispatcher>) {
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             };
-            let line = turn_event_to_agent_event_line(&event);
+            let mut agent_event = turn_event_to_agent_event(&event);
+            // Enrich TurnEnd with the cumulative token-economy figure so the
+            // st-statusbar EfficiencyModule can render it. Sourced from the
+            // savings ledger; advisory — a query error leaves the fields None
+            // and the segment simply does not render (no misleading zero).
+            enrich_turn_end_savings(&mut agent_event, &ingot).await;
+            let line = AgentEventEnvelope::new(agent_event).to_json_line();
             let mut locked = subs_bg.lock().await;
             locked.retain(|tx| tx.try_send(line.clone()).is_ok());
         }
@@ -163,14 +171,49 @@ fn turn_event_to_agent_event(event: &TurnEvent) -> AgentEvent {
         } => AgentEvent::TurnEnd {
             turn_id: Some(turn_id.clone()),
             session_id: Some(session_id.clone()),
+            // Filled in by enrich_turn_end_savings once the ledger is consulted.
+            tokens_saved: None,
+            efficiency_ratio: None,
         },
     }
 }
 
-/// Converts a [`TurnEvent`] into a single newline-free JSON line wrapped in an
-/// [`AgentEventEnvelope`] carrying the current schema version.
-fn turn_event_to_agent_event_line(event: &TurnEvent) -> String {
-    AgentEventEnvelope::new(turn_event_to_agent_event(event)).to_json_line()
+/// Fills a [`AgentEvent::TurnEnd`]'s cumulative savings fields from the ledger.
+///
+/// Queries the session's all-source `tokens_saved` total and the daily-tier
+/// efficiency ratio over the session's window. Advisory: a missing session id or
+/// a ledger error leaves both fields `None`, so the status-bar segment renders
+/// nothing rather than a misleading zero. A non-`TurnEnd` event is left
+/// unchanged.
+async fn enrich_turn_end_savings(event: &mut AgentEvent, ingot: &IngotHandle) {
+    let AgentEvent::TurnEnd {
+        session_id,
+        tokens_saved,
+        efficiency_ratio,
+        ..
+    } = event
+    else {
+        return;
+    };
+    let Some(sid) = session_id.as_deref() else {
+        return;
+    };
+    if let Ok(total) = ingot.session_tokens_saved(sid).await {
+        if total > 0 {
+            *tokens_saved = u64::try_from(total).ok();
+        }
+    }
+    // Efficiency ratio over the whole history (epoch → now), daily tier.
+    let since = Timestamp::from_micros(0);
+    let until = Timestamp::now();
+    if let Ok(ratio) = ingot
+        .efficiency_ratio(RollupTier::Daily, since, until)
+        .await
+    {
+        if ratio > 0.0 {
+            *efficiency_ratio = Some(ratio);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +221,11 @@ mod tests {
     use super::*;
     use smedja_bellows::event::CorrelationCtx;
     use std::path::Path;
+
+    /// Maps a [`TurnEvent`] to an envelope wire line (pure mapper, no enrichment).
+    fn turn_event_to_agent_event_line(event: &TurnEvent) -> String {
+        AgentEventEnvelope::new(turn_event_to_agent_event(event)).to_json_line()
+    }
 
     #[test]
     fn agent_socket_path_appends_dot_agent() {
@@ -267,6 +315,8 @@ mod tests {
             AgentEvent::TurnEnd {
                 turn_id: Some("t1".into()),
                 session_id: Some("s".into()),
+                tokens_saved: None,
+                efficiency_ratio: None,
             }
         );
 
@@ -283,7 +333,68 @@ mod tests {
             AgentEvent::TurnEnd {
                 turn_id: Some("t-fail".into()),
                 session_id: Some("s".into()),
+                tokens_saved: None,
+                efficiency_ratio: None,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn enrich_turn_end_fills_cumulative_tokens_saved() {
+        use smedja_ingot::{Ingot, TokensSavedEntry};
+        use uuid::Uuid;
+
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        ingot
+            .insert_tokens_saved(TokensSavedEntry {
+                id: Uuid::new_v4(),
+                session_id: "sess-e".to_owned(),
+                turn_n: 0,
+                command: "cache_read".to_owned(),
+                tokens_saved: 4242,
+                source: "cache".to_owned(),
+                created_at: Timestamp::now(),
+            })
+            .await
+            .unwrap();
+
+        let mut event = AgentEvent::TurnEnd {
+            turn_id: Some("t1".to_owned()),
+            session_id: Some("sess-e".to_owned()),
+            tokens_saved: None,
+            efficiency_ratio: None,
+        };
+        enrich_turn_end_savings(&mut event, &ingot).await;
+        match event {
+            AgentEvent::TurnEnd { tokens_saved, .. } => {
+                assert_eq!(tokens_saved, Some(4242));
+            }
+            other => panic!("expected TurnEnd, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enrich_leaves_fields_none_when_no_savings() {
+        use smedja_ingot::Ingot;
+
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let mut event = AgentEvent::TurnEnd {
+            turn_id: Some("t1".to_owned()),
+            session_id: Some("empty".to_owned()),
+            tokens_saved: None,
+            efficiency_ratio: None,
+        };
+        enrich_turn_end_savings(&mut event, &ingot).await;
+        match event {
+            AgentEvent::TurnEnd {
+                tokens_saved,
+                efficiency_ratio,
+                ..
+            } => {
+                assert_eq!(tokens_saved, None, "no savings → no misleading zero");
+                assert_eq!(efficiency_ratio, None);
+            }
+            other => panic!("expected TurnEnd, got {other:?}"),
+        }
     }
 }

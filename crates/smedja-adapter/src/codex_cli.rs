@@ -240,12 +240,21 @@ fn parse_codex_line(line: &str) -> Option<Delta> {
             .get("output_tokens")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        if input > 0 || output > 0 {
+        // OpenAI Responses API reports cache reads under
+        // `input_tokens_details.cached_tokens`.
+        let cache = usage
+            .get("input_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if input > 0 || output > 0 || cache > 0 {
             return Some(Delta::Usage {
                 #[allow(clippy::cast_possible_truncation)] // token counts fit in u32
                 input_tokens: input as u32,
                 #[allow(clippy::cast_possible_truncation)]
                 output_tokens: output as u32,
+                #[allow(clippy::cast_possible_truncation)]
+                cache_read_tokens: cache as u32,
             });
         }
     }
@@ -372,9 +381,11 @@ mod tests {
             Some(Delta::Usage {
                 input_tokens,
                 output_tokens,
+                cache_read_tokens,
             }) => {
                 assert_eq!(input_tokens, 100);
                 assert_eq!(output_tokens, 50);
+                assert_eq!(cache_read_tokens, 0);
             }
             other => panic!("expected Usage; got: {other:?}"),
         }

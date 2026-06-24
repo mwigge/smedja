@@ -216,6 +216,7 @@ impl Provider for OpenAiProvider {
                                 if let Delta::Usage {
                                     input_tokens,
                                     output_tokens,
+                                    cache_read_tokens,
                                 } = delta
                                 {
                                     input_tok = Some(input_tokens);
@@ -224,6 +225,7 @@ impl Provider for OpenAiProvider {
                                         .send(Ok(Delta::Usage {
                                             input_tokens,
                                             output_tokens,
+                                            cache_read_tokens,
                                         }))
                                         .await
                                         .is_err()
@@ -261,6 +263,7 @@ impl Provider for OpenAiProvider {
                         if let Delta::Usage {
                             input_tokens,
                             output_tokens,
+                            cache_read_tokens,
                         } = delta
                         {
                             input_tok = Some(input_tokens);
@@ -269,6 +272,7 @@ impl Provider for OpenAiProvider {
                                 .send(Ok(Delta::Usage {
                                     input_tokens,
                                     output_tokens,
+                                    cache_read_tokens,
                                 }))
                                 .await;
                         } else {

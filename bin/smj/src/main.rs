@@ -83,6 +83,21 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Token-economy savings rollup (tokens saved per source + efficiency ratio)
+    Savings {
+        /// Rollup tier: raw | hourly | daily | weekly | monthly
+        #[arg(long, default_value = "daily")]
+        tier: String,
+        /// Lower bound: a duration back from now (`7d`, `24h`, `30m`, `90s`) or bare seconds
+        #[arg(long, default_value = "7d")]
+        since: String,
+        /// Optional exclusive upper bound, same format as `--since`
+        #[arg(long)]
+        until: Option<String>,
+        /// Emit the raw `savings.summary` JSON response
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage Claude Code skill files
     Skill {
         #[command(subcommand)]
@@ -991,6 +1006,34 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             } else {
                 for line in format_metrics_rows(&resp, runner.as_deref()) {
+                    println!("{line}");
+                }
+            }
+        }
+        Cmd::Savings {
+            tier,
+            since,
+            until,
+            json,
+        } => {
+            let mut client = Client::connect(&sock)
+                .await
+                .with_context(|| format!("smdjad not running ({})", sock.display()))?;
+            let now_micros = chrono::Utc::now().timestamp_micros();
+            let since_micros = since_to_micros(&since, now_micros)?;
+            let until_micros = match until {
+                Some(spec) => Some(since_to_micros(&spec, now_micros)?),
+                None => None,
+            };
+            let params = build_metrics_params(&tier, since_micros, until_micros);
+            let resp = client
+                .call("savings.summary", params)
+                .await
+                .context("savings.summary failed")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else {
+                for line in format_savings_rows(&resp) {
                     println!("{line}");
                 }
             }
@@ -2410,6 +2453,34 @@ fn format_bucket_start(micros: i64) -> String {
     )
 }
 
+/// Renders the `savings.summary` response into report lines.
+///
+/// Leads with the efficiency-ratio headline and the compression / cache totals
+/// kept as separate figures (cache savings are "input not re-paid" and are never
+/// folded into the compression total), then lists one row per `(bucket, source)`.
+fn format_savings_rows(resp: &serde_json::Value) -> Vec<String> {
+    let ratio = resp["efficiency_ratio"].as_f64().unwrap_or(0.0);
+    let compression = resp["compression_saved"].as_i64().unwrap_or(0);
+    let cache = resp["cache_saved"].as_i64().unwrap_or(0);
+    let mut lines = vec![
+        format!("EFFICIENCY  {:.1}%", ratio * 100.0),
+        format!("COMPRESSION {compression} tok  (filter + crusher + cold-context)"),
+        format!("CACHE       {cache} tok  (input not re-paid)"),
+        String::new(),
+        format!("{:<22}  {:<14}  {:>12}", "BUCKET", "SOURCE", "TOKENS_SAVED"),
+    ];
+    let Some(buckets) = resp["buckets"].as_array() else {
+        return lines;
+    };
+    for b in buckets {
+        let bucket = format_bucket_start(b["bucket_start"].as_i64().unwrap_or(0));
+        let source = b["source"].as_str().unwrap_or("-");
+        let saved = b["tokens_saved"].as_i64().unwrap_or(0);
+        lines.push(format!("{bucket:<22}  {source:<14}  {saved:>12}"));
+    }
+    lines
+}
+
 /// Resolves a path to its SKILL.md content and the skill name from frontmatter.
 fn read_skill_file(path: &std::path::Path) -> Result<(String, String)> {
     let skill_md = if path.is_dir() {
@@ -2452,6 +2523,77 @@ mod tests {
             }
             _ => panic!("expected Cmd::Metrics"),
         }
+    }
+
+    // --- smj savings ---
+
+    #[test]
+    fn savings_parses_subcommand_with_flags() {
+        let cli = Cli::try_parse_from([
+            "smj", "savings", "--tier", "weekly", "--since", "30d", "--json",
+        ])
+        .expect("savings must parse");
+        match cli.command {
+            Cmd::Savings {
+                tier,
+                since,
+                until,
+                json,
+            } => {
+                assert_eq!(tier, "weekly");
+                assert_eq!(since, "30d");
+                assert_eq!(until, None);
+                assert!(json);
+            }
+            _ => panic!("expected Cmd::Savings"),
+        }
+    }
+
+    #[test]
+    fn savings_tier_defaults_to_daily() {
+        let cli = Cli::try_parse_from(["smj", "savings"]).expect("savings must parse");
+        match cli.command {
+            Cmd::Savings { tier, since, .. } => {
+                assert_eq!(tier, "daily");
+                assert_eq!(since, "7d");
+            }
+            _ => panic!("expected Cmd::Savings"),
+        }
+    }
+
+    #[test]
+    fn format_savings_rows_keeps_cache_separate_from_compression() {
+        let resp = json!({
+            "tier": "daily",
+            "compression_saved": 150,
+            "cache_saved": 9000,
+            "efficiency_ratio": 0.2,
+            "buckets": [
+                { "bucket_start": 1_767_225_600_000_000_i64, "source": "cache", "tokens_saved": 9000 },
+                { "bucket_start": 1_767_225_600_000_000_i64, "source": "filter", "tokens_saved": 150 },
+            ],
+        });
+        let lines = format_savings_rows(&resp);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("EFFICIENCY  20.0%"),
+            "headline ratio: {joined}"
+        );
+        assert!(
+            joined.contains("COMPRESSION 150 tok"),
+            "compression total: {joined}"
+        );
+        assert!(
+            joined.contains("CACHE       9000 tok"),
+            "cache total: {joined}"
+        );
+        // The compression and cache totals are never summed into one figure.
+        assert!(
+            !joined.contains("9150"),
+            "must not fold cache into compression"
+        );
+        assert!(joined.contains("cache"));
+        assert!(joined.contains("filter"));
     }
 
     #[test]

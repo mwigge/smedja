@@ -246,8 +246,22 @@ impl WorkingMemory {
     /// The returned slice always starts with the stable prefix.
     #[must_use]
     pub fn build_prompt(&self, budget_tokens: usize) -> Vec<Message> {
+        self.build_prompt_with_omitted(budget_tokens).0
+    }
+
+    /// Assembles the budgeted prompt and reports the estimated tokens omitted.
+    ///
+    /// Returns `(prompt, omitted_tokens)`. `omitted_tokens` is the summed
+    /// `content.len() / 4 + 1` estimate for every cold/archive turn dropped and
+    /// every warm turn that did not fit the budget — the cold-context saving the
+    /// caller may record on the savings ledger (`source = "cold-context"`).
+    ///
+    /// This crate holds no database handle by design, so recording the saving is
+    /// left to the caller that owns one (the orchestrator).
+    #[must_use]
+    pub fn build_prompt_with_omitted(&self, budget_tokens: usize) -> (Vec<Message>, usize) {
         if self.messages.is_empty() {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
 
         let prefix = &self.messages[..self.stable_prefix];
@@ -255,6 +269,7 @@ impl WorkingMemory {
 
         let mut result: Vec<Message> = prefix.to_vec();
         let mut budget = budget_tokens;
+        let mut omitted = 0usize;
 
         for (i, msg) in mutable.iter().enumerate() {
             let abs_index = self.stable_prefix + i;
@@ -268,14 +283,18 @@ impl WorkingMemory {
                     if budget >= token_estimate {
                         budget = budget.saturating_sub(token_estimate);
                         result.push(msg.clone());
+                    } else {
+                        omitted = omitted.saturating_add(token_estimate);
                     }
                 }
                 Stratum::Cold | Stratum::Archive => {
-                    // ponytail: cold retrieval via cold_context() deferred; skip for now
+                    // Cold retrieval via cold_context() is deferred; the turn is
+                    // dropped from the prompt, so its estimate counts as omitted.
+                    omitted = omitted.saturating_add(token_estimate);
                 }
             }
         }
-        result
+        (result, omitted)
     }
 
     /// Returns messages from the cold stratum that are relevant to `query`.
@@ -643,6 +662,40 @@ mod tests {
         let prompt_full = m.build_prompt(100_000);
         // With a tight budget, we get fewer messages than with a full budget.
         assert!(prompt_tight.len() <= prompt_full.len());
+    }
+
+    #[test]
+    fn build_prompt_with_omitted_reports_dropped_cold_tokens() {
+        let mut m = WorkingMemory::new(4096);
+        m.push(Message::system("sys"));
+        m.seal_prefix();
+        // Many turns push older ones into the cold stratum (deep: hot=5, warm=30).
+        for i in 0..50 {
+            m.push(Message::user(format!(
+                "turn {i:03} with some content to estimate tokens for omission"
+            )));
+        }
+        let (prompt, omitted) = m.build_prompt_with_omitted(100_000);
+        // Cold turns beyond the warm window are dropped → a positive estimate.
+        assert!(
+            omitted > 0,
+            "cold-stratum omission must report saved tokens"
+        );
+        // The prompt itself excludes the cold turns it counted as omitted.
+        assert!(prompt.len() < m.len() + 1);
+    }
+
+    #[test]
+    fn build_prompt_with_omitted_zero_when_all_fit() {
+        let mut m = WorkingMemory::new(4096);
+        m.push(Message::system("sys"));
+        m.seal_prefix();
+        for i in 0..3 {
+            m.push(Message::user(format!("turn {i}")));
+        }
+        // All turns are hot and fit; nothing is omitted.
+        let (_, omitted) = m.build_prompt_with_omitted(100_000);
+        assert_eq!(omitted, 0);
     }
 
     #[test]

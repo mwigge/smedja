@@ -69,6 +69,11 @@ pub struct ModuleContext {
     pub cwd: Option<String>,
     /// Interface mode: `"cli"` or `"tui"`.
     pub interface: Option<String>,
+    /// Cumulative tokens saved by the token economy, when reported. `None` keeps
+    /// the [`EfficiencyModule`] silent rather than showing a misleading zero.
+    pub tokens_saved: Option<u64>,
+    /// Cumulative efficiency ratio `saved / (saved + billed_input)`, when reported.
+    pub efficiency_ratio: Option<f64>,
 }
 
 // ── StatusModule trait ────────────────────────────────────────────────────────
@@ -466,6 +471,33 @@ impl StatusModule for LatencyModule {
     }
 }
 
+/// Displays the cumulative token-economy efficiency headline.
+///
+/// Renders `"⬇ {pct}%"` from the efficiency ratio, falling back to
+/// `"−{n} tok"` (tokens saved) when only the saved count is available. Returns
+/// `None` when neither figure is present, so the segment never shows a
+/// misleading zero — it simply does not render until the economy reports a value.
+pub struct EfficiencyModule;
+
+impl StatusModule for EfficiencyModule {
+    fn name(&self) -> &'static str {
+        "efficiency"
+    }
+
+    fn evaluate(&self, ctx: &ModuleContext) -> Option<Segment> {
+        if let Some(ratio) = ctx.efficiency_ratio {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            // ratio is in [0, 1]; the rounded percentage fits a u32 for display
+            let pct = (ratio * 100.0).round() as u32;
+            return Some(plain_segment("efficiency", format!("\u{2b07} {pct}%")));
+        }
+        if let Some(saved) = ctx.tokens_saved {
+            return Some(plain_segment("efficiency", format!("\u{2212}{saved} tok")));
+        }
+        None
+    }
+}
+
 /// Displays the first 8 characters of the `trace_id` from the most recent turn.
 ///
 /// Parses the W3C `traceparent` header (`version-trace_id-parent_id-flags`).
@@ -727,6 +759,8 @@ mod tests {
             session_id: None,
             cwd: None,
             interface: None,
+            tokens_saved: None,
+            efficiency_ratio: None,
         }
     }
 
@@ -1048,6 +1082,33 @@ mod tests {
     #[test]
     fn latency_module_none_when_missing() {
         assert!(LatencyModule.evaluate(&make_ctx()).is_none());
+    }
+
+    #[test]
+    fn efficiency_module_renders_ratio_as_percentage() {
+        let ctx = ModuleContext {
+            efficiency_ratio: Some(0.41),
+            ..make_ctx()
+        };
+        let seg = EfficiencyModule.evaluate(&ctx).expect("should return Some");
+        assert_eq!(seg.text, "\u{2b07} 41%");
+    }
+
+    #[test]
+    fn efficiency_module_falls_back_to_tokens_saved() {
+        let ctx = ModuleContext {
+            efficiency_ratio: None,
+            tokens_saved: Some(2_300_000),
+            ..make_ctx()
+        };
+        let seg = EfficiencyModule.evaluate(&ctx).expect("should return Some");
+        assert_eq!(seg.text, "\u{2212}2300000 tok");
+    }
+
+    #[test]
+    fn efficiency_module_none_when_absent_no_misleading_zero() {
+        // Neither figure present → no segment, rather than a misleading 0%.
+        assert!(EfficiencyModule.evaluate(&make_ctx()).is_none());
     }
 
     // 22

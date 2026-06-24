@@ -34,6 +34,7 @@ pub(crate) mod loops;
 pub(crate) mod mcp;
 pub(crate) mod metrics;
 pub(crate) mod routing;
+pub(crate) mod savings;
 pub(crate) mod session;
 pub(crate) mod task;
 pub(crate) mod turn;
