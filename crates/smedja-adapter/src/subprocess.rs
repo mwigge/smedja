@@ -104,6 +104,7 @@ mod tests {
             tools: None,
             provider_session_id: None,
             stable_prefix_len: None,
+            cache_strategy: crate::types::CacheStrategy::None,
         };
         let mut stream = p.stream_chat(&messages, &opts);
         let first = stream.next().await;
@@ -140,6 +141,7 @@ mod tests {
             tools: None,
             provider_session_id: None,
             stable_prefix_len: None,
+            cache_strategy: crate::types::CacheStrategy::None,
         };
         let mut stream = p.stream_chat(&messages, &opts);
         let mut collected = String::new();

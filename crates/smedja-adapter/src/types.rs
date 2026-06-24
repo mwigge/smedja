@@ -99,6 +99,39 @@ pub struct CallOptions {
     /// `stable_prefix_len - 1` with a cache-control hint.  `Some(0)` caches
     /// only the system prompt and tools; `None` disables cache hints entirely.
     pub stable_prefix_len: Option<usize>,
+    /// Provider-neutral cache strategy describing how the routed adapter should
+    /// realise the stable-prefix hint.
+    ///
+    /// Defaults to [`CacheStrategy::None`] (a no-op). The Anthropic path is
+    /// driven by `stable_prefix_len` and is unaffected by this field; `OpenAI` and
+    /// Gemini consult it to emit `prompt_cache_key` / `cachedContent` respectively.
+    #[serde(default)]
+    pub cache_strategy: CacheStrategy,
+}
+
+/// Provider-neutral instruction for how an adapter should realise a cache hint.
+///
+/// The orchestrator selects a variant from the routed runner; each adapter
+/// honours only the variants it understands and ignores the rest.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheStrategy {
+    /// No cache strategy; adapters emit their default body.
+    #[default]
+    None,
+    /// Anthropic ephemeral cache-control breakpoints (driven by
+    /// `stable_prefix_len`; this variant is purely descriptive).
+    AnthropicEphemeral,
+    /// `OpenAI` automatic prompt caching with an optional `prompt_cache_key`.
+    OpenAiAutomatic {
+        /// Optional stable key that scopes automatic caching to a session.
+        cache_key: Option<String>,
+    },
+    /// Gemini explicit context caching referencing a `cachedContent` resource.
+    GeminiContext {
+        /// Resource name of a previously-created `cachedContent`, when available.
+        cached_content: Option<String>,
+    },
 }
 
 /// A single unit of streamed output from a provider.
@@ -129,4 +162,42 @@ pub enum Delta {
         /// Number of tokens generated in the response.
         output_tokens: u32,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CacheStrategy, CallOptions};
+
+    fn opts() -> CallOptions {
+        CallOptions {
+            model: "m".to_owned(),
+            max_tokens: None,
+            temperature: None,
+            system: None,
+            tools: None,
+            provider_session_id: None,
+            stable_prefix_len: None,
+            cache_strategy: CacheStrategy::None,
+        }
+    }
+
+    #[test]
+    fn cache_strategy_defaults_to_none() {
+        assert_eq!(CacheStrategy::default(), CacheStrategy::None);
+    }
+
+    #[test]
+    fn call_options_carries_cache_strategy_and_stable_prefix_len() {
+        let o = opts();
+        assert_eq!(o.cache_strategy, CacheStrategy::None);
+        assert!(o.stable_prefix_len.is_none());
+    }
+
+    #[test]
+    fn cache_strategy_deserializes_with_default_when_field_absent() {
+        // A body without `cache_strategy` must still deserialize, defaulting to None.
+        let json = r#"{"model":"m","max_tokens":null,"temperature":null,"system":null,"tools":null,"provider_session_id":null,"stable_prefix_len":null}"#;
+        let parsed: CallOptions = serde_json::from_str(json).expect("must deserialize");
+        assert_eq!(parsed.cache_strategy, CacheStrategy::None);
+    }
 }

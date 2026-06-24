@@ -511,6 +511,11 @@ impl TurnOrchestrator {
         mem.push(AdapterMessage::user(first_user_content));
         mem.seal_prefix();
 
+        // Observe the sealed prefix for cross-turn drift and select a safe cache
+        // breakpoint. The hint feeds both `stable_prefix_len` (Anthropic, OpenAI)
+        // and the per-runner `cache_strategy` below.
+        let cache_hint = smedja_memory::CacheAligner::new().align(&mem);
+
         // 4b. Mark in_progress.
         {
             if let Err(e) = ingot.update_task_status(&turn_id, "in_progress").await {
@@ -589,6 +594,20 @@ impl TurnOrchestrator {
                 None
             };
 
+            // Realise the aligner hint for this runner: Anthropic via
+            // `stable_prefix_len` (unchanged), OpenAI via stable-prefix ordering
+            // plus a per-session cache key, Gemini via an optional context-cache
+            // handle (lifecycle out of scope — none is supplied here, so Gemini
+            // falls back to plain contents). Providers without prompt caching get
+            // no hint.
+            let openai_cache_key = (entry_runner_name == "openai").then(|| session_id.clone());
+            let (stable_prefix_len, cache_strategy) = context::cache_options_for_runner(
+                &entry_runner_name,
+                cache_hint,
+                openai_cache_key,
+                None,
+            );
+
             let mut opts = CallOptions {
                 model: entry_model.clone(),
                 max_tokens: Some(2048),
@@ -600,14 +619,8 @@ impl TurnOrchestrator {
                     Some(all_tools.clone())
                 },
                 provider_session_id,
-                // F-21: cache through the real sealed prefix, not just the system
-                // block. `None` for providers without prompt caching. Recomputed
-                // from the (preserved) WorkingMemory for the new provider.
-                stable_prefix_len: if entry_runner_name == "anthropic" {
-                    Some(mem.stable_prefix())
-                } else {
-                    None
-                },
+                stable_prefix_len,
+                cache_strategy,
             };
 
             runner = entry_runner_name.clone();
