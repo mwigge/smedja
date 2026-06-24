@@ -51,8 +51,10 @@ pub use claude_cli::ClaudeCliProvider;
 pub use codex_cli::CodexCliProvider;
 pub use copilot::CopilotProvider;
 pub use crush::{
-    code_compressor, command_compressor, compress_command_output, compress_tool_result,
-    smart_crusher, trim_code_block, ContentPipeline, Transform,
+    code_compressor, command_compressor, compress_command_output, compress_command_output_with,
+    compress_tool_result, dedup_lines, group_by_directory, smart_crusher, smart_filter,
+    trim_code_block, truncate_lines, ContentPipeline, FilterEntry, FilterParams, FilterRegistry,
+    FilterStrategy, Transform,
 };
 pub use error::{classify_http_error, AdapterError};
 pub use gemini::GeminiProvider;

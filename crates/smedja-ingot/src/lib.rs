@@ -23,7 +23,7 @@ pub mod token_snapshot;
 
 pub use audit::AuditEvent;
 pub use checkpoint::Checkpoint;
-pub use cost::{CostEntry, CostRow};
+pub use cost::{CostEntry, CostRow, TokensSavedEntry};
 pub use error::IngotError;
 pub use guard::{classify as classify_command, is_safe as command_is_safe, CommandRisk};
 pub use handle::IngotHandle;
@@ -167,6 +167,23 @@ const MIGRATIONS: &[(i64, &str)] = &[
              ON cost_ledger(created_at); \
          CREATE INDEX IF NOT EXISTS idx_audit_events_ts_status \
              ON audit_events(ts, status);",
+    ),
+    // Output-filter savings ledger: tokens saved by command-output filtering,
+    // recorded separately from billed cost_ledger totals so smj cost can
+    // attribute filtering value without polluting the exact billed input/output
+    // token sums. Created via IF NOT EXISTS so the migration is idempotent.
+    (
+        23,
+        "CREATE TABLE IF NOT EXISTS tokens_saved_ledger ( \
+             id           TEXT PRIMARY KEY, \
+             session_id   TEXT NOT NULL, \
+             turn_n       INTEGER NOT NULL, \
+             command      TEXT NOT NULL, \
+             tokens_saved INTEGER NOT NULL DEFAULT 0, \
+             created_at   INTEGER NOT NULL \
+         ); \
+         CREATE INDEX IF NOT EXISTS idx_tokens_saved_session \
+             ON tokens_saved_ledger(session_id);",
     ),
 ];
 
@@ -996,6 +1013,31 @@ impl Ingot {
     #[must_use = "check the Result to determine the active model"]
     pub fn session_last_model(&self, session_id: &str) -> Result<Option<String>, IngotError> {
         cost::last_model(&self.conn, session_id)
+    }
+
+    /// Records a [`TokensSavedEntry`] on the tokens-saved ledger.
+    ///
+    /// Savings are kept separate from the billed `cost_ledger` so billed totals
+    /// stay exact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the INSERT fails.
+    #[must_use = "check the Result to confirm the tokens-saved entry was recorded"]
+    pub fn insert_tokens_saved(&self, entry: &TokensSavedEntry) -> Result<(), IngotError> {
+        cost::insert_tokens_saved(&self.conn, entry)
+    }
+
+    /// Returns the total tokens saved by filtering for `session_id`.
+    ///
+    /// Returns `0` when no entries exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned total"]
+    pub fn session_tokens_saved(&self, session_id: &str) -> Result<i64, IngotError> {
+        cost::session_tokens_saved(&self.conn, session_id)
     }
 
     // metrics_rollups --------------------------------------------------------

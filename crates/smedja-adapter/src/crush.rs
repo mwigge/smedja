@@ -63,20 +63,38 @@ fn strip_nulls(value: serde_json::Value) -> serde_json::Value {
 
 // ── Task 52 — RTK-style command-aware compressor ─────────────────────────────
 
-/// Compresses command output by removing known-noisy lines per command type.
+/// Compresses command output by dispatching through the default
+/// [`FilterRegistry`] keyed on the detected command.
 ///
 /// Returns `(compressed_output, ratio)` where `ratio = compressed.len() as f32 /
 /// output.len() as f32`.  A ratio below 1.0 means the output was reduced.
 ///
-/// Supported commands and their targets:
-/// - `cargo test` — removes `running N tests`, `test result: ok`, blank lines,
-///   and carriage-return residue.  Target: ≥ 80% compression ratio ≤ 0.20.
-/// - `git status` — removes "On branch" and "nothing to commit" boilerplate headers.
-/// - All others — removes blank lines only.
+/// The strategy is selected by [`FilterRegistry::with_defaults`] from the first
+/// one or two tokens of `cmd`.  The default set preserves the historical
+/// `cargo test` (smart-filter) and `git status` (group) behaviour; an
+/// unrecognised command falls back to the conservative blank-line removal.
 ///
-/// `SMEDJA_NO_TOOL_COMPRESS=1` bypasses all processing.
+/// `SMEDJA_NO_TOOL_COMPRESS=1` bypasses all processing and returns the output
+/// verbatim with ratio `1.0`.
 #[must_use]
 pub fn compress_command_output(cmd: &str, output: &str) -> (String, f32) {
+    compress_command_output_with(&FilterRegistry::with_defaults(), cmd, output)
+}
+
+/// Compresses command output using an explicit `registry`.
+///
+/// This is the registry-aware core of [`compress_command_output`]; callers that
+/// have loaded a user `.smedja/filters.toml` registry route through here so the
+/// merged user/default filter set is applied.  The bypass env var and the
+/// empty-output shortcut are honoured identically.
+///
+/// Returns `(compressed_output, ratio)`.
+#[must_use]
+pub fn compress_command_output_with(
+    registry: &FilterRegistry,
+    cmd: &str,
+    output: &str,
+) -> (String, f32) {
     if bypass_enabled() {
         return (output.to_owned(), 1.0_f32);
     }
@@ -85,60 +103,172 @@ pub fn compress_command_output(cmd: &str, output: &str) -> (String, f32) {
         return (String::new(), 1.0_f32);
     }
 
-    let compressed = match identify_command(cmd) {
-        CommandKind::CargoTest => compress_cargo_test(output),
-        CommandKind::GitStatus => compress_git_status(output),
-        CommandKind::Other => remove_blank_lines(output),
-    };
+    let (strategy, params) = registry.resolve(cmd);
+    let compressed = strategy.apply(output, &params);
 
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss)] // advisory ratio; precision loss is acceptable
     let ratio = compressed.len() as f32 / output.len() as f32;
     (compressed, ratio)
 }
 
-/// Identifies the class of a shell command string.
-#[derive(Debug, PartialEq)]
-enum CommandKind {
-    CargoTest,
-    GitStatus,
-    Other,
+// ── Filter strategies ────────────────────────────────────────────────────────
+
+/// Collapses verbose command output to its high-signal lines.
+///
+/// A line is kept when its trimmed form contains any marker in `keep_markers`
+/// (case-sensitive substring match) or when it begins the `error[` /
+/// `warning:` family that the historical `cargo test` compressor preserved.
+/// Blank lines and lines matching none of the markers are dropped.
+///
+/// Generalises the old `compress_cargo_test` keep-list into a marker predicate:
+/// passing `&["error", "warning"]` collapses a long `cargo build` to its
+/// `error[...]` / `warning:` lines while discarding `Compiling` / `Finished`
+/// progress noise.
+#[must_use]
+pub fn smart_filter(output: &str, keep_markers: &[String]) -> String {
+    output
+        .lines()
+        .filter(|line| smart_filter_keeps(line, keep_markers))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-fn identify_command(cmd: &str) -> CommandKind {
-    let cmd = cmd.trim();
-    if cmd.starts_with("cargo test") || cmd == "cargo t" {
-        CommandKind::CargoTest
-    } else if cmd.starts_with("git status") || cmd == "git st" {
-        CommandKind::GitStatus
-    } else {
-        CommandKind::Other
+/// Returns `true` when `line` carries signal worth keeping under `smart_filter`.
+fn smart_filter_keeps(line: &str, keep_markers: &[String]) -> bool {
+    let trimmed = line.trim_start_matches('\r').trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    keep_markers
+        .iter()
+        .any(|marker| trimmed.contains(marker.as_str()))
+}
+
+/// Clusters `git status`-style entries by their leading directory.
+///
+/// Each non-empty, non-boilerplate line is bucketed by the directory of the
+/// first path-like token it contains (the segment before the final `/`, or
+/// `"."` when the path has no directory component).  Buckets are emitted in
+/// first-seen order under a `dir/ (N):` heading followed by the member lines.
+/// Boilerplate headers recognised by [`is_git_status_noise`] are dropped.
+#[must_use]
+pub fn group_by_directory(output: &str) -> String {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+
+    for raw in output.lines() {
+        if is_git_status_noise(raw) {
+            continue;
+        }
+        let line = raw.trim_end();
+        let dir = directory_key(line);
+        if !groups.contains_key(&dir) {
+            order.push(dir.clone());
+        }
+        groups.entry(dir).or_default().push(line.to_owned());
+    }
+
+    let mut out = String::new();
+    for dir in order {
+        let members = &groups[&dir];
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let _ = write!(out, "{dir} ({}):", members.len());
+        for member in members {
+            out.push('\n');
+            out.push_str(member);
+        }
+    }
+    out
+}
+
+/// Extracts the grouping directory key for a `git status` member line.
+fn directory_key(line: &str) -> String {
+    let path = line
+        .split_whitespace()
+        .find(|tok| tok.contains('/'))
+        .or_else(|| line.split_whitespace().last())
+        .unwrap_or(line);
+    match path.rsplit_once('/') {
+        Some((dir, _file)) if !dir.is_empty() => dir.to_owned(),
+        _ => ".".to_owned(),
     }
 }
 
-/// Returns `true` when the line is `cargo test` boilerplate.
-fn is_cargo_test_noise(line: &str) -> bool {
-    let l = line.trim_start_matches('\r').trim();
-    l.is_empty()
-        || l.starts_with("running ")
-        || l.starts_with("test result: ok")
-        || l.starts_with("test result: FAILED")
-        || l == "ok"
-        || l == "FAILED"
-        || l.starts_with("failures:")
-        || l.starts_with("test  ... ")
-        || l.starts_with("Compiling ")
-        || l.starts_with("Finished ")
-        || l.starts_with("warning: ")
-        || l.starts_with("   Compiling ")
-        || l.starts_with("   Finished ")
+/// Keeps the first `max_lines` lines and appends an omitted-lines marker.
+///
+/// When the output has at most `max_lines` lines it is returned unchanged.
+/// Otherwise the first `max_lines` lines are kept and a trailing
+/// `… N lines omitted (smedja_retrieve to expand)` marker is appended, mirroring
+/// [`trim_code_block`]'s recovery convention.
+#[must_use]
+pub fn truncate_lines(output: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    if lines.len() <= max_lines {
+        return output.to_owned();
+    }
+    let omitted = lines.len() - max_lines;
+    let mut out = lines[..max_lines].join("\n");
+    out.push('\n');
+    let _ = write!(out, "… {omitted} lines omitted (smedja_retrieve to expand)");
+    out
 }
 
-fn compress_cargo_test(output: &str) -> String {
-    output
-        .lines()
-        .filter(|l| !is_cargo_test_noise(l))
-        .collect::<Vec<_>>()
-        .join("\n")
+/// Collapses runs of identical lines into a single line with an `(×N)` count.
+///
+/// Consecutive lines whose timestamp-stripped form is identical are folded into
+/// one line that carries a trailing ` (×N)` occurrence count when `N > 1`.  A
+/// single occurrence is emitted unchanged.  The first member's original text is
+/// the representative line.
+#[must_use]
+pub fn dedup_lines(output: &str) -> String {
+    let mut out = String::new();
+    let mut current: Option<(String, &str, usize)> = None;
+
+    for line in output.lines() {
+        let key = strip_timestamp(line);
+        match current.as_mut() {
+            Some((prev_key, _repr, count)) if *prev_key == key => {
+                *count += 1;
+            }
+            _ => {
+                if let Some((_, repr, count)) = current.take() {
+                    push_dedup_line(&mut out, repr, count);
+                }
+                current = Some((key, line, 1));
+            }
+        }
+    }
+    if let Some((_, repr, count)) = current.take() {
+        push_dedup_line(&mut out, repr, count);
+    }
+    out
+}
+
+/// Appends one (possibly counted) deduplicated line to `out`.
+fn push_dedup_line(out: &mut String, repr: &str, count: usize) {
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(repr);
+    if count > 1 {
+        let _ = write!(out, " (×{count})");
+    }
+}
+
+/// Strips a leading ISO-8601-ish timestamp prefix so near-identical log lines
+/// differing only by their timestamp dedup to the same key.
+fn strip_timestamp(line: &str) -> String {
+    let trimmed = line.trim_start();
+    // Drop a leading bracketed timestamp like `[2026-01-01T00:00:00Z] `.
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some((_ts, after)) = rest.split_once(']') {
+            return after.trim_start().to_owned();
+        }
+    }
+    trimmed.to_owned()
 }
 
 /// Returns `true` when the line is `git status` boilerplate.
@@ -156,20 +286,212 @@ fn is_git_status_noise(line: &str) -> bool {
         || l.starts_with("  (use \"git")
 }
 
-fn compress_git_status(output: &str) -> String {
-    output
-        .lines()
-        .filter(|l| !is_git_status_noise(l))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn remove_blank_lines(output: &str) -> String {
     output
         .lines()
         .filter(|l| !l.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+// ── Filter registry ──────────────────────────────────────────────────────────
+
+/// Default line count kept by the `truncate` strategy when unspecified.
+const DEFAULT_TRUNCATE_MAX_LINES: usize = 40;
+
+/// One of the four rtk-style command-output filter strategies, plus the
+/// conservative pass-through (`None`, blank-line removal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FilterStrategy {
+    /// Keep only high-signal lines matching the configured markers.
+    SmartFilter,
+    /// Cluster lines by leading directory with a per-group count.
+    Group,
+    /// Keep the first N lines and append an omitted-lines marker.
+    Truncate,
+    /// Collapse runs of identical lines into one with an `(×N)` count.
+    Dedup,
+    /// Conservative fallback: remove blank lines only.
+    None,
+}
+
+impl FilterStrategy {
+    /// Parses a strategy from its kebab-case DSL name.
+    ///
+    /// Recognised names: `smart-filter`, `group`, `truncate`, `dedup`, `none`.
+    /// Returns `None` for any other input.
+    #[must_use]
+    #[allow(clippy::should_implement_trait)] // fallible name parse; FromStr's Err type is needless here
+    pub fn from_str(name: &str) -> Option<Self> {
+        match name {
+            "smart-filter" => Some(Self::SmartFilter),
+            "group" => Some(Self::Group),
+            "truncate" => Some(Self::Truncate),
+            "dedup" => Some(Self::Dedup),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    /// Returns the kebab-case DSL name for this strategy.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SmartFilter => "smart-filter",
+            Self::Group => "group",
+            Self::Truncate => "truncate",
+            Self::Dedup => "dedup",
+            Self::None => "none",
+        }
+    }
+
+    /// Applies this strategy to `output` using `params`.
+    #[must_use]
+    pub fn apply(self, output: &str, params: &FilterParams) -> String {
+        match self {
+            Self::SmartFilter => smart_filter(output, &params.keep),
+            Self::Group => group_by_directory(output),
+            Self::Truncate => truncate_lines(
+                output,
+                params.max_lines.unwrap_or(DEFAULT_TRUNCATE_MAX_LINES),
+            ),
+            Self::Dedup => dedup_lines(output),
+            Self::None => remove_blank_lines(output),
+        }
+    }
+}
+
+/// Parameters for a filter entry.
+///
+/// `keep` supplies the marker substrings for [`FilterStrategy::SmartFilter`];
+/// `max_lines` caps [`FilterStrategy::Truncate`].  Both are ignored by the
+/// strategies that do not consume them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilterParams {
+    /// Marker substrings retained by the smart-filter strategy.
+    pub keep: Vec<String>,
+    /// Maximum kept line count for the truncate strategy.
+    pub max_lines: Option<usize>,
+}
+
+/// One registry entry: the strategy plus its parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilterEntry {
+    /// The strategy this command resolves to.
+    pub strategy: FilterStrategy,
+    /// Parameters threaded into [`FilterStrategy::apply`].
+    pub params: FilterParams,
+}
+
+impl FilterEntry {
+    /// Builds an entry from a strategy with default parameters.
+    #[must_use]
+    pub fn new(strategy: FilterStrategy) -> Self {
+        Self {
+            strategy,
+            params: FilterParams::default(),
+        }
+    }
+}
+
+/// A command-keyed registry mapping a detected command to a [`FilterEntry`].
+///
+/// Keys are the first one or two whitespace-separated tokens of the trimmed
+/// command string (e.g. `cargo`, `git status`, `docker build`).  Longer
+/// (two-token) keys win over shorter (one-token) keys, so `docker build` can
+/// override the generic `docker` entry.  An unrecognised command resolves to
+/// the conservative [`FilterStrategy::None`] (blank-line removal).
+#[derive(Debug, Clone, Default)]
+pub struct FilterRegistry {
+    entries: std::collections::HashMap<String, FilterEntry>,
+}
+
+impl FilterRegistry {
+    /// Creates an empty registry (every command resolves to `None`).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Inserts or overrides the entry for `command_key`.
+    ///
+    /// `command_key` is matched against the leading one or two tokens of a
+    /// command at [`Self::resolve`] time.
+    pub fn insert(&mut self, command_key: impl Into<String>, entry: FilterEntry) {
+        self.entries.insert(command_key.into(), entry);
+    }
+
+    /// Resolves `cmd` to a `(strategy, params)` pair.
+    ///
+    /// Tries the two-token key first (e.g. `git status`), then the one-token key
+    /// (e.g. `git`); an unmatched command yields [`FilterStrategy::None`] with
+    /// default parameters.
+    #[must_use]
+    pub fn resolve(&self, cmd: &str) -> (FilterStrategy, FilterParams) {
+        let trimmed = cmd.trim();
+        let mut tokens = trimmed.split_whitespace();
+        let first = tokens.next().unwrap_or("");
+        let second = tokens.next();
+
+        if let Some(second) = second {
+            let two = format!("{first} {second}");
+            if let Some(entry) = self.entries.get(&two) {
+                return (entry.strategy, entry.params.clone());
+            }
+        }
+        if let Some(entry) = self.entries.get(first) {
+            return (entry.strategy, entry.params.clone());
+        }
+        (FilterStrategy::None, FilterParams::default())
+    }
+
+    /// Builds the built-in default filter set.
+    ///
+    /// Covers the highest-volume noisy commands: `cargo` and `pytest` →
+    /// smart-filter (errors/warnings/failures); `git status` → group (by
+    /// directory); `npm`, `docker`, `kubectl` → dedup.  This preserves the
+    /// historical `cargo test` and `git status` behaviour as registry entries.
+    #[must_use]
+    pub fn with_defaults() -> Self {
+        let mut registry = Self::new();
+        let cargo_keep = vec![
+            "error".to_owned(),
+            "warning".to_owned(),
+            "FAILED".to_owned(),
+            "panicked".to_owned(),
+        ];
+        registry.insert(
+            "cargo",
+            FilterEntry {
+                strategy: FilterStrategy::SmartFilter,
+                params: FilterParams {
+                    keep: cargo_keep,
+                    max_lines: None,
+                },
+            },
+        );
+        registry.insert(
+            "pytest",
+            FilterEntry {
+                strategy: FilterStrategy::SmartFilter,
+                params: FilterParams {
+                    keep: vec![
+                        "FAILED".to_owned(),
+                        "ERROR".to_owned(),
+                        "Error".to_owned(),
+                        "assert".to_owned(),
+                    ],
+                    max_lines: None,
+                },
+            },
+        );
+        registry.insert("git status", FilterEntry::new(FilterStrategy::Group));
+        registry.insert("npm", FilterEntry::new(FilterStrategy::Dedup));
+        registry.insert("docker", FilterEntry::new(FilterStrategy::Dedup));
+        registry.insert("kubectl", FilterEntry::new(FilterStrategy::Dedup));
+        registry
+    }
 }
 
 // ── Task 53 — CodeCompressor ─────────────────────────────────────────────────
@@ -415,6 +737,172 @@ Changes not staged for commit:\n\
             ratio < 1.0_f32,
             "compression of noisy output must yield ratio < 1.0, got {ratio:.3}"
         );
+    }
+
+    // ── output-filters: strategy unit tests ──────────────────────────────────
+
+    #[test]
+    fn smart_filter_collapses_cargo_build_to_error_lines() {
+        let noisy = "\
+   Compiling smedja v0.1.0\n\
+   Compiling serde v1.0\n\
+warning: unused variable `x`\n\
+error[E0308]: mismatched types\n\
+  --> src/lib.rs:10:5\n\
+   Finished dev profile\n";
+        let keep = vec!["error".to_owned(), "warning".to_owned()];
+        let filtered = smart_filter(noisy, &keep);
+        assert!(
+            filtered.contains("error[E0308]"),
+            "error line must survive; got:\n{filtered}"
+        );
+        assert!(
+            filtered.contains("warning: unused"),
+            "warning line must survive; got:\n{filtered}"
+        );
+        assert!(
+            !filtered.contains("Compiling"),
+            "progress lines must be dropped; got:\n{filtered}"
+        );
+        assert!(
+            !filtered.contains("Finished"),
+            "progress lines must be dropped; got:\n{filtered}"
+        );
+    }
+
+    #[test]
+    fn group_clusters_git_status_by_directory() {
+        let input = "On branch main\n\
+\tmodified: src/lib.rs\n\
+\tmodified: src/main.rs\n\
+\tmodified: tests/it.rs\n";
+        let grouped = group_by_directory(input);
+        assert!(
+            !grouped.contains("On branch"),
+            "boilerplate must be dropped; got:\n{grouped}"
+        );
+        assert!(
+            grouped.contains("src (2):"),
+            "src group must carry a count of 2; got:\n{grouped}"
+        );
+        assert!(
+            grouped.contains("tests (1):"),
+            "tests group must carry a count of 1; got:\n{grouped}"
+        );
+        assert!(grouped.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn truncate_keeps_first_n_and_marks_omission() {
+        let body = (1..=100)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let truncated = truncate_lines(&body, 10);
+        assert!(truncated.contains("line 1"));
+        assert!(truncated.contains("line 10"));
+        assert!(
+            !truncated.contains("line 11"),
+            "line 11 must be omitted; got:\n{truncated}"
+        );
+        assert!(
+            truncated.contains("… 90 lines omitted (smedja_retrieve to expand)"),
+            "omitted-lines marker must name smedja_retrieve; got:\n{truncated}"
+        );
+    }
+
+    #[test]
+    fn truncate_below_threshold_unchanged() {
+        let body = "a\nb\nc";
+        assert_eq!(truncate_lines(body, 10), body);
+    }
+
+    #[test]
+    fn dedup_collapses_repeated_lines_with_count() {
+        let input = "downloading\ndownloading\ndownloading\ndone\n";
+        let deduped = dedup_lines(input);
+        assert!(
+            deduped.contains("downloading (×3)"),
+            "repeated line must carry an (×N) count; got:\n{deduped}"
+        );
+        assert!(
+            deduped.contains("done"),
+            "non-repeated line must survive; got:\n{deduped}"
+        );
+        assert!(
+            !deduped.contains("done (×"),
+            "single occurrence must not be counted; got:\n{deduped}"
+        );
+    }
+
+    #[test]
+    fn dedup_strips_timestamps_before_comparing() {
+        let input = "[2026-01-01T00:00:00Z] retrying\n[2026-01-01T00:00:01Z] retrying\n";
+        let deduped = dedup_lines(input);
+        assert!(
+            deduped.contains("(×2)"),
+            "timestamp-only differences must dedup; got:\n{deduped}"
+        );
+    }
+
+    // ── output-filters: FilterStrategy round-trip ─────────────────────────────
+
+    #[test]
+    fn filter_strategy_round_trips_from_name() {
+        for name in ["smart-filter", "group", "truncate", "dedup", "none"] {
+            let strategy = FilterStrategy::from_str(name)
+                .unwrap_or_else(|| panic!("'{name}' must parse to a strategy"));
+            assert_eq!(strategy.as_str(), name, "round-trip must be stable");
+        }
+        assert!(
+            FilterStrategy::from_str("bogus").is_none(),
+            "unknown names must not parse"
+        );
+    }
+
+    // ── output-filters: FilterRegistry resolution ─────────────────────────────
+
+    #[test]
+    fn registry_resolves_known_and_unknown_commands() {
+        let registry = FilterRegistry::with_defaults();
+        assert_eq!(
+            registry.resolve("cargo build").0,
+            FilterStrategy::SmartFilter
+        );
+        assert_eq!(registry.resolve("git status").0, FilterStrategy::Group);
+        assert_eq!(
+            registry.resolve("some-unknown-cmd --flag").0,
+            FilterStrategy::None,
+            "unknown command must resolve to the conservative None strategy"
+        );
+    }
+
+    #[test]
+    fn registry_two_token_key_wins_over_one_token() {
+        let mut registry = FilterRegistry::new();
+        registry.insert("docker", FilterEntry::new(FilterStrategy::Dedup));
+        registry.insert("docker build", FilterEntry::new(FilterStrategy::Truncate));
+        assert_eq!(
+            registry.resolve("docker build -t img .").0,
+            FilterStrategy::Truncate,
+            "two-token key must win"
+        );
+        assert_eq!(
+            registry.resolve("docker ps").0,
+            FilterStrategy::Dedup,
+            "one-token key applies when no two-token match"
+        );
+    }
+
+    #[test]
+    fn registry_defaults_cover_required_commands() {
+        let registry = FilterRegistry::with_defaults();
+        assert_ne!(registry.resolve("git status").0, FilterStrategy::None);
+        assert_ne!(registry.resolve("cargo build").0, FilterStrategy::None);
+        assert_ne!(registry.resolve("pytest -q").0, FilterStrategy::None);
+        assert_ne!(registry.resolve("npm install").0, FilterStrategy::None);
+        assert_ne!(registry.resolve("docker build .").0, FilterStrategy::None);
+        assert_ne!(registry.resolve("kubectl get pods").0, FilterStrategy::None);
     }
 
     // ── Task 53 — trim_code_block ────────────────────────────────────────────

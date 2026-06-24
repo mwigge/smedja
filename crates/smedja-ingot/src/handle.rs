@@ -12,7 +12,7 @@ use smedja_types::{Microdollars, Timestamp};
 
 use crate::{
     AuditEvent, Checkpoint, ConversationRollup, CostEntry, CostRow, Ingot, IngotError, LoopRecord,
-    McpServer, PromptHashRecord, Session, Task, TokenSnapshot,
+    McpServer, PromptHashRecord, Session, Task, TokenSnapshot, TokensSavedEntry,
 };
 
 /// Converts a [`tokio::task::JoinError`] (a panic inside `spawn_blocking`) into
@@ -619,6 +619,29 @@ impl IngotHandle {
     pub async fn session_last_model(&self, session_id: &str) -> Result<Option<String>, IngotError> {
         let session_id = session_id.to_owned();
         self.run_blocking(move |ig| ig.session_last_model(&session_id))
+            .await
+    }
+
+    /// Records a [`TokensSavedEntry`] on the tokens-saved ledger.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying INSERT, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn insert_tokens_saved(&self, entry: TokensSavedEntry) -> Result<(), IngotError> {
+        self.run_blocking(move |ig| ig.insert_tokens_saved(&entry))
+            .await
+    }
+
+    /// Returns the total tokens saved by filtering for `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn session_tokens_saved(&self, session_id: &str) -> Result<i64, IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.session_tokens_saved(&session_id))
             .await
     }
 

@@ -5,6 +5,7 @@ pub mod common;
 pub mod cowork;
 pub mod embedder;
 pub mod executor;
+pub mod filters;
 pub mod fragments;
 pub mod handlers;
 pub mod local_provider;

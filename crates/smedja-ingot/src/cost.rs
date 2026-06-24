@@ -45,6 +45,28 @@ pub struct CostEntry {
     pub created_at: Timestamp,
 }
 
+/// A tokens-saved record from command-output filtering.
+///
+/// Recorded on the `tokens_saved_ledger`, separate from the billed
+/// [`CostEntry`] rows: savings are negative cost (value delivered), never
+/// incurred cost, so they must not be folded into billed `input_tok` /
+/// `output_tok` totals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokensSavedEntry {
+    /// Unique entry identifier (UUID v4 stored as TEXT).
+    pub id: Uuid,
+    /// Owning session identifier.
+    pub session_id: String,
+    /// Turn index within the session.
+    pub turn_n: i64,
+    /// The command whose output was filtered.
+    pub command: String,
+    /// Estimated tokens saved by filtering (clamped at ≥ 0 by the caller).
+    pub tokens_saved: i64,
+    /// Timestamp when the entry was recorded (micros since the Unix epoch).
+    pub created_at: Timestamp,
+}
+
 /// Inserts a new [`CostEntry`] row.
 ///
 /// # Errors
@@ -141,6 +163,51 @@ pub(crate) fn session_cost_entries(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Inserts a new [`TokensSavedEntry`] row on the tokens-saved ledger.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the INSERT fails.
+pub(crate) fn insert_tokens_saved(
+    conn: &rusqlite::Connection,
+    entry: &TokensSavedEntry,
+) -> Result<(), IngotError> {
+    conn.execute(
+        "INSERT INTO tokens_saved_ledger \
+         (id, session_id, turn_n, command, tokens_saved, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            entry.id.to_string(),
+            entry.session_id,
+            entry.turn_n,
+            entry.command,
+            entry.tokens_saved,
+            entry.created_at.as_micros(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Returns the total tokens saved by filtering for `session_id`.
+///
+/// Returns `0` when no entries exist for the session. This is read from the
+/// dedicated `tokens_saved_ledger`, never the billed `cost_ledger`.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the query fails.
+pub(crate) fn session_tokens_saved(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<i64, IngotError> {
+    let total = conn.query_row(
+        "SELECT COALESCE(SUM(tokens_saved), 0) FROM tokens_saved_ledger WHERE session_id = ?1",
+        rusqlite::params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -300,5 +367,63 @@ mod tests {
         let rows = ingot.session_cost_entries("s3").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].cost_usd, Microdollars::from_micros(50_000));
+    }
+
+    // ── tokens-saved ledger (output-filters) ──────────────────────────────────
+
+    fn make_saved(session_id: &str, command: &str, tokens_saved: i64) -> TokensSavedEntry {
+        TokensSavedEntry {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            turn_n: 0,
+            command: command.to_string(),
+            tokens_saved,
+            created_at: Timestamp::from_secs_f64(1_700_000_000.0),
+        }
+    }
+
+    #[test]
+    fn tokens_saved_recorded_separately_from_billed_cost() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        // Billed cost for the session.
+        ingot.insert_cost(&make_entry("s-saved", 0.010, 0)).unwrap();
+        // Filtering savings for the same session.
+        ingot
+            .insert_tokens_saved(&make_saved("s-saved", "cargo build", 120))
+            .unwrap();
+        ingot
+            .insert_tokens_saved(&make_saved("s-saved", "git status", 30))
+            .unwrap();
+
+        // Savings are queryable per session and summed independently.
+        assert_eq!(ingot.session_tokens_saved("s-saved").unwrap(), 150);
+
+        // Billed cost totals are untouched by savings — the ledger stays exact.
+        assert_eq!(
+            ingot.session_cost("s-saved").unwrap(),
+            Microdollars::from_micros(10_000)
+        );
+        // make_entry records 200 input + 100 output tokens; no savings folded in.
+        let rows = ingot.session_cost_entries("s-saved").unwrap();
+        assert_eq!(rows[0].input_tok, 200);
+        assert_eq!(rows[0].output_tok, 100);
+    }
+
+    #[test]
+    fn tokens_saved_scoped_to_session() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        ingot
+            .insert_tokens_saved(&make_saved("a", "cargo build", 40))
+            .unwrap();
+        ingot
+            .insert_tokens_saved(&make_saved("b", "cargo build", 999))
+            .unwrap();
+        assert_eq!(ingot.session_tokens_saved("a").unwrap(), 40);
+    }
+
+    #[test]
+    fn tokens_saved_with_no_entries_returns_zero() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        assert_eq!(ingot.session_tokens_saved("none").unwrap(), 0);
     }
 }
