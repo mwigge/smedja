@@ -226,6 +226,38 @@ mod tests {
     }
 
     #[test]
+    fn single_item_shows_all_decision_shortcuts() {
+        let items = vec![item(1, "bash")];
+        let output = render_widget(&items, false, "");
+        assert!(
+            output.contains("[y]"),
+            "single item must show [y]; got:\n{output}"
+        );
+        assert!(
+            output.contains("[n]"),
+            "single item must show [n]; got:\n{output}"
+        );
+        assert!(
+            output.contains("[m]"),
+            "single item must show [m]; got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn modify_mode_renders_current_instruction_buffer() {
+        let items = vec![item(1, "bash")];
+        let output = render_widget(&items, true, "use ls instead");
+        assert!(
+            output.contains("instruction:"),
+            "modify mode must show instruction prompt; got:\n{output}"
+        );
+        assert!(
+            output.contains("use ls instead"),
+            "modify mode must echo the current instruction buffer; got:\n{output}"
+        );
+    }
+
+    #[test]
     fn empty_items_renders_nothing() {
         let output = render_widget(&[], false, "");
         assert!(
