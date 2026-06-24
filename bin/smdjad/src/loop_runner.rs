@@ -63,6 +63,7 @@ pub(crate) struct LoopRoleRunner {
     price_table: Arc<PriceTable>,
     vault: Arc<Mutex<Vault>>,
     provider_sessions: crate::orchestrator::ProviderSessions,
+    cache_aligners: crate::orchestrator::CacheAligners,
     workspace_root: PathBuf,
     agent_timeout_s: u64,
 }
@@ -121,6 +122,7 @@ impl RoleRunner for LoopRoleRunner {
             Arc::clone(&self.price_table),
             Arc::clone(&self.vault),
             Arc::clone(&self.provider_sessions),
+            Arc::clone(&self.cache_aligners),
         );
         let run = orchestrator.run(session_id.to_string(), task_id.to_string());
         if tokio::time::timeout(std::time::Duration::from_secs(self.agent_timeout_s), run)
@@ -198,7 +200,7 @@ async fn read_pending_slices(workspace_root: &Path, change_name: &str) -> Vec<St
 /// verification gate and bounded fix retries — persisting status through the
 /// ingot as it goes.
 #[allow(clippy::too_many_arguments)] // forwards the turn-orchestrator dependencies
-#[tracing::instrument(skip(ingot, dispatcher, gates, pool, assayer, price_table, vault, provider_sessions, workspace_root), fields(loop_id = %loop_id, change = %change_name))]
+#[tracing::instrument(skip(ingot, dispatcher, gates, pool, assayer, price_table, vault, provider_sessions, cache_aligners, workspace_root), fields(loop_id = %loop_id, change = %change_name))]
 pub(crate) async fn run(
     ingot: IngotHandle,
     dispatcher: Arc<Dispatcher>,
@@ -208,6 +210,7 @@ pub(crate) async fn run(
     price_table: Arc<PriceTable>,
     vault: Arc<Mutex<Vault>>,
     provider_sessions: crate::orchestrator::ProviderSessions,
+    cache_aligners: crate::orchestrator::CacheAligners,
     loop_id: String,
     change_name: String,
     workspace_root: PathBuf,
@@ -245,6 +248,7 @@ pub(crate) async fn run(
         price_table,
         vault,
         provider_sessions,
+        cache_aligners,
         workspace_root: workspace_root.clone(),
         agent_timeout_s: config.limits.agent_timeout_s,
     };
@@ -343,6 +347,7 @@ mod tests {
             price_table,
             vault,
             Arc::new(Mutex::new(std::collections::HashMap::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
             "loop-missing".to_owned(),
             "demo".to_owned(),
             ws.path().to_path_buf(),
@@ -390,6 +395,7 @@ mod tests {
             assayer,
             price_table,
             vault,
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             "loop-empty".to_owned(),
             "demo".to_owned(),

@@ -47,6 +47,20 @@ use context::{classify_tool_outcome, cold_k_for_tier, model_context_window, stra
 /// supply their own map.
 pub(crate) type ProviderSessions = Arc<Mutex<HashMap<String, String>>>;
 
+/// Key identifying a persisted [`smedja_memory::CacheAligner`]: `(session_id, runner_name)`.
+///
+/// Keyed by runner as well as session because a [`smedja_memory::CacheHint`]
+/// targets one specific provider's warm cache; a `provider-failover` runner
+/// rotation must not smear one provider's prefix-digest history onto another.
+pub(crate) type AlignerKey = (String, String);
+
+/// Shared map from `(session_id, runner)` to its persisted cross-turn aligner.
+///
+/// Constructed once in `main()` and threaded to every orchestrator exactly like
+/// [`ProviderSessions`], so a single aligner instance outlives an individual turn
+/// and can observe the prior sealed prefix to report real `Grown`/`Mutated` drift.
+pub(crate) type CacheAligners = Arc<Mutex<HashMap<AlignerKey, smedja_memory::CacheAligner>>>;
+
 /// Owns all the shared resources needed to execute a single agent turn.
 pub(crate) struct TurnOrchestrator {
     ingot: IngotHandle,
@@ -57,6 +71,7 @@ pub(crate) struct TurnOrchestrator {
     price_table: Arc<PriceTable>,
     vault: Arc<Mutex<Vault>>,
     provider_sessions: ProviderSessions,
+    cache_aligners: CacheAligners,
 }
 
 impl TurnOrchestrator {
@@ -70,6 +85,7 @@ impl TurnOrchestrator {
         price_table: Arc<PriceTable>,
         vault: Arc<Mutex<Vault>>,
         provider_sessions: ProviderSessions,
+        cache_aligners: CacheAligners,
     ) -> Self {
         Self {
             ingot,
@@ -80,6 +96,7 @@ impl TurnOrchestrator {
             price_table,
             vault,
             provider_sessions,
+            cache_aligners,
         }
     }
 
@@ -110,6 +127,7 @@ impl TurnOrchestrator {
         let price_table = &self.price_table;
         let vault = &self.vault;
         let provider_sessions = &self.provider_sessions;
+        let cache_aligners = &self.cache_aligners;
 
         let tracer = global::tracer("smedja");
         let mut turn_span = tracer.start(tel::SPAN_AGENT_INVOKE);
@@ -511,10 +529,10 @@ impl TurnOrchestrator {
         mem.push(AdapterMessage::user(first_user_content));
         mem.seal_prefix();
 
-        // Observe the sealed prefix for cross-turn drift and select a safe cache
-        // breakpoint. The hint feeds both `stable_prefix_len` (Anthropic, OpenAI)
-        // and the per-runner `cache_strategy` below.
-        let cache_hint = smedja_memory::CacheAligner::new().align(&mem);
+        // The sealed prefix is observed for cross-turn drift *inside the ring
+        // loop*, where the runner name is known: the aligner is persisted per
+        // `(session_id, runner)`, so the hint must be computed against the
+        // runner's own prefix history. See the `cache_aligners` lookup below.
 
         // 4b. Mark in_progress.
         {
@@ -597,6 +615,22 @@ impl TurnOrchestrator {
                     .cloned()
             } else {
                 None
+            };
+
+            // Observe the sealed prefix for cross-turn drift using the aligner
+            // persisted for THIS runner. Keying by `(session_id, runner)` keeps
+            // each provider's prefix history separate: a `provider-failover`
+            // rotation to a new runner finds no entry and starts fresh (its cache
+            // is cold), and rotating back resumes that runner's recorded boundary.
+            // The lock is held only for the take/align/re-insert and released
+            // before the provider call below (no lock across `.await`).
+            let aligner_key: AlignerKey = (session_id.clone(), entry_runner_name.clone());
+            let cache_hint = {
+                let mut aligners = cache_aligners.lock().await;
+                let mut aligner = aligners.remove(&aligner_key).unwrap_or_default();
+                let hint = aligner.align(&mem);
+                aligners.insert(aligner_key, aligner);
+                hint
             };
 
             // Realise the aligner hint for this runner: Anthropic via
@@ -1328,6 +1362,7 @@ mod tests {
                 Vault::open_in_memory().expect("in-memory Vault must open"),
             )),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
         )
     }
 
@@ -1613,6 +1648,7 @@ mod tests {
         ));
 
         let provider_sessions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let cache_aligners = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let orc = super::TurnOrchestrator::new(
             ingot,
             Arc::clone(&dispatcher),
@@ -1622,6 +1658,7 @@ mod tests {
             price_table,
             vault,
             provider_sessions,
+            cache_aligners,
         );
 
         let session_id = "sess-does-not-exist".to_owned();
@@ -1642,5 +1679,108 @@ mod tests {
             got_fail,
             "orchestrator must publish TurnEvent::Failed for an unknown task"
         );
+    }
+
+    /// Cross-turn persistence of the per-`(session, runner)` aligner.
+    ///
+    /// These tests model exactly what the ring loop does: look up (or default)
+    /// the aligner for a key in the shared [`super::CacheAligners`] map, call
+    /// `align` against the freshly-sealed memory, and store the mutated aligner
+    /// back. A persisted aligner observes the prior turn and reports real
+    /// `Grown`/`Mutated` drift; distinct runner keys never share history.
+    mod cache_aligner_persistence {
+        use std::sync::Arc;
+
+        use smedja_adapter::types::Message as AdapterMessage;
+        use smedja_memory::{Drift, WorkingMemory};
+        use tokio::sync::Mutex;
+
+        use crate::orchestrator::{AlignerKey, CacheAligners};
+
+        /// Builds a sealed [`WorkingMemory`] whose stable prefix is `prefix`.
+        fn sealed(prefix: &[&str]) -> WorkingMemory {
+            let mut mem = WorkingMemory::new(4096);
+            for content in prefix {
+                mem.push(AdapterMessage::system(*content));
+            }
+            mem.seal_prefix();
+            mem
+        }
+
+        /// Mirrors the ring-loop get-or-insert: take-or-default under the lock,
+        /// align, re-insert, and return the hint.
+        async fn align_persisted(
+            aligners: &CacheAligners,
+            key: &AlignerKey,
+            mem: &WorkingMemory,
+        ) -> Drift {
+            let mut guard = aligners.lock().await;
+            let mut aligner = guard.remove(key).unwrap_or_default();
+            let hint = aligner.align(mem);
+            guard.insert(key.clone(), aligner);
+            hint.drift
+        }
+
+        #[tokio::test]
+        async fn second_turn_same_session_runner_reports_grown() {
+            let aligners: CacheAligners = Arc::new(Mutex::new(std::collections::HashMap::new()));
+            let key: AlignerKey = ("sess-1".to_owned(), "anthropic".to_owned());
+
+            let first = align_persisted(&aligners, &key, &sealed(&["sys", "skills"])).await;
+            assert_eq!(first, Drift::Unchanged, "first turn has no prior history");
+
+            // Same leading messages, prefix grew by one settled turn.
+            let second =
+                align_persisted(&aligners, &key, &sealed(&["sys", "skills", "settled turn"])).await;
+            assert_eq!(
+                second,
+                Drift::Grown,
+                "a persisted aligner must observe the prior boundary and report Grown, not a fresh Unchanged"
+            );
+        }
+
+        #[tokio::test]
+        async fn distinct_runner_keys_do_not_share_history() {
+            let aligners: CacheAligners = Arc::new(Mutex::new(std::collections::HashMap::new()));
+            let anthropic: AlignerKey = ("sess-1".to_owned(), "anthropic".to_owned());
+            let openai: AlignerKey = ("sess-1".to_owned(), "openai".to_owned());
+
+            // Anthropic observes a grown prefix across two turns.
+            let _ = align_persisted(&aligners, &anthropic, &sealed(&["sys", "skills"])).await;
+            let grown = align_persisted(
+                &aligners,
+                &anthropic,
+                &sealed(&["sys", "skills", "settled"]),
+            )
+            .await;
+            assert_eq!(grown, Drift::Grown);
+
+            // A failover to openai (same session) must start fresh: first turn is
+            // Unchanged at the full prefix, never compared against anthropic's history.
+            let openai_first =
+                align_persisted(&aligners, &openai, &sealed(&["sys", "skills", "settled"])).await;
+            assert_eq!(
+                openai_first,
+                Drift::Unchanged,
+                "a fresh runner key must not inherit the prior runner's prefix digests"
+            );
+        }
+
+        #[tokio::test]
+        async fn mutated_message_inside_prior_boundary_reports_mutated() {
+            let aligners: CacheAligners = Arc::new(Mutex::new(std::collections::HashMap::new()));
+            let key: AlignerKey = ("sess-1".to_owned(), "anthropic".to_owned());
+
+            let _ = align_persisted(&aligners, &key, &sealed(&["sys", "skills", "context"])).await;
+
+            // Second turn: index 1 changed content inside the prior boundary.
+            let second =
+                align_persisted(&aligners, &key, &sealed(&["sys", "CHANGED", "context"])).await;
+            assert_eq!(
+                second,
+                Drift::Mutated,
+                "a message changing inside the prior sealed boundary must report Mutated"
+            );
+        }
     }
 }
