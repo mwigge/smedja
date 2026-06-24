@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
+use smedja_agent_events::AgentEventEnvelope;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
@@ -118,87 +119,73 @@ pub enum PaneEvent {
 impl PaneEvent {
     /// Deserialises a [`PaneEvent`] from a raw JSON line received from smdjad.
     ///
-    /// Returns `None` when the line is not a recognised event type.
+    /// The line is decoded through [`smedja_agent_events::AgentEventEnvelope`],
+    /// the single source of truth for the push-socket wire contract, and the
+    /// typed [`AgentEvent`] is mapped onto the renderer-facing [`PaneEvent`].
+    ///
+    /// Returns `None` for unparseable input or an unknown event type — a
+    /// malformed line never panics or takes down the receiver. Fields that the
+    /// wire schema does not carry (model tier, token counts, latency) default
+    /// to empty/zero so existing renderer code keeps working.
+    #[must_use]
     pub fn from_json_line(line: &str) -> Option<Self> {
-        let v: Value = serde_json::from_str(line).ok()?;
-        let event_type = v.get("type")?.as_str()?;
-        match event_type {
-            "turn_start" => {
-                let p = v.get("params")?;
-                Some(Self::TurnStart {
-                    session_id: p.get("session_id")?.as_str()?.to_owned(),
-                    turn_id: p.get("turn_id")?.as_str()?.to_owned(),
-                    tier: p
-                        .get("tier")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned(),
-                    model: p
-                        .get("model")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned(),
-                    trace_id: p
-                        .get("trace_id")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned),
-                    span_id: p.get("span_id").and_then(|v| v.as_str()).map(str::to_owned),
-                })
-            }
-            "tool_call" => {
-                let p = v.get("params")?;
-                Some(Self::ToolCall {
-                    tool_name: p.get("tool_name")?.as_str()?.to_owned(),
-                    args_summary: p.get("args_summary")?.as_str()?.to_owned(),
-                    tool_call_id: p
-                        .get("tool_call_id")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned),
-                    trace_id: p
-                        .get("trace_id")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned),
-                    span_id: p.get("span_id").and_then(|v| v.as_str()).map(str::to_owned),
-                })
-            }
-            "approval_prompt" => {
-                let p = v.get("params")?;
-                Some(Self::ApprovalPrompt {
-                    tool_name: p.get("tool_name")?.as_str()?.to_owned(),
-                    args: p.get("args")?.clone(),
-                    prompt: p.get("prompt")?.as_str()?.to_owned(),
-                })
-            }
-            "tool_result" => {
-                let p = v.get("params")?;
-                Some(Self::ToolResult {
-                    tool_name: p.get("tool_name")?.as_str()?.to_owned(),
-                    outcome: p.get("outcome")?.as_str()?.to_owned(),
-                })
-            }
-            "turn_end" => {
-                let p = v.get("params")?;
-                Some(Self::TurnEnd {
-                    input_tokens: p.get("input_tokens")?.as_u64()?,
-                    output_tokens: p.get("output_tokens")?.as_u64()?,
-                    latency_ms: p.get("latency_ms")?.as_u64()?,
-                    traceparent: p
-                        .get("traceparent")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned),
-                })
-            }
-            "stream_delta" => {
-                let p = v.get("params")?;
-                Some(Self::StreamDelta {
-                    text: p.get("text")?.as_str()?.to_owned(),
-                })
-            }
-            other => {
-                warn!(event_type = other, "unrecognised smdjad event");
-                None
-            }
-        }
+        use smedja_agent_events::AgentEvent;
+
+        let Some(envelope) = AgentEventEnvelope::from_json_line(line) else {
+            warn!(line, "unparseable or unknown smdjad agent event");
+            return None;
+        };
+
+        Some(match envelope.event {
+            AgentEvent::TurnStart {
+                turn_id,
+                session_id,
+            } => Self::TurnStart {
+                session_id: session_id.unwrap_or_default(),
+                turn_id: turn_id.unwrap_or_default(),
+                tier: String::new(),
+                model: String::new(),
+                trace_id: None,
+                span_id: None,
+            },
+            AgentEvent::ToolCall {
+                turn_id,
+                tool,
+                summary,
+            } => Self::ToolCall {
+                tool_name: tool.unwrap_or_default(),
+                args_summary: summary.unwrap_or_default(),
+                tool_call_id: turn_id,
+                trace_id: None,
+                span_id: None,
+            },
+            AgentEvent::ApprovalPrompt { tool, prompt, .. } => Self::ApprovalPrompt {
+                tool_name: tool.unwrap_or_default(),
+                args: Value::Null,
+                prompt: prompt.unwrap_or_default(),
+            },
+            AgentEvent::ToolResult {
+                tool, summary, ok, ..
+            } => Self::ToolResult {
+                tool_name: tool.unwrap_or_default(),
+                outcome: summary.unwrap_or_else(|| {
+                    if ok.unwrap_or(false) {
+                        "ok".to_owned()
+                    } else {
+                        String::new()
+                    }
+                }),
+            },
+            AgentEvent::TurnEnd { .. } => Self::TurnEnd {
+                input_tokens: 0,
+                output_tokens: 0,
+                latency_ms: 0,
+                traceparent: None,
+            },
+            AgentEvent::StreamDelta { content, .. } => Self::StreamDelta {
+                text: content.unwrap_or_default(),
+            },
+        })
     }
 }
 
@@ -736,10 +723,17 @@ mod tests {
         assert_eq!(path, PathBuf::from("/tmp/smdjad.sock"));
     }
 
+    fn envelope_line(event: smedja_agent_events::AgentEvent) -> String {
+        smedja_agent_events::AgentEventEnvelope::new(event).to_json_line()
+    }
+
     #[test]
     fn pane_event_deserialise_turn_start() {
-        let line = r#"{"type":"turn_start","params":{"session_id":"s1","turn_id":"t1","tier":"pro","model":"claude-opus-4"}}"#;
-        let event = PaneEvent::from_json_line(line).expect("should parse");
+        let line = envelope_line(smedja_agent_events::AgentEvent::TurnStart {
+            turn_id: Some("t1".into()),
+            session_id: Some("s1".into()),
+        });
+        let event = PaneEvent::from_json_line(&line).expect("should parse");
         if let PaneEvent::TurnStart {
             session_id,
             turn_id,
@@ -750,8 +744,9 @@ mod tests {
         {
             assert_eq!(session_id, "s1");
             assert_eq!(turn_id, "t1");
-            assert_eq!(tier, "pro");
-            assert_eq!(model, "claude-opus-4");
+            // The wire schema does not carry tier/model; they default to empty.
+            assert_eq!(tier, "");
+            assert_eq!(model, "");
         } else {
             panic!("wrong variant");
         }
@@ -759,8 +754,12 @@ mod tests {
 
     #[test]
     fn pane_event_deserialise_tool_call() {
-        let line = r#"{"type":"tool_call","params":{"tool_name":"bash","args_summary":"ls -la"}}"#;
-        let event = PaneEvent::from_json_line(line).expect("should parse");
+        let line = envelope_line(smedja_agent_events::AgentEvent::ToolCall {
+            turn_id: Some("t1".into()),
+            tool: Some("bash".into()),
+            summary: Some("ls -la".into()),
+        });
+        let event = PaneEvent::from_json_line(&line).expect("should parse");
         if let PaneEvent::ToolCall {
             tool_name,
             args_summary,
@@ -776,16 +775,17 @@ mod tests {
 
     #[test]
     fn pane_event_deserialise_approval_prompt() {
-        let line = r#"{"type":"approval_prompt","params":{"tool_name":"rm","args":{"path":"/tmp/x"},"prompt":"Allow deletion?"}}"#;
-        let event = PaneEvent::from_json_line(line).expect("should parse");
+        let line = envelope_line(smedja_agent_events::AgentEvent::ApprovalPrompt {
+            turn_id: Some("t1".into()),
+            tool: Some("rm".into()),
+            prompt: Some("Allow deletion?".into()),
+        });
+        let event = PaneEvent::from_json_line(&line).expect("should parse");
         if let PaneEvent::ApprovalPrompt {
-            tool_name,
-            args,
-            prompt,
+            tool_name, prompt, ..
         } = event
         {
             assert_eq!(tool_name, "rm");
-            assert_eq!(args["path"], "/tmp/x");
             assert_eq!(prompt, "Allow deletion?");
         } else {
             panic!("wrong variant");
@@ -793,22 +793,50 @@ mod tests {
     }
 
     #[test]
-    fn pane_event_deserialise_turn_end() {
-        let line = r#"{"type":"turn_end","params":{"input_tokens":100,"output_tokens":200,"latency_ms":350}}"#;
-        let event = PaneEvent::from_json_line(line).expect("should parse");
-        if let PaneEvent::TurnEnd {
-            input_tokens,
-            output_tokens,
-            latency_ms,
-            ..
-        } = event
-        {
-            assert_eq!(input_tokens, 100);
-            assert_eq!(output_tokens, 200);
-            assert_eq!(latency_ms, 350);
+    fn pane_event_deserialise_tool_result() {
+        let line = envelope_line(smedja_agent_events::AgentEvent::ToolResult {
+            turn_id: Some("t1".into()),
+            tool: Some("read".into()),
+            summary: Some("12 lines".into()),
+            ok: Some(true),
+        });
+        let event = PaneEvent::from_json_line(&line).expect("should parse");
+        if let PaneEvent::ToolResult { tool_name, outcome } = event {
+            assert_eq!(tool_name, "read");
+            assert_eq!(outcome, "12 lines");
         } else {
             panic!("wrong variant");
         }
+    }
+
+    #[test]
+    fn pane_event_deserialise_turn_end() {
+        let line = envelope_line(smedja_agent_events::AgentEvent::TurnEnd {
+            turn_id: Some("t1".into()),
+            session_id: Some("s1".into()),
+        });
+        let event = PaneEvent::from_json_line(&line).expect("should parse");
+        assert!(matches!(event, PaneEvent::TurnEnd { .. }));
+    }
+
+    #[test]
+    fn pane_event_deserialise_stream_delta() {
+        let line = envelope_line(smedja_agent_events::AgentEvent::StreamDelta {
+            turn_id: Some("t1".into()),
+            content: Some("partial".into()),
+        });
+        let event = PaneEvent::from_json_line(&line).expect("should parse");
+        if let PaneEvent::StreamDelta { text } = event {
+            assert_eq!(text, "partial");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn pane_event_unknown_type_returns_none() {
+        assert!(PaneEvent::from_json_line(r#"{"type":"nope"}"#).is_none());
+        assert!(PaneEvent::from_json_line("not json").is_none());
     }
 
     #[test]
@@ -847,36 +875,23 @@ mod tests {
         assert!(!s.suppress_pty_output);
     }
 
-    // ── Phase 6 ───────────────────────────────────────────────────────────
-
-    /// Verifies that `smedja_bellows::event::TurnEvent` can decode JSON that
-    /// includes the new optional correlation fields (`conversation_id`,
-    /// `trace_id`, etc.) without error, and that the decoded variant is
-    /// `TurnEvent::Started`.  The correlation fields are available for
-    /// forwarding to the renderer via the event stream.
+    /// A legacy payload lacking a `schema_version` field still decodes via the
+    /// envelope's `#[serde(default)]` version handling, and maps to the right
+    /// variant — exercising backward compatibility on the receive path.
     #[test]
-    fn st_agent_decodes_enriched_started_event() {
-        let json = r#"{"Started":{"session_id":"s","turn_id":"t","conversation_id":"c","trace_id":"tid"}}"#;
-        let ev: smedja_bellows::event::TurnEvent = serde_json::from_str(json).unwrap();
-        assert!(
-            matches!(ev, smedja_bellows::event::TurnEvent::Started { .. }),
-            "expected TurnEvent::Started"
-        );
-    }
-
-    /// Verifies backward compatibility: a JSON payload that has no correlation
-    /// fields (e.g. from an older daemon) still deserializes successfully and
-    /// all new optional fields default to `None`.
-    #[test]
-    fn st_agent_decodes_legacy_started_event() {
-        let json = r#"{"Started":{"session_id":"old","turn_id":"t0"}}"#;
-        let ev: smedja_bellows::event::TurnEvent = serde_json::from_str(json).unwrap();
-        if let smedja_bellows::event::TurnEvent::Started { correlation, .. } = ev {
-            assert!(correlation.conversation_id.is_none());
-            assert!(correlation.trace_id.is_none());
-            assert!(correlation.agent_name.is_none());
+    fn pane_event_decodes_legacy_versionless_line() {
+        let line = r#"{"type":"turn_start","turn_id":"t0","session_id":"old"}"#;
+        let event = PaneEvent::from_json_line(line).expect("legacy line must decode");
+        if let PaneEvent::TurnStart {
+            session_id,
+            turn_id,
+            ..
+        } = event
+        {
+            assert_eq!(session_id, "old");
+            assert_eq!(turn_id, "t0");
         } else {
-            panic!("expected TurnEvent::Started");
+            panic!("expected TurnStart");
         }
     }
 
@@ -929,49 +944,6 @@ mod tests {
             std::path::PathBuf::from("/run/smdjad.sock.agent"),
             "expected .agent suffix"
         );
-    }
-
-    #[test]
-    fn turn_end_from_json_with_traceparent() {
-        let json = r#"{"type":"turn_end","params":{"input_tokens":412,"output_tokens":88,"latency_ms":4200,"traceparent":"00-abc-def-01"}}"#;
-        let ev = PaneEvent::from_json_line(json).expect("must parse");
-        if let PaneEvent::TurnEnd {
-            input_tokens,
-            output_tokens,
-            latency_ms,
-            traceparent,
-        } = ev
-        {
-            assert_eq!(input_tokens, 412);
-            assert_eq!(output_tokens, 88);
-            assert_eq!(latency_ms, 4200);
-            assert_eq!(traceparent.as_deref(), Some("00-abc-def-01"));
-        } else {
-            panic!("expected TurnEnd");
-        }
-    }
-
-    #[test]
-    fn turn_end_from_json_without_traceparent() {
-        let json = r#"{"type":"turn_end","params":{"input_tokens":10,"output_tokens":5,"latency_ms":100}}"#;
-        let ev = PaneEvent::from_json_line(json).expect("must parse");
-        if let PaneEvent::TurnEnd { traceparent, .. } = ev {
-            assert!(traceparent.is_none(), "missing traceparent must be None");
-        } else {
-            panic!("expected TurnEnd");
-        }
-    }
-
-    #[test]
-    fn turn_start_from_json_missing_tier_model_uses_empty_strings() {
-        let json = r#"{"type":"turn_start","params":{"session_id":"s1","turn_id":"t1"}}"#;
-        let ev = PaneEvent::from_json_line(json).expect("must parse even without tier/model");
-        if let PaneEvent::TurnStart { tier, model, .. } = ev {
-            assert_eq!(tier, "", "missing tier must default to empty string");
-            assert_eq!(model, "", "missing model must default to empty string");
-        } else {
-            panic!("expected TurnStart");
-        }
     }
 
     #[test]

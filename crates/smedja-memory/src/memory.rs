@@ -275,7 +275,7 @@ pub fn inject_workspace_skills(
     let combined = skills
         .iter()
         .enumerate()
-        .map(|(i, body)| smedja_plugins::wrap_skill_body(&format!("skill-{i}"), body))
+        .map(|(i, body)| crate::skills::wrap_skill_body(&format!("skill-{i}"), body))
         .collect::<Vec<_>>()
         .join("\n\n");
     memory.push(crate::types::Message::system(format!(

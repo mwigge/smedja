@@ -22,12 +22,14 @@ reqwest            = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 sha2               = { workspace = true }
-smedja-adapter     = { path = "../../crates/smedja-adapter" }
-smedja-assayer     = { path = "../../crates/smedja-assayer" }
-smedja-bellows     = { path = "../../crates/smedja-bellows" }
-smedja-graph       = { path = "../../crates/smedja-graph" }
+smedja-adapter       = { path = "../../crates/smedja-adapter" }
+smedja-agent-events  = { path = "../../crates/smedja-agent-events" }
+smedja-assayer       = { path = "../../crates/smedja-assayer" }
+smedja-auth          = { path = "../../crates/smedja-auth" }
+smedja-bellows       = { path = "../../crates/smedja-bellows" }
+smedja-graph         = { path = "../../crates/smedja-graph" }
 smedja-ingot       = { path = "../../crates/smedja-ingot" }
-smedja-loop        = { path = "../../crates/smedja-loop", package = "smedja-loop-types" }
+smedja-loop        = { path = "../../crates/smedja-loop" }
 smedja-memory      = { path = "../../crates/smedja-memory" }
 smedja-methodology = { path = "../../crates/smedja-methodology" }
 smedja-rpc         = { path = "../../crates/smedja-rpc" }
@@ -35,7 +37,6 @@ smedja-sre         = { path = "../../crates/smedja-sre" }
 smedja-telemetry   = { path = "../../crates/smedja-telemetry" }
 smedja-types       = { path = "../../crates/smedja-types" }
 smedja-vault       = { path = "../../crates/smedja-vault" }
-subtle             = "2"
 tokio              = { workspace = true }
 toml               = { workspace = true }
 tower              = { workspace = true }

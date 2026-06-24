@@ -622,3 +622,57 @@ pub(crate) async fn context(state: HandlerState, params: Value) -> Result<Value,
         "vault_cold_count": vault_cold_count,
     }))
 }
+
+/// Handles `session.history`: returns the ordered turn/message records for a
+/// session, sourced from the ingot's checkpoint blobs and audit trail.
+///
+/// Params: `{ session_id: string }`.
+/// Response: `{ session_id, turns: [ { turn_n, created_at, messages } ], audit: [ … ] }`
+/// where `turns` is ordered by `turn_n` ascending (each carries the conversation
+/// snapshot for that turn) and `audit` is the ordered tool/turn audit trail.
+///
+/// # Errors
+///
+/// Returns an error when `session_id` is missing or an ingot read fails.
+pub(crate) async fn history(state: HandlerState, params: Value) -> Result<Value, RpcError> {
+    let ig = state.ingot;
+    let session_id = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| missing_param("session_id"))?
+        .to_owned();
+
+    let checkpoints = ig
+        .list_checkpoints(&session_id)
+        .await
+        .map_err(|e| ingot_err(&e))?;
+    let turns: Vec<Value> = checkpoints
+        .iter()
+        .map(|cp| {
+            // The messages blob is stored as a JSON array; surface it parsed so
+            // callers receive structured records rather than an escaped string.
+            let messages: Value =
+                serde_json::from_str(&cp.messages_json).unwrap_or(Value::Array(Vec::new()));
+            json!({
+                "turn_n": cp.turn_n,
+                "created_at": cp.created_at,
+                "messages": messages,
+            })
+        })
+        .collect();
+
+    let audit = ig
+        .list_audit_events(&session_id)
+        .await
+        .map_err(|e| ingot_err(&e))?;
+    let audit_json: Vec<Value> = audit
+        .into_iter()
+        .map(|ev| serde_json::to_value(&ev).unwrap_or(Value::Null))
+        .collect();
+
+    Ok(json!({
+        "session_id": session_id,
+        "turns": turns,
+        "audit": audit_json,
+    }))
+}

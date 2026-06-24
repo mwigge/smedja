@@ -383,9 +383,9 @@ mod tests {
 
     #[test]
     fn inject_traceparent_does_not_panic_with_no_active_span() {
-        // Without an active span the W3C propagator emits nothing; verify no crash.
-        use opentelemetry_sdk::propagation::TraceContextPropagator;
-        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+        // The adapter only *uses* the global propagator via the facade; it never
+        // installs one (that is the binary's responsibility). With no propagator
+        // installed and no active span, injection must be a safe no-op.
         let mut headers = reqwest::header::HeaderMap::new();
         inject_traceparent(&mut headers);
         // No assertion on header presence — background context produces no traceparent.

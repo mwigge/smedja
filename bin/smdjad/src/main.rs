@@ -741,6 +741,40 @@ fn build_router(
         async move { handlers::loops::run(state, params).await }
     });
 
+    // ── agent.routing ────────────────────────────────────────────────────────
+    // Resolves a (role, complexity?) pair through the daemon's assayer and
+    // returns { runner, tier, model, complexity, rationale }.
+    let agent_routing_state = state.clone();
+    router.register("agent.routing", move |params: Value| {
+        let state = agent_routing_state.clone();
+        async move { handlers::routing::routing(state, params).await }
+    });
+
+    // ── graph.index ──────────────────────────────────────────────────────────
+    // Runs the server-side code-graph index over a workspace; returns
+    // { indexed: <count>, workspace }.
+    let graph_index_state = state.clone();
+    router.register("graph.index", move |params: Value| {
+        let state = graph_index_state.clone();
+        async move { handlers::graph::index(state, params).await }
+    });
+
+    // ── graph.query ──────────────────────────────────────────────────────────
+    // Queries the server-side code graph; returns { symbols: [...] }.
+    let graph_query_state = state.clone();
+    router.register("graph.query", move |params: Value| {
+        let state = graph_query_state.clone();
+        async move { handlers::graph::query(state, params).await }
+    });
+
+    // ── session.history ──────────────────────────────────────────────────────
+    // Returns ordered turn/message records and the audit trail for a session.
+    let session_history_state = state.clone();
+    router.register("session.history", move |params: Value| {
+        let state = session_history_state.clone();
+        async move { handlers::session::history(state, params).await }
+    });
+
     router
 }
 
@@ -860,6 +894,14 @@ fn init_tracing() {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
+
+    // Install the W3C trace-context propagator process-wide so outbound HTTP
+    // calls inject `traceparent`/`tracestate` and inbound contexts are
+    // extracted. The adapter only *uses* the global propagator; installing it
+    // is the binary's responsibility.
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
 
     // Install an OTLP exporter when SMEDJA_OTLP_ENDPOINT is set; otherwise fall
     // back to recording spans through the structured-log layer. The trace
