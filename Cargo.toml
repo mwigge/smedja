@@ -15,6 +15,7 @@ members = [
     "crates/smedja-methodology",
     "crates/smedja-plugins",
     "crates/smedja-rpc",
+    "crates/smedja-security",
     "crates/smedja-sre",
     "crates/smedja-telemetry",
     "crates/smedja-types",
