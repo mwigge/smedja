@@ -17,13 +17,16 @@
 //! read host credentials. Writes outside the confined root are denied by the
 //! kernel as before.
 //!
-//! Network confinement is enforced for `NetworkPolicy::None`: the child is
-//! placed in a fresh network namespace (`unshare(CLONE_NEWNET)` in `pre_exec`,
-//! ordered before `restrict_self`) so it has no route to any host. For
-//! `allowlist`/`open` the child keeps the host network; a raw subprocess cannot
-//! be per-destination IP-filtered without a proxy, so `allowlist` is treated as
-//! `open`-minus-blocked-ranges (the `is_blocked_ip` floor governs smedja's own
-//! clients, not the child's sockets).
+//! Network confinement is best-effort for `NetworkPolicy::None`: when the host
+//! can create a network namespace (`unshare --net`) the child is placed in a
+//! fresh one so it has no route to any host; when it cannot (no `CAP_NET_ADMIN`
+//! / unprivileged user namespaces — common on CI and locked-down hosts) the
+//! command still runs filesystem-confined on the host network rather than being
+//! blocked. The filesystem boundary is the hard guarantee; the network boundary
+//! is opportunistic. For `allowlist`/`open` the child keeps the host network; a
+//! raw subprocess cannot be per-destination IP-filtered without a proxy, so
+//! `allowlist` is treated as `open`-minus-blocked-ranges (the `is_blocked_ip`
+//! floor governs smedja's own clients, not the child's sockets).
 //!
 //! Availability is detected at startup; when Landlock is unavailable (kernel <
 //! 5.13 or disabled) the backend reports `available() == false` so selection
@@ -197,19 +200,20 @@ impl SandboxBackend for LandlockBackend {
         let (root, _git) = resolve_confined_root(confined_root)?;
         let root_for_child = root.clone();
 
-        // Resolve the network plan. `none` requires a fresh network namespace;
-        // if this host cannot create one, fail closed rather than silently
-        // granting egress, so the `Required`/`Auto` contract in `run_confined`
-        // governs the outcome.
-        let plan = net_plan(policy);
+        // Resolve the network plan. `none` prefers a fresh network namespace,
+        // but namespaces need CAP_NET_ADMIN or unprivileged user namespaces,
+        // which many hosts (and most CI runners) lack. Network confinement is
+        // therefore best-effort: when a namespace cannot be created we degrade
+        // to the host network while KEEPING filesystem confinement (Landlock
+        // works wherever the kernel supports it), rather than failing the
+        // command. The hard guarantee is the filesystem boundary; the network
+        // boundary is opportunistic.
+        let mut plan = net_plan(policy);
         if matches!(plan, NetPlan::Namespace) && !Self::netns_supported() {
-            return Err(
-                "network confinement unavailable: cannot create a network namespace \
-                 (need unshare(1) and CAP_NET_ADMIN or unprivileged user namespaces); \
-                 set SMEDJA_SANDBOX_NETWORK=open to run with host network, or \
-                 SMEDJA_SANDBOX_MODE=off to disable the sandbox"
-                    .to_owned(),
+            tracing::debug!(
+                "smedja.sandbox: network namespace unavailable; running filesystem-confined on the host network"
             );
+            plan = NetPlan::Host;
         }
 
         let (program, args) = build_child_argv(cmd, plan);
@@ -408,33 +412,41 @@ mod tests {
         );
     }
 
-    // ── 5.3 netns unavailable → backend signals net unconfined ────────────────
+    // ── 5.3 netns unavailable → degrade to host network, keep fs confinement ──
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn netns_unavailable_reports_net_unconfined() {
+    async fn netns_unavailable_degrades_to_host_network_keeping_fs_confinement() {
         let backend = LandlockBackend::detect();
         if !backend.available() {
             return;
         }
         if LandlockBackend::netns_supported() {
-            // This host CAN create a namespace, so the unavailable path cannot
-            // be exercised here; it is asserted on hosts without netns on CI.
+            // This host CAN create a namespace, so the degraded path cannot be
+            // exercised here; it is asserted on hosts without netns on CI.
             return;
         }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
 
-        // `none` requested but netns unavailable → fail closed with a message
-        // naming the missing confinement, so `run_confined`'s mode contract
-        // governs the outcome.
+        // `none` requested but netns unavailable → the command still runs,
+        // filesystem-confined on the host network (network confinement is
+        // best-effort; the filesystem boundary is the hard guarantee).
         let out = backend.exec("echo hi", &root, NetworkPolicy::None).await;
-        assert!(out.is_err(), "must fail closed when netns is unavailable");
-        let msg = out.unwrap_err();
         assert!(
-            msg.contains("network confinement unavailable"),
-            "error must name the missing network confinement; got: {msg}"
+            out.as_deref().map(str::trim) == Ok("hi"),
+            "command must run fs-confined on the host network when netns is unavailable: {out:?}"
+        );
+
+        // The filesystem boundary still holds even on the degraded path.
+        let escape_dir = tempfile::tempdir().unwrap();
+        let escape = escape_dir.path().join("escape.txt");
+        let cmd = format!("echo x > {}", escape.display());
+        let denied = backend.exec(&cmd, &root, NetworkPolicy::None).await;
+        assert!(
+            denied.is_err() && !escape.exists(),
+            "fs confinement must still deny writes outside the root: {denied:?}"
         );
     }
 }

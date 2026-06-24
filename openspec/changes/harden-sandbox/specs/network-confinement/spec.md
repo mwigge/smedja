@@ -2,7 +2,7 @@
 
 ### Requirement: NetworkPolicy::None denies all egress for the sandboxed subprocess
 
-When the active network policy is `none`, the sandbox backend SHALL prevent the sandboxed command from reaching any network destination. On Linux this MUST be enforced by running the command in a fresh network namespace; on macOS Seatbelt by `(deny network*)`; on Docker by `--network none`.
+When the active network policy is `none`, the sandbox backend SHALL prevent the sandboxed command from reaching any network destination wherever the platform supports it. On Linux this SHALL be enforced by a fresh network namespace when one can be created (best-effort — see the degradation requirement below); on macOS Seatbelt by `(deny network*)`; on Docker by `--network none`.
 
 #### Scenario: Linux network namespace denies egress under none
 
@@ -36,18 +36,17 @@ Under `allowlist` and `open`, the `is_blocked_ip` SSRF floor (loopback, RFC-1918
 - **THEN** the subprocess SHALL retain host network egress except for the `is_blocked_ip` ranges
 - **AND** the documentation SHALL state that per-host allow-listing is not enforced for subprocesses in this change
 
-### Requirement: Network confinement honours the mode contract when unavailable
+### Requirement: Network confinement is best-effort; the filesystem boundary is the hard guarantee
 
-When `NetworkPolicy::None` is requested but the platform cannot create a network namespace, the backend SHALL NOT silently grant egress. Under `SandboxMode::Required` the execution SHALL fail closed; under `SandboxMode::Auto` it SHALL fall back per the existing unconfined-marker contract; and the `smedja.sandbox.exec` span SHALL record whether network confinement was applied.
+Network namespaces require capabilities (`CAP_NET_ADMIN` or unprivileged user namespaces) that many hosts and CI runners lack. When `NetworkPolicy::None` is requested but the platform cannot create a network namespace, the backend SHALL NOT fail the command; it SHALL run the command **filesystem-confined on the host network** rather than blocking it or running it fully unconfined. The filesystem boundary remains the hard guarantee on the degraded path. (Failing the command closed under `SandboxMode::Required` when only the network cannot be confined is a documented non-goal of this change; the filesystem-confinement guarantee still fails closed under `Required` when no isolation backend is available at all.)
 
-#### Scenario: required fails closed when netns is unavailable
+#### Scenario: netns unavailable degrades to filesystem-confined host network
 
-- **WHEN** `NetworkPolicy::None` is requested, `SandboxMode::Required` is active, and no network namespace can be created
-- **THEN** the command SHALL NOT execute with network access
-- **AND** the result SHALL be an error naming the missing confinement capability
+- **WHEN** `NetworkPolicy::None` is requested but no network namespace can be created
+- **THEN** the command SHALL still execute, filesystem-confined to the worktree, on the host network
+- **AND** a write outside the confined root SHALL still be denied (the filesystem boundary holds on the degraded path)
 
-#### Scenario: auto falls back with the unconfined marker
+#### Scenario: netns available enforces no egress
 
-- **WHEN** `NetworkPolicy::None` is requested, `SandboxMode::Auto` is active, and no network namespace can be created
-- **THEN** the command SHALL fall back per the existing fallback contract with the unconfined marker
-- **AND** the `smedja.sandbox.exec` span SHALL carry `net_confined = false`
+- **WHEN** `NetworkPolicy::None` is requested on a host that can create a network namespace
+- **THEN** the command SHALL run in a fresh network namespace with no route to any external host
