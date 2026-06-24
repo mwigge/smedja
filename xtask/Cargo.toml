@@ -11,8 +11,10 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
-anyhow     = { workspace = true }
-clap       = { workspace = true }
-schemars   = "0.8"
-serde_json = { workspace = true }
-typify     = "0.4"
+anyhow         = { workspace = true }
+clap           = { workspace = true }
+schemars       = "0.8"
+serde_json     = { workspace = true }
+smedja-assayer = { path = "../crates/smedja-assayer" }
+smedja-eval    = { path = "../crates/smedja-eval" }
+typify         = "0.4"

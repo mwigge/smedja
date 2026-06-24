@@ -29,12 +29,95 @@ struct Cli {
 enum Command {
     /// Generate `crates/smedja-rpc/src/generated.rs` from the JSON Schema.
     GenRpcTypes,
+    /// Run an eval suite and gate on its pass-rate threshold.
+    Eval {
+        /// Path to the suite directory (contains `suite.toml` and case files).
+        suite: PathBuf,
+        /// Override the suite's configured pass-rate threshold (in [0.0, 1.0]).
+        #[arg(long)]
+        threshold: Option<f64>,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::GenRpcTypes => gen_rpc_types(),
+        Command::Eval { suite, threshold } => run_eval(&suite, threshold),
+    }
+}
+
+/// Loads the suite at `dir`, runs it (offline — deterministic scorers only),
+/// prints a report, and exits non-zero when the pass rate is below the
+/// (possibly overridden) threshold. A thin shim over `smedja_eval::run_suite`.
+///
+/// # Errors
+///
+/// Returns an error if the suite cannot be loaded or its report cannot be
+/// serialised.
+fn run_eval(dir: &std::path::Path, threshold_override: Option<f64>) -> Result<()> {
+    use smedja_eval::case::load_suite;
+    use smedja_eval::engine::{run_suite_with, LoopDriver};
+    use smedja_eval::scoring::{Judge, Outcome, Verdict};
+
+    /// An offline stand-in loop driver, never live.
+    ///
+    /// xtask runs the eval gate offline (free, deterministic), so no real loop
+    /// is driven. The stand-in returns a fixed `Complete` outcome so the
+    /// deterministic agent example in the corpus demonstrates a passing
+    /// deterministic check without any model access. The real driver is wired
+    /// at the daemon boundary for online runs.
+    struct OfflineDriver;
+    impl LoopDriver for OfflineDriver {
+        fn drive(&self, _scenario: &str) -> Outcome {
+            Outcome::Loop {
+                final_state: "complete".to_owned(),
+                slices_completed: 1,
+            }
+        }
+        fn is_live(&self) -> bool {
+            false
+        }
+    }
+
+    /// An unused judge: xtask runs offline, so rubric cases are always skipped.
+    struct UnusedJudge;
+    impl Judge for UnusedJudge {
+        fn judge(&self, _rubric: &str, _output: &str) -> Verdict {
+            Verdict::Fail("xtask eval runs offline; rubric cases are skipped".to_owned())
+        }
+    }
+
+    let suite =
+        load_suite(dir).with_context(|| format!("failed to load suite at {}", dir.display()))?;
+    let threshold = threshold_override.unwrap_or(suite.config.pass_threshold);
+    let router = smedja_assayer::Assayer::default_rules();
+    // xtask is the CI/dev path: always offline so it is free and deterministic.
+    let report = run_suite_with(&suite, &router, &OfflineDriver, &UnusedJudge, true);
+
+    eprintln!("Suite: {}", report.suite);
+    for verdict in &report.verdicts {
+        let label = match &verdict.status {
+            smedja_eval::report::CaseStatus::Pass => "PASS".to_owned(),
+            smedja_eval::report::CaseStatus::Fail(reason) => format!("FAIL ({reason})"),
+            smedja_eval::report::CaseStatus::Skip(reason) => format!("SKIP ({reason})"),
+        };
+        eprintln!("  {:<30} {label}", verdict.id);
+    }
+    eprintln!(
+        "{} / {} passed ({} scored, {} skipped) — pass_rate {:.3}, threshold {:.3}",
+        report.passed(),
+        report.total(),
+        report.scored(),
+        report.skipped(),
+        report.pass_rate(),
+        threshold,
+    );
+
+    if report.meets_threshold(threshold) {
+        Ok(())
+    } else {
+        std::process::exit(1);
     }
 }
 

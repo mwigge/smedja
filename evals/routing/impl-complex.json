@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "id": "impl-complex",
+  "description": "Impl at complex complexity escalates to claude/deep",
+  "kind": "routing",
+  "input": { "role": "impl", "complexity": "complex" },
+  "expectation": { "runner": "claude", "tier": "deep" }
+}

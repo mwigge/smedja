@@ -1,0 +1,9 @@
+# Routing eval suite — deterministic exact-match against Assayer::default_rules().
+#
+# Every case names a (role, complexity) input and the (runner, tier) the
+# assayer is expected to return. The suite runs offline with no model access and
+# is exercised inside `cargo test` as a routing regression gate, so a change to
+# the routing table that a case does not expect fails CI immediately.
+
+name = "routing"
+pass_threshold = 1.0

@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "id": "test-coding",
+  "description": "Test role routes to local/local at any complexity",
+  "kind": "routing",
+  "input": { "role": "test", "complexity": "coding" },
+  "expectation": { "runner": "local", "tier": "local" }
+}
