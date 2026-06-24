@@ -153,7 +153,7 @@ Compaction produces structured JSON, not a free-text summary. Each compacted tur
 
 ### How Parallel Agents Share Memory
 
-When tasks fan out to parallel worktrees, agents share **read** access to `smedja-vault` (cold store) but write to isolated working trees. The orchestrator merges vault writes on task completion. (**Note:** `smedja-vault` storage and cosine-similarity retrieval are implemented; the `smedja_vault_search` tool exposed to agents currently returns empty results — daemon wiring is in progress.)
+When tasks fan out to parallel worktrees, agents share **read** access to `smedja-vault` (cold store) but write to isolated working trees. The orchestrator merges vault writes on task completion. Cold retrieval is wired end-to-end: each turn the orchestrator recalls semantically-relevant context from the vault and injects it as a bounded `<cold_context>` block, and the `smedja_vault_search` tool embeds the query, runs hybrid cosine + keyword + recency search over the named namespace, and returns ranked results (an empty `results` array on no match).
 
 <div align="center">
   <img src="assets/diagrams/readme-parallel-memory.png" alt="parallel agents share read access to smedja-vault while writing to isolated worktrees" width="760" />

@@ -34,8 +34,11 @@ use crate::executor::execute_tool;
 use crate::price_table::PriceTable;
 use crate::provider_pool::ProviderPool;
 
+mod cold;
+use cold::VaultColdStore;
+
 mod context;
-use context::{classify_tool_outcome, model_context_window, strata_for_tier};
+use context::{classify_tool_outcome, cold_k_for_tier, model_context_window, strata_for_tier};
 
 /// Shared map from session-resume keys to provider-native resume identifiers.
 ///
@@ -91,6 +94,9 @@ impl TurnOrchestrator {
     pub(crate) async fn run(self, session_id: String, turn_id: String) {
         const MAX_RATE_LIMIT_RETRIES: u32 = 4;
         const RATE_LIMIT_BACKOFF_BASE_SECS: u64 = 1;
+        // Cold context is bounded to at most this fraction (1/N) of the tier
+        // token budget so recalled context can never displace hot turns.
+        const COLD_BUDGET_DIVISOR: usize = 4;
 
         let ingot = &self.ingot;
         let dispatcher = &self.dispatcher;
@@ -431,8 +437,13 @@ impl TurnOrchestrator {
         // 4. Assemble the stable prefix (the user turn plus auto-injected graph
         //    symbols) into working memory, then seal it so the prefix survives
         //    the tool loop unchanged and drives the provider KV-cache hint.
-        let mut mem = WorkingMemory::new(budget_tokens);
+        let cold_adapter = Arc::new(VaultColdStore::new(Arc::clone(vault)));
+        let mut mem = WorkingMemory::new(budget_tokens).with_cold_store(cold_adapter);
         mem.set_strata(strata);
+        // Cold recall scales with tier depth: fast favours latency (k=1), deep
+        // favours recall (k=5). The "compact" namespace is where session.compact
+        // indexes its summaries.
+        mem.set_cold_query("compact", cold_k_for_tier(route.tier));
 
         let first_user_content = {
             let mut content = task.title.clone();
@@ -497,6 +508,26 @@ impl TurnOrchestrator {
             );
             content
         };
+
+        // 4a. Cold recall: pull semantically-relevant context from beyond the
+        //     warm window and inject it as a single delimited system block ahead
+        //     of the user turn, so it falls inside the sealed prefix. The block
+        //     is capped at a fraction of the tier budget; lowest-scored entries
+        //     are dropped until it fits, so cold context never displaces hot
+        //     turns.
+        let cold_results = mem.cold_context(&task.title).await;
+        let cold_budget = budget_tokens / COLD_BUDGET_DIVISOR;
+        let cold_injected = match cold::assemble_cold_block(&cold_results, cold_budget) {
+            Some((block, count)) => {
+                mem.push(block);
+                count
+            }
+            None => 0,
+        };
+        tracing::debug!(
+            smedja.turn.cold_results_injected = cold_injected,
+            "cold context injection"
+        );
 
         mem.push(AdapterMessage::user(first_user_content));
         mem.seal_prefix();

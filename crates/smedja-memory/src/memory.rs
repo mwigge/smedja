@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use crate::cold::ColdStore;
 use crate::types::{Message, Stratum};
 
 /// Hot window size: the last `HOT_WINDOW` turns are always included verbatim.
@@ -15,7 +18,10 @@ pub const WARM_WINDOW: usize = 30;
 ///
 /// The hot/warm/cold strata boundaries default to [`StrataConfig::deep`]
 /// (hot=5, warm=30) and can be reconfigured via [`WorkingMemory::set_strata`].
-#[derive(Debug)]
+///
+/// An optional [`ColdStore`] can be attached via [`WorkingMemory::with_cold_store`]
+/// to enable semantic recall of cold-stratum context through
+/// [`WorkingMemory::cold_context`].
 pub struct WorkingMemory {
     messages: Vec<Message>,
     /// Number of leading messages frozen against compaction and reordering.
@@ -25,6 +31,48 @@ pub struct WorkingMemory {
     max_tokens: usize,
     /// Per-tier context window boundaries for hot/warm/cold strata.
     strata: StrataConfig,
+    /// Optional cold-stratum retrieval port. `None` means cold recall is
+    /// disabled and [`WorkingMemory::cold_context`] returns an empty `Vec`.
+    cold_store: Option<Arc<dyn ColdStore>>,
+    /// Namespace and top-K used when querying the cold store.
+    cold_query: ColdQuery,
+}
+
+impl std::fmt::Debug for WorkingMemory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkingMemory")
+            .field("messages", &self.messages)
+            .field("stable_prefix", &self.stable_prefix)
+            .field("max_tokens", &self.max_tokens)
+            .field("strata", &self.strata)
+            .field(
+                "cold_store",
+                &self.cold_store.as_ref().map(|_| "<ColdStore>"),
+            )
+            .field("cold_query", &self.cold_query)
+            .finish()
+    }
+}
+
+/// Namespace and top-K configuration for cold-store queries.
+///
+/// Defaults to the `"compact"` namespace (where `session.compact` indexes its
+/// summaries) and `k = 3`.
+#[derive(Debug, Clone)]
+pub struct ColdQuery {
+    /// Vault namespace to search.
+    pub namespace: String,
+    /// Maximum number of cold results to retrieve.
+    pub k: usize,
+}
+
+impl Default for ColdQuery {
+    fn default() -> Self {
+        Self {
+            namespace: "compact".to_owned(),
+            k: 3,
+        }
+    }
 }
 
 impl WorkingMemory {
@@ -39,7 +87,29 @@ impl WorkingMemory {
             stable_prefix: 0,
             max_tokens,
             strata: StrataConfig::deep(),
+            cold_store: None,
+            cold_query: ColdQuery::default(),
         }
+    }
+
+    /// Attaches a [`ColdStore`] for semantic recall and returns `self`.
+    ///
+    /// Without a store attached, [`WorkingMemory::cold_context`] returns an
+    /// empty `Vec`. The cold-query config retains its default
+    /// (`namespace = "compact"`, `k = 3`); adjust it with
+    /// [`WorkingMemory::set_cold_query`].
+    #[must_use]
+    pub fn with_cold_store(mut self, store: Arc<dyn ColdStore>) -> Self {
+        self.cold_store = Some(store);
+        self
+    }
+
+    /// Sets the namespace and top-K used by [`WorkingMemory::cold_context`].
+    pub fn set_cold_query(&mut self, namespace: impl Into<String>, k: usize) {
+        self.cold_query = ColdQuery {
+            namespace: namespace.into(),
+            k,
+        };
     }
 
     /// Pushes a message onto the working memory.
@@ -210,21 +280,25 @@ impl WorkingMemory {
 
     /// Returns messages from the cold stratum that are relevant to `query`.
     ///
-    /// Cold retrieval uses semantic similarity between `query` and archived
-    /// message content to surface context from beyond the warm window.
+    /// Cold retrieval uses semantic similarity between `query` and durably
+    /// stored content to surface context from beyond the warm window. The query
+    /// is dispatched to the attached [`ColdStore`] over the configured
+    /// [`ColdQuery`] namespace and top-K; each result is mapped to a system
+    /// [`Message`] in the store's descending-relevance order.
     ///
-    /// # Note
-    ///
-    /// Full semantic retrieval requires a vector index over cold messages.
-    /// This stub returns an empty `Vec`. Activate when a vector store is
-    /// wired into [`WorkingMemory`].
-    ///
-    /// The signature is `async` so callers can `await` it without a breaking
-    /// change once real vector-store I/O is added.
-    // ponytail: cold retrieval stub — returns empty until vector search is wired
-    #[allow(clippy::unused_async)] // async is intentional: callers await this without a breaking change once I/O is added
-    pub async fn cold_context(&self, _query: &str) -> Vec<crate::types::Message> {
-        Vec::new()
+    /// When no cold store is attached the result is an empty `Vec`, preserving
+    /// the behaviour of callers (such as strata unit tests) that never opt in.
+    pub async fn cold_context(&self, query: &str) -> Vec<crate::types::Message> {
+        let Some(store) = &self.cold_store else {
+            return Vec::new();
+        };
+        let results = store
+            .retrieve(query, &self.cold_query.namespace, self.cold_query.k)
+            .await;
+        results
+            .into_iter()
+            .map(|r| crate::types::Message::system(r.content))
+            .collect()
     }
 }
 
@@ -357,7 +431,7 @@ impl StrataConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Message, Stratum};
+    use crate::types::{Message, Role, Stratum};
 
     fn make_mem(n: usize) -> WorkingMemory {
         let mut m = WorkingMemory::new(4096);
@@ -637,30 +711,95 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cold_context_stub_returns_empty() {
-        // cold_context is async but contains no real await points — drive it to
-        // completion with a minimal single-poll executor so the test stays sync.
-        use std::future::Future as _;
-        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-        fn noop_wake(_: *const ()) {}
-        fn noop_wake_ref(_: *const ()) {}
-        fn noop_clone(p: *const ()) -> RawWaker {
-            RawWaker::new(p, &VTABLE)
+    /// Fake [`ColdStore`] that returns a fixed list of results and records the
+    /// arguments it was called with.
+    struct FakeColdStore {
+        results: Vec<crate::cold::ColdResult>,
+        last_call: std::sync::Mutex<Option<(String, String, usize)>>,
+    }
+
+    impl FakeColdStore {
+        fn new(results: Vec<crate::cold::ColdResult>) -> Self {
+            Self {
+                results,
+                last_call: std::sync::Mutex::new(None),
+            }
         }
-        fn noop_drop(_: *const ()) {}
-        static VTABLE: RawWakerVTable =
-            RawWakerVTable::new(noop_clone, noop_wake, noop_wake_ref, noop_drop);
-        // SAFETY: vtable functions are all no-ops and the data pointer is never
-        // dereferenced — this waker is only used to drive a stub future that
-        // returns Poll::Ready on the first poll.
-        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-        let mut cx = Context::from_waker(&waker);
+    }
+
+    #[async_trait::async_trait]
+    impl crate::cold::ColdStore for FakeColdStore {
+        async fn retrieve(
+            &self,
+            query: &str,
+            namespace: &str,
+            k: usize,
+        ) -> Vec<crate::cold::ColdResult> {
+            *self.last_call.lock().expect("lock not poisoned") =
+                Some((query.to_owned(), namespace.to_owned(), k));
+            self.results.clone()
+        }
+    }
+
+    #[test]
+    fn with_cold_store_attaches_store_and_default_query_config() {
+        let store = Arc::new(FakeColdStore::new(Vec::new()));
+        let mem = WorkingMemory::new(4096).with_cold_store(store);
+        // The default cold-query config targets the "compact" namespace, k = 3.
+        let cfg = ColdQuery::default();
+        assert_eq!(cfg.namespace, "compact");
+        assert_eq!(cfg.k, 3);
+        // The Debug impl reflects an attached store.
+        assert!(format!("{mem:?}").contains("ColdStore"));
+    }
+
+    #[tokio::test]
+    async fn cold_context_returns_empty_without_store() {
         let m = make_mem(50);
-        let mut fut = std::pin::pin!(m.cold_context("some query string"));
-        let Poll::Ready(ctx) = fut.as_mut().poll(&mut cx) else {
-            panic!("cold_context stub must resolve on first poll");
-        };
+        let ctx = m.cold_context("some query string").await;
         assert!(ctx.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cold_context_returns_ranked_messages_from_store() {
+        use crate::cold::ColdResult;
+        let store = Arc::new(FakeColdStore::new(vec![
+            ColdResult {
+                content: "high relevance recall".to_owned(),
+                score: 0.92,
+                namespace: "compact".to_owned(),
+            },
+            ColdResult {
+                content: "lower relevance recall".to_owned(),
+                score: 0.41,
+                namespace: "compact".to_owned(),
+            },
+        ]));
+        let mem = WorkingMemory::new(4096).with_cold_store(Arc::clone(&store) as Arc<_>);
+
+        let messages = mem.cold_context("recall query").await;
+
+        assert_eq!(messages.len(), 2);
+        // Order is preserved (descending score as supplied by the store).
+        assert_eq!(messages[0].content, "high relevance recall");
+        assert_eq!(messages[1].content, "lower relevance recall");
+        assert!(messages.iter().all(|m| m.role == Role::System));
+
+        // The default namespace/k were forwarded to the store.
+        let call = store.last_call.lock().expect("lock not poisoned").clone();
+        assert_eq!(
+            call,
+            Some(("recall query".to_owned(), "compact".to_owned(), 3))
+        );
+    }
+
+    #[tokio::test]
+    async fn set_cold_query_overrides_namespace_and_k() {
+        let store = Arc::new(FakeColdStore::new(Vec::new()));
+        let mut mem = WorkingMemory::new(4096).with_cold_store(Arc::clone(&store) as Arc<_>);
+        mem.set_cold_query("notes", 5);
+        let _ = mem.cold_context("q").await;
+        let call = store.last_call.lock().expect("lock not poisoned").clone();
+        assert_eq!(call, Some(("q".to_owned(), "notes".to_owned(), 5)));
     }
 }
