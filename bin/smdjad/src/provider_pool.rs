@@ -13,6 +13,10 @@ use tracing::{error, info, warn};
 /// session-store keying.
 pub struct ProviderEntry {
     pub provider: Box<dyn Provider>,
+    /// The routing runner this entry serves — drives the session-resume store key.
+    pub runner: Runner,
+    /// The routing tier this entry serves.
+    pub tier: Tier,
     /// Short identifier used in logs and the session-resume store key.
     pub runner_name: &'static str,
     /// Default model name when no `SMEDJA_MODEL` env var or session override is set.
@@ -25,12 +29,93 @@ pub struct ProviderEntry {
 /// `Arc<ProviderPool>`.
 pub struct ProviderPool {
     entries: HashMap<(Runner, Tier), ProviderEntry>,
+    /// Keys in stable insertion/priority order — the same order
+    /// [`build_provider_pool`] probes providers, which determines the default
+    /// and the rotation-ring priority. A `HashMap` does not preserve insertion
+    /// order, so the ordering is tracked explicitly here.
+    order: Vec<(Runner, Tier)>,
     /// The `(Runner, Tier)` used when the assayer selects a route that has no
     /// entry in the pool.
     pub default: Option<(Runner, Tier)>,
 }
 
 impl ProviderPool {
+    /// Builds a pool from an explicit, ordered list of entries.
+    ///
+    /// The first entry becomes the default. Used by orchestrator tests to inject
+    /// mock providers in a known rotation order.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn from_entries_for_test(entries: Vec<((Runner, Tier), ProviderEntry)>) -> Self {
+        let mut map = HashMap::new();
+        let mut order = Vec::new();
+        let mut default = None;
+        for (key, entry) in entries {
+            if default.is_none() {
+                default = Some(key);
+            }
+            if map.insert(key, entry).is_none() {
+                order.push(key);
+            }
+        }
+        Self {
+            entries: map,
+            order,
+            default,
+        }
+    }
+
+    /// Returns the ordered, de-duplicated ring of pool entries eligible to serve
+    /// a turn routed to `(runner, tier)`.
+    ///
+    /// The ring yields, in order: the exact routed entry first (if present),
+    /// then other entries whose tier is compatible with the routed tier in the
+    /// pool's stable priority order, and finally the pool default if not already
+    /// yielded. Each `(Runner, Tier)` key appears at most once, so the ring is
+    /// finite. Compatibility uses the rotation `kind` `"rate_limited"` semantics
+    /// (any tier no less capable than the routed tier); callers that rotate on a
+    /// context-length failure must additionally filter the ring with
+    /// [`tier_compatible`].
+    #[must_use]
+    pub fn eligible_ring(&self, runner: Runner, tier: Tier) -> Vec<&ProviderEntry> {
+        let mut seen = std::collections::HashSet::new();
+        let mut ring: Vec<&ProviderEntry> = Vec::new();
+
+        // 1. The exact routed entry first.
+        if let Some(entry) = self.entries.get(&(runner, tier)) {
+            if seen.insert((runner, tier)) {
+                ring.push(entry);
+            }
+        }
+
+        // 2. Other compatible-tier entries in stable priority order.
+        for &(r, t) in &self.order {
+            if seen.contains(&(r, t)) {
+                continue;
+            }
+            if tier_compatible(tier, t, "rate_limited") {
+                if let Some(entry) = self.entries.get(&(r, t)) {
+                    seen.insert((r, t));
+                    ring.push(entry);
+                }
+            }
+        }
+
+        // 3. The pool default last, if not already present and still compatible.
+        //    Compatibility is enforced even for the default so a turn never
+        //    rotates below its routed tier.
+        if let Some(key @ (_, default_tier)) = self.default {
+            if !seen.contains(&key) && tier_compatible(tier, default_tier, "rate_limited") {
+                if let Some(entry) = self.entries.get(&key) {
+                    seen.insert(key);
+                    ring.push(entry);
+                }
+            }
+        }
+
+        ring
+    }
+
     /// Returns the entry for `(runner, tier)`, falling back to the pool's
     /// default when that key is absent.  Returns `None` only when the pool is
     /// completely empty.
@@ -107,6 +192,36 @@ impl ProviderPool {
     }
 }
 
+/// Capability rank of a [`Tier`] for rotation-compatibility comparisons.
+///
+/// Higher means more capable (larger context window / higher quality):
+/// `Fast < Local < Deep`.
+fn tier_capability_rank(tier: Tier) -> u8 {
+    match tier {
+        Tier::Fast => 0,
+        Tier::Local => 1,
+        Tier::Deep => 2,
+    }
+}
+
+/// Returns `true` when a turn routed to `routed` may rotate to a provider of
+/// tier `candidate` for a failure of the given `kind`.
+///
+/// Rotation must never degrade the turn below the routed tier, so `candidate`
+/// must be at least as capable as `routed` (`Fast ≤ Local ≤ Deep`). For a
+/// `context_length_exceeded` failure the candidate must be **strictly** more
+/// capable — an equal-window provider would hit the same limit.
+#[must_use]
+pub fn tier_compatible(routed: Tier, candidate: Tier, kind: &str) -> bool {
+    let routed_rank = tier_capability_rank(routed);
+    let candidate_rank = tier_capability_rank(candidate);
+    if kind == "context_length_exceeded" {
+        candidate_rank > routed_rank
+    } else {
+        candidate_rank >= routed_rank
+    }
+}
+
 /// Probes all available providers and returns a populated pool.
 ///
 /// The priority order matches the original `build_provider()` function so that
@@ -121,23 +236,32 @@ impl ProviderPool {
 #[allow(clippy::too_many_lines)] // sequential provider probes kept inline; each branch logs a distinct readiness signal
 pub async fn build_provider_pool() -> ProviderPool {
     let mut entries: HashMap<(Runner, Tier), ProviderEntry> = HashMap::new();
+    let mut order: Vec<(Runner, Tier)> = Vec::new();
     let mut default: Option<(Runner, Tier)> = None;
 
-    // Helper: record the first inserted (Runner, Tier) as the default.
+    // Helper: record the first inserted (Runner, Tier) as the default and track
+    // probe order so the rotation ring follows the pool's stable priority.
     macro_rules! add {
         ($runner:expr, $tier:expr, $provider:expr, $name:literal, $model:literal) => {{
             let key = ($runner, $tier);
             if default.is_none() {
                 default = Some(key);
             }
-            entries.insert(
-                key,
-                ProviderEntry {
-                    provider: Box::new($provider),
-                    runner_name: $name,
-                    default_model: $model,
-                },
-            );
+            if entries
+                .insert(
+                    key,
+                    ProviderEntry {
+                        provider: Box::new($provider),
+                        runner: $runner,
+                        tier: $tier,
+                        runner_name: $name,
+                        default_model: $model,
+                    },
+                )
+                .is_none()
+            {
+                order.push(key);
+            }
         }};
     }
 
@@ -262,7 +386,11 @@ pub async fn build_provider_pool() -> ProviderPool {
         );
     }
 
-    ProviderPool { entries, default }
+    ProviderPool {
+        entries,
+        order,
+        default,
+    }
 }
 
 #[cfg(test)]
@@ -282,22 +410,31 @@ mod tests {
 
     fn pool_with(entries: Vec<((Runner, Tier), &'static str, &'static str)>) -> ProviderPool {
         let mut map = HashMap::new();
+        let mut order = Vec::new();
         let mut default = None;
         for (key, runner_name, default_model) in entries {
             if default.is_none() {
                 default = Some(key);
             }
-            map.insert(
-                key,
-                ProviderEntry {
-                    provider: Box::new(NullProvider),
-                    runner_name,
-                    default_model,
-                },
-            );
+            if map
+                .insert(
+                    key,
+                    ProviderEntry {
+                        provider: Box::new(NullProvider),
+                        runner: key.0,
+                        tier: key.1,
+                        runner_name,
+                        default_model,
+                    },
+                )
+                .is_none()
+            {
+                order.push(key);
+            }
         }
         ProviderPool {
             entries: map,
+            order,
             default,
         }
     }
@@ -332,6 +469,7 @@ mod tests {
     fn get_returns_none_on_empty_pool() {
         let pool = ProviderPool {
             entries: HashMap::new(),
+            order: Vec::new(),
             default: None,
         };
         assert!(pool.get(Runner::Claude, Tier::Fast).is_none());
@@ -341,6 +479,7 @@ mod tests {
     fn empty_pool_reports_is_empty() {
         let pool = ProviderPool {
             entries: std::collections::HashMap::new(),
+            order: Vec::new(),
             default: None,
         };
         assert!(
@@ -421,5 +560,98 @@ mod tests {
             tiers.contains(&"local"),
             "local tier must appear in list_all_entries"
         );
+    }
+
+    #[test]
+    fn eligible_ring_orders_routed_first_then_compatible_dedup() {
+        // Insertion/priority order: claude-fast (default), claude-deep, local.
+        let pool = pool_with(vec![
+            (
+                (Runner::Claude, Tier::Fast),
+                "claude-cli",
+                "claude-haiku-4-5-20251001",
+            ),
+            (
+                (Runner::Claude, Tier::Deep),
+                "claude-cli",
+                "claude-sonnet-4-6",
+            ),
+            ((Runner::Local, Tier::Local), "local", "local"),
+        ]);
+
+        // Route to fast: ring starts with the routed fast entry, then the more
+        // capable local and deep entries in priority order, ending with the
+        // default (already yielded → not duplicated).
+        let ring = pool.eligible_ring(Runner::Claude, Tier::Fast);
+        let names: Vec<&str> = ring.iter().map(|e| e.runner_name).collect();
+        assert_eq!(
+            names,
+            vec!["claude-cli", "claude-cli", "local"],
+            "ring must be routed-first then compatible entries in priority order"
+        );
+
+        // Every (Runner, Tier) appears at most once: ring length never exceeds
+        // the number of distinct entries.
+        assert_eq!(ring.len(), 3, "ring must de-duplicate by (Runner, Tier)");
+    }
+
+    #[test]
+    fn deep_route_does_not_rotate_down_to_fast() {
+        assert!(
+            !tier_compatible(Tier::Deep, Tier::Fast, "rate_limited"),
+            "a deep-routed turn must not rotate down to fast"
+        );
+        assert!(
+            tier_compatible(Tier::Deep, Tier::Deep, "rate_limited"),
+            "deep is compatible with itself"
+        );
+        assert!(
+            tier_compatible(Tier::Fast, Tier::Deep, "rate_limited"),
+            "fast may rotate up to deep"
+        );
+        assert!(
+            tier_compatible(Tier::Fast, Tier::Local, "rate_limited"),
+            "fast may rotate up to local"
+        );
+    }
+
+    #[test]
+    fn context_length_kind_requires_more_capable_tier() {
+        assert!(
+            !tier_compatible(Tier::Deep, Tier::Deep, "context_length_exceeded"),
+            "context-length must not rotate to an equal-window tier"
+        );
+        assert!(
+            tier_compatible(Tier::Fast, Tier::Deep, "context_length_exceeded"),
+            "context-length may rotate to a strictly-more-capable tier"
+        );
+        assert!(
+            !tier_compatible(Tier::Local, Tier::Fast, "context_length_exceeded"),
+            "context-length must not rotate down"
+        );
+        assert!(
+            tier_compatible(Tier::Local, Tier::Deep, "context_length_exceeded"),
+            "local may rotate up to deep on context-length"
+        );
+    }
+
+    #[test]
+    fn eligible_ring_routes_deep_excludes_fast_entries() {
+        let pool = pool_with(vec![
+            (
+                (Runner::Claude, Tier::Fast),
+                "claude-cli",
+                "claude-haiku-4-5-20251001",
+            ),
+            (
+                (Runner::Claude, Tier::Deep),
+                "claude-cli",
+                "claude-sonnet-4-6",
+            ),
+        ]);
+        let ring = pool.eligible_ring(Runner::Claude, Tier::Deep);
+        // Routed deep entry only; the fast entry is less capable and excluded.
+        // The default (claude-fast) is incompatible so it is not appended.
+        assert_eq!(ring.len(), 1, "deep route must exclude the fast entry");
     }
 }

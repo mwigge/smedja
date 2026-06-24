@@ -81,6 +81,8 @@ The assayer routes by **role + complexity**, not just complexity. A simple fix s
 
 The loop router keeps planning on the strongest tier while pushing mechanical red/green/fix work to local runners.
 
+When a routed provider becomes unusable mid-turn — rate-limited beyond its back-off budget, quota exhausted, context-window exceeded, or down — the orchestrator automatically fails over to the next eligible runner of a compatible tier. Rotation walks a bounded ring (routed provider first, then compatible alternatives in pool priority order, default last; at most three rotations per turn), never degrades a turn below its routed tier, and preserves the assembled prompt and accumulated tool history. Each rotation is visible through the `smedja.error.kind` / `smedja.error.retryable` span attributes.
+
 <div align="center">
   <img src="assets/diagrams/loop-tier-routing.png" alt="tier routing table for loop roles" width="900" />
 </div>
