@@ -61,6 +61,45 @@ pub(crate) type AlignerKey = (String, String);
 /// and can observe the prior sealed prefix to report real `Grown`/`Mutated` drift.
 pub(crate) type CacheAligners = Arc<Mutex<HashMap<AlignerKey, smedja_memory::CacheAligner>>>;
 
+/// Builds the always-on foundational-discipline directive for the sealed system
+/// prefix, gated by `config`.
+///
+/// TDD and clean-code discipline are steer-first: the directive is injected into
+/// the cacheable system block on every code-writing turn so the agent is reminded
+/// of the discipline every turn (the primary enforcement), with the diff backstop
+/// secondary. Each discipline's clause is present only when its config flag is
+/// `true`; when both are disabled the directive is omitted entirely (`None`).
+#[must_use]
+pub(crate) fn methodology_directive(
+    config: smedja_methodology::MethodologyConfig,
+) -> Option<String> {
+    if !config.tdd && !config.clean {
+        return None;
+    }
+    let mut clauses: Vec<&str> = Vec::new();
+    if config.tdd {
+        clauses.push(
+            "Write a failing test before the implementation it covers (Red, then Green, \
+             then Refactor); keep functions small and focused; prefer an early return over \
+             an `else` branch.",
+        );
+    }
+    if config.clean {
+        clauses.push(
+            "Do not use `unwrap`, `expect`, or `println!` in library code — return errors \
+             with `?` and log through the structured logger.",
+        );
+    }
+    let body = clauses
+        .iter()
+        .map(|c| format!("- {c}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "<methodology_discipline>\n{body}\n</methodology_discipline>"
+    ))
+}
+
 /// Owns all the shared resources needed to execute a single agent turn.
 pub(crate) struct TurnOrchestrator {
     ingot: IngotHandle,
@@ -284,7 +323,7 @@ impl TurnOrchestrator {
         // steering can be re-applied per tool-loop iteration without compounding.
         let base_system = {
             let base = format!("You are smedja, an AI coding assistant.{task_prefix}");
-            match smedja_memory::load_workspace_skills(&workspace_root) {
+            let with_skills = match smedja_memory::load_workspace_skills(&workspace_root) {
                 Ok(skills) if !skills.is_empty() => {
                     let joined = skills.join("\n\n");
                     format!("{base}\n\n<workspace_skills>\n{joined}\n</workspace_skills>")
@@ -294,6 +333,17 @@ impl TurnOrchestrator {
                     tracing::warn!(error = %e, "failed to load workspace skills; continuing without");
                     base
                 }
+            };
+            // Always-on, steer-first foundational discipline: the directive is
+            // folded into the same cacheable system block as workspace skills so
+            // it is sealed into the stable prefix before `seal_prefix()` and the
+            // agent is reminded of the discipline on every code-writing turn.
+            // Config-gated per discipline; omitted entirely when both are off.
+            let methodology_config =
+                crate::methodology_config::load_methodology_config(&workspace_root);
+            match methodology_directive(methodology_config) {
+                Some(directive) => format!("{with_skills}\n\n{directive}"),
+                None => with_skills,
             }
         };
 
@@ -1238,6 +1288,52 @@ mod tests {
 
     use crate::price_table::PriceTable;
     use crate::provider_pool::{build_provider_pool, ProviderEntry, ProviderPool};
+
+    use smedja_methodology::MethodologyConfig;
+
+    #[test]
+    fn directive_present_under_default_config() {
+        // On a code-writing turn with default config the sealed system prefix
+        // carries the TDD/clean discipline directive (both clauses present).
+        let directive = super::methodology_directive(MethodologyConfig::default())
+            .expect("default config must yield a directive");
+        assert!(directive.contains("<methodology_discipline>"));
+        assert!(directive.contains("failing test"));
+        assert!(directive.contains("`unwrap`"));
+    }
+
+    #[test]
+    fn tdd_clause_omitted_when_tdd_disabled() {
+        let cfg = MethodologyConfig {
+            tdd: false,
+            clean: true,
+        };
+        let directive =
+            super::methodology_directive(cfg).expect("clean clause must still be present");
+        assert!(!directive.contains("failing test"));
+        assert!(directive.contains("`unwrap`"));
+    }
+
+    #[test]
+    fn clean_clause_omitted_when_clean_disabled() {
+        let cfg = MethodologyConfig {
+            tdd: true,
+            clean: false,
+        };
+        let directive =
+            super::methodology_directive(cfg).expect("tdd clause must still be present");
+        assert!(directive.contains("failing test"));
+        assert!(!directive.contains("`unwrap`"));
+    }
+
+    #[test]
+    fn directive_omitted_entirely_when_both_disabled() {
+        let cfg = MethodologyConfig {
+            tdd: false,
+            clean: false,
+        };
+        assert!(super::methodology_directive(cfg).is_none());
+    }
 
     /// A provider that yields a single classified error then nothing — used to
     /// trigger a rotation in the orchestrator.

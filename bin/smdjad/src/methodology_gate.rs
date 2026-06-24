@@ -5,37 +5,36 @@
 //! The `Mode` enum is the single source of truth for which gate runs — there is
 //! no runtime gate registry that configuration could silently disable.
 
-use smedja_methodology::{clean, ponytail, tdd, MethodologyViolation, Mode};
+use smedja_methodology::{clean, MethodologyViolation, Mode};
 
 /// Parses a persisted session `mode` string into a [`Mode`].
 ///
 /// Returns `None` for an unset or unrecognised mode (those sessions are ungated).
+/// The strings `"tdd"`, `"ponytail"`, and `"sre"` now resolve to `None`: TDD and
+/// clean-code are the always-on foundational discipline (not selectable modes),
+/// and the dormant `sre` gate was retired. A stale persisted `"tdd"`/`"ponytail"`
+/// /`"sre"` therefore degrades gracefully to ungated.
 #[must_use]
 pub(crate) fn parse_mode(mode: Option<&str>) -> Option<Mode> {
     match mode? {
-        "tdd" => Some(Mode::Tdd),
-        "ponytail" => Some(Mode::Ponytail),
         "spec" => Some(Mode::Spec),
         "clean" => Some(Mode::Clean),
-        "sre" => Some(Mode::Sre),
         _ => None,
     }
 }
 
 /// Runs the gate set for `mode` against `diff`, returning the first violation.
 ///
-/// `Tdd` runs the TDD gate; `Clean` and `Ponytail` run the clean-code gate (the
-/// ponytail gate shares the same matcher). `Spec` is enforced by the spec-first
-/// lifecycle rather than a diff gate, and `Sre` is non-gating — both return
-/// `None` here. The match is exhaustive, so a future `Mode` variant forces a
-/// decision about its gate at compile time.
+/// `Clean` runs the hard clean-code backstop. `Spec` is enforced by the
+/// spec-first lifecycle rather than a diff gate, so it returns `None` here. The
+/// match is exhaustive, so a future `Mode` variant forces a decision about its
+/// gate at compile time. The TDD discipline is enforced foundationally (steering
+/// every turn plus an advisory backstop), not through this selectable path.
 #[must_use]
 pub(crate) fn run_gates(mode: &Mode, diff: &str) -> Option<MethodologyViolation> {
     let result = match mode {
-        Mode::Tdd => tdd::check(diff),
         Mode::Clean => clean::check(diff),
-        Mode::Ponytail => ponytail::check(diff),
-        Mode::Spec | Mode::Sre => Ok(()),
+        Mode::Spec => Ok(()),
     };
     result.err()
 }
@@ -68,12 +67,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_mode_known_and_unknown() {
-        assert_eq!(parse_mode(Some("tdd")), Some(Mode::Tdd));
-        assert_eq!(parse_mode(Some("ponytail")), Some(Mode::Ponytail));
+    fn parse_mode_retained_modes_resolve() {
         assert_eq!(parse_mode(Some("spec")), Some(Mode::Spec));
         assert_eq!(parse_mode(Some("clean")), Some(Mode::Clean));
-        assert_eq!(parse_mode(Some("sre")), Some(Mode::Sre));
+    }
+
+    #[test]
+    fn parse_mode_removed_and_unknown_resolve_to_none() {
+        // The removed selectable modes now degrade gracefully to ungated.
+        assert_eq!(parse_mode(Some("tdd")), None);
+        assert_eq!(parse_mode(Some("ponytail")), None);
+        assert_eq!(parse_mode(Some("sre")), None);
         assert_eq!(parse_mode(Some("interactive")), None);
         assert_eq!(parse_mode(None), None);
     }
@@ -98,16 +102,9 @@ mod tests {
     }
 
     #[test]
-    fn tdd_gate_blocks_impl_without_tests() {
-        let diff = build_added_diff("", "fn new_feature() -> u32 { 42 }\n");
-        assert!(run_gates(&Mode::Tdd, &diff).is_some());
-    }
-
-    #[test]
-    fn spec_and_sre_modes_do_not_run_diff_gates() {
+    fn spec_mode_does_not_run_diff_gates() {
         let diff = build_added_diff("", "fn f() {\n    x.unwrap()\n}\n");
         assert!(run_gates(&Mode::Spec, &diff).is_none());
-        assert!(run_gates(&Mode::Sre, &diff).is_none());
     }
 
     #[test]
