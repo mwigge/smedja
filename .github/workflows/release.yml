@@ -111,7 +111,11 @@ jobs:
       - name: build app bundle and DMG
         if: runner.os == 'macOS'
         run: |
-          cargo bundle --release --target ${{ matrix.target }} --bin smedja
+          # cargo-bundle 0.11 has no --package flag and errors with "No root
+          # package found in workspace" at the virtual root, so run it inside the
+          # smedja package. The workspace target dir is still used, so the bundle
+          # lands under the root-relative target/ path the rest of this step reads.
+          ( cd term/bin/smedja && cargo bundle --release --target ${{ matrix.target }} --bin smedja )
           APP="target/${{ matrix.target }}/release/bundle/osx/smedja.app"
           DMG="smedja-darwin-${{ matrix.arch }}.dmg"
           mkdir -p /tmp/dmg-stage
