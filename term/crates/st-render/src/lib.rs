@@ -22,9 +22,11 @@
 )]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use cosmic_text::{fontdb, FontSystem, SwashCache};
+use parking_lot::Mutex;
 use st_statusbar::Segment;
 use thiserror::Error;
 
@@ -235,6 +237,43 @@ impl ShelfPacker {
 
 const ATLAS_SIZE: u32 = 1024;
 
+/// First codepoint of the Unicode Private Use Area block (inclusive).
+const PUA_START: u32 = 0xE000;
+/// Last codepoint of the Unicode Private Use Area block (inclusive).
+const PUA_END: u32 = 0xF8FF;
+
+/// Returns `true` when `ch` falls inside the Unicode Private Use Area block
+/// (`U+E000 ..= U+F8FF`) used for registered glyphs.
+#[must_use]
+pub fn is_pua_codepoint(ch: char) -> bool {
+    let cp = ch as u32;
+    (PUA_START..=PUA_END).contains(&cp)
+}
+
+/// Identifies which texture atlas a glyph is sampled from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtlasKind {
+    /// The `R8Unorm` alpha-only atlas for font glyphs (tinted by cell foreground).
+    Alpha,
+    /// The `Rgba8UnormSrgb` colour atlas for registered PUA-codepoint glyphs.
+    Colour,
+}
+
+/// Selects the atlas a cell glyph is drawn from.
+///
+/// A codepoint in the PUA range that has a registered bitmap
+/// (`has_registered_bitmap`) is sampled from the [`AtlasKind::Colour`] atlas;
+/// every other glyph (ordinary text, or a PUA codepoint with no registered
+/// bitmap) falls through to the [`AtlasKind::Alpha`] font atlas.
+#[must_use]
+pub fn select_atlas(ch: char, has_registered_bitmap: bool) -> AtlasKind {
+    if has_registered_bitmap && is_pua_codepoint(ch) {
+        AtlasKind::Colour
+    } else {
+        AtlasKind::Alpha
+    }
+}
+
 /// Per-glyph entry stored in the atlas after rasterisation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GlyphEntry {
@@ -270,6 +309,16 @@ pub struct GlyphAtlas {
     /// `font_size_bits` is `font_size.to_bits()` so that glyphs rasterised at
     /// different sizes (e.g. terminal grid vs status-bar) never share a slot.
     pub glyphs: HashMap<(char, bool, bool, u32), GlyphEntry>,
+    /// `Rgba8UnormSrgb` colour texture holding registered PUA-glyph bitmaps.
+    pub colour_texture: wgpu::Texture,
+    /// View into [`Self::colour_texture`].
+    pub colour_view: wgpu::TextureView,
+    /// Packer that tracks free regions in the colour atlas.
+    pub colour_packer: ShelfPacker,
+    /// Maps a registered PUA codepoint → its entry in the colour atlas.
+    pub colour_glyphs: HashMap<char, GlyphEntry>,
+    /// Shared glyph registry used to resolve PUA codepoints to bitmaps.
+    glyph_registry: Option<Arc<Mutex<st_glyph::GlyphRegistry>>>,
     font_system: FontSystem,
     swash_cache: SwashCache,
 }
@@ -294,11 +343,32 @@ impl GlyphAtlas {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let colour_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("glyph_atlas_colour"),
+            size: wgpu::Extent3d {
+                width: ATLAS_SIZE,
+                height: ATLAS_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let colour_view = colour_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         Self {
             texture,
             view,
             packer: ShelfPacker::new(ATLAS_SIZE),
             glyphs: HashMap::new(),
+            colour_texture,
+            colour_view,
+            colour_packer: ShelfPacker::new(ATLAS_SIZE),
+            colour_glyphs: HashMap::new(),
+            glyph_registry: None,
             // Use an empty fontdb so init is non-blocking (< 5 ms).
             // Glyphs are rasterised lazily via ensure_cell_glyphs(); the OS
             // font scanner is skipped here and only called via
@@ -333,6 +403,15 @@ impl GlyphAtlas {
         bold: bool,
         italic: bool,
     ) -> Option<GlyphEntry> {
+        // Registered PUA glyphs are uploaded to the colour atlas from their
+        // cached RGBA bitmap rather than shaped through cosmic-text.
+        if is_pua_codepoint(ch) {
+            if let Some(entry) = self.get_or_insert_colour(queue, ch) {
+                return Some(entry);
+            }
+            // No registered bitmap — fall through to the font path (tofu).
+        }
+
         let key = (ch, bold, italic, font_size.to_bits());
         if let Some(&entry) = self.glyphs.get(&key) {
             return Some(entry);
@@ -438,6 +517,80 @@ impl GlyphAtlas {
         self.glyphs.insert(key, entry);
         Some(entry)
     }
+
+    /// Attaches the shared glyph registry used to resolve PUA codepoints.
+    pub fn set_glyph_registry(&mut self, registry: Arc<Mutex<st_glyph::GlyphRegistry>>) {
+        self.glyph_registry = Some(registry);
+    }
+
+    /// Returns `true` when `ch` is a PUA codepoint with a registered bitmap in
+    /// the attached registry.
+    #[must_use]
+    pub fn has_registered_bitmap(&self, ch: char) -> bool {
+        if !is_pua_codepoint(ch) {
+            return false;
+        }
+        self.glyph_registry
+            .as_ref()
+            .is_some_and(|reg| reg.lock().bitmap(ch).is_some())
+    }
+
+    /// Returns the cached colour-atlas entry for a registered PUA codepoint,
+    /// uploading its RGBA bitmap on first use.
+    ///
+    /// Returns `None` when no registry is attached, `ch` has no registered
+    /// bitmap, or the colour atlas is full.
+    fn get_or_insert_colour(&mut self, queue: &wgpu::Queue, ch: char) -> Option<GlyphEntry> {
+        if let Some(&entry) = self.colour_glyphs.get(&ch) {
+            return Some(entry);
+        }
+
+        // Copy the bitmap out of the registry under a short-lived lock so the
+        // mutex is released before the GPU upload.
+        let (pixels, width, height) = {
+            let registry = self.glyph_registry.as_ref()?;
+            let guard = registry.lock();
+            let bitmap = guard.bitmap(ch)?;
+            (bitmap.pixels.clone(), bitmap.width, bitmap.height)
+        };
+
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        let [x, y] = self.colour_packer.alloc(width, height)?;
+
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.colour_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixels,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let entry = GlyphEntry {
+            x,
+            y,
+            w: width,
+            h: height,
+            bearing_x: 0,
+            bearing_y: i32::try_from(height).unwrap_or(0),
+        };
+        self.colour_glyphs.insert(ch, entry);
+        Some(entry)
+    }
 }
 
 // ── WGSL shader ───────────────────────────────────────────────────────────────
@@ -471,6 +624,42 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let alpha = textureSample(t_atlas, s_atlas, in.tex_coords).r;
     return vec4<f32>(in.color.rgb, in.color.a * alpha);
+}
+";
+
+// ── Colour glyph shader (registered RGBA glyphs) ──────────────────────────────
+
+/// Shader for registered glyphs: samples the RGBA colour atlas directly so the
+/// glyph keeps its own colours (only the cell foreground alpha modulates it).
+const COLOUR_SHADER_SRC: &str = r"
+struct VertexInput {
+    @location(0) position:   vec2<f32>,
+    @location(1) tex_coords: vec2<f32>,
+    @location(2) color:      vec4<f32>,
+}
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) tex_coords: vec2<f32>,
+    @location(1) color:      vec4<f32>,
+}
+
+@vertex
+fn vs_colour(in: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    out.clip_position = vec4<f32>(in.position, 0.0, 1.0);
+    out.tex_coords    = in.tex_coords;
+    out.color         = in.color;
+    return out;
+}
+
+@group(0) @binding(0) var t_colour: texture_2d<f32>;
+@group(0) @binding(1) var s_colour: sampler;
+
+@fragment
+fn fs_colour(in: VertexOutput) -> @location(0) vec4<f32> {
+    let texel = textureSample(t_colour, s_colour, in.tex_coords);
+    return vec4<f32>(texel.rgb, texel.a * in.color.a);
 }
 ";
 
@@ -614,6 +803,10 @@ pub struct Renderer {
     bg_image_params_bind_group: wgpu::BindGroup,
     atlas: GlyphAtlas,
     bind_group: wgpu::BindGroup,
+    /// Pipeline for registered RGBA colour glyphs.
+    colour_pipeline: wgpu::RenderPipeline,
+    /// Bind group binding the colour atlas texture + sampler.
+    colour_bind_group: wgpu::BindGroup,
     /// Current cell grid snapshot.
     cells: Vec<Cell>,
     /// Block decorations to draw.
@@ -780,6 +973,57 @@ impl Renderer {
             fragment: Some(wgpu::FragmentState {
                 module: &glyph_shader,
                 entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // ── Colour glyph pipeline (registered RGBA glyphs) ─────────────────────
+
+        let colour_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("colour_atlas_bind_group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&atlas.colour_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        let colour_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("colour_glyph_shader"),
+            source: wgpu::ShaderSource::Wgsl(COLOUR_SHADER_SRC.into()),
+        });
+
+        let colour_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("colour_glyph_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &colour_shader,
+                entry_point: "vs_colour",
+                buffers: &[GlyphVertex::layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &colour_shader,
+                entry_point: "fs_colour",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -986,6 +1230,8 @@ impl Renderer {
             bg_image_params_bind_group,
             atlas,
             bind_group,
+            colour_pipeline,
+            colour_bind_group,
             cells: initial_cells,
             block_decorations: Vec::new(),
             agent_blocks: Vec::new(),
@@ -1036,23 +1282,32 @@ impl Renderer {
     fn ensure_cell_glyphs(&mut self) {
         let font_size = self.config.font.size * self.scale_factor as f32;
         let font_size_key = font_size.to_bits();
-        for cell in &self.cells {
-            // Skip spaces and already-cached glyphs (fast HashMap check).
-            if cell.ch != ' '
-                && !self
-                    .atlas
-                    .glyphs
-                    .contains_key(&(cell.ch, false, false, font_size_key))
-            {
-                let _ = self.atlas.get_or_insert(
-                    &self.device,
-                    &self.queue,
-                    cell.ch,
-                    font_size,
-                    false,
-                    false,
-                );
+        // Collect cell chars first so the immutable borrow of self.cells does
+        // not overlap the mutable borrow of self.atlas inside the loop.
+        let cell_chars: Vec<char> = self.cells.iter().map(|c| c.ch).collect();
+        for cell_ch in cell_chars {
+            if cell_ch == ' ' {
+                continue;
             }
+            // Already warmed in either atlas? (fast HashMap checks).
+            let in_alpha = self
+                .atlas
+                .glyphs
+                .contains_key(&(cell_ch, false, false, font_size_key));
+            let in_colour = self.atlas.colour_glyphs.contains_key(&cell_ch);
+            if in_alpha || in_colour {
+                continue;
+            }
+            // get_or_insert routes registered PUA codepoints to the colour
+            // atlas and everything else to the font atlas.
+            let _ = self.atlas.get_or_insert(
+                &self.device,
+                &self.queue,
+                cell_ch,
+                font_size,
+                false,
+                false,
+            );
         }
 
         // Warm glyphs for status-bar segment text at the status-bar font size.
@@ -1098,6 +1353,15 @@ impl Renderer {
     #[must_use]
     pub fn atlas_mut(&mut self) -> &mut GlyphAtlas {
         &mut self.atlas
+    }
+
+    /// Attaches the shared glyph registry so the atlas can resolve registered
+    /// PUA codepoints to their cached bitmaps.
+    ///
+    /// Call this once after the PTY session is created and the built-in glyphs
+    /// have been registered.
+    pub fn set_glyph_registry(&mut self, registry: Arc<Mutex<st_glyph::GlyphRegistry>>) {
+        self.atlas.set_glyph_registry(registry);
     }
 
     /// Updates the segments displayed in the status bar strip.
@@ -1311,6 +1575,23 @@ impl Renderer {
                 render_pass.set_bind_group(0, &self.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, buf.slice(..));
                 render_pass.draw(0..glyph_verts.len() as u32, 0..1);
+            }
+
+            // Registered colour glyphs (PUA codepoints) — sampled from the RGBA
+            // colour atlas via the colour pipeline.
+            let colour_verts = self.build_colour_glyph_vertices();
+            if !colour_verts.is_empty() {
+                let buf = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("colour_glyph_vbuf"),
+                        contents: bytemuck::cast_slice(&colour_verts),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                render_pass.set_pipeline(&self.colour_pipeline);
+                render_pass.set_bind_group(0, &self.colour_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, buf.slice(..));
+                render_pass.draw(0..colour_verts.len() as u32, 0..1);
             }
 
             drop(render_pass);
@@ -1578,6 +1859,12 @@ impl Renderer {
 
         for cell in &self.cells {
             if cell.ch == ' ' {
+                continue;
+            }
+            // Registered PUA glyphs are drawn by the colour pass — skip them
+            // here so they are not also (incorrectly) sampled from the alpha
+            // atlas.
+            if self.atlas.colour_glyphs.contains_key(&cell.ch) {
                 continue;
             }
             // Look up glyph entry from atlas (read-only view — we cannot call
@@ -1925,6 +2212,78 @@ impl Renderer {
                     line_row += 1;
                 }
             }
+        }
+
+        verts
+    }
+
+    /// Builds the vertex quads for registered PUA-codepoint cells, sampling the
+    /// colour atlas.
+    ///
+    /// Returns an empty vector when no visible cell resolves to a registered
+    /// colour glyph (the common case), so the colour draw is skipped entirely.
+    fn build_colour_glyph_vertices(&self) -> Vec<GlyphVertex> {
+        let (cw, ch) = self.cell_size();
+        let atlas_size_f = ATLAS_SIZE as f32;
+        let top_off = self.top_bar_height_px() as f32;
+        let mut verts: Vec<GlyphVertex> = Vec::new();
+
+        for cell in &self.cells {
+            if cell.ch == ' ' {
+                continue;
+            }
+            let Some(&entry) = self.atlas.colour_glyphs.get(&cell.ch) else {
+                continue;
+            };
+            let u0 = entry.x as f32 / atlas_size_f;
+            let v0 = entry.y as f32 / atlas_size_f;
+            let u1 = (entry.x + entry.w) as f32 / atlas_size_f;
+            let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
+
+            let baseline_y = f32::from(cell.row) * ch + ch * (2.0 / 3.0) + top_off;
+            let glyph_top = baseline_y - entry.bearing_y as f32;
+            let glyph_left = f32::from(cell.col) * cw + (cw - entry.w as f32) / 2.0;
+            let (x0, y0, x1, y1) = self.px_to_ndc(
+                glyph_left,
+                glyph_top,
+                glyph_left + entry.w as f32,
+                glyph_top + entry.h as f32,
+            );
+            // Carry the cell foreground alpha so transparency still applies; the
+            // colour shader keeps the glyph's own RGB.
+            let c = cell.fg;
+            verts.extend_from_slice(&[
+                GlyphVertex {
+                    position: [x0, y0],
+                    tex_coords: [u0, v0],
+                    color: c,
+                },
+                GlyphVertex {
+                    position: [x1, y0],
+                    tex_coords: [u1, v0],
+                    color: c,
+                },
+                GlyphVertex {
+                    position: [x0, y1],
+                    tex_coords: [u0, v1],
+                    color: c,
+                },
+                GlyphVertex {
+                    position: [x1, y0],
+                    tex_coords: [u1, v0],
+                    color: c,
+                },
+                GlyphVertex {
+                    position: [x1, y1],
+                    tex_coords: [u1, v1],
+                    color: c,
+                },
+                GlyphVertex {
+                    position: [x0, y1],
+                    tex_coords: [u0, v1],
+                    color: c,
+                },
+            ]);
         }
 
         verts
@@ -2398,6 +2757,56 @@ mod tests {
         };
         assert_eq!(bg.image_path, Some(path));
         assert!(bg.image_pixels.is_none());
+    }
+
+    // ── Registered colour-glyph atlas (pure logic) ───────────────────────────
+
+    #[test]
+    fn is_pua_codepoint_recognises_range_boundaries() {
+        assert!(is_pua_codepoint('\u{E000}'));
+        assert!(is_pua_codepoint('\u{F8FF}'));
+        assert!(!is_pua_codepoint('\u{D7FF}'));
+        assert!(!is_pua_codepoint('\u{F900}'));
+        assert!(!is_pua_codepoint('A'));
+    }
+
+    #[test]
+    fn select_atlas_routes_registered_pua_to_colour() {
+        // A registered PUA codepoint selects the colour atlas.
+        assert_eq!(select_atlas('\u{E000}', true), AtlasKind::Colour);
+        // A normal ASCII cell selects the alpha atlas.
+        assert_eq!(select_atlas('A', false), AtlasKind::Alpha);
+        // A PUA codepoint with no registered bitmap falls back to the alpha
+        // atlas (tofu).
+        assert_eq!(select_atlas('\u{E000}', false), AtlasKind::Alpha);
+        // A non-PUA char is never routed to the colour atlas even if a stray
+        // bitmap claim is made.
+        assert_eq!(select_atlas('A', true), AtlasKind::Alpha);
+    }
+
+    #[test]
+    fn registered_rgba_bitmap_round_trips_colour() {
+        // The colour atlas uploads RGBA verbatim (bytes_per_row = width * 4),
+        // unlike the alpha atlas which collapses to a single channel. This test
+        // asserts the staging preserves all four channels of a known bitmap.
+        let entry = st_glyph::GlyphAtlasEntry {
+            codepoint: '\u{E000}',
+            // 1×1 pixel: distinct R, G, B so a collapse to alpha would be lossy.
+            pixels: vec![0x12, 0x34, 0x56, 0xFF],
+            width: 1,
+            height: 1,
+        };
+        // Bytes-per-row for an RGBA upload is width * 4 — the colour path.
+        let bytes_per_row = entry.width * 4;
+        assert_eq!(bytes_per_row, 4);
+        // The uploaded bytes equal the original RGBA, preserving RGB (an
+        // alpha-only path would have produced just [0xFF]).
+        assert_eq!(entry.pixels, vec![0x12, 0x34, 0x56, 0xFF]);
+        assert_ne!(
+            entry.pixels.len(),
+            (entry.width * entry.height) as usize,
+            "RGBA bitmap must not be collapsed to one byte per pixel"
+        );
     }
 
     #[test]

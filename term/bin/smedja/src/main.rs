@@ -320,7 +320,7 @@ impl ApplicationHandler<UserEvent> for App {
 
         // Initialise wgpu renderer — this blocks briefly; in production we'd
         // do this async but pollster makes it tractable here.
-        let renderer =
+        let mut renderer =
             match pollster::block_on(st_render::Renderer::new(Arc::clone(&window), &self.config)) {
                 Ok(r) => r,
                 Err(e) => {
@@ -375,6 +375,10 @@ impl ApplicationHandler<UserEvent> for App {
             let mut reg = pty.glyph_registry.lock();
             st_glyph::register_builtin_glyphs(&mut reg);
         }
+
+        // Share the PTY's glyph registry with the renderer so the atlas can
+        // resolve registered PUA codepoints to their cached bitmaps.
+        renderer.set_glyph_registry(Arc::clone(&pty.glyph_registry));
 
         spawn_agent_bridge(
             self.pane_state.clone(),
@@ -564,8 +568,20 @@ impl ApplicationHandler<UserEvent> for App {
                             git_branch_symbol,
                         )));
                     }
-                    let segments =
+                    let mut segments =
                         st_statusbar::render_status_bar_parallel(&sb_modules, &sb_ctx, 8);
+                    // Resolve the tier badge to a registered PUA glyph (or plain
+                    // fallback text) using the shared registry.
+                    if let Some(tier) = sb_ctx.tier.as_deref() {
+                        let term = std::env::var("TERM").unwrap_or_default();
+                        let badge = {
+                            let reg = pty.glyph_registry.lock();
+                            tier_badge_text(&reg, tier, &term)
+                        };
+                        if let Some(seg) = segments.iter_mut().find(|s| s.name == "tier") {
+                            seg.text = badge;
+                        }
+                    }
                     renderer.set_status_bar_segments(&segments);
 
                     // Build top-bar segments and push them to the renderer.
@@ -770,6 +786,27 @@ fn status_bar_height_for_font(font_size: f32) -> u32 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let px = font_size.max(0.0) as u32;
     px.min(36)
+}
+
+// ── Tier badge resolution ──────────────────────────────────────────────────────
+
+/// Resolves a status-bar tier badge to its display text.
+///
+/// Maps `tier` to its built-in glyph ID via [`st_glyph::glyph_id_for_tier`],
+/// then resolves it against `registry` and `term`: when the terminal supports
+/// APC sequences and the glyph is registered, returns the single PUA codepoint
+/// as a `String`; otherwise returns the plain-text fallback (e.g. `[deep]`).
+///
+/// An unknown tier returns `[<tier>]` unchanged so existing behaviour is kept.
+#[must_use]
+fn tier_badge_text(registry: &st_glyph::GlyphRegistry, tier: &str, term: &str) -> String {
+    let Some(glyph_id) = st_glyph::glyph_id_for_tier(tier) else {
+        return format!("[{tier}]");
+    };
+    match st_glyph::resolve_badge(registry, glyph_id, term) {
+        st_glyph::BadgeRender::Glyph(cp) => cp.to_string(),
+        st_glyph::BadgeRender::Text(text) => text.to_owned(),
+    }
 }
 
 // ── Window title helpers ───────────────────────────────────────────────────────
@@ -1119,7 +1156,30 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::App;
+    use super::{tier_badge_text, App};
+
+    #[test]
+    fn tier_badge_resolves_to_pua_glyph_when_apc_supported() {
+        let mut reg = st_glyph::GlyphRegistry::new();
+        st_glyph::register_builtin_glyphs(&mut reg);
+        let badge = tier_badge_text(&reg, "deep", "xterm-wezterm");
+        let cp = reg.lookup("smedja.tier.deep").expect("deep is registered");
+        assert_eq!(badge, cp.to_string());
+    }
+
+    #[test]
+    fn tier_badge_falls_back_to_text_when_apc_unsupported() {
+        let mut reg = st_glyph::GlyphRegistry::new();
+        st_glyph::register_builtin_glyphs(&mut reg);
+        let badge = tier_badge_text(&reg, "deep", "xterm-256color");
+        assert_eq!(badge, "[deep]");
+    }
+
+    #[test]
+    fn tier_badge_unknown_tier_is_unchanged() {
+        let reg = st_glyph::GlyphRegistry::new();
+        assert_eq!(tier_badge_text(&reg, "cloud", "xterm-wezterm"), "[cloud]");
+    }
 
     fn make_app() -> App {
         let config = st_config::Config::default();
