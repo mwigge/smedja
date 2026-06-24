@@ -57,6 +57,11 @@ impl LandlockBackend {
     fn apply(root: &Path, git_dir: &Path, _policy: NetworkPolicy) -> std::io::Result<()> {
         let abi = ABI::V1;
         let map_err = |e: landlock::RulesetError| std::io::Error::other(format!("landlock: {e}"));
+        // PathFd::new's error type is landlock-internal; map it to io::Error by
+        // its Display so this io::Result function can propagate it uniformly.
+        let open = |p: &Path| {
+            PathFd::new(p).map_err(|e| std::io::Error::other(format!("landlock path: {e}")))
+        };
 
         // Filesystem confinement only (ABI v1). Network egress is governed by
         // the daemon's is_blocked_ip floor, not Landlock — see the module docs.
@@ -66,22 +71,15 @@ impl LandlockBackend {
             .create()
             .map_err(map_err)?;
 
-        // Read-write under the confined root. PathFd::new yields std::io::Error,
-        // which propagates directly through this io::Result function.
+        // Read-write under the confined root.
         created = created
-            .add_rule(PathBeneath::new(
-                PathFd::new(root)?,
-                AccessFs::from_all(abi),
-            ))
+            .add_rule(PathBeneath::new(open(root)?, AccessFs::from_all(abi)))
             .map_err(map_err)?;
 
         // Read-only .git (read access only; no write).
         if git_dir.exists() {
             created = created
-                .add_rule(PathBeneath::new(
-                    PathFd::new(git_dir)?,
-                    AccessFs::from_read(abi),
-                ))
+                .add_rule(PathBeneath::new(open(git_dir)?, AccessFs::from_read(abi)))
                 .map_err(map_err)?;
         }
 
@@ -89,7 +87,7 @@ impl LandlockBackend {
         if Path::new("/tmp").exists() {
             created = created
                 .add_rule(PathBeneath::new(
-                    PathFd::new("/tmp")?,
+                    open(Path::new("/tmp"))?,
                     AccessFs::from_all(abi),
                 ))
                 .map_err(map_err)?;
