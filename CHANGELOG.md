@@ -6,6 +6,31 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.14.0] — 2026-06-25
+
+### Added
+
+- Token economy: an attributed, multi-source tokens-saved ledger (`filter`/`crusher`/`cold-context`/`cache`), a savings rollup with an efficiency ratio, surfaced as an always-on `st-statusbar` efficiency segment, in the TUI metrics panel, and via `smj savings`. Provider cache reads count as savings, kept distinct from compression.
+- Lean specs: an umbrella + slice model — the umbrella holds the durable thought-trail with detail chunked into the vault; thin slices link to it by pointer; loading is hybrid (intent in the KV-cached prefix, detail recalled per slice via cold-context); savings self-measured as `source=lean-spec`.
+- Pluggable vault embedder: an `Embedder` port (FNV the offline default, a local `/v1/embeddings` learned backend) with per-row model/dim versioning, same-model-only comparison, and a `vault.reembed` backfill.
+- Command-aware output filtering: `bash`/`run_command` output compressed by command-keyed strategies, configurable via `.smedja/filters.toml`, with the full output teed to the vault for recovery and savings recorded.
+- Local-model UX: inventory, GPU probe, hot-swap, and install orchestration via `local.*` RPCs and `smj local`.
+- Time-tiered local metrics rollups and a live TUI metrics panel (`Ctrl-T`).
+- Sandbox read + network confinement: a tightened Landlock read allow-list so host secrets are unreadable, and best-effort network-namespace confinement (degrades to filesystem-confined host network where namespaces are unavailable).
+- TUI: `@file`/`@git`/`@branch`/`@shell` context-fragment expansion; session resume via `--session`/`/resume`; an inline `y`/`n`/`m` cowork approval that honours the daemon's resolved contract.
+- Terminal: Glyph Protocol PUA registration wired end to end (RGBA colour atlas).
+- Cross-provider cache hints (OpenAI/Gemini) plus cross-turn cache-aligner persistence keyed by `(session, runner)`.
+
+### Changed
+
+- Methodology is now foundational: TDD + clean are always-on, steer-first (a directive in the sealed system prefix), default-on with a `.smedja/config.toml` escape; the diff gate is a sane backstop (TDD advisory, only `clean` hard-blocks).
+- CI runs once per PR and once per merge to `main` (no duplicate push+PR runs) and cancels superseded runs.
+- `smedja-agent-events` wire schema bumped `1 → 2` (backward-compatible) to carry a cumulative efficiency figure on `TurnEnd`.
+
+### Removed
+
+- The `/tdd` and `/ponytail` TUI commands and the selectable `tdd`/`ponytail`/`sre` methodology modes; ponytail ships as a review skill instead.
+
 ## [0.13.0] — 2026-06-24
 
 ### Added
