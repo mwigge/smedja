@@ -188,6 +188,10 @@ impl App {
         match event_loop.create_window(attrs) {
             Ok(w) => {
                 let w = Arc::new(w);
+                #[cfg(target_os = "linux")]
+                if let Some(icon) = load_window_icon() {
+                    w.set_window_icon(Some(icon));
+                }
                 info!("opened window {:?}", w.id());
                 self.windows.insert(w.id(), w);
             }
@@ -317,6 +321,11 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+
+        #[cfg(target_os = "linux")]
+        if let Some(icon) = load_window_icon() {
+            window.set_window_icon(Some(icon));
+        }
 
         // Initialise wgpu renderer — this blocks briefly; in production we'd
         // do this async but pollster makes it tractable here.
@@ -1115,6 +1124,19 @@ fn spawn_agent_bridge(state: SharedPaneState, agent_manager: SharedAgentManager,
             });
         })
         .ok();
+}
+
+// ── Window icon ───────────────────────────────────────────────────────────────
+
+/// Loads the smedja brand icon from the embedded PNG and returns a winit `Icon`.
+///
+/// Only called on Linux; macOS uses the `.icns` bundle resource. Returns `None`
+/// on decode or icon-creation failure so the caller can skip silently.
+fn load_window_icon() -> Option<winit::window::Icon> {
+    let png_bytes = include_bytes!("../../../../assets/brand/smedja-256.png");
+    let img = image::load_from_memory(png_bytes).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    winit::window::Icon::from_rgba(img.into_raw(), w, h).ok()
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
