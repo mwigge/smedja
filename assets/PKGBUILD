@@ -7,8 +7,9 @@ pkgdesc="GPU-accelerated terminal emulator and AI orchestration forge"
 arch=('x86_64' 'aarch64')
 url="https://github.com/mwigge/smedja"
 license=('Apache-2.0')
-depends=('libssl.so')
-optdepends=('ttf-jetbrains-mono: monospace font for the terminal')
+depends=('libssl.so' 'wl-clipboard')
+optdepends=('ttf-jetbrains-mono: monospace font for the terminal'
+            'xclip: X11 clipboard fallback (not needed under Wayland)')
 provides=('smedja')
 
 source_x86_64=("smedja-linux-x86_64.tar.gz::https://github.com/mwigge/smedja/releases/download/v${pkgver}/smedja-linux-x86_64.tar.gz")

@@ -191,6 +191,27 @@ PLIST_EOF
   fi
 fi
 
+# ── Linux: clipboard dependency ───────────────────────────────────────────────
+# smedja-tui uses wl-copy (Wayland) or xclip (X11) to write to the system
+# clipboard. Install wl-clipboard unless a suitable tool is already present.
+if [ "$OS" = "linux" ]; then
+  if ! command -v wl-copy >/dev/null 2>&1 && ! command -v xclip >/dev/null 2>&1; then
+    if command -v pacman >/dev/null 2>&1; then
+      echo "installing wl-clipboard (required for copy support)..."
+      sudo pacman -S --noconfirm wl-clipboard 2>/dev/null || \
+        echo "  warning: could not install wl-clipboard — install it manually: sudo pacman -S wl-clipboard"
+    elif command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get install -y wl-clipboard 2>/dev/null || \
+        echo "  warning: could not install wl-clipboard — install it manually: sudo apt-get install wl-clipboard"
+    elif command -v dnf >/dev/null 2>&1; then
+      sudo dnf install -y wl-clipboard 2>/dev/null || \
+        echo "  warning: could not install wl-clipboard — install it manually: sudo dnf install wl-clipboard"
+    else
+      echo "  note: install wl-clipboard (Wayland) or xclip (X11) for clipboard support"
+    fi
+  fi
+fi
+
 # ── Linux: install icon + .desktop + systemd user unit ────────────────────────
 if [ "$OS" = "linux" ] && [ -f "$INSTALL_DIR/smedja" ]; then
   # Icon
