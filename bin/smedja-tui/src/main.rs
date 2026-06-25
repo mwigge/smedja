@@ -818,29 +818,48 @@ fn next_char_boundary(s: &str, pos: usize) -> usize {
     }
 }
 
-fn yank_to_clipboard(lines: &[String]) {
+/// Writes `lines` to the system clipboard.
+///
+/// Tries clipboard tools in order: `pbcopy` (macOS), `wl-copy` (Wayland),
+/// `xclip` (X11), `xsel` (X11 fallback). Returns the tool name on success,
+/// or an error string describing what was tried so the caller can surface it.
+fn yank_to_clipboard(lines: &[String]) -> Result<&'static str, String> {
     use std::io::Write as _;
     let text = lines.join("\n");
-    #[cfg(target_os = "macos")]
-    let mut cmd = std::process::Command::new("pbcopy");
-    #[cfg(not(target_os = "macos"))]
-    let mut cmd = {
-        let mut c = std::process::Command::new("xclip");
-        c.args(["-selection", "clipboard"]);
-        c
-    };
-    let result = cmd
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(text.as_bytes())?;
-            }
-            child.wait()
-        });
-    if let Err(e) = result {
-        tracing::debug!(error = %e, "clipboard write failed");
+
+    let candidates: &[(&str, &[&str])] = &[
+        #[cfg(target_os = "macos")]
+        ("pbcopy", &[]),
+        #[cfg(not(target_os = "macos"))]
+        ("wl-copy", &[]),
+        #[cfg(not(target_os = "macos"))]
+        ("xclip", &["-selection", "clipboard"]),
+        #[cfg(not(target_os = "macos"))]
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+
+    for (bin, args) in candidates {
+        let result = std::process::Command::new(bin)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                if let Some(mut stdin) = child.stdin.take() {
+                    stdin.write_all(text.as_bytes())?;
+                }
+                child.wait()
+            });
+        match result {
+            Ok(status) if status.success() => return Ok(bin),
+            Ok(_) | Err(_) => continue,
+        }
     }
+
+    let tried: Vec<&str> = candidates.iter().map(|(b, _)| *b).collect();
+    Err(format!(
+        "clipboard unavailable — install one of: {}",
+        tried.join(", ")
+    ))
 }
 
 /// Runs `openspec bin args` as a subprocess and returns stdout on success, stderr on error.
@@ -941,9 +960,12 @@ fn handle_mouse(state: &mut AppState, me: MouseEvent) {
                 let hi = screen_row_to_line(start.max(end), top, scroll);
                 let lines = state.main_panel.lines_text(lo, hi);
                 let count = lines.len();
-                yank_to_clipboard(&lines);
+                let msg = match yank_to_clipboard(&lines) {
+                    Ok(_) => format!("\u{2713} {count} lines copied to clipboard"),
+                    Err(e) => e,
+                };
                 state.clipboard = Some(lines.join("\n"));
-                push_system_message(state, format!("\u{2713} {count} lines copied"));
+                push_system_message(state, msg);
             }
             state.mouse_drag_start = None;
             state.mouse_drag_end = None;
@@ -1309,20 +1331,88 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
         }
         "login" => {
             let guidance = if args.is_empty() {
-                "usage: /login <runner>\n\
-                 runners: claude | codex | openai\n\
-                 set ANTHROPIC_API_KEY, OPENAI_API_KEY, or install the claude/codex CLI"
-                    .to_owned()
+                // Scan for installed CLIs so the user sees what's found vs missing.
+                let claude_found = std::process::Command::new("which")
+                    .arg("claude")
+                    .output()
+                    .map_or(false, |o| o.status.success());
+                let codex_found = std::process::Command::new("which")
+                    .arg("codex")
+                    .output()
+                    .map_or(false, |o| o.status.success());
+                let llmctl_found = std::process::Command::new("which")
+                    .arg("llmctl")
+                    .output()
+                    .map_or(false, |o| o.status.success());
+
+                let mut lines = vec![
+                    "available runners:".to_owned(),
+                    format!(
+                        "  claude   [{}]  — Claude.ai subscription (OAuth, no API key needed)",
+                        if claude_found { "installed" } else { "not found" }
+                    ),
+                    format!(
+                        "  codex    [{}]  — OpenAI Codex CLI",
+                        if codex_found { "installed" } else { "not found" }
+                    ),
+                    format!(
+                        "  local    [{}]  — local model via rs-llmctl",
+                        if llmctl_found { "installed" } else { "not found" }
+                    ),
+                    "  copilot              — GitHub Copilot".to_owned(),
+                    "  minimax              — Minimax (set MINIMAX_API_KEY)".to_owned(),
+                    "  berget               — Berget AI (set BERGET_API_KEY)".to_owned(),
+                ];
+                if !claude_found {
+                    lines.push(String::new());
+                    lines.push("to install claude CLI: https://claude.ai/download".to_owned());
+                    lines.push("then run: claude login".to_owned());
+                }
+                lines.join("\n")
             } else {
                 match args {
-                    "claude" => "install claude CLI: https://claude.ai/download\n\
-                                 then set ANTHROPIC_API_KEY in your shell profile"
+                    "claude" => {
+                        let found = std::process::Command::new("which")
+                            .arg("claude")
+                            .output()
+                            .map_or(false, |o| o.status.success());
+                        if found {
+                            "claude CLI is installed — uses your Claude.ai subscription (OAuth).\n\
+                             if not authenticated yet, run: claude login"
+                                .to_owned()
+                        } else {
+                            "claude CLI not found.\n\
+                             install: https://claude.ai/download\n\
+                             then run: claude login\n\
+                             no API key required — uses your Claude.ai subscription."
+                                .to_owned()
+                        }
+                    }
+                    "codex" => {
+                        let found = std::process::Command::new("which")
+                            .arg("codex")
+                            .output()
+                            .map_or(false, |o| o.status.success());
+                        if found {
+                            "codex CLI is installed.\n\
+                             set OPENAI_API_KEY in your shell profile to authenticate."
+                                .to_owned()
+                        } else {
+                            "codex CLI not found.\n\
+                             install: npm install -g @openai/codex\n\
+                             then set OPENAI_API_KEY in your shell profile."
+                                .to_owned()
+                        }
+                    }
+                    "local" => "local runner uses rs-llmctl and a llama-swap proxy.\n\
+                                install rs-llmctl, then restart smdjad."
                         .to_owned(),
-                    "codex" => "install codex CLI: npm install -g @openai/codex\n\
-                                 then set OPENAI_API_KEY in your shell profile"
+                    "copilot" => "copilot runner uses GitHub Copilot.\n\
+                                  authenticate via the copilot CLI or VS Code extension."
                         .to_owned(),
-                    "openai" => "set OPENAI_API_KEY=<your-key> in your shell profile".to_owned(),
-                    other => format!("unknown runner: {other}"),
+                    "minimax" => "set MINIMAX_API_KEY=<your-key> in your shell profile.".to_owned(),
+                    "berget" => "set BERGET_API_KEY=<your-key> in your shell profile.".to_owned(),
+                    other => format!("unknown runner: {other}\nvalid: claude, codex, local, copilot, minimax, berget"),
                 }
             };
             push_system_message(state, guidance);
@@ -1976,15 +2066,18 @@ async fn handle_key(
                 let hi = state.selection_anchor.max(state.selection_end);
                 let lines = state.main_panel.lines_text(lo, hi);
                 let count = lines.len();
-                yank_to_clipboard(&lines);
+                let msg = match yank_to_clipboard(&lines) {
+                    Ok(_) => format!("\u{2713} {count} lines copied to clipboard"),
+                    Err(e) => e,
+                };
                 state.clipboard = Some(lines.join("\n"));
                 state.selection_mode = false;
-                push_system_message(state, format!("\u{2713} {count} lines copied"));
+                push_system_message(state, msg);
                 return Ok(());
             }
             KeyCode::Char('t') => {
                 if let Some(tp) = state.last_traceparent.clone() {
-                    yank_to_clipboard(std::slice::from_ref(&tp));
+                    let _ = yank_to_clipboard(std::slice::from_ref(&tp));
                     state.clipboard = Some(tp.clone());
                     let hint = if state.otlp_configured {
                         // Extract trace_id: field index 1 of the W3C traceparent
@@ -2015,7 +2108,7 @@ async fn handle_key(
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(ref text) = state.clipboard.clone() {
-                yank_to_clipboard(std::slice::from_ref(text));
+                let _ = yank_to_clipboard(std::slice::from_ref(text));
             } else {
                 state.quit = true;
             }
@@ -4997,12 +5090,14 @@ mod tests {
             "drag start must be cleared"
         );
         assert!(state.mouse_drag_end.is_none(), "drag end must be cleared");
+        // After drag release the panel shows either a success message ("lines copied")
+        // or a clipboard-unavailable error — either way something was pushed.
         let has_msg = state
             .main_panel
             .lines_text(0, 200)
             .iter()
-            .any(|l| l.contains("lines copied") || l.contains("✓"));
-        assert!(has_msg, "panel must show copy confirmation message");
+            .any(|l| l.contains("lines copied") || l.contains("✓") || l.contains("clipboard"));
+        assert!(has_msg, "panel must show copy confirmation or clipboard-error message");
     }
 
     #[test]
