@@ -678,15 +678,17 @@ impl ApplicationHandler<UserEvent> for App {
                     }
 
                     if let Err(e) = renderer.render() {
-                        use wgpu::SurfaceError;
-                        match e.downcast_ref::<SurfaceError>() {
+                        // The renderer wraps wgpu::SurfaceError as RenderError::Frame,
+                        // so we must downcast to RenderError, not SurfaceError directly.
+                        if let Some(st_render::RenderError::Frame(
+                            wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated,
+                        )) = e.downcast_ref::<st_render::RenderError>()
+                        {
                             // Surface lost or outdated (Alt-Tab, window covered on
-                            // Wayland) — reconfigure with the current size so the next
-                            // frame renders correctly instead of staying grey/blank.
-                            Some(SurfaceError::Lost | SurfaceError::Outdated) => {
-                                renderer.resize(renderer.size);
-                            }
-                            _ => debug!("render error: {}", e),
+                            // Wayland) — reconfigure so the next frame renders correctly.
+                            renderer.resize(renderer.size);
+                        } else {
+                            debug!("render error: {}", e);
                         }
                     }
                 }
