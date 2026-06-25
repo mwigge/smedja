@@ -491,15 +491,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::Focused(focused) => {
+                info!("Focused({}) occluded_before={}", focused, self.occluded);
                 if focused {
-                    // Gaining focus means the window is visible — clear the
-                    // occlusion flag regardless of whether Occluded(false) fires.
-                    // Some compositors (Hyprland, KDE) never send Occluded(false)
-                    // after an Alt-Tab, leaving self.occluded stuck at true and
-                    // redraws suppressed permanently.
                     self.occluded = false;
-                    // Reconfigure the wgpu surface and kick off a redraw so the
-                    // compositor gets a fresh frame immediately.
                     if let Some(renderer) = &mut self.renderer {
                         renderer.resize(renderer.size);
                     }
@@ -519,8 +513,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
-            // Track occlusion so about_to_wait can skip redraws for invisible windows.
             WindowEvent::Occluded(occluded) => {
+                info!("Occluded({})", occluded);
                 self.occluded = occluded;
                 if !occluded {
                     // Window became visible — reconfigure surface and request a
@@ -547,32 +541,29 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::RedrawRequested => {
-                // If the PTY has new data, update the renderer cells.
                 if let (Some(pty), Some(renderer)) = (&self.pty, &mut self.renderer) {
-                    if pty.dirty.load(Ordering::Acquire) {
-                        // When synchronized output is active (?2026h) the application
-                        // is mid-update; hold the current frame to avoid flicker and
-                        // let dirty stay true so we catch up when ?2026l arrives.
-                        let sync_active = pty.grid.lock().synchronized_output;
-                        if !sync_active {
-                            pty.dirty.store(false, Ordering::Release);
-                            let grid = pty.grid.lock();
-                            let cells: Vec<st_render::Cell> = grid
-                                .cells
-                                .iter()
-                                .flat_map(|row| {
-                                    row.iter().map(|c| st_render::Cell {
-                                        ch: c.ch,
-                                        fg: c.fg,
-                                        bg: c.bg,
-                                        col: c.col,
-                                        row: c.row,
-                                    })
+                    let dirty = pty.dirty.load(Ordering::Acquire);
+                    let sync_active = pty.grid.lock().synchronized_output;
+                    let occluded = self.occluded;
+                    debug!(dirty, sync_active, occluded, "RedrawRequested");
+                    if dirty && !sync_active {
+                        pty.dirty.store(false, Ordering::Release);
+                        let grid = pty.grid.lock();
+                        let cells: Vec<st_render::Cell> = grid
+                            .cells
+                            .iter()
+                            .flat_map(|row| {
+                                row.iter().map(|c| st_render::Cell {
+                                    ch: c.ch,
+                                    fg: c.fg,
+                                    bg: c.bg,
+                                    col: c.col,
+                                    row: c.row,
                                 })
-                                .collect();
-                            drop(grid);
-                            renderer.update_cells(&cells);
-                        }
+                            })
+                            .collect();
+                        drop(grid);
+                        renderer.update_cells(&cells);
                     }
 
                     // Evaluate status bar modules and update the renderer.
@@ -730,20 +721,19 @@ impl ApplicationHandler<UserEvent> for App {
                     }
 
                     if let Err(e) = renderer.render() {
-                        // Renderer wraps wgpu::SurfaceError as RenderError::Frame.
                         match e.downcast_ref::<st_render::RenderError>() {
                             Some(st_render::RenderError::Frame(
                                 wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated,
                             )) => {
+                                info!("render: surface Lost/Outdated — reconfiguring");
                                 renderer.resize(renderer.size);
                             }
-                            // Timeout = compositor skipped this frame (vsync throttle).
-                            // Skip silently; the proactive Focused/Occluded reconfigure
-                            // handles the grey-screen case before we ever reach here.
                             Some(st_render::RenderError::Frame(
                                 wgpu::SurfaceError::Timeout,
-                            )) => {}
-                            _ => debug!("render error: {}", e),
+                            )) => {
+                                debug!("render: surface Timeout (vsync skip)");
+                            }
+                            _ => info!("render error: {}", e),
                         }
                     }
                 }
@@ -984,12 +974,13 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
+                debug!("MouseInput {:?} {:?} occluded={}", state, button, self.occluded);
                 if let Some(pty) = &mut self.pty {
                     let btn_code: u8 = match button {
                         MouseButton::Left => 0,
                         MouseButton::Middle => 1,
                         MouseButton::Right => 2,
-                        _ => return, // unknown button (Back/Forward) — skip, but fall through to _ => {}
+                        _ => return, // unknown button (Back/Forward)
                     };
                     let pressed = state == ElementState::Pressed;
                     if pressed {
@@ -1016,7 +1007,9 @@ impl ApplicationHandler<UserEvent> for App {
                         (col, row, grid.mouse_mode, grid.mouse_sgr)
                     };
 
+                    debug!("MouseInput mode={:?} sgr={} col={} row={}", mode, sgr, col, row);
                     if mode == st_pty::MouseMode::None {
+                        debug!("MouseInput: mode=None, not forwarding to PTY");
                         return;
                     }
                     let bytes = if sgr {
