@@ -487,6 +487,17 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::Focused(focused) => {
+                if focused {
+                    // Reconfigure the wgpu surface when the window regains focus.
+                    // On Wayland the compositor may have invalidated or suppressed
+                    // the surface while the window was occluded, leaving a grey
+                    // frame.  Reconfiguring here is the reliable fix; the render-
+                    // error path alone is not sufficient because Wayland can
+                    // suppress frame callbacks without ever surfacing an error.
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.resize(renderer.size);
+                    }
+                }
                 if let Some(pty) = &mut self.pty {
                     let send_focus = pty.grid.lock().focus_events;
                     if send_focus {
@@ -496,6 +507,15 @@ impl ApplicationHandler<UserEvent> for App {
                             debug!("PTY focus event write error: {}", e);
                         }
                     }
+                }
+            }
+
+            // On Wayland a window can be occluded without losing keyboard focus
+            // (e.g. another window overlaps it).  Reconfigure when it becomes
+            // visible again so the compositor gets a fresh surface.
+            WindowEvent::Occluded(false) => {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.resize(renderer.size);
                 }
             }
 
@@ -683,17 +703,20 @@ impl ApplicationHandler<UserEvent> for App {
                     }
 
                     if let Err(e) = renderer.render() {
-                        // The renderer wraps wgpu::SurfaceError as RenderError::Frame,
-                        // so we must downcast to RenderError, not SurfaceError directly.
-                        if let Some(st_render::RenderError::Frame(
-                            wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated,
-                        )) = e.downcast_ref::<st_render::RenderError>()
-                        {
-                            // Surface lost or outdated (Alt-Tab, window covered on
-                            // Wayland) — reconfigure so the next frame renders correctly.
-                            renderer.resize(renderer.size);
-                        } else {
-                            debug!("render error: {}", e);
+                        // Renderer wraps wgpu::SurfaceError as RenderError::Frame.
+                        match e.downcast_ref::<st_render::RenderError>() {
+                            Some(st_render::RenderError::Frame(
+                                wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated,
+                            )) => {
+                                renderer.resize(renderer.size);
+                            }
+                            // Timeout = compositor skipped this frame (vsync throttle).
+                            // Skip silently; the proactive Focused/Occluded reconfigure
+                            // handles the grey-screen case before we ever reach here.
+                            Some(st_render::RenderError::Frame(
+                                wgpu::SurfaceError::Timeout,
+                            )) => {}
+                            _ => debug!("render error: {}", e),
                         }
                     }
                 }
