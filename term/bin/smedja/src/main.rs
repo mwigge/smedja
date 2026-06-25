@@ -492,14 +492,19 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::Focused(focused) => {
                 if focused {
-                    // Reconfigure the wgpu surface when the window regains focus.
-                    // On Wayland the compositor may have invalidated or suppressed
-                    // the surface while the window was occluded, leaving a grey
-                    // frame.  Reconfiguring here is the reliable fix; the render-
-                    // error path alone is not sufficient because Wayland can
-                    // suppress frame callbacks without ever surfacing an error.
+                    // Gaining focus means the window is visible — clear the
+                    // occlusion flag regardless of whether Occluded(false) fires.
+                    // Some compositors (Hyprland, KDE) never send Occluded(false)
+                    // after an Alt-Tab, leaving self.occluded stuck at true and
+                    // redraws suppressed permanently.
+                    self.occluded = false;
+                    // Reconfigure the wgpu surface and kick off a redraw so the
+                    // compositor gets a fresh frame immediately.
                     if let Some(renderer) = &mut self.renderer {
                         renderer.resize(renderer.size);
+                    }
+                    if let Some(w) = self.windows.get(&window_id) {
+                        w.request_redraw();
                     }
                 }
                 if let Some(pty) = &mut self.pty {
@@ -518,10 +523,13 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Occluded(occluded) => {
                 self.occluded = occluded;
                 if !occluded {
-                    // Window became visible — reconfigure the surface so the
-                    // compositor gets a fresh swapchain instead of a stale one.
+                    // Window became visible — reconfigure surface and request a
+                    // frame so content appears without waiting for the next vsync.
                     if let Some(renderer) = &mut self.renderer {
                         renderer.resize(renderer.size);
+                    }
+                    if let Some(w) = self.windows.get(&window_id) {
+                        w.request_redraw();
                     }
                 }
             }
