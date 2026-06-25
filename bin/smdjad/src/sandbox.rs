@@ -18,7 +18,7 @@
 //! egress and shares the daemon's `is_blocked_ip` SSRF floor. A
 //! [`SandboxMode`] governs the fallback when no backend is available.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use which::which;
@@ -44,6 +44,58 @@ const EXEC_TIMEOUT_SECS: u64 = 30;
 /// Marker prefixed to a tool result that ran on the host without confinement.
 pub const UNCONFINED_MARKER: &str = "[unconfined] sandbox unavailable; command ran on the host\n";
 
+/// System directories a sandboxed command may *read* from by default.
+///
+/// This is the read allow-list floor: the directories a shell and common tools
+/// need to load (binaries and shared libraries) and resolve basic system
+/// configuration. It deliberately excludes the user's home directory and its
+/// secret subpaths (`~/.ssh`, `~/.aws`, `~/.config`, `~/.gnupg`) so a sandboxed
+/// command cannot read host credentials. The macOS-only entries
+/// (`/System`, `/Library`, `/private/var/db/dyld`) cover the dyld shared cache
+/// the Seatbelt backend needs. Operators widen the list via
+/// `SMEDJA_SANDBOX_READ_PATHS`; they never shrink it.
+pub(crate) const DEFAULT_READ_PATHS: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/etc",
+    "/opt",
+    #[cfg(target_os = "macos")]
+    "/System",
+    #[cfg(target_os = "macos")]
+    "/Library",
+    #[cfg(target_os = "macos")]
+    "/private/var/db/dyld",
+];
+
+/// Resolves the read allow-list for sandboxed commands.
+///
+/// Starts from [`DEFAULT_READ_PATHS`] and *appends* the colon-separated paths in
+/// `SMEDJA_SANDBOX_READ_PATHS` (operators widen, never replace). Paths that do
+/// not exist on the host are skipped so a missing default (for example
+/// `/lib64` on macOS) is not an error. Backends share this one source of truth
+/// so the read floor is identical across Landlock and Seatbelt.
+#[must_use]
+pub(crate) fn resolve_read_paths() -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = DEFAULT_READ_PATHS.iter().map(PathBuf::from).collect();
+
+    if let Ok(extra) = std::env::var("SMEDJA_SANDBOX_READ_PATHS") {
+        for entry in extra.split(':') {
+            let entry = entry.trim();
+            if !entry.is_empty() {
+                paths.push(PathBuf::from(entry));
+            }
+        }
+    }
+
+    // Skip paths that do not exist on this host (no error); backends that open
+    // an fd per path would otherwise fail on an absent default.
+    paths.retain(|p| p.exists());
+    paths
+}
+
 /// Structured attributes for the `smedja.sandbox.exec` span and the
 /// `smedja.sandbox.unconfined` event. Built once per sandboxed execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +108,12 @@ pub struct SandboxTelemetry {
     pub mode: &'static str,
     /// The confined writable root for this execution.
     pub confined_root: String,
+    /// `true` when the active backend confines the command's filesystem reads
+    /// to the system-dir allow-list plus the confined root.
+    pub read_confined: bool,
+    /// `true` when the active backend denies the command all network egress
+    /// (network policy `none` with an available backend).
+    pub net_confined: bool,
 }
 
 /// Declarative network policy for sandboxed commands.
@@ -330,11 +388,22 @@ impl SandboxExecutor {
     /// `confined_root`.
     #[must_use]
     pub fn telemetry(&self, confined_root: &Path) -> SandboxTelemetry {
+        // Read confinement applies whenever a backend is active (every backend
+        // tightens reads to the allow-list / structural floor). Network
+        // confinement applies only under policy `none`, the sole policy that
+        // denies the subprocess all egress; `allowlist`/`open` retain host
+        // network (open-minus-blocked-ranges for the subprocess).
+        let active = self.available();
+        let read_confined = active;
+        let net_confined = active && matches!(self.network, NetworkPolicy::None);
+
         SandboxTelemetry {
             backend: self.backend_name(),
             network_policy: self.network.as_str(),
             mode: self.mode.as_str(),
             confined_root: confined_root.display().to_string(),
+            read_confined,
+            net_confined,
         }
     }
 
@@ -358,6 +427,8 @@ impl SandboxExecutor {
             network_policy = tel.network_policy,
             mode = tel.mode,
             confined_root = %tel.confined_root,
+            read_confined = tel.read_confined,
+            net_confined = tel.net_confined,
         );
         let _enter = span.enter();
 
@@ -672,6 +743,109 @@ mod tests {
         assert_eq!(tel.backend, "none");
     }
 
+    // ── 1.1 shared read-path resolution ───────────────────────────────────────
+
+    #[test]
+    fn resolve_read_paths_uses_defaults_and_appends_env() {
+        // The defaults must contain core system dirs and must NOT contain the
+        // user's home or secret directories.
+        let home = std::env::var("HOME").unwrap_or_default();
+        for d in DEFAULT_READ_PATHS {
+            // Defaults are absolute system dirs, never under $HOME.
+            assert!(d.starts_with('/'), "default path must be absolute: {d}");
+            if !home.is_empty() {
+                assert!(
+                    !std::path::Path::new(d).starts_with(&home),
+                    "default read paths must not include the home dir: {d}"
+                );
+            }
+        }
+        assert!(
+            DEFAULT_READ_PATHS.contains(&"/usr"),
+            "defaults must include /usr"
+        );
+        assert!(
+            DEFAULT_READ_PATHS.contains(&"/bin"),
+            "defaults must include /bin"
+        );
+
+        // A colon-separated override is appended to (not replacing) the defaults.
+        // Use real, existing directories so the existence filter keeps them.
+        let tmp = tempfile::tempdir().unwrap();
+        let extra_a = tmp.path().join("toola");
+        let extra_b = tmp.path().join("toolb");
+        std::fs::create_dir(&extra_a).unwrap();
+        std::fs::create_dir(&extra_b).unwrap();
+        let override_val = format!("{}:{}", extra_a.display(), extra_b.display());
+
+        // SAFETY: single-threaded test; restored below.
+        unsafe {
+            std::env::set_var("SMEDJA_SANDBOX_READ_PATHS", &override_val);
+        }
+        let resolved = resolve_read_paths();
+        unsafe {
+            std::env::remove_var("SMEDJA_SANDBOX_READ_PATHS");
+        }
+
+        // The override entries are present, appended after the defaults.
+        assert!(
+            resolved.contains(&extra_a),
+            "override path A must be appended; got: {resolved:?}"
+        );
+        assert!(
+            resolved.contains(&extra_b),
+            "override path B must be appended; got: {resolved:?}"
+        );
+        // Non-existent default paths are skipped, but at least one default that
+        // exists on every host (`/usr` or `/etc`) must survive.
+        assert!(
+            resolved
+                .iter()
+                .any(|p| p == std::path::Path::new("/usr") || p == std::path::Path::new("/etc")),
+            "at least one existing default must remain; got: {resolved:?}"
+        );
+    }
+
+    // ── 1.3 telemetry records read/net confinement ────────────────────────────
+
+    #[test]
+    fn telemetry_records_read_and_net_confinement() {
+        // A backend-backed executor under network=none reports both confinements.
+        let ex = SandboxExecutor {
+            backend: Some(Box::new(StubBackend {
+                name: "stub",
+                avail: true,
+            })),
+            mode: SandboxMode::Auto,
+            network: NetworkPolicy::None,
+        };
+        let tel = ex.telemetry(Path::new("/tmp/wt"));
+        assert!(tel.read_confined, "active backend confines reads");
+        assert!(
+            tel.net_confined,
+            "network=none with an active backend confines the network"
+        );
+
+        // No backend → neither confinement applies.
+        let ex = no_backend(SandboxMode::Auto);
+        let tel = ex.telemetry(Path::new("/tmp/wt"));
+        assert!(!tel.read_confined, "no backend → reads not confined");
+        assert!(!tel.net_confined, "no backend → network not confined");
+
+        // open network with a backend → reads confined, network not confined.
+        let ex = SandboxExecutor {
+            backend: Some(Box::new(StubBackend {
+                name: "stub",
+                avail: true,
+            })),
+            mode: SandboxMode::Auto,
+            network: NetworkPolicy::Open,
+        };
+        let tel = ex.telemetry(Path::new("/tmp/wt"));
+        assert!(tel.read_confined);
+        assert!(!tel.net_confined, "open egress is not a confined network");
+    }
+
     // ── 5.1 / 5.2 network policy reuses is_blocked_ip floor ────────────────────
 
     #[test]
@@ -696,5 +870,30 @@ mod tests {
         assert!(NetworkPolicy::Open.permits_dest(public));
         assert!(!NetworkPolicy::Open.permits_dest(imds));
         assert!(!NetworkPolicy::Open.permits_dest(loopback));
+    }
+
+    // ── 7.1 is_blocked_ip floor stays intact under open ───────────────────────
+
+    #[test]
+    fn is_blocked_ip_floor_unchanged_under_open() {
+        use std::net::IpAddr;
+        let imds: IpAddr = "169.254.169.254".parse().unwrap();
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let public: IpAddr = "93.184.216.34".parse().unwrap();
+
+        // The SSRF floor for smedja's own clients is untouched: under `open`
+        // the IMDS and loopback addresses stay blocked, public stays allowed.
+        assert!(
+            !NetworkPolicy::Open.permits_dest(imds),
+            "IMDS must stay blocked under open"
+        );
+        assert!(
+            !NetworkPolicy::Open.permits_dest(loopback),
+            "loopback must stay blocked under open"
+        );
+        assert!(
+            NetworkPolicy::Open.permits_dest(public),
+            "public must stay reachable under open"
+        );
     }
 }
