@@ -1,0 +1,316 @@
+//! Observability panel widget — p95/p99 latency, token throughput, context
+//! fill, daily quota, session cost, and cache efficiency in the right-hand rail.
+//!
+//! Renders below the LSP panel when `Ctrl-O` is active. All data is taken from
+//! `ObsSnapshot`; the widget never fetches or blocks.
+
+use std::collections::VecDeque;
+
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::Frame;
+
+/// Immutable snapshot of all observability data the panel needs to render.
+#[derive(Debug, Clone, Default)]
+pub struct ObsSnapshot {
+    /// Round-trip turn latencies in milliseconds (capped at 50 entries).
+    pub latency_samples: VecDeque<u64>,
+    /// Cumulative input tokens for this session.
+    pub tokens_input: u64,
+    /// Cumulative output tokens for this session.
+    pub tokens_output: u64,
+    /// Context window size in tokens for the active model.
+    pub context_window: u64,
+    /// Context tokens used so far.
+    pub context_used: u64,
+    /// Estimated session cost in USD.
+    pub session_cost_usd: f64,
+    /// `saved / (saved + billed)` over the current savings window.
+    pub efficiency_ratio: f64,
+    /// Tokens saved by cache in the current window.
+    pub cache_saved: i64,
+    /// Daily tokens consumed (`None` when unknown).
+    pub daily_tokens_used: Option<u64>,
+    /// Daily token budget (`None` when unknown or unlimited).
+    pub daily_tokens_limit: Option<u64>,
+}
+
+impl ObsSnapshot {
+    fn p95_ms(&self) -> Option<u64> {
+        percentile(&self.latency_samples, 95)
+    }
+
+    fn p99_ms(&self) -> Option<u64> {
+        percentile(&self.latency_samples, 99)
+    }
+}
+
+fn percentile(samples: &VecDeque<u64>, pct: usize) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<u64> = samples.iter().copied().collect();
+    sorted.sort_unstable();
+    // Index clamped to the last valid position.
+    let idx = ((pct * sorted.len()) / 100).saturating_sub(1).min(sorted.len() - 1);
+    Some(sorted[idx])
+}
+
+fn fmt_ms(ms: u64) -> String {
+    if ms >= 60_000 {
+        format!("{:.1}m", ms as f64 / 60_000.0)
+    } else if ms >= 1_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else {
+        format!("{ms}ms")
+    }
+}
+
+fn fmt_tok(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn fill_bar(value: u64, max: u64, width: usize, color: Color) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
+    let filled = if max == 0 {
+        0usize
+    } else {
+        ((value as f64 / max as f64) * width as f64)
+            .round()
+            .min(width as f64) as usize
+    };
+    let empty = width - filled;
+    Line::from(vec![
+        Span::styled("\u{2588}".repeat(filled), Style::default().fg(color)),
+        Span::styled(
+            "\u{2591}".repeat(empty),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+/// The observability rail panel.
+pub struct ObsPanel<'a> {
+    pub snapshot: &'a ObsSnapshot,
+}
+
+impl<'a> ObsPanel<'a> {
+    #[must_use]
+    pub fn new(snapshot: &'a ObsSnapshot) -> Self {
+        Self { snapshot }
+    }
+
+    pub fn render(&self, area: Rect, frame: &mut Frame) {
+        if area.height < 3 {
+            return;
+        }
+
+        let snap = self.snapshot;
+        let bar_w = (area.width as usize).saturating_sub(6).max(1);
+        let mut lines: Vec<Line<'_>> = Vec::new();
+
+        // ── Latency p95 / p99 ───────────────────────────────────────────────
+        match (snap.p95_ms(), snap.p99_ms()) {
+            (Some(p95), Some(p99)) => {
+                lines.push(Line::from(vec![
+                    Span::styled("p95", Style::default().fg(Color::DarkGray)),
+                    Span::raw(format!(" {:>5}  ", fmt_ms(p95))),
+                    Span::styled("p99", Style::default().fg(Color::DarkGray)),
+                    Span::raw(format!(" {}", fmt_ms(p99))),
+                ]));
+            }
+            _ => {
+                lines.push(Line::from(Span::styled(
+                    "p95  \u{2014}   p99  \u{2014}",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+
+        // ── Token throughput ─────────────────────────────────────────────────
+        let total = snap.tokens_input + snap.tokens_output;
+        lines.push(Line::from(vec![
+            Span::styled("tok ", Style::default().fg(Color::DarkGray)),
+            Span::styled(fmt_tok(total), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("  \u{2191}", Style::default().fg(Color::Green)),
+            Span::raw(fmt_tok(snap.tokens_input)),
+            Span::styled(" \u{2193}", Style::default().fg(Color::Yellow)),
+            Span::raw(fmt_tok(snap.tokens_output)),
+        ]));
+
+        // ── Context fill bar ─────────────────────────────────────────────────
+        if snap.context_window > 0 {
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let pct = ((snap.context_used as f64 / snap.context_window as f64) * 100.0) as u64;
+            let color = if pct > 80 {
+                Color::Red
+            } else if pct > 60 {
+                Color::Yellow
+            } else {
+                Color::Green
+            };
+            let mut bar = fill_bar(snap.context_used, snap.context_window, bar_w, color);
+            bar.spans.push(Span::styled(
+                format!(" {pct:>3}%"),
+                Style::default().fg(Color::DarkGray),
+            ));
+            lines.push(bar);
+        }
+
+        // ── Daily quota bar ──────────────────────────────────────────────────
+        if let (Some(used), Some(limit)) = (snap.daily_tokens_used, snap.daily_tokens_limit) {
+            if limit > 0 {
+                #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+                let pct = ((used as f64 / limit as f64) * 100.0).min(100.0) as u64;
+                let color = if pct > 80 {
+                    Color::Red
+                } else if pct > 60 {
+                    Color::Yellow
+                } else {
+                    Color::Cyan
+                };
+                let mut bar = fill_bar(used, limit, bar_w, color);
+                bar.spans.push(Span::styled(
+                    format!(" dy{pct:>2}%"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                lines.push(bar);
+            }
+        }
+
+        // ── Cost + efficiency ────────────────────────────────────────────────
+        if snap.session_cost_usd > 0.0 || snap.efficiency_ratio > 0.0 {
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let eff_pct = (snap.efficiency_ratio * 100.0).round() as u64;
+            lines.push(Line::from(vec![
+                Span::styled("\u{24}", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{:.3}", snap.session_cost_usd)),
+                Span::styled("  eff ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{eff_pct}%"),
+                    Style::default().fg(Color::Green),
+                ),
+            ]));
+        }
+
+        // ── Cache savings ────────────────────────────────────────────────────
+        if snap.cache_saved > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("cache ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    fmt_tok(snap.cache_saved.max(0) as u64),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::raw(" saved"),
+            ]));
+        }
+
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title("obs")),
+            area,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn snap_with_latency(samples: &[u64]) -> ObsSnapshot {
+        ObsSnapshot {
+            latency_samples: samples.iter().copied().collect(),
+            ..ObsSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn percentile_empty_returns_none() {
+        let empty: VecDeque<u64> = VecDeque::new();
+        assert!(percentile(&empty, 95).is_none());
+    }
+
+    #[test]
+    fn percentile_single_sample() {
+        let single: VecDeque<u64> = vec![1500].into();
+        assert_eq!(percentile(&single, 95), Some(1500));
+        assert_eq!(percentile(&single, 99), Some(1500));
+    }
+
+    #[test]
+    fn percentile_picks_correct_index() {
+        // 10 samples sorted: 100,200,...,1000
+        let samples: VecDeque<u64> = (1..=10).map(|i| i * 100).collect();
+        // p50 of 10 → idx = (50*10/100)-1 = 4 → value 500
+        assert_eq!(percentile(&samples, 50), Some(500));
+        // p90 → idx = (90*10/100)-1 = 8 → value 900
+        assert_eq!(percentile(&samples, 90), Some(900));
+    }
+
+    #[test]
+    fn fmt_ms_rounds_correctly() {
+        assert_eq!(fmt_ms(500), "500ms");
+        assert_eq!(fmt_ms(1500), "1.5s");
+        assert_eq!(fmt_ms(90_000), "1.5m");
+    }
+
+    #[test]
+    fn panel_renders_without_panic() {
+        let snap = ObsSnapshot {
+            latency_samples: vec![1000, 2000, 3000, 4000, 5000].into(),
+            tokens_input: 50_000,
+            tokens_output: 10_000,
+            context_window: 200_000,
+            context_used: 60_000,
+            session_cost_usd: 0.042,
+            efficiency_ratio: 0.25,
+            cache_saved: 9000,
+            ..ObsSnapshot::default()
+        };
+        let panel = ObsPanel::new(&snap);
+        let backend = TestBackend::new(27, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| panel.render(f.area(), f)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(rendered.contains("obs"), "title present: {rendered}");
+    }
+
+    #[test]
+    fn daily_bar_hidden_when_limit_unknown() {
+        let snap = ObsSnapshot {
+            daily_tokens_limit: None,
+            daily_tokens_used: Some(100),
+            ..ObsSnapshot::default()
+        };
+        let panel = ObsPanel::new(&snap);
+        let backend = TestBackend::new(27, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| panel.render(f.area(), f)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(!rendered.contains("dy"), "daily bar must be hidden: {rendered}");
+    }
+}

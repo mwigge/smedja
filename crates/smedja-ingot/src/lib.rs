@@ -641,6 +641,42 @@ impl Ingot {
         session::delete(&self.conn, id)
     }
 
+    /// Deletes sessions with a terminal status (`complete`, `failed`, `orphaned`)
+    /// whose `updated_at` timestamp is older than `older_than_days` days, then
+    /// removes orphaned dependent rows from `checkpoints`, `cost_ledger`,
+    /// `audit_events`, and `tasks`. Returns the number of sessions deleted.
+    pub fn prune_old_sessions(&self, older_than_days: u64) -> Result<usize, IngotError> {
+        let micros_per_day: i64 = 86_400 * 1_000_000;
+        let cutoff = smedja_types::Timestamp::now().as_micros()
+            - i64::try_from(older_than_days).unwrap_or(i64::MAX) * micros_per_day;
+
+        let deleted = self.conn.execute(
+            "DELETE FROM sessions WHERE status IN ('complete','failed','orphaned') AND updated_at < ?1",
+            rusqlite::params![cutoff],
+        )?;
+
+        // Remove dependent rows whose session is gone.
+        for table in &["checkpoints", "cost_ledger", "audit_events"] {
+            self.conn.execute(
+                &format!("DELETE FROM {table} WHERE session_id NOT IN (SELECT id FROM sessions)"),
+                [],
+            )?;
+        }
+        // tasks.session_id is nullable; only prune rows with a non-null orphaned ref.
+        self.conn.execute(
+            "DELETE FROM tasks WHERE session_id IS NOT NULL AND session_id NOT IN (SELECT id FROM sessions)",
+            [],
+        )?;
+
+        Ok(deleted)
+    }
+
+    /// Checkpoints the WAL and rebuilds the database file to reclaim space.
+    pub fn vacuum(&self) -> Result<(), IngotError> {
+        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+        Ok(())
+    }
+
     /// Updates the `status` of a session to `status` and records a new `updated_at`
     /// timestamp using the current Unix epoch.
     ///

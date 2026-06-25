@@ -2,12 +2,15 @@ pub mod action_log;
 mod blocks;
 mod context_rail;
 mod cowork_widget;
+mod lsp_panel;
 pub mod main_panel;
 mod metrics_view;
+mod obs_panel;
 mod staging;
 mod statusbar;
 pub mod theme;
 
+use std::collections::VecDeque;
 use std::io::stdout;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -136,6 +139,7 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/health",
     "/help",
     "/login",
+    "/lsp",
     "/metrics",
     "/model",
     "/pptx",
@@ -146,6 +150,7 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/spec",
     "/switch",
     "/takeover",
+    "/test",
     "/tier",
     "/upgrade",
     "/version",
@@ -161,6 +166,7 @@ slash commands:
   /health            — check daemon connectivity
   /help              — show this message
   /login             — authenticate with runner
+  /lsp               — show LSP server status and diagnostic summary
   /metrics           — show token usage and cost
   /model [name]      — show or set model (local runner: lists GPU fit / hot-swaps)
   /pptx <slug>       — generate PowerPoint
@@ -171,6 +177,7 @@ slash commands:
   /spec              — browse OpenSpec changes
   /switch [runner]   — switch AI runner (omit for interactive picker)
   /takeover <runner> — fork session to new runner
+  /test              — run cargo test and show a pass/fail summary
   /tier <t>          — set tier (local|fast|deep)
   /version           — print current version and check for a newer release
   /upgrade           — download and install the latest release in-place
@@ -192,6 +199,8 @@ keybindings (scroll/normal mode):
   j / k              — scroll down / up
   G                  — scroll to bottom
   gg                 — scroll to top
+  Ctrl-L             — toggle LSP diagnostic panel
+  Ctrl-O             — toggle observability panel
   Ctrl-R             — toggle context rail
   v                  — start line selection (visual mode)
   y                  — yank selection to clipboard
@@ -248,6 +257,9 @@ struct AppState {
     /// per-runner fetch and the `savings.summary` token-economy fetch on one
     /// cadence). `None` forces an immediate fetch on the next tick.
     last_metrics_poll: Option<std::time::Instant>,
+    /// Timestamp of the last obs-panel poll (session.cost + daily token total).
+    /// Independent of `metrics_view_visible` so the obs panel is always current.
+    last_obs_poll: Option<std::time::Instant>,
     /// Cumulative tokens used so far in this session (input + output).
     context_used: u64,
     /// Context window size in tokens for the active model.
@@ -330,6 +342,22 @@ struct AppState {
     history_search_query: String,
     /// Resolved path to the `openspec` binary, or `None` if not installed.
     openspec_bin: Option<PathBuf>,
+    /// Instant of last `lsp.status` / `lsp.diagnostics` RPC poll; `None` before first poll.
+    lsp_last_poll: Option<std::time::Instant>,
+    /// Most recent LSP snapshot (updated from RPC polls every 5 s).
+    lsp_snapshot: smedja_lsp::LspSnapshot,
+    /// Whether the LSP diagnostic panel is visible in the right rail (Ctrl-L).
+    lsp_panel_visible: bool,
+    /// Observability snapshot — updated from turn events + metrics polls.
+    obs_snapshot: obs_panel::ObsSnapshot,
+    /// Whether the observability panel is visible in the right rail (Ctrl-O).
+    obs_panel_visible: bool,
+    /// Last 50 turn round-trip latencies in ms, used for p95/p99 computation.
+    latency_samples: VecDeque<u64>,
+    /// Cumulative input tokens for this session (updated on each turn done event).
+    session_tokens_in: u64,
+    /// Cumulative output tokens for this session.
+    session_tokens_out: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1494,11 +1522,119 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
             }
             Ok(true)
         }
+        "lsp" => {
+            let snap = &state.lsp_snapshot;
+            if snap.servers.is_empty() {
+                push_system_message(state, "lsp: no language servers running (install rust-analyzer, gopls, pyright, or typescript-language-server)");
+            } else {
+                let mut lines = vec!["lsp servers:".to_owned()];
+                for srv in &snap.servers {
+                    let state_str = match &srv.state {
+                        smedja_lsp::ServerState::Starting => "starting".to_owned(),
+                        smedja_lsp::ServerState::Ready => "ready".to_owned(),
+                        smedja_lsp::ServerState::Degraded(r) => format!("degraded ({r})"),
+                    };
+                    lines.push(format!("  {} — {}", srv.name, state_str));
+                }
+                let errs = snap.error_count();
+                let warns = snap.warning_count();
+                lines.push(format!("diagnostics: {errs} error(s), {warns} warning(s)"));
+                for diag in snap.diagnostics.iter().take(10) {
+                    let label = diag.severity.label();
+                    let file = diag.file.display();
+                    let code = diag.code.as_deref().unwrap_or("");
+                    lines.push(format!("  {label} {file}:{} {code} — {}", diag.line, &diag.message[..diag.message.len().min(60)]));
+                }
+                push_system_message(state, lines.join("\n"));
+            }
+            Ok(true)
+        }
+        "test" => {
+            let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            // Detect project type by manifest presence; report when multiple are found.
+            let has_cargo = workspace.join("Cargo.toml").exists();
+            let has_npm   = workspace.join("package.json").exists();
+            let has_go    = workspace.join("go.mod").exists();
+            let has_py    = workspace.join("pyproject.toml").exists();
+            let detected: Vec<&str> = [
+                has_cargo.then_some("Cargo.toml"),
+                has_npm.then_some("package.json"),
+                has_go.then_some("go.mod"),
+                has_py.then_some("pyproject.toml"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if detected.len() > 1 {
+                push_system_message(
+                    state,
+                    format!(
+                        "note: multiple manifests ({}) — using {} (pass /test cargo|npm|go|py to override)",
+                        detected.join(", "),
+                        detected[0]
+                    ),
+                );
+            }
+            let (cmd, cmd_args): (&str, &[&str]) = match args {
+                "cargo" => ("cargo", &["test", "--", "--test-output=immediate"]),
+                "npm"   => ("npm", &["test"]),
+                "go"    => ("go", &["test", "./..."]),
+                "py" | "pytest" => ("python", &["-m", "pytest"]),
+                _ => {
+                    if has_cargo { ("cargo", &["test", "--", "--test-output=immediate"]) }
+                    else if has_npm { ("npm", &["test"]) }
+                    else if has_go { ("go", &["test", "./..."]) }
+                    else if has_py { ("python", &["-m", "pytest"]) }
+                    else { ("cargo", &["test", "--", "--test-output=immediate"]) }
+                }
+            };
+            push_system_message(state, format!("running {cmd} {}\u{2026}", cmd_args.join(" ")));
+            let text = match tokio::process::Command::new(cmd)
+                .args(cmd_args)
+                .current_dir(&workspace)
+                .output()
+                .await
+            {
+                Err(e) => format!("{cmd} failed to start: {e}"),
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let combined = format!("{stdout}{stderr}");
+                    let passed = combined.matches("test result: ok").count()
+                        + combined.matches("PASSED").count()
+                        + combined.matches(" passed").count();
+                    let failed = combined.matches("FAILED").count()
+                        + combined.matches(" failed").count();
+                    let mut summary = format!("test: {passed} passed, {failed} failed");
+                    // Show last 20 lines of output for context.
+                    let tail: Vec<&str> = combined.lines().rev().take(20).collect();
+                    let tail_text: Vec<&str> = tail.into_iter().rev().collect();
+                    if !tail_text.is_empty() {
+                        summary.push('\n');
+                        summary.push_str(&tail_text.join("\n"));
+                    }
+                    summary
+                }
+            };
+            push_system_message(state, text);
+            Ok(true)
+        }
         "quota" => {
-            push_system_message(
-                state,
-                "quota data is not available for this runner. Check your provider dashboard.",
-            );
+            let used = state.obs_snapshot.daily_tokens_used;
+            let limit = state.obs_snapshot.daily_tokens_limit;
+            let text = match (used, limit) {
+                (Some(u), Some(l)) if l > 0 => {
+                    let pct = (u as f64 / l as f64 * 100.0).min(100.0);
+                    format!("quota: {}/{} tokens used ({:.1}%)",
+                        format_token_count(u), format_token_count(l), pct)
+                }
+                (Some(u), _) => format!(
+                    "quota: {} tokens used (no daily limit configured — set SMEDJA_DAILY_TOKEN_LIMIT)",
+                    format_token_count(u)
+                ),
+                (None, _) => "quota: no usage data yet — opens after first turn completes".into(),
+            };
+            push_system_message(state, text);
             Ok(true)
         }
         "login" => {
@@ -2391,6 +2527,16 @@ async fn handle_key(
             toggle_metrics_view(state);
         }
 
+        // Ctrl-L: toggle LSP diagnostic panel in the right rail.
+        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.lsp_panel_visible = !state.lsp_panel_visible;
+        }
+
+        // Ctrl-O: toggle observability panel in the right rail.
+        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.obs_panel_visible = !state.obs_panel_visible;
+        }
+
         KeyCode::Esc => {
             if state.panel_search_mode {
                 state.panel_search_mode = false;
@@ -2622,13 +2768,22 @@ async fn handle_key(
                         }
                     }
                     "status" => {
-                        let cowork_on = false; // ponytail: read from session state when wired
-                        let msg = Message {
-                            role: Role::System,
-                            text: format!("cowork: {}", if cowork_on { "on" } else { "off" }),
-                        };
-                        state.main_panel.push_line(msg.text.clone());
-                        state.messages.push(msg);
+                        let session_id = state.session_id.clone();
+                        match client
+                            .call("session.get", json!({ "id": session_id }))
+                            .await
+                        {
+                            Ok(resp) => {
+                                let cowork_on = resp["cowork_mode"].as_bool().unwrap_or(false);
+                                push_system_message(
+                                    state,
+                                    format!("cowork: {}", if cowork_on { "on" } else { "off" }),
+                                );
+                            }
+                            Err(_) => {
+                                push_system_message(state, "cowork: status unavailable");
+                            }
+                        }
                     }
                     _ => {
                         let msg = Message {
@@ -2962,17 +3117,50 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         frame.render_widget(search_widget, search_area);
     }
 
-    // -- Context rail ---------------------------------------------------------
+    // -- Right rail: context | LSP panel | obs panel -------------------------
+    // The rail is split vertically into 1–3 sections. Context (1 row) is always
+    // present; LSP and obs panels are individually toggled via Ctrl-L / Ctrl-O.
+    // When both are on, obs gets a fixed 9-row allocation and LSP fills the rest.
     if let Some(rail_rect) = rail_area {
-        // Clamp to usize::MAX — context windows are well within usize range on
-        // any 64-bit target, but the explicit clamp satisfies pedantic lints.
+        use Constraint::{Fill, Length};
+
+        let show_lsp = state.lsp_panel_visible;
+        let show_obs = state.obs_panel_visible;
+
+        // Build constraint list dynamically so Layout never gets zero-length.
+        let mut constraints: Vec<Constraint> = vec![Length(1)]; // context row
+        if show_lsp && show_obs {
+            constraints.push(Fill(1));
+            constraints.push(Length(9));
+        } else if show_lsp {
+            constraints.push(Fill(1));
+        } else if show_obs {
+            constraints.push(Fill(1));
+        }
+
+        let rail_chunks = Layout::vertical(constraints).split(rail_rect);
+        let mut ci = 0usize;
+
+        // ── Context slot ──────────────────────────────────────────────────
+        // Clamp to usize::MAX — well within range on 64-bit targets.
         let slots = vec![context_rail::ContextSlot {
             name: "context".into(),
             used: usize::try_from(state.context_used).unwrap_or(usize::MAX),
             total: usize::try_from(state.context_window).unwrap_or(usize::MAX),
         }];
-        let rail = context_rail::ContextRail::new(slots);
-        frame.render_widget(rail, rail_rect);
+        frame.render_widget(context_rail::ContextRail::new(slots), rail_chunks[ci]);
+        ci += 1;
+
+        // ── LSP panel ─────────────────────────────────────────────────────
+        if show_lsp && ci < rail_chunks.len() {
+            lsp_panel::LspPanel::new(&state.lsp_snapshot).render(rail_chunks[ci], frame);
+            ci += 1;
+        }
+
+        // ── Observability panel ───────────────────────────────────────────
+        if show_obs && ci < rail_chunks.len() {
+            obs_panel::ObsPanel::new(&state.obs_snapshot).render(rail_chunks[ci], frame);
+        }
     }
 
     // -- Metrics view ---------------------------------------------------------
@@ -3271,6 +3459,7 @@ async fn main() -> Result<()> {
         metrics_snapshot: Vec::new(),
         savings_snapshot: metrics_view::SavingsSnapshot::default(),
         last_metrics_poll: None,
+        last_obs_poll: None,
         context_used: 0,
         context_window: 200_000,
         main_panel: main_panel::MainPanel::new(),
@@ -3310,6 +3499,14 @@ async fn main() -> Result<()> {
         history_search_mode: false,
         history_search_query: String::new(),
         openspec_bin: which::which("openspec").ok(),
+        lsp_last_poll: None,
+        lsp_snapshot: smedja_lsp::LspSnapshot::default(),
+        lsp_panel_visible: true,
+        obs_snapshot: obs_panel::ObsSnapshot::default(),
+        obs_panel_visible: true,
+        latency_samples: VecDeque::new(),
+        session_tokens_in: 0,
+        session_tokens_out: 0,
     };
 
     // Connect banner — shown on every startup so the user knows what's connected.
@@ -3450,6 +3647,20 @@ async fn main() -> Result<()> {
                         state.turn_submitted_at = None;
                         state.last_traceparent.clone_from(&tp);
 
+                        // Track latency samples for p95/p99 in the obs panel.
+                        if elapsed_ms > 0 {
+                            if state.latency_samples.len() >= LATENCY_SAMPLE_CAP {
+                                state.latency_samples.pop_front();
+                            }
+                            state.latency_samples.push_back(elapsed_ms);
+                            state.obs_snapshot.latency_samples = state.latency_samples.clone();
+                        }
+                        // Accumulate session token totals.
+                        state.session_tokens_in = state.session_tokens_in.saturating_add(input_tok);
+                        state.session_tokens_out = state.session_tokens_out.saturating_add(output_tok);
+                        state.obs_snapshot.tokens_input = state.session_tokens_in;
+                        state.obs_snapshot.tokens_output = state.session_tokens_out;
+
                         let block_content = if let Some(mut block) = state.current_block.take() {
                             block.complete(elapsed_ms);
                             let content = block.content.clone();
@@ -3511,6 +3722,8 @@ async fn main() -> Result<()> {
                             state.context_window = window;
                         }
                     }
+                    state.obs_snapshot.context_used = state.context_used;
+                    state.obs_snapshot.context_window = state.context_window;
                 }
             }
         } else if let Some(task_id) = state.pending_task_id.clone() {
@@ -3583,11 +3796,17 @@ async fn main() -> Result<()> {
                                     state.context_window = window;
                                 }
                             }
+                            state.obs_snapshot.context_used = state.context_used;
+                            state.obs_snapshot.context_window = state.context_window;
                         }
                     }
                     Ok(_) => {
                         state.poll_retry_count += 1;
-                        state.last_poll = None;
+                        // Exponential backoff on non-terminal returns: 100 ms → 200 ms → … → 1 s.
+                        let backoff_ms = (100u64 << state.poll_retry_count.saturating_sub(1)).min(1_000);
+                        state.last_poll = Some(std::time::Instant::now()
+                            - std::time::Duration::from_millis(50)
+                            + std::time::Duration::from_millis(backoff_ms));
                         if state.poll_retry_count % 5 == 1 {
                             state.main_panel.push_line(format!(
                                 "waiting for turn… (poll attempt {})",
@@ -3698,6 +3917,20 @@ async fn main() -> Result<()> {
                 .await
             {
                 state.metrics_snapshot = metrics_rows_from_summary(&resp);
+                // Extract 24h token total for the daily quota bar (buckets array).
+                if let Some(buckets) = resp["buckets"].as_array() {
+                    let total_24h: u64 = buckets
+                        .iter()
+                        .filter_map(|b| {
+                            let i = b["input_tok"].as_u64().unwrap_or(0);
+                            let o = b["output_tok"].as_u64().unwrap_or(0);
+                            Some(i.saturating_add(o))
+                        })
+                        .sum();
+                    if total_24h > 0 {
+                        state.obs_snapshot.daily_tokens_used = Some(total_24h);
+                    }
+                }
             }
 
             // Token-economy savings: daily tier over the last 7 days, matching
@@ -3711,6 +3944,47 @@ async fn main() -> Result<()> {
                 .await
             {
                 state.savings_snapshot = metrics_view::savings_snapshot_from_json(&resp);
+                // Mirror savings data into obs_snapshot.
+                state.obs_snapshot.efficiency_ratio = state.savings_snapshot.efficiency_ratio;
+                state.obs_snapshot.cache_saved = state.savings_snapshot.cache_saved;
+            }
+        }
+
+        // Independent obs-panel poll (session.cost) — runs even when the metrics
+        // overlay is closed so the obs rail always shows current cost.
+        const OBS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+        let obs_due = state
+            .last_obs_poll
+            .is_none_or(|t| t.elapsed() >= OBS_POLL_INTERVAL);
+        if obs_due {
+            state.last_obs_poll = Some(std::time::Instant::now());
+            if let Ok(cost_resp) = client
+                .call("session.cost", json!({ "session_id": &state.session_id }))
+                .await
+            {
+                if let Some(usd) = cost_resp["cost_usd"].as_f64() {
+                    state.obs_snapshot.session_cost_usd = usd;
+                }
+            }
+            // Fetch daily token limit from daemon (reads SMEDJA_DAILY_TOKEN_LIMIT).
+            if let Ok(quota_resp) = client.call("quota.limit", serde_json::Value::Null).await {
+                state.obs_snapshot.daily_tokens_limit =
+                    quota_resp["daily_tokens"].as_u64();
+            }
+        }
+
+        // Poll smdjad for LSP state every 5 s (single canonical source).
+        const LSP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        let lsp_due = state
+            .lsp_last_poll
+            .is_none_or(|t| t.elapsed() >= LSP_POLL_INTERVAL);
+        if lsp_due {
+            state.lsp_last_poll = Some(std::time::Instant::now());
+            if let (Ok(status_resp), Ok(diag_resp)) = (
+                client.call("lsp.status", serde_json::Value::Null).await,
+                client.call("lsp.diagnostics", serde_json::Value::Null).await,
+            ) {
+                state.lsp_snapshot = lsp_snapshot_from_rpc(&status_resp, &diag_resp);
             }
         }
 
@@ -3731,10 +4005,78 @@ async fn main() -> Result<()> {
 
 /// Refresh interval for the metrics panel poll. Metrics are aggregates, not live
 /// deltas, so a slow cadence is correct and cheap.
+/// Maximum number of turn latency samples retained for p95/p99 computation.
+const LATENCY_SAMPLE_CAP: usize = 50;
+
 const METRICS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Window covered by the metrics fetch: the last 24h, in microseconds.
 const METRICS_SINCE_WINDOW_MICROS: i64 = 24 * 3_600 * 1_000_000;
+
+/// Builds an `LspSnapshot` from `lsp.status` and `lsp.diagnostics` RPC responses.
+///
+/// State field: `"starting"` | `"ready"` | `"degraded: <reason>"` (daemon format).
+/// Severity field: `"error"` | `"warning"` | `"info"` | `"hint"` (daemon format).
+fn format_token_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn lsp_snapshot_from_rpc(
+    status_resp: &serde_json::Value,
+    diag_resp: &serde_json::Value,
+) -> smedja_lsp::LspSnapshot {
+    let servers = status_resp["servers"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let name = s["name"].as_str()?.to_owned();
+                    let state_str = s["state"].as_str().unwrap_or("starting");
+                    let state = if state_str == "ready" {
+                        smedja_lsp::ServerState::Ready
+                    } else if let Some(reason) = state_str.strip_prefix("degraded: ") {
+                        smedja_lsp::ServerState::Degraded(reason.to_owned())
+                    } else {
+                        smedja_lsp::ServerState::Starting
+                    };
+                    Some(smedja_lsp::ServerStatus { name, state })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let diagnostics = diag_resp["diagnostics"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| {
+                    let file = std::path::PathBuf::from(d["file"].as_str()?);
+                    let line = u32::try_from(d["line"].as_u64().unwrap_or(1))
+                        .unwrap_or(u32::MAX);
+                    let col = u32::try_from(d["col"].as_u64().unwrap_or(1))
+                        .unwrap_or(u32::MAX);
+                    let severity = match d["severity"].as_str().unwrap_or("error") {
+                        "warning" => smedja_lsp::Severity::Warning,
+                        "info"    => smedja_lsp::Severity::Info,
+                        "hint"    => smedja_lsp::Severity::Hint,
+                        _         => smedja_lsp::Severity::Error,
+                    };
+                    let code = d["code"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+                    let message = d["message"].as_str()?.to_owned();
+                    Some(smedja_lsp::Diagnostic { file, line, col, severity, code, message })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    smedja_lsp::LspSnapshot { servers, diagnostics }
+}
 
 /// Folds a `metrics.summary` response into one [`metrics_view::MetricsRow`] per
 /// runner, in first-seen runner order.
@@ -4664,6 +5006,7 @@ mod tests {
             metrics_snapshot: Vec::new(),
             savings_snapshot: metrics_view::SavingsSnapshot::default(),
             last_metrics_poll: None,
+            last_obs_poll: None,
             context_used: 0,
             context_window: 200_000,
             main_panel: main_panel::MainPanel::new(),
@@ -4702,6 +5045,14 @@ mod tests {
             history_search_mode: false,
             history_search_query: String::new(),
             openspec_bin: None,
+            lsp_last_poll: None,
+            lsp_snapshot: smedja_lsp::LspSnapshot::default(),
+            lsp_panel_visible: true,
+            obs_snapshot: obs_panel::ObsSnapshot::default(),
+            obs_panel_visible: true,
+            latency_samples: VecDeque::new(),
+            session_tokens_in: 0,
+            session_tokens_out: 0,
         }
     }
 

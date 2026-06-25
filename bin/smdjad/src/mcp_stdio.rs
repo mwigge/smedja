@@ -103,10 +103,32 @@ impl McpStdioClient {
 
     /// Spawns the child process with piped stdin/stdout.
     fn spawn(&self) -> Result<StdioChild, String> {
+        // Reject shell metacharacters to prevent injection via DB-seeded commands.
+        const SHELL_METAS: &[char] = &[
+            ';', '&', '|', '`', '$', '>', '<', '(', ')', '{', '}', '\n', '\r',
+        ];
+        if let Some(c) = self.command.chars().find(|ch| SHELL_METAS.contains(ch)) {
+            return Err(format!(
+                "stdio MCP command contains disallowed character '{c}': {}",
+                self.command
+            ));
+        }
+
         let mut parts = self.command.split_whitespace();
         let program = parts
             .next()
             .ok_or_else(|| "empty stdio command".to_owned())?;
+
+        // Require the binary to resolve on PATH (or be an absolute path that exists).
+        if std::path::Path::new(program).is_absolute() {
+            if !std::path::Path::new(program).exists() {
+                return Err(format!("stdio MCP binary not found: {program}"));
+            }
+        } else {
+            which::which(program)
+                .map_err(|_| format!("stdio MCP binary not on PATH: {program}"))?;
+        }
+
         let mut cmd = Command::new(program);
         cmd.args(parts)
             .stdin(Stdio::piped())

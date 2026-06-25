@@ -224,6 +224,7 @@ pub(crate) async fn get(state: HandlerState, params: Value) -> Result<Value, Rpc
         "updated_at": session.updated_at,
         "status": session.status,
         "task_id": session.task_id,
+        "cowork_mode": session.cowork_mode,
     }))
 }
 

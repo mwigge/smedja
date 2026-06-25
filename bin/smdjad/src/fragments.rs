@@ -42,6 +42,12 @@ pub(crate) enum Fragment {
     Branch,
     /// `@shell <cmd>` — inject the command's captured output.
     Shell(String),
+    /// `@clippy` — inject `cargo clippy --message-format=short` output (no
+    /// cowork gate; read-only static analysis, never modifies files).
+    Clippy,
+    /// `@lsp` — inject the current LSP diagnostic snapshot from the daemon's
+    /// `LspManager`. Empty when no language servers are running.
+    Lsp,
 }
 
 /// Per-fragment and per-message size caps, with environment overrides resolved at
@@ -88,7 +94,7 @@ fn env_usize(key: &str) -> Option<usize> {
 
 /// Returns `true` when `kind` names a recognised fragment.
 fn is_known_kind(kind: &str) -> bool {
-    matches!(kind, "file" | "git" | "branch" | "shell")
+    matches!(kind, "file" | "git" | "branch" | "shell" | "clippy" | "lsp")
 }
 
 /// Parses `content` into a sequence of literal-text and recognised-fragment
@@ -174,6 +180,8 @@ fn take_fragment(
     match kind {
         "git" => Some((Fragment::Git, kind_end)),
         "branch" => Some((Fragment::Branch, kind_end)),
+        "clippy" => Some((Fragment::Clippy, kind_end)),
+        "lsp" => Some((Fragment::Lsp, kind_end)),
         "file" => {
             // Skip inline spaces/tabs (not newlines) before the path token.
             let path_start = skip_inline_space(bytes, kind_end);
@@ -234,14 +242,18 @@ fn scan_to_eol(bytes: &[u8], start: usize) -> usize {
 /// cowork approval flow; when `None`, cowork is disabled and `@shell` runs
 /// directly. Surrounding literal text is preserved byte-for-byte.
 ///
+/// `lsp` is the daemon-side LSP manager; when `None`, `@lsp` expands to a
+/// "no LSP servers running" marker instead of silently discarding the fragment.
+///
 /// Resolved content is capped per fragment and per message; over-cap content is
 /// truncated with a visible `[smedja: truncated N bytes]` marker.
 pub(crate) async fn expand(
     content: &str,
     workspace: &std::path::Path,
     gate: Option<&CoworkGate>,
+    lsp: Option<&smedja_lsp::LspManager>,
 ) -> String {
-    expand_with_caps(content, workspace, gate, Caps::from_env()).await
+    expand_with_caps(content, workspace, gate, lsp, Caps::from_env()).await
 }
 
 /// Core of [`expand`] with explicit `caps`, so callers (and tests) can supply
@@ -250,6 +262,7 @@ async fn expand_with_caps(
     content: &str,
     workspace: &std::path::Path,
     gate: Option<&CoworkGate>,
+    lsp: Option<&smedja_lsp::LspManager>,
     caps: Caps,
 ) -> String {
     let fragments = parse(content);
@@ -274,6 +287,14 @@ async fn expand_with_caps(
             Fragment::Shell(cmd) => {
                 let block = resolve_shell(workspace, &cmd, gate).await;
                 push_block(&mut out, "shell", &cmd, block, caps, &mut budget);
+            }
+            Fragment::Clippy => {
+                let block = resolve_clippy(workspace).await;
+                push_block(&mut out, "clippy", "", block, caps, &mut budget);
+            }
+            Fragment::Lsp => {
+                let block = resolve_lsp(lsp);
+                push_block(&mut out, "lsp", "", block, caps, &mut budget);
             }
         }
     }
@@ -337,12 +358,54 @@ async fn resolve_branch(workspace: &std::path::Path) -> Resolved {
     Resolved::Content(body)
 }
 
+/// Resolves an `@clippy` fragment by running `cargo clippy --message-format=short`
+/// in `workspace`. No cowork gate is applied because clippy is read-only static
+/// analysis — but note that `cargo` may run `build.rs` scripts, which can execute
+/// arbitrary code. Only use `@clippy` in workspaces you trust.
+async fn resolve_clippy(workspace: &std::path::Path) -> Resolved {
+    let out = crate::exec_bash("cargo clippy --message-format=short 2>&1", workspace).await;
+    Resolved::Content(out)
+}
+
+/// Resolves an `@lsp` fragment from the daemon's shared `LspManager` snapshot.
+fn resolve_lsp(lsp: Option<&smedja_lsp::LspManager>) -> Resolved {
+    let Some(mgr) = lsp else {
+        return Resolved::Marker("[smedja: @lsp — no LSP manager available]".to_owned());
+    };
+    let snap = mgr.snapshot();
+    if snap.servers.is_empty() {
+        return Resolved::Marker(
+            "[smedja: @lsp — no language servers running (install rust-analyzer, pyright, gopls, etc.)]"
+                .to_owned(),
+        );
+    }
+    let mut lines = vec!["LSP diagnostics:".to_owned()];
+    if snap.diagnostics.is_empty() {
+        lines.push("  (clean — no diagnostics)".to_owned());
+    } else {
+        for d in &snap.diagnostics {
+            let label = d.severity.label();
+            let code = d.code.as_deref().map_or_else(String::new, |c| format!(" {c}"));
+            lines.push(format!(
+                "  {label}{code}  {}:{}  {}",
+                d.file.display(),
+                d.line,
+                d.message
+            ));
+        }
+    }
+    Resolved::Content(lines.join("\n"))
+}
+
 /// Resolves an `@shell` fragment, gating execution through cowork when enabled.
 async fn resolve_shell(
     workspace: &std::path::Path,
     cmd: &str,
     gate: Option<&CoworkGate>,
 ) -> Resolved {
+    if gate.is_none() {
+        tracing::warn!(cmd = %cmd, "executing @shell fragment without cowork gate — enable cowork mode to require human approval");
+    }
     if let Some(gate) = gate {
         let prompt = ApprovalPrompt {
             step_n: 0,
@@ -523,6 +586,7 @@ mod tests {
             "before @file hello.txt after",
             &ws,
             None,
+            None,
             caps(1 << 20, 2_000, 1 << 20),
         )
         .await;
@@ -543,13 +607,13 @@ mod tests {
         tokio::fs::create_dir(&ws).await.unwrap();
 
         let big = caps(1 << 20, 2_000, 1 << 20);
-        let out = expand_with_caps("@file ../secret.txt", &ws, None, big).await;
+        let out = expand_with_caps("@file ../secret.txt", &ws, None, None, big).await;
         assert_eq!(out, "[smedja: @file rejected: path outside workspace]");
         assert!(!out.contains("TOPSECRET"), "no file content leaked: {out}");
 
         // Absolute path outside the workspace is rejected too.
         let abs = parent.join("secret.txt");
-        let out = expand_with_caps(&format!("@file {}", abs.display()), &ws, None, big).await;
+        let out = expand_with_caps(&format!("@file {}", abs.display()), &ws, None, None, big).await;
         assert_eq!(out, "[smedja: @file rejected: path outside workspace]");
         assert!(!out.contains("TOPSECRET"));
     }
@@ -561,10 +625,10 @@ mod tests {
         tokio::fs::create_dir(ws.join("adir")).await.unwrap();
 
         let big = caps(1 << 20, 2_000, 1 << 20);
-        let out = expand_with_caps("@file adir", &ws, None, big).await;
+        let out = expand_with_caps("@file adir", &ws, None, None, big).await;
         assert_eq!(out, "[smedja: @file not a regular file]");
 
-        let out = expand_with_caps("@file missing.txt", &ws, None, big).await;
+        let out = expand_with_caps("@file missing.txt", &ws, None, None, big).await;
         assert!(
             out.starts_with("[smedja: @file unreadable:"),
             "marker: {out}"
@@ -597,7 +661,7 @@ mod tests {
         tokio::fs::write(ws.join("a.txt"), b"two\n").await.unwrap();
         tokio::fs::write(ws.join("b.txt"), b"new\n").await.unwrap();
 
-        let out = expand_with_caps("@git", &ws, None, caps(1 << 20, 2_000, 1 << 20)).await;
+        let out = expand_with_caps("@git", &ws, None, None, caps(1 << 20, 2_000, 1 << 20)).await;
         assert!(out.contains("```git\n"), "fenced header: {out}");
         assert!(out.contains("$ git status --short"), "status label: {out}");
         assert!(out.contains("b.txt"), "untracked file in status: {out}");
@@ -614,7 +678,7 @@ mod tests {
         tokio::fs::write(ws.join("a.txt"), b"one\n").await.unwrap();
         crate::exec_bash("git add a.txt && git commit -q -m init", &ws).await;
 
-        let out = expand_with_caps("@branch", &ws, None, caps(1 << 20, 2_000, 1 << 20)).await;
+        let out = expand_with_caps("@branch", &ws, None, None, caps(1 << 20, 2_000, 1 << 20)).await;
         assert!(out.contains("```branch\n"), "fenced header: {out}");
         assert!(out.contains("branch: work"), "current branch: {out}");
     }
@@ -626,7 +690,7 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         let ws = ws.path().canonicalize().unwrap();
         let out =
-            expand_with_caps("@shell echo hi", &ws, None, caps(1 << 20, 2_000, 1 << 20)).await;
+            expand_with_caps("@shell echo hi", &ws, None, None, caps(1 << 20, 2_000, 1 << 20)).await;
         assert!(out.contains("```shell echo hi\n"), "fenced header: {out}");
         assert!(out.contains("hi"), "command output injected: {out}");
     }
@@ -645,6 +709,7 @@ mod tests {
                 "@shell echo hi",
                 &ws2,
                 Some(&gate2),
+                None,
                 caps(1 << 20, 2_000, 1 << 20),
             )
             .await
@@ -666,6 +731,7 @@ mod tests {
                 "@shell echo nope",
                 &ws2,
                 Some(&gate2),
+                None,
                 caps(1 << 20, 2_000, 1 << 20),
             )
             .await
@@ -720,6 +786,7 @@ mod tests {
         let out = expand_with_caps(
             "@file a.txt @file b.txt",
             &ws,
+            None,
             None,
             caps(1_000_000, 2_000, 8),
         )

@@ -10,6 +10,7 @@ members = [
     "crates/smedja-bellows",
     "crates/smedja-eval",
     "crates/smedja-graph",
+    "crates/smedja-lsp",
     "crates/smedja-ingot",
     "crates/smedja-loop",
     "crates/smedja-memory",
@@ -34,7 +35,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.15.1"
+version = "0.16.0"
 edition    = "2021"
 license    = "Apache-2.0"
 repository = "https://github.com/mwigge/smedja"
