@@ -1,14 +1,27 @@
 ;; smedja macOS Seatbelt profile template.
 ;;
-;; Placeholders substituted at generation time by the SeatbeltBackend:
-;;   @CONFINED_ROOT@  — canonical confined writable root (the active worktree
-;;                      or session workspace)
-;;   @GIT_DIR@        — the confined root's .git directory (read-only)
-;;   @NETWORK_RULE@   — (deny|allow) network* line per the network policy
+;; Placeholders (written here without their at-sign delimiters so this comment
+;; is not itself substituted) are filled at generation time by the backend:
+;;   CONFINED_ROOT  — canonical confined writable root (the active worktree or
+;;                    session workspace)
+;;   GIT_DIR        — the confined root's .git directory (read-only)
+;;   READ_PATHS     — an (allow file-read*) block over the system-dir allow-list
+;;                    (the directories an operator can widen via env var)
+;;   READ_DENY      — a (deny file-read*) block over the user's secret subpaths
+;;   NETWORK_RULE   — the (deny|allow) network* line per the network policy
 ;;
-;; The profile denies by default, grants read-write only under the confined
-;; root (plus an ephemeral /tmp and the system read paths a shell needs), keeps
-;; .git read-only, and applies the network policy.
+;; Read confinement on Seatbelt is enforced by deny-precedence, not by a
+;; tightened allow-list. macOS resolves a program's dynamic libraries from the
+;; dyld shared cache via a read that only a root-level grant satisfies (a
+;; subpath-only allow-list aborts every exec on modern macOS), so the profile
+;; grants a broad file-read base for loader/library reads and then layers
+;; explicit (deny file-read*) rules over the user's secret directories
+;; (~/.ssh, ~/.aws, ~/.config, ~/.gnupg). In Seatbelt the last matching rule
+;; wins, so the denies override the broad allow and the secrets are unreadable
+;; while the shell still loads. The READ_PATHS allow-list documents the
+;; operator-widenable system dirs and keeps one source of truth with the other
+;; backends. Writes are confined to the root (plus an ephemeral /tmp), .git is
+;; read-only, and the network policy is applied.
 
 (version 1)
 (deny default)
@@ -19,9 +32,23 @@
 (allow signal (target self))
 (allow sysctl-read)
 (allow mach-lookup)
+(allow file-read-metadata)
+(allow file-map-executable)
 
-;; System read paths required to launch a shell and common tools.
+;; Broad read base required for the dyld shared cache and the loader to map a
+;; program's libraries. Secret directories are carved back out by the deny
+;; block below (deny wins on last match).
 (allow file-read*)
+
+;; System read paths an operator can widen via SMEDJA_SANDBOX_READ_PATHS. These
+;; are already covered by the broad base above; the block keeps the documented
+;; allow-list visible and consistent with the Landlock/Docker backends.
+@READ_PATHS@
+
+;; Deny reads of the user's secret directories. This is the actual read-
+;; confinement boundary on Seatbelt: the last matching rule wins, so these
+;; denies override the broad allow above and the secrets stay unreadable.
+@READ_DENY@
 
 ;; Read-write only under the confined root.
 (allow file-write*

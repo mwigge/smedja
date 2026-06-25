@@ -12,7 +12,12 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use super::{resolve_confined_root, NetworkPolicy, SandboxBackend, EXEC_TIMEOUT_SECS};
+use super::{
+    resolve_confined_root, resolve_read_paths, NetworkPolicy, SandboxBackend, EXEC_TIMEOUT_SECS,
+};
+
+/// Secret subdirectories of `$HOME` that are explicitly read-denied.
+const SECRET_SUBDIRS: &[&str] = &[".ssh", ".aws", ".config", ".gnupg"];
 
 /// The Seatbelt profile template (lives under `scripts/sandbox/`).
 const PROFILE_TEMPLATE: &str = include_str!("../../../../scripts/sandbox/seatbelt.sb.template");
@@ -41,6 +46,41 @@ impl SeatbeltBackend {
         }
     }
 
+    /// Renders the `(allow file-read*)` block scoped to the system-dir
+    /// allow-list (`resolve_read_paths()`), one `(subpath ...)` per directory.
+    ///
+    /// Replaces the former blanket `(allow file-read*)` so host secrets outside
+    /// the allow-list stay unreadable.
+    fn render_read_paths() -> String {
+        let mut block = String::from("(allow file-read*");
+        for path in resolve_read_paths() {
+            block.push_str("\n  (subpath \"");
+            block.push_str(&path.display().to_string());
+            block.push_str("\")");
+        }
+        block.push(')');
+        block
+    }
+
+    /// Renders the `(deny file-read*)` block over the user's secret subpaths
+    /// (`$HOME/.ssh`, `.aws`, `.config`, `.gnupg`) for defence in depth.
+    ///
+    /// When `$HOME` is unset the block is a harmless no-op deny scoped to the
+    /// secret names under `/` (which the default-deny already covers).
+    fn render_read_deny() -> String {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let mut block = String::from("(deny file-read*");
+        for secret in SECRET_SUBDIRS {
+            block.push_str("\n  (subpath \"");
+            block.push_str(&home);
+            block.push('/');
+            block.push_str(secret);
+            block.push_str("\")");
+        }
+        block.push(')');
+        block
+    }
+
     /// Generates the `.sb` profile string for `confined_root` / `git_dir` under
     /// `policy`.
     pub(crate) fn render_profile(
@@ -51,6 +91,8 @@ impl SeatbeltBackend {
         PROFILE_TEMPLATE
             .replace("@CONFINED_ROOT@", &confined_root.display().to_string())
             .replace("@GIT_DIR@", &git_dir.display().to_string())
+            .replace("@READ_PATHS@", &Self::render_read_paths())
+            .replace("@READ_DENY@", &Self::render_read_deny())
             .replace("@NETWORK_RULE@", Self::network_rule(policy))
     }
 }
@@ -157,5 +199,118 @@ mod tests {
             po.contains("(allow network-outbound)"),
             "open must allow outbound"
         );
+    }
+
+    // ── 3.1 read confinement: deny secrets, allow system dirs ─────────────────
+
+    #[test]
+    fn profile_denies_secret_reads_and_allows_system_reads() {
+        let root = Path::new("/tmp/smedja-confined");
+        let git = Path::new("/tmp/smedja-confined/.git");
+        let p = SeatbeltBackend::render_profile(root, git, NetworkPolicy::None);
+
+        // The documented system-dir allow-list is present and operator-widenable.
+        assert!(
+            p.contains(r#"(subpath "/usr")"#),
+            "system read paths must be allow-listed; got:\n{p}"
+        );
+
+        // The secret directories are explicitly read-denied. On Seatbelt the
+        // last matching rule wins, so these denies are the read-confinement
+        // boundary even though a broad read base loads the dyld shared cache.
+        let home = std::env::var("HOME").unwrap_or_default();
+        for secret in [".ssh", ".aws", ".config", ".gnupg"] {
+            let needle = format!(r#"(subpath "{home}/{secret}")"#);
+            assert!(
+                p.contains(&needle),
+                "secret path {secret} must be read-denied; got:\n{p}"
+            );
+        }
+        assert!(
+            p.contains("(deny file-read*"),
+            "profile must contain a file-read deny over secrets; got:\n{p}"
+        );
+
+        // The deny block must come AFTER the broad allow so deny-precedence
+        // (last match wins) actually carves the secrets back out.
+        let allow_pos = p
+            .find("(allow file-read*)")
+            .expect("broad read base must exist for the dyld cache");
+        let deny_pos = p
+            .find("(deny file-read*")
+            .expect("secret deny block must exist");
+        assert!(
+            deny_pos > allow_pos,
+            "the secret deny must follow the broad allow so it wins; got:\n{p}"
+        );
+
+        // No unsubstituted placeholders remain.
+        assert!(
+            !p.contains('@'),
+            "all placeholders must be substituted; got:\n{p}"
+        );
+    }
+
+    // ── 3.1 (end-to-end) the rendered profile actually denies a secret read ───
+
+    #[tokio::test]
+    async fn seatbelt_exec_denies_secret_read_but_allows_shell() {
+        let backend = SeatbeltBackend::detect();
+        if !backend.available() {
+            // sandbox-exec absent (unexpected on macOS): contract is downgrade.
+            return;
+        }
+
+        // Hermetic HOME so the secret deny targets a path we control. Canonicalise
+        // it: macOS temp dirs live under `/var/folders` which firmlinks to
+        // `/private/var/folders`; the Seatbelt deny must use the same canonical
+        // path the kernel resolves a read to, exactly as a real `$HOME` is
+        // already canonical. The renderer reads HOME at render time inside `exec`.
+        let fake_home_dir = tempfile::tempdir().unwrap();
+        let fake_home = fake_home_dir.path().canonicalize().unwrap();
+        let ssh = fake_home.join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        std::fs::write(ssh.join("id_rsa"), "TOPSECRET-KEY").unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+
+        // SAFETY: single-threaded test section; HOME restored before returning.
+        let prev_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+        }
+
+        // A normal command runs (the shell + libs load under the broad base).
+        let ok = backend
+            .exec("printf alive", &root, NetworkPolicy::Open)
+            .await;
+
+        // Reading the secret is denied (deny-precedence wins).
+        let secret_cmd = format!("cat {}", ssh.join("id_rsa").display());
+        let denied = backend.exec(&secret_cmd, &root, NetworkPolicy::Open).await;
+
+        unsafe {
+            match prev_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert_eq!(
+            ok.as_deref(),
+            Ok("alive"),
+            "the shell must still load and run; got: {ok:?}"
+        );
+        assert!(
+            denied.is_err(),
+            "reading a secret under $HOME/.ssh must be denied; got: {denied:?}"
+        );
+        if let Ok(text) = denied {
+            assert!(
+                !text.contains("TOPSECRET"),
+                "secret content must not leak in output"
+            );
+        }
     }
 }
