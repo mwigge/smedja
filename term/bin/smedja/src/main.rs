@@ -791,6 +791,56 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x, position.y);
+                // Send mouse motion events when a button is held (ButtonEvent mode)
+                // or unconditionally (AnyEvent mode).
+                if let Some(pty) = &mut self.pty {
+                    let (mode, sgr, col, row) = {
+                        let grid = pty.grid.lock();
+                        let sf = self.renderer.as_ref().map_or(1.0_f64, |r| r.scale_factor);
+                        #[allow(clippy::cast_possible_truncation)]
+                        let eff_font = self.config.font.size * sf as f32;
+                        let top_bar_h = self.renderer.as_ref().map_or(0, |r| r.top_bar_height_px());
+                        let phys_x = (position.x * sf) as u32;
+                        let phys_y = (position.y * sf) as u32;
+                        let grid_y = phys_y.saturating_sub(top_bar_h);
+                        let cw = st_glyph::char_advance_width(eff_font).max(1.0);
+                        let ch = st_glyph::line_height(eff_font).max(1.0);
+                        #[allow(clippy::cast_possible_truncation)]
+                        let col = ((phys_x as f32 / cw) as u16).min(grid.cols.saturating_sub(1));
+                        #[allow(clippy::cast_possible_truncation)]
+                        let row = ((grid_y as f32 / ch) as u16).min(grid.rows.saturating_sub(1));
+                        (grid.mouse_mode, grid.mouse_sgr, col, row)
+                    };
+
+                    let should_send = match mode {
+                        st_pty::MouseMode::AnyEvent => true,
+                        st_pty::MouseMode::ButtonEvent => self.mouse_buttons != 0,
+                        _ => false,
+                    };
+
+                    if should_send {
+                        // Motion button code: base 32 + held button (0=left,1=mid,2=right).
+                        let held = if self.mouse_buttons & 1 != 0 {
+                            0u8
+                        } else if self.mouse_buttons & 2 != 0 {
+                            1
+                        } else if self.mouse_buttons & 4 != 0 {
+                            2
+                        } else {
+                            0
+                        };
+                        // Bit 5 (32) signals motion in the button encoding.
+                        let motion_btn = 32u8 + held;
+                        let bytes = if sgr {
+                            encode_mouse_sgr(col, row, motion_btn, true)
+                        } else {
+                            encode_mouse_x10(col, row, motion_btn)
+                        };
+                        if let Err(e) = pty.write_input(&bytes) {
+                            debug!("PTY mouse motion write error: {}", e);
+                        }
+                    }
+                }
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
@@ -799,7 +849,7 @@ impl ApplicationHandler<UserEvent> for App {
                         MouseButton::Left => 0,
                         MouseButton::Middle => 1,
                         MouseButton::Right => 2,
-                        _ => return,
+                        _ => return, // unknown button (Back/Forward) — skip, but fall through to _ => {}
                     };
                     let pressed = state == ElementState::Pressed;
                     if pressed {
@@ -808,17 +858,12 @@ impl ApplicationHandler<UserEvent> for App {
                         self.mouse_buttons &= !(1 << btn_code);
                     }
 
-                    let (col, row) = {
+                    let (col, row, mode, sgr) = {
                         let grid = pty.grid.lock();
                         let sf = self.renderer.as_ref().map_or(1.0_f64, |r| r.scale_factor);
                         #[allow(clippy::cast_possible_truncation)]
                         let eff_font = self.config.font.size * sf as f32;
-                        // Grid starts below the top bar; subtract that offset before
-                        // dividing by cell height so row 0 maps to the first text row.
-                        let top_bar_h = self
-                            .renderer
-                            .as_ref()
-                            .map_or(0, |r| r.top_bar_height_px());
+                        let top_bar_h = self.renderer.as_ref().map_or(0, |r| r.top_bar_height_px());
                         let phys_x = (self.cursor_pos.0 * sf) as u32;
                         let phys_y = (self.cursor_pos.1 * sf) as u32;
                         let grid_y = phys_y.saturating_sub(top_bar_h);
@@ -828,19 +873,16 @@ impl ApplicationHandler<UserEvent> for App {
                         let col = ((phys_x as f32 / cw) as u16).min(grid.cols.saturating_sub(1));
                         #[allow(clippy::cast_possible_truncation)]
                         let row = ((grid_y as f32 / ch) as u16).min(grid.rows.saturating_sub(1));
-                        (col, row)
+                        (col, row, grid.mouse_mode, grid.mouse_sgr)
                     };
 
-                    let bytes = {
-                        let grid = pty.grid.lock();
-                        if grid.mouse_mode == st_pty::MouseMode::None {
-                            return;
-                        }
-                        if grid.mouse_sgr {
-                            encode_mouse_sgr(col, row, btn_code, pressed)
-                        } else {
-                            encode_mouse_x10(col, row, if pressed { btn_code } else { 3 })
-                        }
+                    if mode == st_pty::MouseMode::None {
+                        return;
+                    }
+                    let bytes = if sgr {
+                        encode_mouse_sgr(col, row, btn_code, pressed)
+                    } else {
+                        encode_mouse_x10(col, row, if pressed { btn_code } else { 3 })
                     };
                     if let Err(e) = pty.write_input(&bytes) {
                         debug!("PTY mouse write error: {}", e);
