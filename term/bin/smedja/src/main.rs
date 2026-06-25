@@ -293,16 +293,21 @@ impl App {
         if !self.launch_menu_open {
             return;
         }
-        // Collect the command string before splitting (borrow ends after the block).
         let launch_cmd = self
             .launch_entries
             .get(self.launch_menu_selection)
             .map(|e| e.command.clone());
 
-        if let Some(launch_cmd) = launch_cmd {
-            info!("launch: {}", launch_cmd);
-            // Split the active pane horizontally to host the new command.
-            self.split_active_pane(SplitDirection::Horizontal);
+        if let Some(cmd) = launch_cmd {
+            info!("launch: {}", cmd);
+            // Write the command to the PTY as if the user typed it.
+            if let Some(pty) = &mut self.pty {
+                let mut input = cmd.into_bytes();
+                input.push(b'\r');
+                if let Err(e) = pty.write_input(&input) {
+                    debug!("PTY launch write error: {}", e);
+                }
+            }
         }
         self.launch_menu_open = false;
     }
@@ -1335,9 +1340,10 @@ fn encode_mouse_sgr(col: u16, row: u16, button: u8, pressed: bool) -> Vec<u8> {
 ///
 /// Coordinates are 1-based and clamped to 223 (X10 limit).
 fn encode_mouse_x10(col: u16, row: u16, button: u8) -> Vec<u8> {
-    let cb = (button + 32).min(255) as u8;
-    let cx = ((col + 1) as u8).min(223).saturating_add(32);
-    let cy = ((row + 1) as u8).min(223).saturating_add(32);
+    let cb = button.saturating_add(32);
+    // Clamp in u16 space first to avoid silent truncation when col/row >= 255.
+    let cx = (col + 1).min(223) as u8 + 32;
+    let cy = (row + 1).min(223) as u8 + 32;
     vec![b'\x1b', b'[', b'M', cb, cx, cy]
 }
 

@@ -381,17 +381,26 @@ impl CellGrid {
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
-        self.cells.resize_with(rows as usize, Vec::new);
-        for (r, row) in self.cells.iter_mut().enumerate() {
+        Self::resize_cells(&mut self.cells, cols, rows);
+        // Keep alt_cells in sync so that leaving alt screen after a resize
+        // restores a correctly-sized grid instead of causing dimension mismatches.
+        if self.alt_screen {
+            Self::resize_cells(&mut self.alt_cells, cols, rows);
+        }
+        // Clamp cursor.
+        self.cursor.0 = self.cursor.0.min(cols.saturating_sub(1));
+        self.cursor.1 = self.cursor.1.min(rows.saturating_sub(1));
+    }
+
+    fn resize_cells(cells: &mut Vec<Vec<Cell>>, cols: u16, rows: u16) {
+        cells.resize_with(rows as usize, Vec::new);
+        for (r, row) in cells.iter_mut().enumerate() {
             row.resize_with(cols as usize, || Cell::blank(0, r as u16));
             for (c, cell) in row.iter_mut().enumerate() {
                 cell.col = c as u16;
                 cell.row = r as u16;
             }
         }
-        // Clamp cursor.
-        self.cursor.0 = self.cursor.0.min(cols.saturating_sub(1));
-        self.cursor.1 = self.cursor.1.min(rows.saturating_sub(1));
     }
 
     /// Returns a slice of rows visible at the given scroll offset.
@@ -481,7 +490,15 @@ impl CellGrid {
             let blank = blank_row(self.cols, new_row_idx);
             self.cells.push(blank);
         }
-        self.lines_since_start += 1;
+        // Re-stamp row indices so the renderer positions every cell correctly
+        // after the shift.  Without this, shifted cells retain stale row values
+        // and are drawn at the wrong vertical position.
+        for (r, row) in self.cells.iter_mut().enumerate() {
+            for cell in row.iter_mut() {
+                cell.row = r as u16;
+            }
+        }
+        self.lines_since_start = self.lines_since_start.saturating_add(u32::from(n));
     }
 
     fn scroll_down(&mut self, n: u16) {
@@ -489,6 +506,12 @@ impl CellGrid {
             self.cells.pop();
             let blank = blank_row(self.cols, 0);
             self.cells.insert(0, blank);
+        }
+        // Re-stamp row indices after shift (same reason as scroll_up).
+        for (r, row) in self.cells.iter_mut().enumerate() {
+            for cell in row.iter_mut() {
+                cell.row = r as u16;
+            }
         }
     }
 
@@ -1782,6 +1805,65 @@ mod tests {
         grid.resize(4, 4);
         assert!(grid.cursor.0 < 4);
         assert!(grid.cursor.1 < 4);
+    }
+
+    #[test]
+    fn scroll_up_restamps_row_indices() {
+        let mut grid = make_grid(4, 3);
+        // Fill each row with a character so we can distinguish them.
+        for r in 0..3usize {
+            for c in 0..4usize {
+                grid.cells[r][c].row = r as u16;
+            }
+        }
+        grid.scroll_up(1);
+        // After scrolling up by 1, visual row 0 holds what was row 1.
+        // All cells in cells[0] must report row=0, not the stale row=1.
+        for cell in &grid.cells[0] {
+            assert_eq!(cell.row, 0, "scroll_up must re-stamp row indices");
+        }
+        for cell in &grid.cells[1] {
+            assert_eq!(cell.row, 1);
+        }
+        for cell in &grid.cells[2] {
+            assert_eq!(cell.row, 2);
+        }
+    }
+
+    #[test]
+    fn scroll_down_restamps_row_indices() {
+        let mut grid = make_grid(4, 3);
+        for r in 0..3usize {
+            for c in 0..4usize {
+                grid.cells[r][c].row = r as u16;
+            }
+        }
+        grid.scroll_down(1);
+        for (r, row) in grid.cells.iter().enumerate() {
+            for cell in row {
+                assert_eq!(cell.row, r as u16, "scroll_down must re-stamp row indices");
+            }
+        }
+    }
+
+    #[test]
+    fn scroll_up_n_lines_increments_lines_since_start_correctly() {
+        let mut grid = make_grid(4, 3);
+        grid.scroll_up(5);
+        assert_eq!(grid.lines_since_start, 5, "scroll_up(n) must add n, not 1");
+    }
+
+    #[test]
+    fn resize_also_resizes_alt_cells_when_alt_screen_active() {
+        let mut grid = make_grid(80, 24);
+        grid.enter_alt_screen();
+        assert!(grid.alt_screen);
+        // Resize while alt screen is active.
+        grid.resize(40, 12);
+        // Leave alt screen — must not panic and must have correct dimensions.
+        grid.leave_alt_screen();
+        assert_eq!(grid.cells.len(), 12, "restored cells must have new row count");
+        assert_eq!(grid.cells[0].len(), 40, "restored cells must have new col count");
     }
 
     // ── scroll on last row ────────────────────────────────────────────────────
