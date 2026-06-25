@@ -333,6 +333,14 @@ pub struct CellGrid {
     pub mouse_mode: MouseMode,
     /// Whether SGR extended mouse coordinates are active (`?1006h`).
     pub mouse_sgr: bool,
+    /// Whether bracketed paste mode is active (`?2004h`).
+    pub bracketed_paste: bool,
+    /// Whether focus-in/out events are enabled (`?1004h`).
+    pub focus_events: bool,
+    /// Whether synchronized output mode is active (`?2026h`).
+    pub synchronized_output: bool,
+    /// Decoded clipboard text to be written, drained by the reader thread after each batch.
+    pub pending_clipboard_write: Option<String>,
 }
 
 impl CellGrid {
@@ -362,6 +370,10 @@ impl CellGrid {
             cursor_visible: true,
             mouse_mode: MouseMode::None,
             mouse_sgr: false,
+            bracketed_paste: false,
+            focus_events: false,
+            synchronized_output: false,
+            pending_clipboard_write: None,
         }
     }
 
@@ -815,6 +827,9 @@ impl vte::Perform for VtHandler {
                 1002 => grid.mouse_mode = MouseMode::ButtonEvent,
                 1003 => grid.mouse_mode = MouseMode::AnyEvent,
                 1006 => grid.mouse_sgr = true,
+                1004 => grid.focus_events = true,
+                2004 => grid.bracketed_paste = true,
+                2026 => grid.synchronized_output = true,
                 _ => {}
             },
             'l' if intermediates == [b'?'] => match p.first().copied().unwrap_or(0) {
@@ -822,6 +837,9 @@ impl vte::Perform for VtHandler {
                 25 => grid.cursor_visible = false,
                 1000 | 1002 | 1003 => grid.mouse_mode = MouseMode::None,
                 1006 => grid.mouse_sgr = false,
+                1004 => grid.focus_events = false,
+                2004 => grid.bracketed_paste = false,
+                2026 => grid.synchronized_output = false,
                 _ => {}
             },
             // ── Line delete / insert ─────────────────────────────────────────
@@ -941,6 +959,20 @@ impl vte::Perform for VtHandler {
                         n.title, n.body
                     );
                     grid.notifications.push(n);
+                }
+            }
+            "52" => {
+                // OSC 52 ; Pc ; Pd — clipboard write.
+                // Pd is base64-encoded UTF-8 text; "?" means query (not supported).
+                if let Some(b64) = params.get(2).and_then(|b| std::str::from_utf8(b).ok()) {
+                    if b64 != "?" && !b64.is_empty() {
+                        use base64::Engine as _;
+                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                            if let Ok(text) = String::from_utf8(bytes) {
+                                grid.pending_clipboard_write = Some(text);
+                            }
+                        }
+                    }
                 }
             }
             _ => {
@@ -1331,6 +1363,15 @@ impl PtySession {
                             }
                             parser.advance(&mut handler, byte);
                         }
+                        // Drain any OSC 52 clipboard write queued during parsing.
+                        let pending = handler.grid.lock().pending_clipboard_write.take();
+                        if let Some(text) = pending {
+                            if let Ok(mut cb) = arboard::Clipboard::new() {
+                                if let Err(e) = cb.set_text(text) {
+                                    debug!("OSC 52 clipboard write error: {}", e);
+                                }
+                            }
+                        }
                         dirty.store(true, Ordering::Release);
                     }
                     Err(e) => {
@@ -1390,6 +1431,15 @@ impl PtySession {
                                 }
                             }
                             parser.advance(&mut handler, byte);
+                        }
+                        // Drain any OSC 52 clipboard write queued during parsing.
+                        let pending = handler.grid.lock().pending_clipboard_write.take();
+                        if let Some(text) = pending {
+                            if let Ok(mut cb) = arboard::Clipboard::new() {
+                                if let Err(e) = cb.set_text(text) {
+                                    debug!("OSC 52 clipboard write error: {}", e);
+                                }
+                            }
                         }
                         dirty.store(true, Ordering::Release);
                     }

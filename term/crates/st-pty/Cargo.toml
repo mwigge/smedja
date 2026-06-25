@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 anyhow       = { workspace = true }
 arboard      = "3"
+base64       = "0.22"
 parking_lot  = { workspace = true }
 portable-pty = { workspace = true }
 st-glyph     = { path = "../st-glyph" }

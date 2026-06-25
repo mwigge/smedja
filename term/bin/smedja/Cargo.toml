@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow            = { workspace = true }
+arboard           = "3"
 clap              = { workspace = true }
 dirs              = "5"
 image             = { version = "0.25", default-features = false, features = ["png"] }

@@ -481,27 +481,46 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
+            WindowEvent::Focused(focused) => {
+                if let Some(pty) = &mut self.pty {
+                    let send_focus = pty.grid.lock().focus_events;
+                    if send_focus {
+                        // CSI I = focus gained, CSI O = focus lost (xterm focus protocol)
+                        let bytes: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
+                        if let Err(e) = pty.write_input(bytes) {
+                            debug!("PTY focus event write error: {}", e);
+                        }
+                    }
+                }
+            }
+
             WindowEvent::RedrawRequested => {
                 // If the PTY has new data, update the renderer cells.
                 if let (Some(pty), Some(renderer)) = (&self.pty, &mut self.renderer) {
                     if pty.dirty.load(Ordering::Acquire) {
-                        pty.dirty.store(false, Ordering::Release);
-                        let grid = pty.grid.lock();
-                        let cells: Vec<st_render::Cell> = grid
-                            .cells
-                            .iter()
-                            .flat_map(|row| {
-                                row.iter().map(|c| st_render::Cell {
-                                    ch: c.ch,
-                                    fg: c.fg,
-                                    bg: c.bg,
-                                    col: c.col,
-                                    row: c.row,
+                        // When synchronized output is active (?2026h) the application
+                        // is mid-update; hold the current frame to avoid flicker and
+                        // let dirty stay true so we catch up when ?2026l arrives.
+                        let sync_active = pty.grid.lock().synchronized_output;
+                        if !sync_active {
+                            pty.dirty.store(false, Ordering::Release);
+                            let grid = pty.grid.lock();
+                            let cells: Vec<st_render::Cell> = grid
+                                .cells
+                                .iter()
+                                .flat_map(|row| {
+                                    row.iter().map(|c| st_render::Cell {
+                                        ch: c.ch,
+                                        fg: c.fg,
+                                        bg: c.bg,
+                                        col: c.col,
+                                        row: c.row,
+                                    })
                                 })
-                            })
-                            .collect();
-                        drop(grid);
-                        renderer.update_cells(&cells);
+                                .collect();
+                            drop(grid);
+                            renderer.update_cells(&cells);
+                        }
                     }
 
                     // Evaluate status bar modules and update the renderer.
@@ -766,8 +785,31 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.split_active_pane(SplitDirection::Horizontal);
                                 return;
                             }
-                            // Ctrl+Shift+V → vertical split
+                            // Ctrl+Shift+V → paste from clipboard (with bracketed paste support)
                             "v" => {
+                                if let Some(pty) = &mut self.pty {
+                                    let bracketed = pty.grid.lock().bracketed_paste;
+                                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                                        if let Ok(text) = cb.get_text() {
+                                            let payload = text.into_bytes();
+                                            let data = if bracketed {
+                                                let mut w = b"\x1b[200~".to_vec();
+                                                w.extend_from_slice(&payload);
+                                                w.extend_from_slice(b"\x1b[201~");
+                                                w
+                                            } else {
+                                                payload
+                                            };
+                                            if let Err(e) = pty.write_input(&data) {
+                                                debug!("PTY paste write error: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                                return;
+                            }
+                            // Ctrl+Shift+B → vertical split (was Ctrl+Shift+V before paste)
+                            "b" => {
                                 self.split_active_pane(SplitDirection::Vertical);
                                 return;
                             }
