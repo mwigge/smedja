@@ -27,7 +27,7 @@ use clap::{Parser, Subcommand};
 use tracing::{debug, error, info};
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, KeyEvent, Modifiers, WindowEvent},
+    event::{ElementState, KeyEvent, Modifiers, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{Key, NamedKey},
     window::{Window, WindowId},
@@ -147,6 +147,10 @@ struct App {
     cwd: Option<String>,
     /// Pane UUID string (used as `session_id` in statusbar / window title).
     pane_id: String,
+    /// Last known cursor position in logical pixels.
+    cursor_pos: (f64, f64),
+    /// Which mouse buttons are currently held down.
+    mouse_buttons: u8,
 }
 
 impl App {
@@ -179,6 +183,8 @@ impl App {
                 .ok()
                 .and_then(|p| p.to_str().map(str::to_owned)),
             pane_id: String::new(),
+            cursor_pos: (0.0, 0.0),
+            mouse_buttons: 0,
         }
     }
 
@@ -783,6 +789,65 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_pos = (position.x, position.y);
+            }
+
+            WindowEvent::MouseInput { state, button, .. } => {
+                if let Some(pty) = &mut self.pty {
+                    let btn_code: u8 = match button {
+                        MouseButton::Left => 0,
+                        MouseButton::Middle => 1,
+                        MouseButton::Right => 2,
+                        _ => return,
+                    };
+                    let pressed = state == ElementState::Pressed;
+                    if pressed {
+                        self.mouse_buttons |= 1 << btn_code;
+                    } else {
+                        self.mouse_buttons &= !(1 << btn_code);
+                    }
+
+                    let (col, row) = {
+                        let grid = pty.grid.lock();
+                        let sf = self.renderer.as_ref().map_or(1.0_f64, |r| r.scale_factor);
+                        #[allow(clippy::cast_possible_truncation)]
+                        let eff_font = self.config.font.size * sf as f32;
+                        // Grid starts below the top bar; subtract that offset before
+                        // dividing by cell height so row 0 maps to the first text row.
+                        let top_bar_h = self
+                            .renderer
+                            .as_ref()
+                            .map_or(0, |r| r.top_bar_height_px());
+                        let phys_x = (self.cursor_pos.0 * sf) as u32;
+                        let phys_y = (self.cursor_pos.1 * sf) as u32;
+                        let grid_y = phys_y.saturating_sub(top_bar_h);
+                        let cw = st_glyph::char_advance_width(eff_font).max(1.0);
+                        let ch = st_glyph::line_height(eff_font).max(1.0);
+                        #[allow(clippy::cast_possible_truncation)]
+                        let col = ((phys_x as f32 / cw) as u16).min(grid.cols.saturating_sub(1));
+                        #[allow(clippy::cast_possible_truncation)]
+                        let row = ((grid_y as f32 / ch) as u16).min(grid.rows.saturating_sub(1));
+                        (col, row)
+                    };
+
+                    let bytes = {
+                        let grid = pty.grid.lock();
+                        if grid.mouse_mode == st_pty::MouseMode::None {
+                            return;
+                        }
+                        if grid.mouse_sgr {
+                            encode_mouse_sgr(col, row, btn_code, pressed)
+                        } else {
+                            encode_mouse_x10(col, row, if pressed { btn_code } else { 3 })
+                        }
+                    };
+                    if let Err(e) = pty.write_input(&bytes) {
+                        debug!("PTY mouse write error: {}", e);
+                    }
+                }
+            }
+
             _ => {}
         }
     }
@@ -1151,6 +1216,34 @@ fn key_to_pty_bytes(key: &Key) -> Option<Vec<u8>> {
         Key::Named(NamedKey::PageDown) => Some(b"\x1b[6~".to_vec()),
         _ => None,
     }
+}
+
+// ── Mouse encoding ────────────────────────────────────────────────────────────
+
+/// Encodes a mouse event as an SGR sequence (`\x1b[<Cb;Px;PyM` / `m`).
+///
+/// SGR mode (`?1006h`) uses decimal coordinates and is unambiguous for large
+/// terminals.  `col` and `row` are 0-based; the escape sequence uses 1-based.
+fn encode_mouse_sgr(col: u16, row: u16, button: u8, pressed: bool) -> Vec<u8> {
+    let suffix = if pressed { b'M' } else { b'm' };
+    format!(
+        "\x1b[<{};{};{}{}",
+        button,
+        col + 1,
+        row + 1,
+        suffix as char
+    )
+    .into_bytes()
+}
+
+/// Encodes a mouse event as an X10 sequence (`\x1b[M` + 3 bytes).
+///
+/// Coordinates are 1-based and clamped to 223 (X10 limit).
+fn encode_mouse_x10(col: u16, row: u16, button: u8) -> Vec<u8> {
+    let cb = (button + 32).min(255) as u8;
+    let cx = ((col + 1) as u8).min(223).saturating_add(32);
+    let cy = ((row + 1) as u8).min(223).saturating_add(32);
+    vec![b'\x1b', b'[', b'M', cb, cx, cy]
 }
 
 // ── Window icon ───────────────────────────────────────────────────────────────

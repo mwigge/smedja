@@ -157,6 +157,21 @@ fn ansi256_to_rgba(n: u8) -> [f32; 4] {
     }
 }
 
+// ── Mouse mode ────────────────────────────────────────────────────────────────
+
+/// Which mouse-reporting protocol the application has enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MouseMode {
+    #[default]
+    None,
+    /// `?1000h` — click events only (press + release).
+    X10,
+    /// `?1002h` — button events (click + drag while button held).
+    ButtonEvent,
+    /// `?1003h` — any motion (click + all mouse movement).
+    AnyEvent,
+}
+
 // ── SGR state ─────────────────────────────────────────────────────────────────
 
 /// Current SGR (Select Graphic Rendition) attribute state.
@@ -314,6 +329,10 @@ pub struct CellGrid {
     pub cursor_saved: Option<(u16, u16)>,
     /// Whether the cursor is visible (`true` by default; `?25l` hides it).
     pub cursor_visible: bool,
+    /// Active mouse-reporting mode (set by the application via DEC private modes).
+    pub mouse_mode: MouseMode,
+    /// Whether SGR extended mouse coordinates are active (`?1006h`).
+    pub mouse_sgr: bool,
 }
 
 impl CellGrid {
@@ -341,6 +360,8 @@ impl CellGrid {
             title: None,
             cursor_saved: None,
             cursor_visible: true,
+            mouse_mode: MouseMode::None,
+            mouse_sgr: false,
         }
     }
 
@@ -790,11 +811,17 @@ impl vte::Perform for VtHandler {
             'h' if intermediates == [b'?'] => match p.first().copied().unwrap_or(0) {
                 1049 => grid.enter_alt_screen(),
                 25 => grid.cursor_visible = true,
+                1000 => grid.mouse_mode = MouseMode::X10,
+                1002 => grid.mouse_mode = MouseMode::ButtonEvent,
+                1003 => grid.mouse_mode = MouseMode::AnyEvent,
+                1006 => grid.mouse_sgr = true,
                 _ => {}
             },
             'l' if intermediates == [b'?'] => match p.first().copied().unwrap_or(0) {
                 1049 => grid.leave_alt_screen(),
                 25 => grid.cursor_visible = false,
+                1000 | 1002 | 1003 => grid.mouse_mode = MouseMode::None,
+                1006 => grid.mouse_sgr = false,
                 _ => {}
             },
             // ── Line delete / insert ─────────────────────────────────────────
