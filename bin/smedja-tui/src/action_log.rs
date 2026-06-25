@@ -93,8 +93,13 @@ impl ActionLog {
             })
             .collect();
 
+        let title = if self.events.len() >= self.max {
+            format!("actions ({}/{})", self.events.len(), self.max)
+        } else {
+            format!("actions ({})", self.events.len())
+        };
         let widget =
-            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("actions"));
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
         frame.render_widget(widget, area);
     }
 }

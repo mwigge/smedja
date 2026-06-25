@@ -1,7 +1,5 @@
 //! Modular status bar — composable segments rendered to a single line.
 
-use std::time::Duration;
-
 /// Context passed to each status module at render time.
 pub struct ModuleCtx<'a> {
     pub session_id: &'a str,
@@ -94,35 +92,20 @@ pub fn render_status_bar_with_timeout(ctx: &ModuleCtx<'_>, timeout_ms: u64) -> S
 /// - If `config.format` is `Some`, renders only the named segments in that
 ///   order (`"{tier} {mode}"` → tier then mode).
 /// - If a module key appears in `config` with `disabled: true`, it is skipped.
+/// - `timeout_ms` is accepted for API compatibility but ignored — all segments
+///   are computed synchronously (they do no I/O) so no timeout is needed.
 pub fn render_status_bar_configured(
     ctx: &ModuleCtx<'_>,
     config: Option<&StatusBarConfig>,
-    timeout_ms: u64,
+    _timeout_ms: u64,
 ) -> String {
-    use std::sync::mpsc;
-    use std::thread;
-
-    // Snapshot all context data needed by threads (no borrowing across threads).
-    let session_id = ctx.session_id.to_owned();
-    let mode = ctx.mode.map(str::to_owned);
-    let tier = ctx.tier.map(str::to_owned);
-    let runner = ctx.runner.map(str::to_owned);
-    let pending = ctx.pending;
-    let input_mode = ctx.input_mode;
-
-    // Determine which modules to render and in what order.
     let all_keys: &[&str] = &["input_mode", "runner", "tier", "mode", "session"];
     let ordered_keys: Vec<&str> = if let Some(cfg) = config {
         if let Some(fmt) = &cfg.format {
-            // Extract `{key}` tokens from the format string.
             fmt.split_whitespace()
                 .filter_map(|tok| {
                     let inner = tok.strip_prefix('{')?.strip_suffix('}')?;
-                    if all_keys.contains(&inner) {
-                        Some(inner)
-                    } else {
-                        None
-                    }
+                    if all_keys.contains(&inner) { Some(inner) } else { None }
                 })
                 .collect()
         } else {
@@ -132,43 +115,20 @@ pub fn render_status_bar_configured(
         all_keys.to_vec()
     };
 
-    let timeout = Duration::from_millis(timeout_ms);
-
     let mut parts: Vec<String> = ordered_keys
         .into_iter()
-        .filter_map(|key| {
-            // Build per-thread context snapshot.
-            let s_id = session_id.clone();
-            let md = mode.clone();
-            let tr = tier.clone();
-            let rn = runner.clone();
-
-            let (tx, rx) = mpsc::channel::<String>();
-            let key_owned = key.to_owned();
-            thread::spawn(move || {
-                let snapshot = ModuleCtx {
-                    session_id: &s_id,
-                    mode: md.as_deref(),
-                    tier: tr.as_deref(),
-                    runner: rn.as_deref(),
-                    pending,
-                    input_mode,
-                };
-                let text = match key_owned.as_str() {
-                    "input_mode" => segment_input_mode(&snapshot),
-                    "runner" => segment_runner(&snapshot),
-                    "tier" => segment_tier(&snapshot),
-                    "mode" => segment_mode(&snapshot),
-                    "session" => segment_session(&snapshot),
-                    _ => return,
-                };
-                let _ = tx.send(text);
-            });
-            rx.recv_timeout(timeout).ok()
+        .map(|key| match key {
+            "input_mode" => segment_input_mode(ctx),
+            "runner"     => segment_runner(ctx),
+            "tier"       => segment_tier(ctx),
+            "mode"       => segment_mode(ctx),
+            "session"    => segment_session(ctx),
+            _            => String::new(),
         })
+        .filter(|s| !s.is_empty())
         .collect();
 
-    if pending {
+    if ctx.pending {
         parts.push("\u{27f3}".to_owned());
     }
 

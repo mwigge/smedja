@@ -154,6 +154,10 @@ struct App {
     /// True while the window is fully occluded by another window on Wayland.
     /// Used to suppress redraws that would burn GPU for invisible frames.
     occluded: bool,
+    /// After a PTY resize, suppress blank frames until this instant (or None).
+    /// Prevents the compositor showing grey during the terminal's clear+redraw
+    /// cycle that ratatui emits on resize.
+    suppress_clear_until: Option<std::time::Instant>,
 }
 
 impl App {
@@ -189,6 +193,7 @@ impl App {
             cursor_pos: (0.0, 0.0),
             mouse_buttons: 0,
             occluded: false,
+            suppress_clear_until: None,
         }
     }
 
@@ -449,6 +454,11 @@ impl ApplicationHandler<UserEvent> for App {
                 info!("close requested for {:?}", window_id);
                 self.windows.remove(&window_id);
                 if self.windows.is_empty() {
+                    // Drop the renderer before exiting so we never call
+                    // get_current_texture() on a surface whose underlying
+                    // Wayland surface has been destroyed (→ SIGSEGV).
+                    self.renderer = None;
+                    self.pty = None;
                     event_loop.exit();
                 }
             }
@@ -475,8 +485,22 @@ impl ApplicationHandler<UserEvent> for App {
                     );
                     let (cols, rows) =
                         st_glyph::pixel_size_to_grid(new_size.width, grid_h, eff_font);
-                    if let Err(e) = pty.resize(cols, rows) {
-                        debug!("PTY resize error: {}", e);
+                    let same_size = {
+                        let g = pty.grid.lock();
+                        g.cols == cols && g.rows == rows
+                    };
+                    if !same_size {
+                        if let Err(e) = pty.resize(cols, rows) {
+                            debug!("PTY resize error: {}", e);
+                        }
+                        // Suppress blank frames for up to 200ms while the child
+                        // process (e.g. ratatui TUI) clears and redraws after
+                        // receiving SIGWINCH.  Keeps old content visible instead
+                        // of showing a grey flash between clear and redraw.
+                        self.suppress_clear_until = Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_millis(200),
+                        );
                     }
                 }
             }
@@ -494,8 +518,15 @@ impl ApplicationHandler<UserEvent> for App {
                 info!("Focused({}) occluded_before={}", focused, self.occluded);
                 if focused {
                     self.occluded = false;
-                    if let Some(renderer) = &mut self.renderer {
-                        renderer.resize(renderer.size);
+                    // Do NOT call renderer.resize() here — reconfiguring an
+                    // already-visible Wayland surface briefly detaches the buffer,
+                    // making the compositor show grey until the next present.
+                    // SurfaceError::Lost/Outdated in the render path handles the
+                    // rare case where the surface is actually stale.
+                    // Force a cell re-upload so content is redrawn even when the
+                    // PTY has been quiet.
+                    if let Some(pty) = &self.pty {
+                        pty.dirty.store(true, Ordering::Release);
                     }
                     if let Some(w) = self.windows.get(&window_id) {
                         w.request_redraw();
@@ -521,6 +552,10 @@ impl ApplicationHandler<UserEvent> for App {
                     // frame so content appears without waiting for the next vsync.
                     if let Some(renderer) = &mut self.renderer {
                         renderer.resize(renderer.size);
+                    }
+                    // Surface was reconfigured — force cell re-upload.
+                    if let Some(pty) = &self.pty {
+                        pty.dirty.store(true, Ordering::Release);
                     }
                     if let Some(w) = self.windows.get(&window_id) {
                         w.request_redraw();
@@ -562,8 +597,28 @@ impl ApplicationHandler<UserEvent> for App {
                                 })
                             })
                             .collect();
+                        let non_blank = cells.iter().filter(|c| c.ch != ' ').count();
                         drop(grid);
-                        renderer.update_cells(&cells);
+                        debug!("update_cells: total={} non_blank={}", cells.len(), non_blank);
+
+                        // If all cells just went blank and we're inside the
+                        // post-resize suppress window, skip this frame.  The
+                        // child (ratatui) sends clear+redraw atomically; keeping
+                        // the old cell content avoids the grey flash while waiting
+                        // for the redraw to arrive.
+                        let in_suppress_window = self
+                            .suppress_clear_until
+                            .is_some_and(|t| std::time::Instant::now() < t);
+                        if non_blank == 0 && in_suppress_window {
+                            // Keep dirty=true so we process the next PTY batch
+                            // (the redraw content) without waiting for a new event.
+                            pty.dirty.store(true, Ordering::Release);
+                        } else {
+                            if non_blank > 0 {
+                                self.suppress_clear_until = None;
+                            }
+                            renderer.update_cells(&cells);
+                        }
                     }
 
                     // Evaluate status bar modules and update the renderer.
@@ -727,6 +782,7 @@ impl ApplicationHandler<UserEvent> for App {
                             )) => {
                                 info!("render: surface Lost/Outdated — reconfiguring");
                                 renderer.resize(renderer.size);
+                                pty.dirty.store(true, Ordering::Release);
                             }
                             Some(st_render::RenderError::Frame(
                                 wgpu::SurfaceError::Timeout,
@@ -738,12 +794,11 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                // Request another frame — skip when occluded to avoid burning
-                // GPU cycles rendering to an invisible surface.
-                if !self.occluded {
-                    for w in self.windows.values() {
-                        w.request_redraw();
-                    }
+                // Always request another frame — stopping on occluded caused
+                // Hyprland to show grey when the window lost focus, because
+                // the compositor shows its fallback when the app stops presenting.
+                for w in self.windows.values() {
+                    w.request_redraw();
                 }
             }
 
@@ -1028,12 +1083,11 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Request a redraw every frame — skip when occluded to avoid wasting
-        // GPU cycles on frames the compositor will never display.
-        if !self.occluded {
-            for w in self.windows.values() {
-                w.request_redraw();
-            }
+        // Always request a redraw — stopping on occluded causes the compositor
+        // to show grey when the window is unfocused (it shows its fallback
+        // background when the app stops presenting frames).
+        for w in self.windows.values() {
+            w.request_redraw();
         }
     }
 }
