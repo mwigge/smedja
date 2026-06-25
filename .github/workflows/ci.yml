@@ -1,8 +1,17 @@
 name: ci
 
 on:
+  # Run once on PRs (the pull_request event) and once on merges to main (the
+  # push event). Restricting push to main means feature-branch commits no longer
+  # trigger a duplicate push run alongside the pull_request run.
   push:
+    branches: [main]
   pull_request:
+
+# Cancel an in-progress run when a newer commit supersedes it on the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
