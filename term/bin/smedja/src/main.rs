@@ -151,6 +151,9 @@ struct App {
     cursor_pos: (f64, f64),
     /// Which mouse buttons are currently held down.
     mouse_buttons: u8,
+    /// True while the window is fully occluded by another window on Wayland.
+    /// Used to suppress redraws that would burn GPU for invisible frames.
+    occluded: bool,
 }
 
 impl App {
@@ -185,6 +188,7 @@ impl App {
             pane_id: String::new(),
             cursor_pos: (0.0, 0.0),
             mouse_buttons: 0,
+            occluded: false,
         }
     }
 
@@ -510,12 +514,27 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
-            // On Wayland a window can be occluded without losing keyboard focus
-            // (e.g. another window overlaps it).  Reconfigure when it becomes
-            // visible again so the compositor gets a fresh surface.
-            WindowEvent::Occluded(false) => {
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.resize(renderer.size);
+            // Track occlusion so about_to_wait can skip redraws for invisible windows.
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
+                if !occluded {
+                    // Window became visible — reconfigure the surface so the
+                    // compositor gets a fresh swapchain instead of a stale one.
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.resize(renderer.size);
+                    }
+                }
+            }
+
+            // Show an I-beam cursor over the terminal content area.
+            WindowEvent::CursorEntered { .. } => {
+                if let Some(w) = self.windows.get(&window_id) {
+                    w.set_cursor(winit::window::CursorIcon::Text);
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(w) = self.windows.get(&window_id) {
+                    w.set_cursor(winit::window::CursorIcon::Default);
                 }
             }
 
@@ -721,9 +740,12 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                // Request another frame for each open window.
-                for w in self.windows.values() {
-                    w.request_redraw();
+                // Request another frame — skip when occluded to avoid burning
+                // GPU cycles rendering to an invisible surface.
+                if !self.occluded {
+                    for w in self.windows.values() {
+                        w.request_redraw();
+                    }
                 }
             }
 
@@ -769,6 +791,35 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                         _ => {}
+                    }
+                }
+
+                // Ctrl+V (no shift) → paste from clipboard.
+                // Mirrors Ctrl+Shift+V so both common conventions work.
+                if self.ctrl() && !self.shift() {
+                    if let Key::Character(s) = &logical_key {
+                        if s.to_lowercase() == "v" {
+                            if let Some(pty) = &mut self.pty {
+                                let bracketed = pty.grid.lock().bracketed_paste;
+                                if let Ok(mut cb) = arboard::Clipboard::new() {
+                                    if let Ok(text) = cb.get_text() {
+                                        let payload = text.into_bytes();
+                                        let data = if bracketed {
+                                            let mut w = b"\x1b[200~".to_vec();
+                                            w.extend_from_slice(&payload);
+                                            w.extend_from_slice(b"\x1b[201~");
+                                            w
+                                        } else {
+                                            payload
+                                        };
+                                        if let Err(e) = pty.write_input(&data) {
+                                            debug!("PTY paste write error: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                            return;
+                        }
                     }
                 }
 
@@ -976,9 +1027,12 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Request a redraw every frame — the renderer will throttle via vsync.
-        for w in self.windows.values() {
-            w.request_redraw();
+        // Request a redraw every frame — skip when occluded to avoid wasting
+        // GPU cycles on frames the compositor will never display.
+        if !self.occluded {
+            for w in self.windows.values() {
+                w.request_redraw();
+            }
         }
     }
 }
