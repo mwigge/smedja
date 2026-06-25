@@ -33,6 +33,11 @@ use winit::{
     window::{Window, WindowId},
 };
 
+// Set Wayland app_id and X11 WM_CLASS so the desktop environment matches the
+// window to smedja.desktop and shows the correct icon from the icon theme.
+#[cfg(target_os = "linux")]
+use winit::platform::wayland::WindowAttributesExtWayland;
+
 use crate::split::{SplitDirection, SplitLayout};
 use crate::tab::TabBar;
 
@@ -181,9 +186,14 @@ impl App {
 
     /// Opens a new terminal window and registers it in `self.windows`.
     fn open_window(&mut self, event_loop: &ActiveEventLoop) {
-        let attrs = Window::default_attributes()
+        #[allow(unused_mut)]
+        let mut attrs = Window::default_attributes()
             .with_title("smedja")
             .with_inner_size(winit::dpi::LogicalSize::new(1200u32, 800u32));
+        #[cfg(target_os = "linux")]
+        {
+            attrs = attrs.with_name("smedja", "smedja");
+        }
 
         match event_loop.create_window(attrs) {
             Ok(w) => {
@@ -309,9 +319,14 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
 
-        let attrs = Window::default_attributes()
+        #[allow(unused_mut)]
+        let mut attrs = Window::default_attributes()
             .with_title("smedja")
             .with_inner_size(winit::dpi::LogicalSize::new(1200u32, 800u32));
+        #[cfg(target_os = "linux")]
+        {
+            attrs = attrs.with_name("smedja", "smedja");
+        }
 
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
@@ -758,24 +773,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // ── Pass remaining input to the PTY ───────────────────────────
                 if let Some(pty) = &mut self.pty {
-                    let bytes: Option<Vec<u8>> = match &logical_key {
-                        Key::Character(s) => Some(s.as_str().as_bytes().to_vec()),
-                        Key::Named(NamedKey::Space) => Some(b" ".to_vec()),
-                        Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
-                        Key::Named(NamedKey::Backspace) => Some(b"\x7f".to_vec()),
-                        Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
-                        Key::Named(NamedKey::Escape) => Some(b"\x1b".to_vec()),
-                        Key::Named(NamedKey::ArrowUp) => Some(b"\x1b[A".to_vec()),
-                        Key::Named(NamedKey::ArrowDown) => Some(b"\x1b[B".to_vec()),
-                        Key::Named(NamedKey::ArrowRight) => Some(b"\x1b[C".to_vec()),
-                        Key::Named(NamedKey::ArrowLeft) => Some(b"\x1b[D".to_vec()),
-                        Key::Named(NamedKey::Home) => Some(b"\x1b[H".to_vec()),
-                        Key::Named(NamedKey::End) => Some(b"\x1b[F".to_vec()),
-                        Key::Named(NamedKey::Delete) => Some(b"\x1b[3~".to_vec()),
-                        Key::Named(NamedKey::PageUp) => Some(b"\x1b[5~".to_vec()),
-                        Key::Named(NamedKey::PageDown) => Some(b"\x1b[6~".to_vec()),
-                        _ => None,
-                    };
+                    let bytes = key_to_pty_bytes(&logical_key);
                     if let Some(data) = bytes {
                         // Write errors are non-fatal; PTY may have exited.
                         if let Err(e) = pty.write_input(&data) {
@@ -1126,6 +1124,35 @@ fn spawn_agent_bridge(state: SharedPaneState, agent_manager: SharedAgentManager,
         .ok();
 }
 
+// ── PTY key dispatch ──────────────────────────────────────────────────────────
+
+/// Maps a winit logical key to the byte sequence to write to the PTY.
+///
+/// Returns `None` for keys that have no PTY representation (modifier-only keys,
+/// unhandled media keys, etc.).  The caller is responsible for writing the
+/// returned bytes to the PTY's stdin.
+#[must_use]
+fn key_to_pty_bytes(key: &Key) -> Option<Vec<u8>> {
+    match key {
+        Key::Character(s) => Some(s.as_str().as_bytes().to_vec()),
+        Key::Named(NamedKey::Space) => Some(b" ".to_vec()),
+        Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
+        Key::Named(NamedKey::Backspace) => Some(b"\x7f".to_vec()),
+        Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
+        Key::Named(NamedKey::Escape) => Some(b"\x1b".to_vec()),
+        Key::Named(NamedKey::ArrowUp) => Some(b"\x1b[A".to_vec()),
+        Key::Named(NamedKey::ArrowDown) => Some(b"\x1b[B".to_vec()),
+        Key::Named(NamedKey::ArrowRight) => Some(b"\x1b[C".to_vec()),
+        Key::Named(NamedKey::ArrowLeft) => Some(b"\x1b[D".to_vec()),
+        Key::Named(NamedKey::Home) => Some(b"\x1b[H".to_vec()),
+        Key::Named(NamedKey::End) => Some(b"\x1b[F".to_vec()),
+        Key::Named(NamedKey::Delete) => Some(b"\x1b[3~".to_vec()),
+        Key::Named(NamedKey::PageUp) => Some(b"\x1b[5~".to_vec()),
+        Key::Named(NamedKey::PageDown) => Some(b"\x1b[6~".to_vec()),
+        _ => None,
+    }
+}
+
 // ── Window icon ───────────────────────────────────────────────────────────────
 
 /// Loads the smedja brand icon from the embedded PNG and returns a winit `Icon`.
@@ -1275,5 +1302,40 @@ mod tests {
         let short = "/short";
         let result = truncate_cwd(short, 40);
         assert_eq!(result, "/short");
+    }
+
+    #[test]
+    fn space_key_produces_space_byte() {
+        use super::key_to_pty_bytes;
+        use winit::keyboard::{Key, NamedKey};
+        let bytes = key_to_pty_bytes(&Key::Named(NamedKey::Space));
+        assert_eq!(bytes, Some(b" ".to_vec()), "space must produce 0x20");
+    }
+
+    #[test]
+    fn named_keys_produce_correct_escape_sequences() {
+        use super::key_to_pty_bytes;
+        use winit::keyboard::{Key, NamedKey};
+        assert_eq!(key_to_pty_bytes(&Key::Named(NamedKey::Enter)), Some(b"\r".to_vec()));
+        assert_eq!(key_to_pty_bytes(&Key::Named(NamedKey::Backspace)), Some(b"\x7f".to_vec()));
+        assert_eq!(key_to_pty_bytes(&Key::Named(NamedKey::Tab)), Some(b"\t".to_vec()));
+        assert_eq!(key_to_pty_bytes(&Key::Named(NamedKey::ArrowUp)), Some(b"\x1b[A".to_vec()));
+        assert_eq!(key_to_pty_bytes(&Key::Named(NamedKey::ArrowDown)), Some(b"\x1b[B".to_vec()));
+        assert_eq!(key_to_pty_bytes(&Key::Named(NamedKey::Delete)), Some(b"\x1b[3~".to_vec()));
+    }
+
+    #[test]
+    fn character_key_produces_utf8_bytes() {
+        use super::key_to_pty_bytes;
+        use winit::keyboard::{Key, SmolStr};
+        let bytes = key_to_pty_bytes(&Key::Character(SmolStr::new("a")));
+        assert_eq!(bytes, Some(b"a".to_vec()));
+    }
+
+    #[test]
+    fn unknown_key_produces_none() {
+        use super::key_to_pty_bytes;
+        use winit::keyboard::{Key, NamedKey};
+        assert_eq!(key_to_pty_bytes(&Key::Named(NamedKey::F1)), None);
     }
 }

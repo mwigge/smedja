@@ -49,6 +49,7 @@ fn stream_claude_cli(messages: &[Message], opts: &CallOptions) -> DeltaStream {
         let mut command = tokio::process::Command::new("claude");
         command
             .arg("--print")
+            .arg("--verbose")
             .arg("--output-format")
             .arg("stream-json")
             .arg("--include-partial-messages")
