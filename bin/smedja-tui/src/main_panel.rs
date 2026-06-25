@@ -25,10 +25,19 @@ pub enum LineStyle {
 /// A single line of text with its rendering style.
 #[derive(Debug, Clone)]
 pub struct StyledLine {
-    /// The text content of the line.
+    /// The text content of the line (plain, for clipboard / search).
     pub text: String,
-    /// The visual style to apply when rendering.
+    /// The visual style to apply when rendering (used when `spans` is None).
     pub style: LineStyle,
+    /// Pre-built per-character coloured spans (syntax highlighting).
+    /// When `Some`, `render` uses these instead of the flat `style`.
+    pub spans: Option<Line<'static>>,
+}
+
+impl StyledLine {
+    fn plain(text: String, style: LineStyle) -> Self {
+        Self { text, style, spans: None }
+    }
 }
 
 /// Scrollable panel displaying styled message lines.
@@ -72,15 +81,17 @@ impl MainPanel {
     /// - A triple-backtick boundary toggles code mode; subsequent lines are
     ///   [`LineStyle::Code`] and highlighted via syntect if a language tag was
     ///   present on the opening fence.
+    ///
+    /// Auto-scrolls to follow new content when the view is already at the bottom.
     pub fn push_line(&mut self, text: String) {
+        // Track whether we're at the bottom before pushing so we can auto-scroll.
+        let was_at_bottom = self.scroll + 1 >= self.lines.len();
+
         // Detect fence boundaries (``` with optional language tag).
         if text.trim_start().starts_with("```") {
             if self.in_code_block {
                 // Closing fence — push it as Code and exit code mode.
-                self.lines.push(StyledLine {
-                    text,
-                    style: LineStyle::Code,
-                });
+                self.lines.push(StyledLine::plain(text, LineStyle::Code));
                 self.in_code_block = false;
                 self.code_lang = String::new();
             } else {
@@ -88,53 +99,56 @@ impl MainPanel {
                 let lang = text.trim_start().trim_start_matches('`').trim().to_owned();
                 self.code_lang = lang;
                 self.in_code_block = true;
-                self.lines.push(StyledLine {
-                    text,
-                    style: LineStyle::Code,
-                });
+                self.lines.push(StyledLine::plain(text, LineStyle::Code));
             }
-            return;
-        }
-
-        if self.in_code_block {
+        } else if self.in_code_block {
             // Inside a fenced block: apply syntect if we know the language.
             if self.code_lang.is_empty() {
-                self.lines.push(StyledLine {
-                    text,
-                    style: LineStyle::Code,
-                });
+                self.lines.push(StyledLine::plain(text, LineStyle::Code));
             } else {
                 let lang = self.code_lang.clone();
                 let highlighted = apply_syntect(&lang, &text);
                 if highlighted.is_empty() {
-                    self.lines.push(StyledLine {
-                        text,
-                        style: LineStyle::Code,
-                    });
+                    self.lines.push(StyledLine::plain(text, LineStyle::Code));
                 } else {
                     self.lines.extend(highlighted);
                 }
             }
-            return;
+        } else {
+            // Outside code blocks: classify by prefix.
+            let style = if text.starts_with('+') {
+                LineStyle::Added
+            } else if text.starts_with('-') {
+                LineStyle::Removed
+            } else {
+                LineStyle::Normal
+            };
+            self.lines.push(StyledLine::plain(text, style));
         }
 
-        // Outside code blocks: classify by prefix.
-        let style = if text.starts_with('+') {
-            LineStyle::Added
-        } else if text.starts_with('-') {
-            LineStyle::Removed
-        } else {
-            LineStyle::Normal
-        };
-
-        self.lines.push(StyledLine { text, style });
+        if was_at_bottom {
+            self.scroll = self.lines.len().saturating_sub(1);
+        }
     }
 
     /// Renders the panel into `frame` at `area`, respecting the scroll offset.
     ///
     /// `selection` highlights lines from `lo` to `hi` (inclusive) in reverse video.
-    pub fn render(&self, area: Rect, frame: &mut Frame, selection: Option<(usize, usize)>) {
+    /// `search_query` highlights lines containing the query text (yellow background).
+    /// `no_color` strips all colours when the `NO_COLOR` env var is set.
+    pub fn render(
+        &self,
+        area: Rect,
+        frame: &mut Frame,
+        selection: Option<(usize, usize)>,
+        search_query: Option<&str>,
+        no_color: bool,
+    ) {
         let height = area.height.saturating_sub(2) as usize; // subtract border rows
+
+        let search_needle = search_query
+            .filter(|q| !q.is_empty())
+            .map(|q| q.to_lowercase());
 
         let visible: Vec<Line<'_>> = self
             .lines
@@ -143,23 +157,55 @@ impl MainPanel {
             .skip(self.scroll.max(self.display_start))
             .take(height)
             .map(|(abs_line, sl)| {
-                let base = match sl.style {
-                    LineStyle::Normal => Style::default(),
-                    LineStyle::Added => Style::default().fg(Color::Green),
-                    LineStyle::Removed => Style::default().fg(Color::Red),
-                    LineStyle::Code => Style::default().fg(Color::Yellow),
-                };
-                let style = if selection.is_some_and(|(lo, hi)| abs_line >= lo && abs_line <= hi) {
-                    Style::default().fg(Color::Black).bg(Color::White)
+                let selected =
+                    selection.is_some_and(|(lo, hi)| abs_line >= lo && abs_line <= hi);
+                let is_search_match = search_needle
+                    .as_deref()
+                    .is_some_and(|q| sl.text.to_lowercase().contains(q));
+
+                if selected {
+                    // Selection always overrides spans — flatten to a single styled span.
+                    let text = sl
+                        .spans
+                        .as_ref()
+                        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                        .unwrap_or_else(|| sl.text.clone());
+                    Line::from(Span::styled(
+                        text,
+                        Style::default().fg(Color::Black).bg(Color::White),
+                    ))
+                } else if is_search_match {
+                    // Search match: yellow highlight overrides normal rendering.
+                    Line::from(Span::styled(
+                        sl.text.clone(),
+                        Style::default().fg(Color::Black).bg(Color::Yellow),
+                    ))
+                } else if let Some(ref rich) = sl.spans {
+                    if no_color {
+                        let text =
+                            rich.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+                        Line::raw(text)
+                    } else {
+                        rich.clone()
+                    }
                 } else {
-                    base
-                };
-                Line::from(Span::styled(sl.text.clone(), style))
+                    let base = if no_color {
+                        Style::default()
+                    } else {
+                        match sl.style {
+                            LineStyle::Normal  => Style::default(),
+                            LineStyle::Added   => Style::default().fg(Color::Green),
+                            LineStyle::Removed => Style::default().fg(Color::Red),
+                            LineStyle::Code    => Style::default().fg(Color::Yellow),
+                        }
+                    };
+                    Line::from(Span::styled(sl.text.clone(), base))
+                }
             })
             .collect();
 
-        let widget =
-            Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title("messages"));
+        let widget = Paragraph::new(visible)
+            .block(Block::default().borders(Borders::ALL).title("messages"));
         frame.render_widget(widget, area);
     }
 
@@ -194,6 +240,14 @@ impl MainPanel {
         self.scroll = self.lines.len().saturating_sub(1);
     }
 
+    /// Clamps `scroll` to the valid range after a resize.
+    pub fn clamp_scroll(&mut self) {
+        let max = self.lines.len().saturating_sub(1).max(self.display_start);
+        if self.scroll > max {
+            self.scroll = max;
+        }
+    }
+
     /// Returns the text of lines from `from` to `to` (inclusive, either order).
     #[must_use]
     pub fn lines_text(&self, from: usize, to: usize) -> Vec<String> {
@@ -211,11 +265,10 @@ impl MainPanel {
     pub fn push_delta(&mut self, text: &str) {
         if let Some(last) = self.lines.last_mut() {
             last.text.push_str(text);
+            // Clear cached spans since text changed.
+            last.spans = None;
         } else {
-            self.lines.push(StyledLine {
-                text: text.to_owned(),
-                style: LineStyle::Normal,
-            });
+            self.lines.push(StyledLine::plain(text.to_owned(), LineStyle::Normal));
         }
     }
 
@@ -245,7 +298,7 @@ impl Default for MainPanel {
 // ---------------------------------------------------------------------------
 
 /// Highlights `code` for the given `lang` using syntect, returning one
-/// [`StyledLine`] per input line (all with [`LineStyle::Code`]).
+/// [`StyledLine`] per input line with per-character [`Color::Rgb`] spans.
 ///
 /// Falls back to plain [`LineStyle::Code`] lines when the language is unknown
 /// or highlighting fails.
@@ -266,36 +319,43 @@ pub fn apply_syntect(lang: &str, code: &str) -> Vec<StyledLine> {
         .cloned();
 
     let Some(theme) = theme else {
-        // No theme available — fall back to plain text.
         return code
             .lines()
-            .map(|l| StyledLine {
-                text: l.to_owned(),
-                style: LineStyle::Code,
-            })
+            .map(|l| StyledLine::plain(l.to_owned(), LineStyle::Code))
             .collect();
     };
 
     let mut highlighter = HighlightLines::new(syntax, &theme);
     let mut result = Vec::new();
 
-    // syntect's LinesWithEndings keeps line endings; strip them for display.
     for line in syntect::util::LinesWithEndings::from(code) {
+        let text = line.trim_end_matches(['\n', '\r']).to_owned();
         match highlighter.highlight_line(line, &ss) {
-            Ok(_regions) => {
-                // We use the text content only; colour comes from LineStyle::Code.
-                // Full colour support would require mapping syntect colours to
-                // ratatui Color values, which is out of scope for this widget.
+            Ok(regions) => {
+                let spans: Vec<Span<'static>> = regions
+                    .iter()
+                    .filter_map(|(style, fragment)| {
+                        let s = fragment.trim_end_matches(['\n', '\r']);
+                        if s.is_empty() {
+                            return None;
+                        }
+                        let fg = style.foreground;
+                        let color = Color::Rgb(fg.r, fg.g, fg.b);
+                        Some(Span::styled(s.to_owned(), Style::default().fg(color)))
+                    })
+                    .collect();
                 result.push(StyledLine {
-                    text: line.trim_end_matches(['\n', '\r']).to_owned(),
+                    text,
                     style: LineStyle::Code,
+                    spans: if spans.is_empty() {
+                        None
+                    } else {
+                        Some(Line::from(spans))
+                    },
                 });
             }
             Err(_) => {
-                result.push(StyledLine {
-                    text: line.trim_end_matches(['\n', '\r']).to_owned(),
-                    style: LineStyle::Code,
-                });
+                result.push(StyledLine::plain(text, LineStyle::Code));
             }
         }
     }
@@ -412,6 +472,15 @@ mod tests {
         panel.push_line("```".into());
         // The code line (index 1) must be Code style.
         assert_eq!(panel.lines[1].style, LineStyle::Code);
+    }
+
+    // apply_syntect: rust code gets per-character RGB spans
+    #[test]
+    fn apply_syntect_rust_produces_rgb_spans() {
+        let lines = apply_syntect("rust", "let x = 1;");
+        // At least one line should have coloured spans from syntect.
+        let has_spans = lines.iter().any(|l| l.spans.is_some());
+        assert!(has_spans, "syntect should produce RGB spans for rust code");
     }
 
     // push_delta: appending two deltas to an empty panel produces one line
@@ -543,5 +612,37 @@ mod tests {
         }
         let got = panel.lines_text(3, 1);
         assert_eq!(got, vec!["L1", "L2", "L3"]);
+    }
+
+    #[test]
+    fn push_line_auto_scrolls_when_at_bottom() {
+        let mut panel = MainPanel::new();
+        // Push 5 lines — each should auto-scroll since we start at bottom.
+        for i in 0..5u32 {
+            panel.push_line(format!("line {i}"));
+        }
+        assert_eq!(panel.scroll, 4, "scroll should follow new lines when at bottom");
+    }
+
+    #[test]
+    fn push_line_does_not_auto_scroll_when_scrolled_up() {
+        let mut panel = MainPanel::new();
+        for i in 0..5u32 {
+            panel.push_line(format!("line {i}"));
+        }
+        panel.scroll = 0; // user scrolled up
+        panel.push_line("new line".into());
+        assert_eq!(panel.scroll, 0, "scroll must stay when user has scrolled up");
+    }
+
+    #[test]
+    fn clamp_scroll_reduces_out_of_bounds_scroll() {
+        let mut panel = MainPanel::new();
+        for i in 0..3u32 {
+            panel.push_line(format!("line {i}"));
+        }
+        panel.scroll = 100;
+        panel.clamp_scroll();
+        assert_eq!(panel.scroll, 2);
     }
 }

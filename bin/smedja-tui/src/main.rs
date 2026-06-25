@@ -16,9 +16,7 @@ use statusbar::{render_status_bar, ModuleCtx};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEvent,
-};
+use crossterm::event::{Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -141,6 +139,7 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/metrics",
     "/model",
     "/pptx",
+    "/quit",
     "/quota",
     "/resume",
     "/review",
@@ -163,6 +162,7 @@ slash commands:
   /metrics           — show token usage and cost
   /model [name]      — show or set model (local runner: lists GPU fit / hot-swaps)
   /pptx <slug>       — generate PowerPoint
+  /quit              — exit smedja-tui
   /quota             — show usage quota
   /resume [id [turn]] — resume a session (omit id for interactive picker; turn rewinds)
   /review            — send git diff for review
@@ -189,10 +189,13 @@ keybindings (scroll/normal mode):
   G                  — scroll to bottom
   gg                 — scroll to top
   Ctrl-R             — toggle context rail
-  v                  — start line selection
+  v                  — start line selection (visual mode)
   y                  — yank selection to clipboard
   t                  — copy traceparent
-  Esc                — exit selection / return to input";
+  Esc                — exit selection / return to input
+
+note: mouse capture is disabled so the GPU terminal handles selection;
+      use v/y in scroll mode to copy text from the TUI";
 
 #[allow(clippy::struct_excessive_bools)] // AppState is a TUI dispatch table; enum-splitting would add indirection without clarity
 #[derive(Debug)]
@@ -300,12 +303,14 @@ struct AppState {
     pending_output_type: Option<OutputType>,
     /// True when `SMEDJA_OTLP_ENDPOINT` is set in the environment at startup.
     otlp_configured: bool,
-    /// Start screen row of an in-progress mouse drag (messages area only).
-    mouse_drag_start: Option<u16>,
-    /// Current end screen row of an in-progress mouse drag.
-    mouse_drag_end: Option<u16>,
-    /// Top row of the messages panel as recorded by the last render frame.
-    messages_top: u16,
+    /// Disable all colours when `NO_COLOR` is set in the environment.
+    no_color: bool,
+    /// Braille spinner frame counter; advances each render tick while a turn is in flight.
+    spinner_tick: u8,
+    /// Whether '/' panel search is active (intercepts keys to refine the query).
+    panel_search_mode: bool,
+    /// Current search query string (highlights matching panel lines while non-empty).
+    panel_search_query: String,
     /// Watermark index into `messages`; messages before this index are not
     /// re-displayed after a `/clear`.
     display_start_idx: usize,
@@ -842,16 +847,21 @@ fn yank_to_clipboard(lines: &[String]) -> Result<&'static str, String> {
         let result = std::process::Command::new(bin)
             .args(*args)
             .stdin(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                if let Some(mut stdin) = child.stdin.take() {
-                    stdin.write_all(text.as_bytes())?;
-                }
-                child.wait()
-            });
+            .spawn();
         match result {
-            Ok(status) if status.success() => return Ok(bin),
-            Ok(_) | Err(_) => continue,
+            Ok(mut child) => {
+                let write_ok = child.stdin.take().map_or(true, |mut stdin| {
+                    stdin.write_all(text.as_bytes()).is_ok()
+                });
+                if write_ok {
+                    // Reap the child in a background thread so we don't block
+                    // the TUI event loop (clipboard tools like wl-copy stay
+                    // alive serving paste requests until another owner takes over).
+                    std::thread::spawn(move || { let _ = child.wait(); });
+                    return Ok(bin);
+                }
+            }
+            Err(_) => continue,
         }
     }
 
@@ -860,6 +870,51 @@ fn yank_to_clipboard(lines: &[String]) -> Result<&'static str, String> {
         "clipboard unavailable — install one of: {}",
         tried.join(", ")
     ))
+}
+
+/// Reads text from the system clipboard using wl-paste (Wayland) or xclip/xsel (X11).
+fn paste_from_clipboard() -> Option<String> {
+    use std::process::Command;
+
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new("pbpaste").output().ok()?;
+        if out.status.success() {
+            return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        return None;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        if std::env::var("WAYLAND_DISPLAY").is_ok() {
+            let out = Command::new("wl-paste")
+                .arg("--no-newline")
+                .output()
+                .ok()?;
+            if out.status.success() {
+                return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+            }
+        }
+        // X11 fallbacks
+        if let Ok(out) = Command::new("xclip")
+            .args(["-selection", "clipboard", "-o"])
+            .output()
+        {
+            if out.status.success() {
+                return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+            }
+        }
+        if let Ok(out) = Command::new("xsel")
+            .args(["--clipboard", "--output"])
+            .output()
+        {
+            if out.status.success() {
+                return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+            }
+        }
+        None
+    }
 }
 
 /// Runs `openspec bin args` as a subprocess and returns stdout on success, stderr on error.
@@ -921,11 +976,6 @@ fn format_openspec_status(json: &str) -> String {
         .join("\n")
 }
 
-fn screen_row_to_line(row: u16, messages_top: u16, scroll: usize) -> usize {
-    let offset = (row as usize).saturating_sub(messages_top as usize);
-    scroll + offset
-}
-
 /// Searches `history` backwards for the most recent entry containing `query`.
 ///
 /// Returns `(index, matched_text)` on success.  An empty `query` always returns `None`.
@@ -940,38 +990,6 @@ fn history_search<'a>(history: &'a [String], query: &str) -> Option<(usize, &'a 
         .rev()
         .find(|(_, s)| s.contains(query))
         .map(|(i, s)| (i, s.as_str()))
-}
-
-fn handle_mouse(state: &mut AppState, me: MouseEvent) {
-    use crossterm::event::{MouseButton, MouseEventKind};
-    match me.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            state.mouse_drag_start = Some(me.row);
-            state.mouse_drag_end = Some(me.row);
-        }
-        MouseEventKind::Drag(MouseButton::Left) => {
-            state.mouse_drag_end = Some(me.row);
-        }
-        MouseEventKind::Up(MouseButton::Left) => {
-            if let (Some(start), Some(end)) = (state.mouse_drag_start, state.mouse_drag_end) {
-                let top = state.messages_top;
-                let scroll = state.main_panel.scroll;
-                let lo = screen_row_to_line(start.min(end), top, scroll);
-                let hi = screen_row_to_line(start.max(end), top, scroll);
-                let lines = state.main_panel.lines_text(lo, hi);
-                let count = lines.len();
-                let msg = match yank_to_clipboard(&lines) {
-                    Ok(_) => format!("\u{2713} {count} lines copied to clipboard"),
-                    Err(e) => e,
-                };
-                state.clipboard = Some(lines.join("\n"));
-                push_system_message(state, msg);
-            }
-            state.mouse_drag_start = None;
-            state.mouse_drag_end = None;
-        }
-        _ => {}
-    }
 }
 
 fn accept_slash_completion(state: &mut AppState, append_space: bool) -> bool {
@@ -1086,6 +1104,10 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
         }
         "help" => {
             push_system_message(state, HELP_TEXT);
+            Ok(true)
+        }
+        "quit" | "exit" => {
+            state.quit = true;
             Ok(true)
         }
         "clear" => {
@@ -2018,6 +2040,48 @@ async fn handle_key(
     }
 
     // ------------------------------------------------------------------
+    // Panel search mode intercept — '/' in scroll mode opens this.
+    // ------------------------------------------------------------------
+    if state.panel_search_mode {
+        match key.code {
+            KeyCode::Esc => {
+                state.panel_search_mode = false;
+                state.panel_search_query.clear();
+            }
+            KeyCode::Enter => {
+                // Keep query on Enter so the user can browse matches.
+                state.panel_search_mode = false;
+            }
+            KeyCode::Backspace => {
+                state.panel_search_query.pop();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.panel_search_query.push(c);
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // ------------------------------------------------------------------
+    // Ctrl-V: paste from system clipboard into the input buffer.
+    // ------------------------------------------------------------------
+    if key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if !state.scroll_focus {
+            if let Some(text) = paste_from_clipboard() {
+                let text = text.replace('\r', "");
+                let before = &state.input[..state.input_cursor];
+                let after = &state.input[state.input_cursor..];
+                let new_input = format!("{before}{text}{after}");
+                let advance = text.len();
+                state.input = new_input;
+                state.input_cursor += advance;
+            }
+        }
+        return Ok(());
+    }
+
+    // ------------------------------------------------------------------
     // Scroll / visual-selection mode intercept.
     // ------------------------------------------------------------------
     if state.scroll_focus {
@@ -2098,6 +2162,11 @@ async fn handle_key(
                 state.g_pending = false;
                 return Ok(());
             }
+            KeyCode::Char('/') => {
+                state.panel_search_mode = true;
+                state.panel_search_query.clear();
+                return Ok(());
+            }
             KeyCode::Esc => {
                 // Fall through to the main Esc handler below.
             }
@@ -2134,7 +2203,10 @@ async fn handle_key(
         }
 
         KeyCode::Esc => {
-            if state.diff_overlay.is_some() {
+            if state.panel_search_mode {
+                state.panel_search_mode = false;
+                state.panel_search_query.clear();
+            } else if state.diff_overlay.is_some() {
                 state.diff_overlay = None;
             } else if state.selection_mode {
                 state.selection_mode = false;
@@ -2603,7 +2675,12 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         input_mode: !state.scroll_focus,
     };
     let status_text = render_status_bar(&ctx);
-    let status = Paragraph::new(status_text).style(Style::default().add_modifier(Modifier::BOLD));
+    let status_style = if state.no_color {
+        Style::default()
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
+    let status = Paragraph::new(status_text).style(status_style);
     frame.render_widget(status, status_area);
 
     // -- Body: main panel | optional context rail ----------------------------
@@ -2619,36 +2696,40 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         (body_area, None)
     };
 
-    // Record messages area top row for mouse-to-line mapping.
-    state.messages_top = main_area.y;
-
     // L122: render MainPanel from state.main_panel.
     let selection = if state.selection_mode {
         let lo = state.selection_anchor.min(state.selection_end);
         let hi = state.selection_anchor.max(state.selection_end);
         Some((lo, hi))
-    } else if let (Some(start), Some(end)) = (state.mouse_drag_start, state.mouse_drag_end) {
-        let lo = screen_row_to_line(start.min(end), state.messages_top, state.main_panel.scroll);
-        let hi = screen_row_to_line(start.max(end), state.messages_top, state.main_panel.scroll);
-        Some((lo, hi))
     } else {
         None
     };
-    state.main_panel.render(main_area, frame, selection);
+    let search_q = if state.panel_search_query.is_empty() {
+        None
+    } else {
+        Some(state.panel_search_query.as_str())
+    };
+    state.main_panel.render(main_area, frame, selection, search_q, state.no_color);
 
-    // Overlay a one-row "⠿ thinking…" indicator at the bottom of the main area.
+    // Overlay an animated thinking indicator at the bottom of the main area.
     if state.turn_in_flight && main_area.height >= 1 {
+        const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let frame_char = SPINNER[state.spinner_tick as usize % SPINNER.len()];
+        state.spinner_tick = state.spinner_tick.wrapping_add(1);
         let thinking_area = ratatui::layout::Rect::new(
             main_area.x,
             main_area.y + main_area.height.saturating_sub(1),
             main_area.width,
             1,
         );
-        let thinking_para = Paragraph::new(Line::from(Span::styled(
-            "\u{283f} thinking\u{2026}",
+        let thinking_style = if state.no_color {
             Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+        } else {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        };
+        let thinking_para = Paragraph::new(Line::from(Span::styled(
+            format!("{frame_char} thinking\u{2026}"),
+            thinking_style,
         )));
         frame.render_widget(thinking_para, thinking_area);
     }
@@ -2776,6 +2857,74 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         frame.render_widget(diff_widget, overlay_rect);
     }
 
+    // -- Block browser overlay ------------------------------------------------
+    if state.block_browser_open && state.block_store.len() > 0 {
+        let total = state.block_store.len();
+        let cursor = state.block_browser_cursor;
+        let overlay_lines: Vec<Line<'_>> = state
+            .block_store
+            .blocks()
+            .enumerate()
+            .map(|(i, b)| {
+                let status_icon = match &b.status {
+                    blocks::BlockStatus::Complete => "\u{2713}",
+                    blocks::BlockStatus::Failed => "\u{2717}",
+                    blocks::BlockStatus::Streaming => "\u{22ef}",
+                    blocks::BlockStatus::ToolCall { .. } => "\u{25c6}",
+                };
+                let text = format!(" {status_icon} turn {}", b.turn_n);
+                if i == cursor {
+                    Line::from(Span::styled(
+                        text,
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                } else {
+                    Line::raw(text)
+                }
+            })
+            .collect();
+        let bb_title = format!("blocks {}/{}", cursor.saturating_add(1).min(total), total);
+        #[allow(clippy::cast_possible_truncation)]
+        let bb_h = (total + 2).min(body_area.height as usize) as u16;
+        let bb_w = 24u16.min(body_area.width);
+        let bb_rect = ratatui::layout::Rect::new(
+            body_area.x + body_area.width.saturating_sub(bb_w),
+            body_area.y,
+            bb_w,
+            bb_h,
+        );
+        frame.render_widget(Clear, bb_rect);
+        frame.render_widget(
+            Paragraph::new(overlay_lines)
+                .block(Block::default().borders(Borders::ALL).title(bb_title)),
+            bb_rect,
+        );
+    }
+
+    // -- Panel search bar -----------------------------------------------------
+    if state.panel_search_mode {
+        // Show the search query as a one-row overlay at the top of the main panel.
+        let sb_rect = ratatui::layout::Rect::new(
+            main_area.x,
+            main_area.y,
+            main_area.width,
+            1,
+        );
+        let search_text = format!("/ {}_", state.panel_search_query);
+        let search_style = if state.no_color {
+            Style::default()
+        } else {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(search_text, search_style))),
+            sb_rect,
+        );
+    }
+
     // -- Slash-completion popup -----------------------------------------------
     if state.slash_popup_visible && !state.slash_completions.is_empty() {
         render_slash_popup(frame, area, state);
@@ -2836,7 +2985,7 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(stdout(), LeaveAlternateScreen);
     }
 }
 
@@ -2960,9 +3109,11 @@ async fn main() -> Result<()> {
         last_traceparent: None,
         pending_output_type: None,
         otlp_configured,
-        mouse_drag_start: None,
-        mouse_drag_end: None,
-        messages_top: 0,
+        no_color: std::env::var("NO_COLOR").is_ok()
+            || std::env::var("TERM").ok().as_deref() == Some("dumb"),
+        spinner_tick: 0,
+        panel_search_mode: false,
+        panel_search_query: String::new(),
         display_start_idx: 0,
         prompt_history: Vec::new(),
         history_idx: None,
@@ -3000,12 +3151,22 @@ async fn main() -> Result<()> {
     }
 
     enable_raw_mode().context("enable raw mode")?;
-    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)
-        .context("enter alternate screen")?;
+    execute!(stdout(), EnterAlternateScreen).context("enter alternate screen")?;
     let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend).context("create terminal")?;
+
+    // Watch for SIGTERM so we can clean up the terminal state before exiting.
+    let (sigterm_tx, sigterm_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        if let Ok(mut sig) = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ) {
+            sig.recv().await;
+        }
+        let _ = sigterm_tx.send(true);
+    });
 
     loop {
         // Collect all ready crossterm events before drawing — one render per batch.
@@ -3024,7 +3185,11 @@ async fn main() -> Result<()> {
                     Event::Key(key) => {
                         handle_key(key, &mut state, &mut client, &mut editor).await?;
                     }
-                    Event::Mouse(me) => handle_mouse(&mut state, me),
+                    Event::Resize(_, _) => {
+                        // Clamp scroll after resize so we don't end up past the
+                        // last available line.
+                        state.main_panel.clamp_scroll();
+                    }
                     _ => {}
                 }
                 // Check if more events are ready without blocking.
@@ -3360,7 +3525,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        if state.quit {
+        if state.quit || *sigterm_rx.borrow() {
             break;
         }
     }
@@ -4337,9 +4502,10 @@ mod tests {
             last_traceparent: None,
             pending_output_type: None,
             otlp_configured: false,
-            mouse_drag_start: None,
-            mouse_drag_end: None,
-            messages_top: 0,
+            no_color: false,
+            spinner_tick: 0,
+            panel_search_mode: false,
+            panel_search_query: String::new(),
             display_start_idx: 0,
             prompt_history: Vec::new(),
             history_idx: None,
@@ -4522,6 +4688,9 @@ mod tests {
         state
             .main_panel
             .push_line("type a message or /help for commands".into());
+        // Auto-scroll leaves scroll at the last line; scroll to top to see the
+        // full banner in the rendered frame.
+        state.main_panel.scroll_to_top();
         let buf = render_frame(&mut state);
         let content: String = buf
             .content()
@@ -5015,89 +5184,6 @@ mod tests {
             !footer.contains("traces not exported"),
             "footer must not show warning when OTLP is configured"
         );
-    }
-
-    // --- tui-mouse-copy tests ---
-
-    #[test]
-    fn screen_row_to_line_maps_correctly() {
-        // row=5, messages_top=3, scroll=10 → offset=2, result=12
-        assert_eq!(screen_row_to_line(5, 3, 10), 12);
-        // row at top → offset=0, result=scroll
-        assert_eq!(screen_row_to_line(3, 3, 7), 7);
-        // row above messages_top → saturating_sub gives 0
-        assert_eq!(screen_row_to_line(1, 3, 5), 5);
-    }
-
-    #[test]
-    fn handle_mouse_down_sets_drag_start_and_end() {
-        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-        let mut state = make_state("sess-mouse");
-        let me = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 0,
-            row: 5,
-            modifiers: KeyModifiers::NONE,
-        };
-        handle_mouse(&mut state, me);
-        assert_eq!(state.mouse_drag_start, Some(5));
-        assert_eq!(state.mouse_drag_end, Some(5));
-    }
-
-    #[test]
-    fn handle_mouse_drag_updates_end_only() {
-        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-        let mut state = make_state("sess-mouse");
-        state.mouse_drag_start = Some(3);
-        state.mouse_drag_end = Some(3);
-        let me = MouseEvent {
-            kind: MouseEventKind::Drag(MouseButton::Left),
-            column: 0,
-            row: 8,
-            modifiers: KeyModifiers::NONE,
-        };
-        handle_mouse(&mut state, me);
-        assert_eq!(state.mouse_drag_start, Some(3));
-        assert_eq!(state.mouse_drag_end, Some(8));
-    }
-
-    #[test]
-    fn handle_mouse_up_yanks_and_clears_drag_state() {
-        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-        let mut state = make_state("sess-mouse");
-        // Push a few lines to the panel so lines_text has content.
-        state.main_panel.push_line("line alpha".to_owned());
-        state.main_panel.push_line("line beta".to_owned());
-        state.main_panel.push_line("line gamma".to_owned());
-        state.messages_top = 1;
-        state.mouse_drag_start = Some(1); // row 1 → line 0 + scroll(0)
-        state.mouse_drag_end = Some(2); // row 2 → line 1 + scroll(0)
-
-        let me = MouseEvent {
-            kind: MouseEventKind::Up(MouseButton::Left),
-            column: 0,
-            row: 2,
-            modifiers: KeyModifiers::NONE,
-        };
-        handle_mouse(&mut state, me);
-
-        assert!(
-            state.clipboard.is_some(),
-            "clipboard must be populated after drag release"
-        );
-        assert!(
-            state.mouse_drag_start.is_none(),
-            "drag start must be cleared"
-        );
-        assert!(state.mouse_drag_end.is_none(), "drag end must be cleared");
-        // After drag release the panel shows either a success message ("lines copied")
-        // or a clipboard-unavailable error — either way something was pushed.
-        let has_msg = state
-            .main_panel
-            .lines_text(0, 200)
-            .iter()
-            .any(|l| l.contains("lines copied") || l.contains("✓") || l.contains("clipboard"));
-        assert!(has_msg, "panel must show copy confirmation or clipboard-error message");
     }
 
     #[test]
