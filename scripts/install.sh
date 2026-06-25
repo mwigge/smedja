@@ -227,6 +227,10 @@ EOF
   fi
   echo "  smedja.desktop → $DESKTOP_DIR"
 
+  # Pre-create dirs required by the service's ReadWritePaths= sandbox.
+  # systemd bind-mounts these before exec, so they must exist at start time.
+  mkdir -p "$HOME/.config/smedja" "$HOME/.local/share/smedja"
+
   # systemd user unit
   SERVICE_SRC="$EXTRACT_DIR/smdjad.service"
   if [ -f "$SERVICE_SRC" ]; then

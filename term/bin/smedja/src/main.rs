@@ -751,6 +751,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(pty) = &mut self.pty {
                     let bytes: Option<Vec<u8>> = match &logical_key {
                         Key::Character(s) => Some(s.as_str().as_bytes().to_vec()),
+                        Key::Named(NamedKey::Space) => Some(b" ".to_vec()),
                         Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
                         Key::Named(NamedKey::Backspace) => Some(b"\x7f".to_vec()),
                         Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
@@ -759,6 +760,11 @@ impl ApplicationHandler<UserEvent> for App {
                         Key::Named(NamedKey::ArrowDown) => Some(b"\x1b[B".to_vec()),
                         Key::Named(NamedKey::ArrowRight) => Some(b"\x1b[C".to_vec()),
                         Key::Named(NamedKey::ArrowLeft) => Some(b"\x1b[D".to_vec()),
+                        Key::Named(NamedKey::Home) => Some(b"\x1b[H".to_vec()),
+                        Key::Named(NamedKey::End) => Some(b"\x1b[F".to_vec()),
+                        Key::Named(NamedKey::Delete) => Some(b"\x1b[3~".to_vec()),
+                        Key::Named(NamedKey::PageUp) => Some(b"\x1b[5~".to_vec()),
+                        Key::Named(NamedKey::PageDown) => Some(b"\x1b[6~".to_vec()),
                         _ => None,
                     };
                     if let Some(data) = bytes {
