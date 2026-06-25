@@ -991,6 +991,19 @@ impl IngotHandle {
     pub async fn import_jsonl(&self, records: Vec<serde_json::Value>) -> Result<usize, IngotError> {
         self.run_blocking(move |ig| ig.import_jsonl(&records)).await
     }
+
+    /// Deletes old terminated sessions and orphaned dependent rows.
+    /// See [`Ingot::prune_old_sessions`].
+    pub async fn prune_old_sessions(&self, older_than_days: u64) -> Result<usize, IngotError> {
+        self.run_blocking(move |ig| ig.prune_old_sessions(older_than_days))
+            .await
+    }
+
+    /// Checkpoints the WAL and rebuilds the database to reclaim space.
+    /// See [`Ingot::vacuum`].
+    pub async fn vacuum(&self) -> Result<(), IngotError> {
+        self.run_blocking(|ig| ig.vacuum()).await
+    }
 }
 
 #[cfg(test)]

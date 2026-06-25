@@ -36,6 +36,10 @@ const MAX_BUFFER_PER_TURN: usize = 2048;
 /// `Started`, the subscriber waits up to this duration before giving up.
 const STREAM_TIMEOUT_SECS: u64 = 90;
 
+/// Seconds to retain a terminal turn's buffer after completion before auto-eviction.
+/// This window allows late-connecting stream clients to still replay the turn.
+const DELTA_TTL_SECS: u64 = 60;
+
 /// Per-turn event buffer — keyed by `turn_id` (= `task_id` in smdjad).
 ///
 /// Populated by a background subscriber task; drained by each streaming
@@ -67,73 +71,87 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             };
-            let mut store = store_inner.lock().await;
-            match event {
-                TurnEvent::Started { ref turn_id, .. } => {
-                    store.insert(turn_id.clone(), VecDeque::new());
-                }
-                TurnEvent::AssistantDelta {
-                    ref content,
-                    ref turn_id,
-                    ..
-                } => {
-                    let Some(tid) = turn_id else { continue };
-                    if let Some(buf) = store.get_mut(tid) {
-                        let line = json!({"type": "delta", "text": content}).to_string();
-                        if buf.len() >= MAX_BUFFER_PER_TURN {
-                            buf.pop_front();
+            let mut cleanup_tid: Option<String> = None;
+            {
+                let mut store = store_inner.lock().await;
+                match event {
+                    TurnEvent::Started { ref turn_id, .. } => {
+                        store.insert(turn_id.clone(), VecDeque::new());
+                    }
+                    TurnEvent::AssistantDelta {
+                        ref content,
+                        ref turn_id,
+                        ..
+                    } => {
+                        let Some(tid) = turn_id else { continue };
+                        if let Some(buf) = store.get_mut(tid) {
+                            let line = json!({"type": "delta", "text": content}).to_string();
+                            if buf.len() >= MAX_BUFFER_PER_TURN {
+                                buf.pop_front();
+                            }
+                            buf.push_back(line);
                         }
-                        buf.push_back(line);
+                    }
+                    TurnEvent::ToolCalled {
+                        ref tool_name,
+                        ref input_summary,
+                        ref turn_id,
+                        ..
+                    } => {
+                        let Some(tid) = turn_id else { continue };
+                        if let Some(buf) = store.get_mut(tid) {
+                            let line =
+                                json!({"type": "tool_call", "name": tool_name, "input": input_summary})
+                                    .to_string();
+                            if buf.len() >= MAX_BUFFER_PER_TURN {
+                                buf.pop_front();
+                            }
+                            buf.push_back(line);
+                        }
+                    }
+                    TurnEvent::Completed {
+                        ref turn_id,
+                        output_tokens,
+                        input_tokens,
+                        ref traceparent,
+                        ..
+                    } => {
+                        if let Some(buf) = store.get_mut(turn_id) {
+                            let mut obj = serde_json::Map::new();
+                            obj.insert("type".into(), json!("done"));
+                            obj.insert("output_tok".into(), json!(output_tokens));
+                            if let Some(n) = input_tokens {
+                                obj.insert("input_tok".into(), json!(n));
+                            }
+                            if let Some(tp) = traceparent {
+                                obj.insert("traceparent".into(), json!(tp));
+                            }
+                            let line = serde_json::Value::Object(obj).to_string();
+                            buf.push_back(line);
+                        }
+                        cleanup_tid = Some(turn_id.clone());
+                    }
+                    TurnEvent::Failed {
+                        ref turn_id,
+                        ref reason,
+                        ..
+                    } => {
+                        if let Some(buf) = store.get_mut(turn_id) {
+                            let line = json!({"type": "error", "message": reason}).to_string();
+                            buf.push_back(line);
+                        }
+                        cleanup_tid = Some(turn_id.clone());
                     }
                 }
-                TurnEvent::ToolCalled {
-                    ref tool_name,
-                    ref input_summary,
-                    ref turn_id,
-                    ..
-                } => {
-                    let Some(tid) = turn_id else { continue };
-                    if let Some(buf) = store.get_mut(tid) {
-                        let line =
-                            json!({"type": "tool_call", "name": tool_name, "input": input_summary})
-                                .to_string();
-                        if buf.len() >= MAX_BUFFER_PER_TURN {
-                            buf.pop_front();
-                        }
-                        buf.push_back(line);
-                    }
-                }
-                TurnEvent::Completed {
-                    ref turn_id,
-                    output_tokens,
-                    input_tokens,
-                    ref traceparent,
-                    ..
-                } => {
-                    if let Some(buf) = store.get_mut(turn_id) {
-                        let mut obj = serde_json::Map::new();
-                        obj.insert("type".into(), json!("done"));
-                        obj.insert("output_tok".into(), json!(output_tokens));
-                        if let Some(n) = input_tokens {
-                            obj.insert("input_tok".into(), json!(n));
-                        }
-                        if let Some(tp) = traceparent {
-                            obj.insert("traceparent".into(), json!(tp));
-                        }
-                        let line = serde_json::Value::Object(obj).to_string();
-                        buf.push_back(line);
-                    }
-                }
-                TurnEvent::Failed {
-                    ref turn_id,
-                    ref reason,
-                    ..
-                } => {
-                    if let Some(buf) = store.get_mut(turn_id) {
-                        let line = json!({"type": "error", "message": reason}).to_string();
-                        buf.push_back(line);
-                    }
-                }
+            } // lock released here
+            // Schedule buffer eviction after TTL so late-connecting stream
+            // clients can still replay the final event.
+            if let Some(tid) = cleanup_tid {
+                let store_gc = Arc::clone(&store_inner);
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(DELTA_TTL_SECS)).await;
+                    cleanup_turn(&store_gc, &tid).await;
+                });
             }
         }
     });

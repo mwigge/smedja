@@ -37,6 +37,7 @@ pub(crate) mod metrics;
 pub(crate) mod routing;
 pub(crate) mod savings;
 pub(crate) mod session;
+pub(crate) mod lsp;
 pub(crate) mod task;
 pub(crate) mod turn;
 pub(crate) mod vault;
@@ -62,4 +63,10 @@ pub(crate) struct HandlerState {
     pub(crate) task_set: Arc<Mutex<JoinSet<()>>>,
     pub(crate) startup_runner: Arc<str>,
     pub(crate) startup_model: Arc<str>,
+    /// Shared LSP manager — holds language server processes started at daemon
+    /// startup and serves their diagnostic snapshots to `lsp.*` handlers.
+    pub(crate) lsp_manager: Arc<smedja_lsp::LspManager>,
+    /// Direct channel to the turn worker — bypasses the broadcast so `Started`
+    /// events are never dropped even under high diagnostic/delta burst.
+    pub(crate) work_tx: tokio::sync::mpsc::Sender<(String, String)>,
 }

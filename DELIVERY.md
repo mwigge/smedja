@@ -22,7 +22,7 @@ If `scripts/smoke-test.sh` does not pass, do not check the box.
 | smedja-tui | turn submission + response | working — `turn.submit` queues a task; `turn.subscribe` polls until `done=true` |
 | smedja-tui | connect banner | working — shows socket path, session ID, provider, tier on startup |
 | smedja-tui | status bar tier | working — reads tier from session response; falls back to `"default"` |
-| smedja-tui | cowork gate (slash command) | working — `/cowork on|off` sends `cowork.set`; approval prompts shown as text |
+| smedja-tui | cowork gate (slash command) | working — `/cowork on|off|status` sends `cowork.set`; `/cowork status` reads live from `session.get`; approval prompts shown as text |
 | smedja-tui | cowork gate (inline widget) | roadmap — keyboard `y`/`n`/`m` approval widget not implemented |
 | agent bridge (st-agent → smdjad) | wired | working — `spawn_agent_bridge` subscribes to pane events; tier and model propagated from `TurnStart` |
 | smedja-vault | storage + cosine retrieval | working — SQLite BLOB store with full-scan cosine-similarity query |
@@ -37,6 +37,17 @@ If `scripts/smoke-test.sh` does not pass, do not check the box.
 | TUI | functional tests | 22 tests in `smedja-tui` lib + 6 smoke tests |
 | GPU terminal | headless tests | 1 smoke test (`st-render` non-blocking init) |
 | MCP OAuth | redirect listener + token exchange | in progress — `start_pkce` stub returns `Cancelled`; HTTP listener not implemented |
+| smedja-tui | daily quota panel (`/quota`) | working — reads `daily_tokens_used` + `daily_tokens_limit` from obs snapshot; bar shown in obs panel; limit set via `SMEDJA_DAILY_TOKEN_LIMIT` |
+| smedja-tui | `/test` project detection | working — auto-detects Cargo / npm / Go / pytest manifests; monorepo disambiguation message; `pass /test cargo\|npm\|go\|py` to override |
+| smedja-tui | LSP empty state | working — shows install hint when no servers registered |
+| smedja-tui | obs panel independent poll | working — 3 s cadence independent of metrics overlay open state |
+| smdjad | MCP stdio allowlist | working — shell metachar rejection + binary-on-PATH check in `McpStdioClient::spawn` |
+| smdjad | `@shell` cowork gate warning | working — `tracing::warn!` when called without a cowork gate |
+| smdjad | DeltaStore TTL (60 s) | working — delta buffers evicted 60 s after terminal event |
+| smdjad | DB prune + vacuum (daily) | working — `prune_old_sessions(30)` + `VACUUM` in background task |
+| smdjad | lifecycle mpsc channel | working — `TurnEvent::Started` sent on bounded mpsc(256) to worker, never dropped |
+| smdjad | signal handler safety | working — SIGTERM/SIGHUP installed before `select!`, errors propagated with `?` |
+| smedja-lsp | `LspManager::shutdown()` | working — aborts `run_all` JoinHandle, kills child LSP processes |
 
 ## Test Layers
 

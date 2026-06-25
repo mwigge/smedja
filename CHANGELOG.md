@@ -6,6 +6,40 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.16.0] — 2026-06-25
+
+### Added
+
+- **Daily token quota panel** — `SMEDJA_DAILY_TOKEN_LIMIT` env var exposes a `quota.limit` RPC; the TUI obs panel shows a live daily-usage bar (`used / limit`) populated from `obs_snapshot.daily_tokens_used` + `daily_tokens_limit` polled every 3 s independently of the metrics overlay.
+- **LSP empty state** — the LSP panel now renders an install hint (`no servers found — install rust-analyzer, gopls, or pyright`) when no language servers are registered, instead of a blank pane.
+- **`/test` project-type detection** — TUI `/test` auto-detects Cargo / npm / Go / pytest manifests in the session workspace; if multiple are found a disambiguation message is emitted; `pass /test cargo|npm|go|py` to override.
+- **`/cowork status` live** — reads `cowork_mode` from the `session.get` RPC response (was previously missing from the payload) so `/cowork status` reflects the real daemon state.
+- **`/quota` live** — shows real `daily_tokens_used` and `daily_tokens_limit` from the obs snapshot instead of placeholder zeros.
+- **DB prune + vacuum** — `prune_old_sessions(30)` deletes terminal sessions older than 30 days (cascades through `cost_ledger`, `audit_events`, `tasks`), then `PRAGMA wal_checkpoint(TRUNCATE); VACUUM;` runs once daily in a background task, keeping the SQLite file bounded.
+- **DeltaStore TTL** — streaming delta buffers auto-evict 60 s after a turn reaches a terminal state, so late subscribers can still replay but memory is reclaimed in steady state.
+- **Dedicated mpsc lifecycle channel** — `turn.submit` also sends on a bounded `mpsc::channel(256)` so `TurnEvent::Started` can never be dropped even under broadcast burst; `spawn_worker` reads exclusively from this channel.
+- **`route!` macro** — eliminates the four-line handler-registration boilerplate; all 50+ routes now use `route!(router, "method.name", state, handlers::module::fn)`.
+- **`lsp_snapshot_from_rpc()`** — converts `lsp.status` + `lsp.diagnostics` RPC responses to `LspSnapshot`; severity decoded from strings (`"error"/"warning"/"info"/"hint"`), state decoded from `"starting"/"ready"/"degraded: <reason>"`.
+- **`LspManager::shutdown()`** — aborts the `run_all` JoinHandle, killing child LSP processes (guarded by `kill_on_drop(true)`).
+- **Signal handler safety** — `SIGTERM`/`SIGHUP` handlers installed before `tokio::select!` and errors propagated with `?` rather than `.unwrap()`, preventing panics under FD exhaustion.
+- **`exec_bash` 30 s timeout** — shell fragments time out at 30 s, preventing hung turns.
+- **DB file permissions 0600** — SQLite file opened with `0o600` permissions on creation.
+- **PID file in XDG_RUNTIME_DIR** — PID file placed in `$XDG_RUNTIME_DIR` or `~/.cache`, never in `/tmp`.
+- **Obs poll independent of metrics overlay** — `session.cost` and `obs_snapshot` fields polled on a dedicated 3 s cadence regardless of whether the metrics panel is open.
+- **MCP refresh background** — MCP server list refresh moved to a `tokio::spawn` so it never blocks the router.
+- **Dispatcher capacity 1024** — broadcast channel capacity raised from 256 to 1024.
+
+### Fixed
+
+- **MCP stdio allowlist** — `McpStdioClient::spawn` now rejects commands containing shell metacharacters (`; & | \` $ > < ( ) { } \n \r`) and requires the binary to be on PATH (or an absolute path that exists), closing a command-injection vector.
+- **`@shell` cowork gate warning** — `resolve_shell()` emits `tracing::warn!` when called without a cowork gate, making unapproved shell execution auditable.
+- **Duplicate route detection** — `Router::register` now fires `debug_assert!(prev.is_none(), "duplicate route: {method_str}")` so double-registrations fail fast in debug builds.
+- **`metrics.summary` field names** — TUI metrics poll was reading `resp["rows"]` and `tokens_total`; corrected to `resp["buckets"]` with `input_tok`/`output_tok` fields matching the actual RPC schema.
+- **LSP severity type mismatch** — `lsp_snapshot_from_rpc` was calling `Severity::from_lsp(d["severity"].as_u64())` but the daemon emits string severities; fixed to match on `d["severity"].as_str()`.
+- **LSP degraded state format** — TUI matched `"degraded"` literally; daemon sends `"degraded: <reason>"`; fixed with `strip_prefix("degraded: ")`.
+- **Mutex poison recovery** — `loop_runner.rs` test harness uses `unwrap_or_else(|e| e.into_inner())` to survive poisoned locks.
+- **`session.cowork_mode` in `session.get` response** — the field was absent from the handler's JSON output; added so `/cowork status` can read it.
+
 ## [0.14.0] — 2026-06-25
 
 ### Added

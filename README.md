@@ -562,6 +562,51 @@ Inside the TUI, `/resume` opens an interactive picker listing resumable sessions
 
 ---
 
+## TUI Reference
+
+### Slash Commands
+
+| Command | What it does |
+|---------|-------------|
+| `/help` | List all slash commands |
+| `/session` | Show current session ID and state |
+| `/resume [id] [turn]` | Reopen a prior session, optionally rewinding to a turn |
+| `/model [name]` | List models or hot-swap; local-runner aware |
+| `/cowork on\|off\|status` | Toggle cowork approval gate or query live state |
+| `/lsp` | Toggle the LSP diagnostic rail (`Ctrl-L`) |
+| `/test [cargo\|npm\|go\|py]` | Run the project's test suite; auto-detects manifest type; pass an arg to override in monorepos |
+| `/quota` | Show daily token usage vs. `SMEDJA_DAILY_TOKEN_LIMIT` |
+| `/version` | Show daemon and TUI versions |
+| `/upgrade` | Pull and install the latest release |
+
+### Key Bindings
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Submit message |
+| `↑ / ↓` | Navigate turn blocks |
+| `c` | Copy selected block |
+| `r` | Replay selected turn |
+| `Ctrl-T` | Toggle metrics overlay |
+| `Ctrl-R` | Toggle context-fill rail |
+| `Ctrl-L` | Toggle LSP diagnostic rail |
+| `Ctrl-O` | Toggle observability panel |
+| `Esc` | Cancel in-flight turn |
+
+### Environment Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SMEDJA_SOCK` | `$XDG_RUNTIME_DIR/smdjad.sock` | Override daemon socket path |
+| `SMEDJA_DAILY_TOKEN_LIMIT` | *(unset — no limit)* | Daily token budget; shown in the `/quota` panel as a usage bar |
+| `SMEDJA_SANDBOX_MODE` | `auto` | Sandbox fallback: `auto \| required \| off` |
+| `SMEDJA_SANDBOX_NETWORK` | `none` | Subprocess network policy: `none \| allowlist \| open` |
+| `SMEDJA_SANDBOX_READ_PATHS` | *(empty)* | Colon-separated extra paths appended to the sandbox read allow-list |
+| `SMEDJA_LOCAL_ENDPOINT` | `http://127.0.0.1:9090` | OpenAI-compatible local model endpoint |
+| `SMEDJA_LOCAL_SWAP_ENDPOINT` | same as above | Hot-swap endpoint (for llama-swap) |
+
+---
+
 ## Getting Started
 
 ```bash

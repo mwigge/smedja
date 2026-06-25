@@ -33,6 +33,7 @@ async fn expand_submission(
     gates: &Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
     session_id: &str,
     content: String,
+    lsp: Option<&smedja_lsp::LspManager>,
 ) -> String {
     let session = ig.get_session(session_id).await.ok().flatten();
 
@@ -47,7 +48,7 @@ async fn expand_submission(
         None
     };
 
-    fragments::expand(&content, &workspace, gate.as_deref()).await
+    fragments::expand(&content, &workspace, gate.as_deref(), lsp).await
 }
 
 /// Handles `turn.submit`: records a new turn task and publishes `Started`.
@@ -70,10 +71,12 @@ pub(crate) async fn submit(state: HandlerState, params: Value) -> Result<Value, 
         .ok_or_else(|| missing_param("content"))?
         .to_owned();
 
-    // Expand inline context fragments (`@file`, `@git`, `@branch`, `@shell`)
-    // against the session workspace before the prompt is recorded, so the stored
-    // and executed prompt is the expanded text.
-    let content = expand_submission(&ig, &state.gates, &session_id, content).await;
+    // Expand inline context fragments (`@file`, `@git`, `@branch`, `@shell`,
+    // `@clippy`, `@lsp`) against the session workspace before the prompt is
+    // recorded, so the stored and executed prompt is the expanded text.
+    let content =
+        expand_submission(&ig, &state.gates, &session_id, content, Some(&state.lsp_manager))
+            .await;
 
     let task_id = Uuid::new_v4();
     let task = Task {
@@ -105,6 +108,10 @@ pub(crate) async fn submit(state: HandlerState, params: Value) -> Result<Value, 
             status: None,
         },
     });
+
+    // Also send directly to the worker via a dedicated mpsc channel so the
+    // Started event cannot be dropped if the broadcast is temporarily full.
+    let _ = state.work_tx.send((session_id.clone(), task_id.to_string())).await;
 
     Ok(json!({ "task_id": task_id }))
 }
@@ -176,7 +183,8 @@ mod tests {
         ig.create_session(session_at(&sid, &ws)).await.unwrap();
 
         let expanded =
-            expand_submission(&ig, &empty_gates(), &sid, "look @file note.txt".to_owned()).await;
+            expand_submission(&ig, &empty_gates(), &sid, "look @file note.txt".to_owned(), None)
+                .await;
 
         assert!(
             expanded.contains("hello from file"),
@@ -199,7 +207,7 @@ mod tests {
         ig.create_session(session_at(&sid, &ws)).await.unwrap();
 
         let raw = "plain question with an email foo@bar.com and no fragments";
-        let out = expand_submission(&ig, &empty_gates(), &sid, raw.to_owned()).await;
+        let out = expand_submission(&ig, &empty_gates(), &sid, raw.to_owned(), None).await;
         assert_eq!(
             out, raw,
             "fragment-free content must pass through byte-for-byte"

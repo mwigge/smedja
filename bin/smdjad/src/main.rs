@@ -96,7 +96,14 @@ fn open_ingot() -> anyhow::Result<Ingot> {
 
     if let Some(dir) = data_dir {
         let db_path = dir.join("smedja.db");
-        Ingot::open(&db_path).map_err(anyhow::Error::from)
+        let ingot = Ingot::open(&db_path).map_err(anyhow::Error::from)?;
+        // Ensure the database file is only readable by the owner.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(ingot)
     } else {
         tracing::error!("cannot create data directory; using in-memory store — all session data will be lost on restart");
         Ingot::open_in_memory().map_err(anyhow::Error::from)
@@ -113,7 +120,14 @@ fn open_vault() -> Vault {
 
     if let Some(path) = vault_path {
         match Vault::open(&path) {
-            Ok(v) => return v,
+            Ok(v) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                }
+                return v;
+            }
             Err(e) => tracing::warn!(error = %e, "vault open failed; using in-memory vault"),
         }
     } else {
@@ -138,19 +152,23 @@ pub(crate) fn missing_param(name: &str) -> RpcError {
     )
 }
 
+/// Timeout for `exec_bash` commands (git diff on large repos, cargo clippy, etc.).
+const EXEC_BASH_TIMEOUT_SECS: u64 = 30;
+
 /// Executes a bash command in `workspace` using `sh -c`, returning stdout or a
-/// formatted error string.
+/// formatted error string. Bounded by [`EXEC_BASH_TIMEOUT_SECS`]; a hung command
+/// (e.g. git diff on a large repo) returns a timeout error rather than blocking.
 pub(crate) async fn exec_bash(cmd: &str, workspace: &std::path::Path) -> String {
-    match tokio::process::Command::new("sh")
+    let run = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
         .current_dir(workspace)
-        .output()
-        .await
-    {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
-        Ok(out) => format!("error: {}", String::from_utf8_lossy(&out.stderr)),
-        Err(e) => format!("error: {e}"),
+        .output();
+    match tokio::time::timeout(std::time::Duration::from_secs(EXEC_BASH_TIMEOUT_SECS), run).await {
+        Ok(Ok(out)) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        Ok(Ok(out)) => format!("error: {}", String::from_utf8_lossy(&out.stderr)),
+        Ok(Err(e)) => format!("error: {e}"),
+        Err(_) => format!("error: command timed out after {EXEC_BASH_TIMEOUT_SECS}s"),
     }
 }
 
@@ -296,6 +314,10 @@ async fn run_turn(
 /// Completed tasks are reaped from the set as they finish (via `try_join_next`)
 /// so the set is bounded by the number of *in-flight* tasks rather than every
 /// task ever spawned. The same set is drained at shutdown.
+///
+/// Started events arrive via a dedicated `work_rx` mpsc channel (sent by the
+/// `turn.submit` handler) rather than the broadcast, so they cannot be dropped
+/// even when the broadcast is temporarily full from delta events.
 #[allow(clippy::too_many_arguments)] // forwarded directly to TurnOrchestrator
 fn spawn_worker(
     ingot: IngotHandle,
@@ -309,51 +331,31 @@ fn spawn_worker(
     provider_sessions: orchestrator::ProviderSessions,
     cache_aligners: orchestrator::CacheAligners,
     task_set: Arc<Mutex<tokio::task::JoinSet<()>>>,
+    mut work_rx: tokio::sync::mpsc::Receiver<(String, String)>,
 ) {
     tokio::spawn(async move {
-        let mut rx = dispatcher.subscribe();
         loop {
-            // Block on the first event, then drain any additionally-queued events
-            // to reduce per-delta task spawns during high-rate streaming.
-            let first = match rx.recv().await {
-                Ok(ev) => ev,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::error!(
-                        dropped = n,
-                        "turn worker lagged; events dropped — some turns may be lost",
-                    );
-                    continue;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            let (session_id, turn_id) = match work_rx.recv().await {
+                Some(pair) => pair,
+                None => break, // sender dropped — daemon shutting down
             };
-            let mut batch = vec![first];
-            batch.extend(smedja_bellows::drain_ready(&mut rx));
-            for event in batch {
-                if let TurnEvent::Started {
-                    session_id,
-                    turn_id,
-                    ..
-                } = event
-                {
-                    let ig = ingot.clone();
-                    let dp = Arc::clone(&dispatcher);
-                    let g = Arc::clone(&gates);
-                    let pl = Arc::clone(&pool);
-                    let as_ = Arc::clone(&assayer);
-                    let pt = Arc::clone(&price_table);
-                    let vt = Arc::clone(&vault);
-                    let em = Arc::clone(&embedder);
-                    let ps = Arc::clone(&provider_sessions);
-                    let ca = Arc::clone(&cache_aligners);
-                    let mut set = task_set.lock().await;
-                    set.spawn(run_turn(
-                        ig, dp, session_id, turn_id, g, pl, as_, pt, vt, em, ps, ca,
-                    ));
-                    // Reap finished tasks so the set tracks only in-flight work.
-                    while set.try_join_next().is_some() {}
-                }
-                // ignore non-Started events
-            }
+            let ig = ingot.clone();
+            let dp = Arc::clone(&dispatcher);
+            let g = Arc::clone(&gates);
+            let pl = Arc::clone(&pool);
+            let as_ = Arc::clone(&assayer);
+            let pt = Arc::clone(&price_table);
+            let vt = Arc::clone(&vault);
+            let em = Arc::clone(&embedder);
+            let ps = Arc::clone(&provider_sessions);
+            let ca = Arc::clone(&cache_aligners);
+            let mut set = task_set.lock().await;
+            set.spawn(run_turn(
+                ig, dp, session_id, turn_id, g, pl, as_, pt, vt, em, ps, ca,
+            ));
+            // Reap finished tasks so the set tracks only in-flight work.
+            while set.try_join_next().is_some() {}
+            tracing::debug!(in_flight = set.len(), "turn spawned");
         }
     });
 }
@@ -424,7 +426,23 @@ pub(crate) fn is_safe_mcp_url(url: &str) -> bool {
     true
 }
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // thin wiring: one registration per RPC method
+/// Registers an RPC handler with boilerplate-free cloning.
+///
+/// Expands to: clone `$state`, register a closure that re-clones state per
+/// call, and delegates to `$handler(state, params)`. This eliminates the
+/// 4-line let+register+move+async pattern that would otherwise repeat for
+/// every method.
+macro_rules! route {
+    ($router:expr, $method:literal, $state:expr, $handler:path) => {{
+        let s = $state.clone();
+        $router.register($method, move |params: Value| {
+            let state = s.clone();
+            async move { $handler(state, params).await }
+        });
+    }};
+}
+
+#[allow(clippy::too_many_arguments)] // startup wiring: each arg is a distinct resource
 fn build_router(
     ingot: &IngotHandle,
     dispatcher: &Arc<Dispatcher>,
@@ -439,6 +457,8 @@ fn build_router(
     provider_sessions: &orchestrator::ProviderSessions,
     cache_aligners: &orchestrator::CacheAligners,
     task_set: &Arc<Mutex<tokio::task::JoinSet<()>>>,
+    lsp_manager: &Arc<smedja_lsp::LspManager>,
+    work_tx: tokio::sync::mpsc::Sender<(String, String)>,
 ) -> Router {
     let mut router = Router::new();
 
@@ -461,398 +481,78 @@ fn build_router(
         task_set: Arc::clone(task_set),
         startup_runner: Arc::clone(startup_runner),
         startup_model: Arc::clone(startup_model),
+        lsp_manager: Arc::clone(lsp_manager),
+        work_tx,
     };
 
-    // ── ping ────────────────────────────────────────────────────────────────
     router.register("ping", |_| async { Ok(json!("pong")) });
 
-    // ── session.create ──────────────────────────────────────────────────────
-    let session_create_state = state.clone();
-    router.register("session.create", move |params: Value| {
-        let state = session_create_state.clone();
-        async move { handlers::session::create(state, params).await }
-    });
+    route!(router, "session.create",          state, handlers::session::create);
+    route!(router, "session.list",            state, handlers::session::list);
+    route!(router, "session.get",             state, handlers::session::get);
+    route!(router, "session.delete",          state, handlers::session::delete);
+    route!(router, "session.fork",            state, handlers::session::fork);
+    route!(router, "session.takeover",        state, handlers::session::takeover);
+    route!(router, "session.set_model",       state, handlers::session::set_model);
+    route!(router, "session.set_runner",      state, handlers::session::set_runner);
+    route!(router, "session.set_mode",        state, handlers::session::set_mode);
+    route!(router, "session.context",         state, handlers::session::context);
+    route!(router, "session.token_usage",     state, handlers::session::token_usage);
+    route!(router, "session.history",         state, handlers::session::history);
+    route!(router, "session.checkpoint.list", state, handlers::checkpoint::list);
+    route!(router, "session.rollback",        state, handlers::checkpoint::rollback);
+    route!(router, "session.compact",         state, handlers::checkpoint::compact);
+    route!(router, "session.cost",            state, handlers::cost::cost);
+    route!(router, "runner.list",             state, handlers::session::runner_list);
+    route!(router, "turn.submit",             state, handlers::turn::submit);
+    // Blocks until terminal status or 60 s deadline; event-driven, no poll.
+    route!(router, "turn.subscribe",          state, handlers::turn::subscribe);
+    route!(router, "task.get",                state, handlers::task::get);
+    route!(router, "task.list",               state, handlers::task::list);
+    route!(router, "task.create",             state, handlers::task::create);
+    route!(router, "task.close",              state, handlers::task::close);
+    route!(router, "task.parallel",           state, handlers::task::parallel);
+    route!(router, "task.cancel",             state, handlers::task::cancel);
+    route!(router, "metrics.summary",         state, handlers::metrics::summary);
+    route!(router, "savings.summary",         state, handlers::savings::summary);
+    route!(router, "cowork.set",              state, handlers::audit::set);
+    route!(router, "cowork.approve",          state, handlers::audit::approve);
+    route!(router, "cowork.deny",             state, handlers::audit::deny);
+    route!(router, "cowork.modify",           state, handlers::audit::modify);
+    route!(router, "cowork.pending",          state, handlers::audit::pending);
+    route!(router, "mcp.register",            state, handlers::mcp::register);
+    route!(router, "mcp.list",                state, handlers::mcp::list);
+    route!(router, "mcp.remove",              state, handlers::mcp::remove);
+    route!(router, "mcp.refresh",             state, handlers::mcp::refresh);
+    route!(router, "local.models",            state, handlers::local::models);
+    route!(router, "local.gpu",               state, handlers::local::gpu);
+    route!(router, "local.swap",              state, handlers::local::swap);
+    route!(router, "local.install",           state, handlers::local::install);
+    route!(router, "loop.create",             state, handlers::loops::create);
+    route!(router, "loop.status",             state, handlers::loops::status);
+    route!(router, "loop.cancel",             state, handlers::loops::cancel);
+    route!(router, "loop.list",               state, handlers::loops::list);
+    route!(router, "loop.retire",             state, handlers::loops::retire);
+    route!(router, "loop.list_by_status",     state, handlers::loops::list_by_status);
+    // Drives the smedja-loop engine: policy hash, evaluator separation, slice pipeline.
+    route!(router, "loop.run",                state, handlers::loops::run);
+    route!(router, "audit.list",              state, handlers::audit::list);
+    // Bounded read-only repo/PR/branch audit; returns findings + report.
+    route!(router, "audit.run",               state, handlers::auditor::run);
+    // Resolves (role, complexity?) through the assayer.
+    route!(router, "agent.routing",           state, handlers::routing::routing);
+    route!(router, "lsp.status",              state, handlers::lsp::status);
+    route!(router, "lsp.diagnostics",         state, handlers::lsp::diagnostics);
+    route!(router, "graph.index",             state, handlers::graph::index);
+    route!(router, "graph.query",             state, handlers::graph::query);
+    route!(router, "vault.reembed",           state, handlers::vault::reembed);
 
-    // ── session.list ────────────────────────────────────────────────────────
-    let session_list_state = state.clone();
-    router.register("session.list", move |params: Value| {
-        let state = session_list_state.clone();
-        async move { handlers::session::list(state, params).await }
-    });
-
-    // ── session.get ─────────────────────────────────────────────────────────
-    let session_get_state = state.clone();
-    router.register("session.get", move |params: Value| {
-        let state = session_get_state.clone();
-        async move { handlers::session::get(state, params).await }
-    });
-
-    // ── session.delete ──────────────────────────────────────────────────────
-    let session_delete_state = state.clone();
-    router.register("session.delete", move |params: Value| {
-        let state = session_delete_state.clone();
-        async move { handlers::session::delete(state, params).await }
-    });
-
-    // ── session.fork ────────────────────────────────────────────────────────
-    let session_fork_state = state.clone();
-    router.register("session.fork", move |params: Value| {
-        let state = session_fork_state.clone();
-        async move { handlers::session::fork(state, params).await }
-    });
-
-    // ── turn.subscribe ──────────────────────────────────────────────────────
-    // Blocks until the named task reaches a terminal status (complete / failed)
-    // or a 60-second deadline expires.  Returns a single response envelope so
-    // callers do not need to poll task.get in a loop.
-    let turn_subscribe_state = state.clone();
-    router.register("turn.subscribe", move |params: Value| {
-        let state = turn_subscribe_state.clone();
-        async move { handlers::turn::subscribe(state, params).await }
-    });
-
-    // ── task.get ────────────────────────────────────────────────────────────
-    let task_get_state = state.clone();
-    router.register("task.get", move |params: Value| {
-        let state = task_get_state.clone();
-        async move { handlers::task::get(state, params).await }
-    });
-
-    // ── task.list ───────────────────────────────────────────────────────────
-    let task_list_state = state.clone();
-    router.register("task.list", move |params: Value| {
-        let state = task_list_state.clone();
-        async move { handlers::task::list(state, params).await }
-    });
-
-    // ── task.create ─────────────────────────────────────────────────────────
-    let task_create_state = state.clone();
-    router.register("task.create", move |params: Value| {
-        let state = task_create_state.clone();
-        async move { handlers::task::create(state, params).await }
-    });
-
-    // ── task.close ──────────────────────────────────────────────────────────
-    let task_close_state = state.clone();
-    router.register("task.close", move |params: Value| {
-        let state = task_close_state.clone();
-        async move { handlers::task::close(state, params).await }
-    });
-
-    // ── turn.submit ─────────────────────────────────────────────────────────
-    let turn_submit_state = state.clone();
-    router.register("turn.submit", move |params: Value| {
-        let state = turn_submit_state.clone();
-        async move { handlers::turn::submit(state, params).await }
-    });
-
-    // ── session.checkpoint.list ─────────────────────────────────────────────
-    let checkpoint_list_state = state.clone();
-    router.register("session.checkpoint.list", move |params: Value| {
-        let state = checkpoint_list_state.clone();
-        async move { handlers::checkpoint::list(state, params).await }
-    });
-
-    // ── session.rollback ────────────────────────────────────────────────────
-    let rollback_state = state.clone();
-    router.register("session.rollback", move |params: Value| {
-        let state = rollback_state.clone();
-        async move { handlers::checkpoint::rollback(state, params).await }
-    });
-
-    // ── session.compact ──────────────────────────────────────────────────────
-    let compact_state = state.clone();
-    router.register("session.compact", move |params: Value| {
-        let state = compact_state.clone();
-        async move { handlers::checkpoint::compact(state, params).await }
-    });
-
-    // ── session.token_usage ──────────────────────────────────────────────────
-    let token_usage_state = state.clone();
-    router.register("session.token_usage", move |params: Value| {
-        let state = token_usage_state.clone();
-        async move { handlers::session::token_usage(state, params).await }
-    });
-
-    // ── session.cost ────────────────────────────────────────────────────────
-    let cost_state = state.clone();
-    router.register("session.cost", move |params: Value| {
-        let state = cost_state.clone();
-        async move { handlers::cost::cost(state, params).await }
-    });
-
-    // ── metrics.summary ───────────────────────────────────────────────────────
-    let metrics_state = state.clone();
-    router.register("metrics.summary", move |params: Value| {
-        let state = metrics_state.clone();
-        async move { handlers::metrics::summary(state, params).await }
-    });
-
-    // ── savings.summary ───────────────────────────────────────────────────────
-    let savings_state = state.clone();
-    router.register("savings.summary", move |params: Value| {
-        let state = savings_state.clone();
-        async move { handlers::savings::summary(state, params).await }
-    });
-
-    // ── session.set_model ────────────────────────────────────────────────────
-    let set_model_state = state.clone();
-    router.register("session.set_model", move |params: Value| {
-        let state = set_model_state.clone();
-        async move { handlers::session::set_model(state, params).await }
-    });
-
-    // ── session.set_runner ───────────────────────────────────────────────────
-    let set_runner_state = state.clone();
-    router.register("session.set_runner", move |params: Value| {
-        let state = set_runner_state.clone();
-        async move { handlers::session::set_runner(state, params).await }
-    });
-
-    // ── session.takeover ─────────────────────────────────────────────────────
-    // Forks the current session onto a new runner in one atomic operation:
-    // creates a new session, copies the latest checkpoint, and sets the
-    // runner_override so the next turn routes to the requested runner.
-    let takeover_state = state.clone();
-    router.register("session.takeover", move |params: Value| {
-        let state = takeover_state.clone();
-        async move { handlers::session::takeover(state, params).await }
-    });
-
-    // ── runner.list ──────────────────────────────────────────────────────────
-    let runner_list_state = state.clone();
-    router.register("runner.list", move |params: Value| {
-        let state = runner_list_state.clone();
-        async move { handlers::session::runner_list(state, params).await }
-    });
-
-    // ── local.models ─────────────────────────────────────────────────────────
-    let local_models_state = state.clone();
-    router.register("local.models", move |params: Value| {
-        let state = local_models_state.clone();
-        async move { handlers::local::models(state, params).await }
-    });
-
-    // ── local.gpu ────────────────────────────────────────────────────────────
-    let local_gpu_state = state.clone();
-    router.register("local.gpu", move |params: Value| {
-        let state = local_gpu_state.clone();
-        async move { handlers::local::gpu(state, params).await }
-    });
-
-    // ── local.swap ───────────────────────────────────────────────────────────
-    let local_swap_state = state.clone();
-    router.register("local.swap", move |params: Value| {
-        let state = local_swap_state.clone();
-        async move { handlers::local::swap(state, params).await }
-    });
-
-    // ── local.install ────────────────────────────────────────────────────────
-    let local_install_state = state.clone();
-    router.register("local.install", move |params: Value| {
-        let state = local_install_state.clone();
-        async move { handlers::local::install(state, params).await }
-    });
-
-    // ── session.context ─────────────────────────────────────────────────────
-    let context_state = state.clone();
-    router.register("session.context", move |params: Value| {
-        let state = context_state.clone();
-        async move { handlers::session::context(state, params).await }
-    });
-
-    // ── cowork.set ──────────────────────────────────────────────────────────
-    let cowork_set_state = state.clone();
-    router.register("cowork.set", move |params: Value| {
-        let state = cowork_set_state.clone();
-        async move { handlers::audit::set(state, params).await }
-    });
-
-    // ── session.set_mode ────────────────────────────────────────────────────
-    let set_mode_state = state.clone();
-    router.register("session.set_mode", move |params: Value| {
-        let state = set_mode_state.clone();
-        async move { handlers::session::set_mode(state, params).await }
-    });
-
-    // ── mcp.register ────────────────────────────────────────────────────────
-    let mcp_register_state = state.clone();
-    router.register("mcp.register", move |params: Value| {
-        let state = mcp_register_state.clone();
-        async move { handlers::mcp::register(state, params).await }
-    });
-
-    // ── mcp.list ────────────────────────────────────────────────────────────
-    let mcp_list_state = state.clone();
-    router.register("mcp.list", move |params: Value| {
-        let state = mcp_list_state.clone();
-        async move { handlers::mcp::list(state, params).await }
-    });
-
-    // ── cowork.approve ───────────────────────────────────────────────────────
-    let cowork_approve_state = state.clone();
-    router.register("cowork.approve", move |params: Value| {
-        let state = cowork_approve_state.clone();
-        async move { handlers::audit::approve(state, params).await }
-    });
-
-    // ── cowork.deny ──────────────────────────────────────────────────────────
-    let cowork_deny_state = state.clone();
-    router.register("cowork.deny", move |params: Value| {
-        let state = cowork_deny_state.clone();
-        async move { handlers::audit::deny(state, params).await }
-    });
-
-    // ── cowork.modify ────────────────────────────────────────────────────────
-    let cowork_modify_state = state.clone();
-    router.register("cowork.modify", move |params: Value| {
-        let state = cowork_modify_state.clone();
-        async move { handlers::audit::modify(state, params).await }
-    });
-
-    // ── cowork.pending ───────────────────────────────────────────────────────
-    let cowork_pending_state = state.clone();
-    router.register("cowork.pending", move |params: Value| {
-        let state = cowork_pending_state.clone();
-        async move { handlers::audit::pending(state, params).await }
-    });
-
-    // ── task.parallel ────────────────────────────────────────────────────────
-    let task_parallel_state = state.clone();
-    router.register("task.parallel", move |params: Value| {
-        let state = task_parallel_state.clone();
-        async move { handlers::task::parallel(state, params).await }
-    });
-
-    // ── task.cancel ──────────────────────────────────────────────────────────
-    let task_cancel_state = state.clone();
-    router.register("task.cancel", move |params: Value| {
-        let state = task_cancel_state.clone();
-        async move { handlers::task::cancel(state, params).await }
-    });
-
-    // ── mcp.remove ───────────────────────────────────────────────────────────
-    let mcp_remove_state = state.clone();
-    router.register("mcp.remove", move |params: Value| {
-        let state = mcp_remove_state.clone();
-        async move { handlers::mcp::remove(state, params).await }
-    });
-
-    // ── mcp.refresh ──────────────────────────────────────────────────────────
-    let mcp_refresh_state = state.clone();
-    router.register("mcp.refresh", move |params: Value| {
-        let state = mcp_refresh_state.clone();
-        async move { handlers::mcp::refresh(state, params).await }
-    });
-
-    // ── loop.create ──────────────────────────────────────────────────────────
-    let loop_create_state = state.clone();
-    router.register("loop.create", move |params: Value| {
-        let state = loop_create_state.clone();
-        async move { handlers::loops::create(state, params).await }
-    });
-
-    // ── loop.status ──────────────────────────────────────────────────────────
-    let loop_status_state = state.clone();
-    router.register("loop.status", move |params: Value| {
-        let state = loop_status_state.clone();
-        async move { handlers::loops::status(state, params).await }
-    });
-
-    // ── loop.cancel ──────────────────────────────────────────────────────────
-    let loop_cancel_state = state.clone();
-    router.register("loop.cancel", move |params: Value| {
-        let state = loop_cancel_state.clone();
-        async move { handlers::loops::cancel(state, params).await }
-    });
-
-    // ── loop.list ────────────────────────────────────────────────────────────
-    let loop_list_state = state.clone();
-    router.register("loop.list", move |params: Value| {
-        let state = loop_list_state.clone();
-        async move { handlers::loops::list(state, params).await }
-    });
-
-    // ── loop.retire ──────────────────────────────────────────────────────────
-    let loop_retire_state = state.clone();
-    router.register("loop.retire", move |params: Value| {
-        let state = loop_retire_state.clone();
-        async move { handlers::loops::retire(state, params).await }
-    });
-
-    // ── loop.list_by_status ──────────────────────────────────────────────────
-    let loop_lbs_state = state.clone();
-    router.register("loop.list_by_status", move |params: Value| {
-        let state = loop_lbs_state.clone();
-        async move { handlers::loops::list_by_status(state, params).await }
-    });
-
-    // ── audit.list ───────────────────────────────────────────────────────────
-    let audit_list_state = state.clone();
-    router.register("audit.list", move |params: Value| {
-        let state = audit_list_state.clone();
-        async move { handlers::audit::list(state, params).await }
-    });
-
-    // ── loop.run ────────────────────────────────────────────────────────────
-    // Drives the real `smedja-loop` engine: load `.smedja/loop.json`, verify the
-    // policy hash, enforce evaluator separation, then run each slice through the
-    // implementer / verification gate / reviewer / bounded fix-retry pipeline.
-    let loop_run_state = state.clone();
-    router.register("loop.run", move |params: Value| {
-        let state = loop_run_state.clone();
-        async move { handlers::loops::run(state, params).await }
-    });
-
-    // ── audit.run ─────────────────────────────────────────────────────────────
-    // Runs the bounded, read-only repo/PR/branch audit loop under the Review
-    // role and returns { findings, counts, report | report_path }.
-    let audit_run_state = state.clone();
-    router.register("audit.run", move |params: Value| {
-        let state = audit_run_state.clone();
-        async move { handlers::auditor::run(state, params).await }
-    });
-
-    // ── agent.routing ────────────────────────────────────────────────────────
-    // Resolves a (role, complexity?) pair through the daemon's assayer and
-    // returns { runner, tier, model, complexity, rationale }.
-    let agent_routing_state = state.clone();
-    router.register("agent.routing", move |params: Value| {
-        let state = agent_routing_state.clone();
-        async move { handlers::routing::routing(state, params).await }
-    });
-
-    // ── graph.index ──────────────────────────────────────────────────────────
-    // Runs the server-side code-graph index over a workspace; returns
-    // { indexed: <count>, workspace }.
-    let graph_index_state = state.clone();
-    router.register("graph.index", move |params: Value| {
-        let state = graph_index_state.clone();
-        async move { handlers::graph::index(state, params).await }
-    });
-
-    // ── graph.query ──────────────────────────────────────────────────────────
-    // Queries the server-side code graph; returns { symbols: [...] }.
-    let graph_query_state = state.clone();
-    router.register("graph.query", move |params: Value| {
-        let state = graph_query_state.clone();
-        async move { handlers::graph::query(state, params).await }
-    });
-
-    // ── session.history ──────────────────────────────────────────────────────
-    // Returns ordered turn/message records and the audit trail for a session.
-    let session_history_state = state.clone();
-    router.register("session.history", move |params: Value| {
-        let state = session_history_state.clone();
-        async move { handlers::session::history(state, params).await }
-    });
-
-    // ── vault.reembed ─────────────────────────────────────────────────────────
-    // Re-embeds existing vault rows under the active embedder (backfill/upgrade).
-    let vault_reembed_state = state.clone();
-    router.register("vault.reembed", move |params: Value| {
-        let state = vault_reembed_state.clone();
-        async move { handlers::vault::reembed(state, params).await }
+    // quota.limit — reads SMEDJA_DAILY_TOKEN_LIMIT env var; no handler state needed.
+    router.register("quota.limit", |_| async {
+        let limit = std::env::var("SMEDJA_DAILY_TOKEN_LIMIT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+        Ok(serde_json::json!({ "daily_tokens": limit }))
     });
 
     router
@@ -1027,13 +727,20 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("failed to set socket permissions: {e}"))?;
     }
 
-    // Write PID file so `smj daemon stop` can send SIGTERM.
-    let pid_path = {
-        let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-        std::path::PathBuf::from(base).join("smdjad.pid")
-    };
-    std::fs::write(&pid_path, std::process::id().to_string())
-        .unwrap_or_else(|e| tracing::warn!(error = %e, "failed to write PID file"));
+    // Write PID file so `smj daemon stop` can send SIGTERM. Stored in
+    // XDG_RUNTIME_DIR (per-user tmpfs, 0700 by default on systemd) or
+    // ~/.cache as a private fallback; never /tmp which is world-traversable.
+    let pid_path = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|d| std::path::PathBuf::from(d).join("smdjad.pid"))
+        .or_else(|| dirs_home().map(|h| h.join(".cache").join("smdjad.pid")));
+    if let Some(ref p) = pid_path {
+        std::fs::write(p, std::process::id().to_string())
+            .unwrap_or_else(|e| tracing::warn!(error = %e, "failed to write PID file"));
+    } else {
+        tracing::warn!("no private directory for PID file (set XDG_RUNTIME_DIR or HOME); smj daemon stop will not work");
+    }
 
     info!(path = %path.display(), "smdjad listening");
 
@@ -1080,47 +787,51 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Refresh MCP server tool lists that have not been updated in the last hour.
-    {
-        let stale_threshold = crate::common::now_epoch() - 3600.0;
-        let servers = ingot
-            .list_mcp_servers()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|s| s.last_refresh < stale_threshold)
-            .collect::<Vec<_>>();
+    // Dispatcher capacity 1024: lifecycle events (Started/Completed/Failed) must
+    // never be dropped during streaming delta bursts. 1024 provides 4× the
+    // previous headroom while remaining negligible in memory cost.
+    let dispatcher = Arc::new(Dispatcher::new(1024));
 
-        for server in servers {
-            match crate::mcp_http::McpHttpClient::new(&server.url, "") {
-                Ok(client) => match client.list_tools().await {
-                    Ok(tools) => {
-                        let tools_json =
-                            serde_json::to_string(&tools).unwrap_or_else(|_| "[]".to_owned());
-                        let updated = McpServer {
-                            tools_json,
-                            last_refresh: crate::common::now_epoch(),
-                            ..server.clone()
-                        };
-                        if let Err(e) = ingot.register_mcp_server(updated).await {
-                            tracing::warn!(name = %server.name, error = %e, "failed to update MCP tools at startup");
+    // Refresh stale MCP server tool lists in the background so startup is not
+    // delayed by N×network_latency when multiple servers are registered.
+    {
+        let ingot_clone = ingot.clone();
+        tokio::spawn(async move {
+            let stale_threshold = crate::common::now_epoch() - 3600.0;
+            let servers = ingot_clone
+                .list_mcp_servers()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|s| s.last_refresh < stale_threshold)
+                .collect::<Vec<_>>();
+
+            for server in servers {
+                match crate::mcp_http::McpHttpClient::new(&server.url, "") {
+                    Ok(client) => match client.list_tools().await {
+                        Ok(tools) => {
+                            let tools_json =
+                                serde_json::to_string(&tools).unwrap_or_else(|_| "[]".to_owned());
+                            let updated = McpServer {
+                                tools_json,
+                                last_refresh: crate::common::now_epoch(),
+                                ..server.clone()
+                            };
+                            if let Err(e) = ingot_clone.register_mcp_server(updated).await {
+                                tracing::warn!(name = %server.name, error = %e, "failed to update MCP tools at startup");
+                            }
                         }
-                    }
+                        Err(e) => {
+                            tracing::warn!(name = %server.name, error = %e, "MCP refresh failed at startup");
+                        }
+                    },
                     Err(e) => {
-                        tracing::warn!(name = %server.name, error = %e, "MCP refresh failed at startup");
+                        tracing::warn!(name = %server.name, error = %e, "failed to build MCP client at startup");
                     }
-                },
-                Err(e) => {
-                    tracing::warn!(name = %server.name, error = %e, "failed to build MCP client at startup");
                 }
             }
-        }
+        });
     }
-
-    // Capacity 256: lifecycle events (Started/Completed/Failed) must never be
-    // dropped by streaming delta overflow.  256 provides enough headroom for
-    // bursts of AssistantDelta chunks without discarding control events.
-    let dispatcher = Arc::new(Dispatcher::new(256));
     let gates: Arc<Mutex<HashMap<String, Arc<CoworkGate>>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // Build the provider pool and assayer once at startup; thread through Arc.
@@ -1203,6 +914,20 @@ async fn main() -> anyhow::Result<()> {
     let task_set: Arc<Mutex<tokio::task::JoinSet<()>>> =
         Arc::new(Mutex::new(tokio::task::JoinSet::new()));
 
+    // Start LSP manager for the daemon workspace. Servers are auto-detected
+    // from PATH; missing servers fail silently.
+    let lsp_manager = {
+        let mgr = smedja_lsp::LspManager::new();
+        let ws = common::workspace_root();
+        mgr.start(ws);
+        Arc::new(mgr)
+    };
+
+    // Dedicated mpsc channel for turn start events — bypasses the broadcast so
+    // Started is never dropped under high delta/diagnostic load (capacity 256
+    // is a hard upper bound on concurrent in-flight turns).
+    let (work_tx, work_rx) = tokio::sync::mpsc::channel::<(String, String)>(256);
+
     let router = build_router(
         &ingot,
         &dispatcher,
@@ -1217,6 +942,8 @@ async fn main() -> anyhow::Result<()> {
         &provider_sessions,
         &cache_aligners,
         &task_set,
+        &lsp_manager,
+        work_tx,
     );
 
     spawn_worker(
@@ -1231,7 +958,28 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&provider_sessions),
         Arc::clone(&cache_aligners),
         Arc::clone(&task_set),
+        work_rx,
     );
+
+    // Background daily maintenance: prune old sessions and VACUUM both databases.
+    {
+        let ingot_for_vacuum = ingot.clone();
+        tokio::spawn(async move {
+            // First run after 1 hour so startup I/O is not affected.
+            tokio::time::sleep(std::time::Duration::from_secs(3_600)).await;
+            loop {
+                match ingot_for_vacuum.prune_old_sessions(30).await {
+                    Ok(n) if n > 0 => info!(pruned = n, "pruned old terminated sessions"),
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "session prune failed"),
+                }
+                if let Err(e) = ingot_for_vacuum.vacuum().await {
+                    warn!(error = %e, "database vacuum failed");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(86_400)).await;
+            }
+        });
+    }
 
     // ACP HTTP server — activated by SMEDJA_ACP_PORT.
     if let Ok(port_str) = std::env::var("SMEDJA_ACP_PORT") {
@@ -1324,6 +1072,13 @@ async fn main() -> anyhow::Result<()> {
     // Socket is bound and the database is open: signal readiness to systemd.
     sd_notify_ready();
 
+    // Install signal handlers before entering select! so registration failures
+    // surface at startup rather than panicking inside the async block.
+    let mut sig_term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| anyhow::anyhow!("failed to install SIGTERM handler: {e}"))?;
+    let mut sig_hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .map_err(|e| anyhow::anyhow!("failed to install SIGHUP handler: {e}"))?;
+
     tokio::select! {
         result = server.serve(listener) => {
             result?;
@@ -1331,25 +1086,17 @@ async fn main() -> anyhow::Result<()> {
         _ = tokio::signal::ctrl_c() => {
             info!("received SIGINT; shutting down");
         }
-        _ = async {
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("SIGTERM handler failed")
-                .recv()
-                .await
-        } => {
+        _ = sig_term.recv() => {
             info!("received SIGTERM; shutting down");
         }
-        _ = async {
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-                .expect("SIGHUP handler failed")
-                .recv()
-                .await
-        } => {
+        _ = sig_hup.recv() => {
             // Treat SIGHUP as a graceful shutdown so the drain and SocketGuard
             // cleanup run, rather than the default terminate-without-cleanup.
             info!("received SIGHUP; shutting down");
         }
     }
+
+    lsp_manager.shutdown();
 
     // Drain in-flight turn tasks and loop.run background tasks before cleaning
     // up, so mid-stream work can complete (or fail cleanly) rather than being
@@ -1370,7 +1117,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("smdjad stopped");
-    let _ = std::fs::remove_file(&pid_path);
+    if let Some(ref p) = pid_path {
+        let _ = std::fs::remove_file(p);
+    }
     // Socket is removed by _socket_guard's Drop impl on function exit.
 
     Ok(())

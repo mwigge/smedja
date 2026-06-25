@@ -29,8 +29,11 @@ impl Router {
         F: Fn(Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value, RpcError>> + Send + 'static,
     {
-        self.handlers
-            .insert(method.into(), Arc::new(move |p| Box::pin(handler(p))));
+        let method_str: String = method.into();
+        let prev = self
+            .handlers
+            .insert(method_str.clone(), Arc::new(move |p| Box::pin(handler(p))));
+        debug_assert!(prev.is_none(), "duplicate route registered: {method_str}");
         self
     }
 
