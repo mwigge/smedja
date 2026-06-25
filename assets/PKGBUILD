@@ -24,6 +24,7 @@ package() {
   done
 
   install -Dm644 smdjad.service "$pkgdir/usr/lib/systemd/user/smdjad.service"
+  sed -i 's|^ExecStart=.*|ExecStart=/usr/bin/smdjad|' "$pkgdir/usr/lib/systemd/user/smdjad.service"
   install -Dm644 smedja.desktop  "$pkgdir/usr/share/applications/smedja.desktop"
   install -Dm644 smedja-256.png  "$pkgdir/usr/share/icons/hicolor/256x256/apps/smedja.png"
 }

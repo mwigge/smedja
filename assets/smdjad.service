@@ -7,6 +7,7 @@ After=network.target graphical-session.target
 # and the database is open, so systemd only considers the unit started when it
 # is actually ready to serve.
 Type=notify
+ExecStartPre=-/bin/mkdir -p %h/.config/smedja %h/.local/share/smedja
 ExecStart=%h/.local/bin/smdjad
 Restart=on-failure
 RestartSec=5s

@@ -21,6 +21,121 @@ smedja is a Rust rewrite and evolution of [milliways](https://github.com/mwigge/
 
 ---
 
+## Install
+
+### macOS
+
+**One-line install (recommended)**
+
+```sh
+curl -fsSL https://github.com/mwigge/smedja/releases/latest/download/install.sh | sh
+```
+
+Installs `smdjad`, `smj`, `smedja`, and `smedja-tui` to `~/.local/bin/` and registers `smdjad` as a LaunchAgent so it starts at login.
+
+**DMG**
+
+Download `smedja-darwin-<arch>.dmg` from the [latest release](https://github.com/mwigge/smedja/releases/latest), open it, and drag `smedja.app` to `/Applications`.
+
+**Gatekeeper**
+
+macOS will block unsigned binaries downloaded from the internet. Run once after install to clear the quarantine flag:
+
+```sh
+# For the install.sh tarball install:
+xattr -dr com.apple.quarantine ~/.local/bin/smedja ~/.local/bin/smdjad ~/.local/bin/smj ~/.local/bin/smedja-tui
+
+# For the .app bundle:
+xattr -cr /Applications/smedja.app
+```
+
+Alternatively: right-click the binary or app in Finder → Open → Open anyway.
+
+---
+
+### Arch Linux / CachyOS
+
+**One-line install (recommended)**
+
+```sh
+curl -fsSL https://github.com/mwigge/smedja/releases/latest/download/install.sh | sh
+```
+
+Installs `smdjad`, `smj`, `smedja`, and `smedja-tui` to `~/.local/bin/`, enables `smdjad` as a systemd user service, and registers `smedja` in the application launcher.
+
+**PKGBUILD**
+
+```sh
+git clone https://github.com/mwigge/smedja
+cd smedja/assets
+makepkg -si
+systemctl --user enable --now smdjad
+```
+
+---
+
+### Debian / Ubuntu
+
+Download the `.deb` from the [latest release](https://github.com/mwigge/smedja/releases/latest):
+
+```sh
+curl -fsSL -O https://github.com/mwigge/smedja/releases/latest/download/smedja-linux-x86_64.deb
+sudo dpkg -i smedja-linux-x86_64.deb
+```
+
+Enable the daemon:
+
+```sh
+systemctl --user enable --now smdjad
+```
+
+---
+
+### Fedora
+
+Download the `.rpm` from the [latest release](https://github.com/mwigge/smedja/releases/latest):
+
+```sh
+sudo dnf install https://github.com/mwigge/smedja/releases/latest/download/smedja-linux-x86_64.rpm
+```
+
+Enable the daemon:
+
+```sh
+systemctl --user enable --now smdjad
+```
+
+---
+
+### WSL2
+
+Install the Linux tarball as normal — smedja renders via WSLg. Ensure WSLg is enabled in your Windows setup (Windows 11 or Windows 10 with WSLg preview).
+
+```sh
+curl -fsSL https://github.com/mwigge/smedja/releases/latest/download/install.sh | sh
+```
+
+If systemd is not available in your WSL2 distro, add this to `~/.bashrc` or `~/.zshrc` to start the daemon automatically:
+
+```sh
+pgrep -u "$USER" smdjad >/dev/null || smdjad &
+```
+
+---
+
+### Build from source
+
+Requires Rust stable ≥ 1.82.
+
+```bash
+git clone https://github.com/mwigge/smedja
+cd smedja
+cargo build --release --workspace
+cp target/release/{smdjad,smj,smedja-tui,smedja} ~/.local/bin/
+```
+
+---
+
 ## Workspace
 
 <div align="center">
@@ -446,123 +561,6 @@ An unknown `--session <id>` fails fast with `session not found: <id>` before the
 Inside the TUI, `/resume` opens an interactive picker listing resumable sessions (short id, title, mode, last-updated); press Enter on a row to resume it in place without restarting. `/resume <id>` resumes directly, and `/resume <id> <turn>` rewinds to that turn before replaying. Plain resume (no turn) is non-destructive — it only reads history. `/resume` is refused while a turn is in flight.
 
 ---
-
-## Install
-
-### macOS
-
-**One-line install (recommended)**
-
-```sh
-curl -fsSL https://github.com/mwigge/smedja/releases/latest/download/install.sh | sh
-```
-
-Installs `smdjad`, `smj`, `smedja`, and `smedja-tui` to `~/.local/bin/` and registers `smdjad` as a LaunchAgent so it starts at login.
-
-**DMG**
-
-Download `smedja-darwin-<arch>.dmg` from the [latest release](https://github.com/mwigge/smedja/releases/latest), open it, and drag `smedja.app` to `/Applications`.
-
-**Gatekeeper**
-
-macOS will block unsigned binaries downloaded from the internet. Run once after install to clear the quarantine flag:
-
-```sh
-# For the install.sh tarball install:
-xattr -dr com.apple.quarantine ~/.local/bin/smedja ~/.local/bin/smdjad ~/.local/bin/smj ~/.local/bin/smedja-tui
-
-# For the .app bundle:
-xattr -cr /Applications/smedja.app
-```
-
-Alternatively: right-click the binary or app in Finder → Open → Open anyway.
-
----
-
-### Arch Linux / CachyOS
-
-Install from the AUR using any AUR helper:
-
-```sh
-yay -S smedja
-# or: paru -S smedja
-```
-
-Or build from the PKGBUILD directly:
-
-```sh
-git clone https://github.com/mwigge/smedja
-cd smedja/assets
-makepkg -si
-```
-
-After install, enable the daemon for auto-start on login:
-
-```sh
-systemctl --user enable --now smdjad
-```
-
----
-
-### Debian / Ubuntu
-
-Download the `.deb` from the [latest release](https://github.com/mwigge/smedja/releases/latest):
-
-```sh
-curl -fsSL -O https://github.com/mwigge/smedja/releases/latest/download/smedja-linux-x86_64.deb
-sudo dpkg -i smedja-linux-x86_64.deb
-```
-
-Enable the daemon:
-
-```sh
-systemctl --user enable --now smdjad
-```
-
----
-
-### Fedora
-
-Download the `.rpm` from the [latest release](https://github.com/mwigge/smedja/releases/latest):
-
-```sh
-sudo dnf install https://github.com/mwigge/smedja/releases/latest/download/smedja-linux-x86_64.rpm
-```
-
-Enable the daemon:
-
-```sh
-systemctl --user enable --now smdjad
-```
-
----
-
-### WSL2
-
-Install the Linux tarball as normal — smedja renders via WSLg. Ensure WSLg is enabled in your Windows setup (Windows 11 or Windows 10 with WSLg preview).
-
-```sh
-curl -fsSL https://github.com/mwigge/smedja/releases/latest/download/install.sh | sh
-```
-
-If systemd is not available in your WSL2 distro, add this to `~/.bashrc` or `~/.zshrc` to start the daemon automatically:
-
-```sh
-pgrep -u "$USER" smdjad >/dev/null || smdjad &
-```
-
----
-
-### Build from source
-
-Requires Rust stable ≥ 1.82.
-
-```bash
-git clone https://github.com/mwigge/smedja
-cd smedja
-cargo build --release --workspace
-cp target/release/{smdjad,smj,smedja-tui,smedja} ~/.local/bin/
-```
 
 ## Getting Started
 

@@ -131,12 +131,9 @@ fn resume_plan(turn: Option<u32>) -> ResumePlan {
 /// Available slash-command completions shown in the popup.
 const SLASH_COMPLETIONS: &[&str] = &[
     "/agent",
-    "/agents",
-    "/approvals",
     "/approve",
     "/briefing",
     "/clear",
-    "/deny",
     "/drawio",
     "/health",
     "/help",
@@ -155,13 +152,10 @@ const SLASH_COMPLETIONS: &[&str] = &[
 
 const HELP_TEXT: &str = "\
 slash commands:
-  /agent <id>        — run named agent
-  /agents            — list available agents
-  /approvals         — list pending cowork approvals
-  /approve <id>      — approve a cowork item
+  /agent [id]        — run named agent (omit id to list available agents)
+  /approve [id]      — approve a cowork item (omit id to list pending approvals)
   /briefing          — show session briefing
   /clear             — clear message display (keeps session data)
-  /deny <id>         — deny a cowork item
   /drawio <slug>     — generate draw.io diagram
   /health            — check daemon connectivity
   /help              — show this message
@@ -1027,20 +1021,29 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
             Ok(true)
         }
         "agent" => {
-            let text = apply_agent(args, state);
-            if matches!(args, "impl" | "review" | "test" | "sre" | "explain") {
-                let session_id = state.session_id.clone();
-                let _ = client
-                    .call(
-                        "session.set_mode",
-                        json!({
-                            "session_id": session_id,
-                            "mode": args,
-                        }),
-                    )
-                    .await;
+            if args.is_empty() {
+                let result = client.call("runner.list", json!({})).await;
+                let text = match result {
+                    Ok(v) => format_agents_table(&v),
+                    Err(e) => format!("runner.list error: {e}"),
+                };
+                push_system_message(state, text);
+            } else {
+                let text = apply_agent(args, state);
+                if matches!(args, "impl" | "review" | "test" | "sre" | "explain") {
+                    let session_id = state.session_id.clone();
+                    let _ = client
+                        .call(
+                            "session.set_mode",
+                            json!({
+                                "session_id": session_id,
+                                "mode": args,
+                            }),
+                        )
+                        .await;
+                }
+                push_system_message(state, text);
             }
-            push_system_message(state, text);
             Ok(true)
         }
         "health" => {
@@ -1157,15 +1160,6 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
             }
             Ok(true)
         }
-        "agents" => {
-            let result = client.call("runner.list", json!({})).await;
-            let text = match result {
-                Ok(v) => format_agents_table(&v),
-                Err(e) => format!("runner.list error: {e}"),
-            };
-            push_system_message(state, text);
-            Ok(true)
-        }
         "metrics" => {
             let session_id = state.session_id.clone();
             let usage_result = client
@@ -1178,21 +1172,17 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
             push_system_message(state, text);
             Ok(true)
         }
-        "approvals" => {
-            let session_id = state.session_id.clone();
-            let result = client
-                .call("cowork.pending", json!({ "session_id": session_id }))
-                .await;
-            let text = match result {
-                Ok(v) => format_approvals_list(&v),
-                Err(e) => format!("cowork.pending error: {e}"),
-            };
-            push_system_message(state, text);
-            Ok(true)
-        }
         "approve" => {
             if args.is_empty() {
-                push_system_message(state, "usage: /approve <id>");
+                let session_id = state.session_id.clone();
+                let result = client
+                    .call("cowork.pending", json!({ "session_id": session_id }))
+                    .await;
+                let text = match result {
+                    Ok(v) => format_approvals_list(&v),
+                    Err(e) => format!("cowork.pending error: {e}"),
+                };
+                push_system_message(state, text);
                 return Ok(true);
             }
             let id = args.to_owned();
@@ -1217,38 +1207,6 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
                     push_system_message(state, text);
                 }
                 Err(e) => push_system_message(state, format!("cowork.approve error: {e}")),
-            }
-            Ok(true)
-        }
-        "deny" => {
-            if args.is_empty() {
-                push_system_message(state, "usage: /deny <id> [reason]");
-                return Ok(true);
-            }
-            let mut parts = args.splitn(2, ' ');
-            let id = parts.next().unwrap_or_default().to_owned();
-            let reason = parts.next().unwrap_or("denied").to_owned();
-            let session_id = state.session_id.clone();
-            let result = client
-                .call(
-                    "cowork.deny",
-                    json!({ "session_id": session_id, "id": id, "reason": reason }),
-                )
-                .await;
-            match result {
-                Ok(v) => {
-                    let resolved = v
-                        .get("resolved")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
-                    let text = if resolved {
-                        format!("denied: {id}")
-                    } else {
-                        format!("item not found: {id}")
-                    };
-                    push_system_message(state, text);
-                }
-                Err(e) => push_system_message(state, format!("cowork.deny error: {e}")),
             }
             Ok(true)
         }
@@ -1638,7 +1596,7 @@ fn format_approvals_list(v: &serde_json::Value) -> String {
         let args = item.get("args").and_then(|v| v.as_str()).unwrap_or("");
         lines.push(format!("  [{id}] {tool}: {args}"));
     }
-    lines.push("use /approve <id> or /deny <id> [reason]".to_owned());
+    lines.push("use /approve <id> to approve".to_owned());
     lines.join("\n")
 }
 
@@ -3952,11 +3910,9 @@ mod tests {
     #[test]
     fn slash_completions_include_new_commands() {
         let required = [
-            "/agents",
+            "/agent",
             "/approve",
-            "/approvals",
             "/briefing",
-            "/deny",
             "/login",
             "/metrics",
             "/model",
@@ -5098,7 +5054,7 @@ mod tests {
             "/switch",
             "/health",
             "/tier",
-            "/agents",
+            "/agent",
             "/briefing",
             "/clear",
         ] {
