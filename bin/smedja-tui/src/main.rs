@@ -147,6 +147,8 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/switch",
     "/takeover",
     "/tier",
+    "/upgrade",
+    "/version",
 ];
 
 const HELP_TEXT: &str = "\
@@ -170,6 +172,8 @@ slash commands:
   /switch [runner]   — switch AI runner (omit for interactive picker)
   /takeover <runner> — fork session to new runner
   /tier <t>          — set tier (local|fast|deep)
+  /version           — print current version and check for a newer release
+  /upgrade           — download and install the latest release in-place
 
 inline context fragments (expanded into your message before the turn runs):
   @file <path>       — inject a workspace file's contents (path stays inside the workspace)
@@ -918,6 +922,152 @@ fn paste_from_clipboard() -> Option<String> {
 }
 
 /// Runs `openspec bin args` as a subprocess and returns stdout on success, stderr on error.
+/// Current binary version, baked in at compile time.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Fetches the latest release tag from the GitHub API.
+///
+/// Returns `Some("v0.15.1")` on success, `None` on any network or parse
+/// failure.  Uses `curl` as an external subprocess so we don't need a full
+/// HTTP client dependency.
+async fn fetch_latest_version() -> Option<String> {
+    let out = tokio::process::Command::new("curl")
+        .args([
+            "-sf",
+            "--max-time",
+            "10",
+            "-H",
+            "Accept: application/vnd.github.v3+json",
+            "-H",
+            &format!("User-Agent: smedja-tui/{VERSION}"),
+            "https://api.github.com/repos/mwigge/smedja/releases/latest",
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let body: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    body.get("tag_name")?.as_str().map(str::to_owned)
+}
+
+/// Returns `true` when `latest` (e.g. `"v0.16.0"`) is strictly greater than
+/// `current` (e.g. `"0.15.0"`).  Leading `v` is stripped before comparison.
+fn is_newer(latest: &str, current: &str) -> bool {
+    let parse = |v: &str| -> Option<(u64, u64, u64)> {
+        let v = v.trim_start_matches('v');
+        let p: Vec<u64> = v.split('.').filter_map(|s| s.parse().ok()).collect();
+        if p.len() == 3 { Some((p[0], p[1], p[2])) } else { None }
+    };
+    match (parse(latest), parse(current)) {
+        (Some(l), Some(c)) => l > c,
+        _ => false,
+    }
+}
+
+/// Downloads the latest release tarball and installs the binaries alongside
+/// the currently-running executable.
+///
+/// Returns a human-readable outcome string (success or error details) so the
+/// caller can push it straight into the panel.
+async fn run_upgrade(latest_tag: &str) -> String {
+    let arch = if cfg!(target_arch = "x86_64") { "x86_64" } else { "aarch64" };
+    let url = format!(
+        "https://github.com/mwigge/smedja/releases/download/{latest_tag}/smedja-linux-{arch}.tar.gz"
+    );
+
+    // Resolve the directory that contains the currently running smedja-tui
+    // binary; new binaries will be placed alongside it.
+    let install_dir = match std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
+        Some(d) => d,
+        None => return "upgrade failed: could not determine install directory".into(),
+    };
+
+    let tmp = std::env::temp_dir().join("smedja-upgrade");
+    let _ = std::fs::remove_dir_all(&tmp);
+    if std::fs::create_dir_all(&tmp).is_err() {
+        return "upgrade failed: could not create temp directory".into();
+    }
+    let tarball = tmp.join("release.tar.gz");
+
+    // Download
+    let dl = tokio::process::Command::new("curl")
+        .args(["-sfL", "--max-time", "120", &url, "-o"])
+        .arg(&tarball)
+        .status()
+        .await;
+    if !matches!(dl, Ok(s) if s.success()) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return format!("upgrade failed: could not download {url}");
+    }
+
+    // Extract
+    let ex = tokio::process::Command::new("tar")
+        .args(["-xzf"])
+        .arg(&tarball)
+        .arg("-C")
+        .arg(&tmp)
+        .status()
+        .await;
+    if !matches!(ex, Ok(s) if s.success()) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return "upgrade failed: extraction error".into();
+    }
+
+    // Install each binary with mv (atomic) falling back to copy.
+    let src_dir = tmp.join(format!("smedja-linux-{arch}"));
+    let bins = ["smedja", "smedja-tui", "smdjad", "smj"];
+    let mut installed = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+
+    for bin in bins {
+        let src = src_dir.join(bin);
+        let dst = install_dir.join(bin);
+        if !src.exists() {
+            continue;
+        }
+        // mv is atomic on the same filesystem; fall back to copy for cross-fs
+        let ok = std::fs::rename(&src, &dst)
+            .or_else(|_| std::fs::copy(&src, &dst).map(|_| ()))
+            .is_ok();
+        if ok {
+            installed.push(bin);
+        } else {
+            failed.push(bin.into());
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // Restart smdjad if systemctl is available.
+    let smdjad_status = tokio::process::Command::new("systemctl")
+        .args(["--user", "restart", "smdjad"])
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let mut msg = if failed.is_empty() {
+        format!(
+            "upgraded to {latest_tag} ({})\nrestart smedja to use the new binary",
+            installed.join(", ")
+        )
+    } else {
+        format!(
+            "partial upgrade to {latest_tag}\n  ok: {}\n  failed: {}",
+            installed.join(", "),
+            failed.join(", ")
+        )
+    };
+    if smdjad_status {
+        msg.push_str("\nsmdjad restarted via systemctl");
+    }
+    msg
+}
+
 async fn run_openspec(bin: &std::path::Path, args: &[&str]) -> Result<String, String> {
     let output = tokio::process::Command::new(bin)
         .args(args)
@@ -1589,6 +1739,45 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
                     resume_into_view(state, client, resume_plan(turn)).await;
                 }
             }
+            Ok(true)
+        }
+        "version" => {
+            push_system_message(state, format!("smedja v{VERSION}"));
+            match fetch_latest_version().await {
+                Some(ref tag) if is_newer(tag, VERSION) => {
+                    push_system_message(
+                        state,
+                        format!("new version {tag} available — run /upgrade to install"),
+                    );
+                }
+                Some(_) => {
+                    push_system_message(state, "you are up to date");
+                }
+                None => {
+                    push_system_message(
+                        state,
+                        "could not reach GitHub to check for updates",
+                    );
+                }
+            }
+            Ok(true)
+        }
+        "upgrade" => {
+            push_system_message(state, format!("checking for updates (current: v{VERSION})…"));
+            let latest = match fetch_latest_version().await {
+                Some(t) => t,
+                None => {
+                    push_system_message(state, "upgrade failed: could not reach GitHub releases");
+                    return Ok(true);
+                }
+            };
+            if !is_newer(&latest, VERSION) {
+                push_system_message(state, format!("already at {latest}, nothing to upgrade"));
+                return Ok(true);
+            }
+            push_system_message(state, format!("downloading {latest}…"));
+            let result = run_upgrade(&latest).await;
+            push_system_message(state, result);
             Ok(true)
         }
         _ => Ok(false),
