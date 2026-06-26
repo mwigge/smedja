@@ -1337,6 +1337,34 @@ impl Renderer {
                 );
             }
         }
+
+        // Warm glyphs for the TOP-bar segments too — they render at the same
+        // small font key as the status bar. Without this every top-bar cell
+        // whose glyph isn't already cached misses the atlas and is skipped on
+        // every frame (the "glyph atlas miss — top-bar cell skipped" spam), so
+        // the title/cwd render unreliably.
+        let tb_chars: Vec<char> = self
+            .top_bar_segments
+            .iter()
+            .flat_map(|seg| seg.text.chars())
+            .filter(|&c| c != ' ')
+            .collect();
+        for ch in tb_chars {
+            if !self
+                .atlas
+                .glyphs
+                .contains_key(&(ch, false, false, sb_font_size_key))
+            {
+                let _ = self.atlas.get_or_insert(
+                    &self.device,
+                    &self.queue,
+                    ch,
+                    sb_font_size,
+                    false,
+                    false,
+                );
+            }
+        }
     }
 
     /// Sets the block decorations for the next render pass.
