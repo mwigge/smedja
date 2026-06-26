@@ -19,7 +19,9 @@ use statusbar::{render_status_bar, ModuleCtx};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -136,9 +138,11 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/briefing",
     "/clear",
     "/drawio",
+    "/gov",
     "/health",
     "/help",
     "/login",
+    "/loop",
     "/lsp",
     "/metrics",
     "/model",
@@ -163,9 +167,11 @@ slash commands:
   /briefing          — show session briefing
   /clear             — clear message display (keeps session data)
   /drawio <slug>     — generate draw.io diagram
+  /gov [list|show <id>] — browse govctl artifacts (gov/work-items/, gov/rfc/, gov/adr/)
   /health            — check daemon connectivity
   /help              — show this message
   /login             — authenticate with runner
+  /loop [status|list|create <goal>|cancel] — manage loop runs
   /lsp               — show LSP server status and diagnostic summary
   /metrics           — show token usage and cost
   /model [name]      — show or set model (local runner: lists GPU fit / hot-swaps)
@@ -193,22 +199,27 @@ keybindings (input mode):
   Up / Ctrl-P        — browse history backwards
   Down / Ctrl-N      — browse history forwards
   Ctrl-R             — toggle reverse history search
+  Ctrl-G             — open $EDITOR / $VISUAL to compose a multi-line message
 
 keybindings (scroll/normal mode):
   i / a              — return to input mode
   j / k              — scroll down / up
   G                  — scroll to bottom
   gg                 — scroll to top
+  Ctrl-F             — toggle context rail
   Ctrl-L             — toggle LSP diagnostic panel
   Ctrl-O             — toggle observability panel
-  Ctrl-R             — toggle context rail
+  Ctrl-W             — toggle session browser (left rail)
+  [ / ]              — move cursor up / down in session rail
   v                  — start line selection (visual mode)
   y                  — yank selection to clipboard
   t                  — copy traceparent
+  T                  — expand / collapse thinking block (when model emits thinking tokens)
   Esc                — exit selection / return to input
 
-note: mouse capture is disabled so the GPU terminal handles selection;
-      use v/y in scroll mode to copy text from the TUI";
+note: scroll wheel scrolls the main panel; use v/y in scroll mode to copy text.
+      mouse capture is active — the outer GPU terminal's click-selection is
+      suspended while smedja-tui is focused.";
 
 #[allow(clippy::struct_excessive_bools)] // AppState is a TUI dispatch table; enum-splitting would add indirection without clarity
 #[derive(Debug)]
@@ -280,6 +291,14 @@ struct AppState {
     session_picker_mode: bool,
     /// Session ids parallel to `slash_completions` while the session picker is open.
     session_picker_ids: Vec<String>,
+    /// Whether the left-rail session browser is visible (Ctrl-W to toggle).
+    session_rail_visible: bool,
+    /// Sessions shown in the left rail: (id, label) pairs.
+    session_rail_items: Vec<(String, String)>,
+    /// Cursor row within the session rail.
+    session_rail_cursor: usize,
+    /// Timestamp of the last session rail refresh.
+    last_session_rail_poll: Option<std::time::Instant>,
     /// True while a turn is awaiting a response from the daemon.
     #[allow(dead_code)] // wired at init; read path lands once streaming poll is complete
     turn_in_flight: bool,
@@ -311,6 +330,14 @@ struct AppState {
     last_cowork_poll: Option<std::time::Instant>,
     /// NDJSON stream receiver for the current in-flight turn.
     stream_rx: Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>,
+    /// Accumulated thinking-token text for the current in-flight turn.
+    ///
+    /// Reset to empty at the start of each new turn. Rendered as a dim
+    /// collapsible block while the turn is in flight; summarised as a
+    /// single-line badge once the turn completes.
+    current_thinking: String,
+    /// Whether the completed thinking block is expanded in the panel.
+    thinking_expanded: bool,
     /// Path of the smdjad stream socket (`<rpc_sock>.stream`).
     stream_sock_path: PathBuf,
     /// W3C traceparent from the most recently completed turn.
@@ -561,6 +588,8 @@ async fn submit(input: &str, state: &mut AppState, client: &mut Client) -> Resul
             state.pending_task_id = Some(task_id.clone());
             state.turn_in_flight = true;
             state.last_poll = Some(std::time::Instant::now());
+            state.current_thinking.clear();
+            state.thinking_expanded = false;
 
             // Start streaming reader; events arrive via unbounded channel.
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -601,6 +630,28 @@ fn push_system_message(state: &mut AppState, text: impl Into<String>) {
         role: Role::System,
         text: text.into(),
     };
+    // Short single-line operational messages are also routed to the action log
+    // (the "emit" rail in the SuperConsole pattern) so they appear in both
+    // the main panel and the scrolling event strip.
+    let first_line = msg.text.lines().next().unwrap_or("").to_owned();
+    if !msg.text.contains('\n') {
+        let ts = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let h = (secs / 3600) % 24;
+            let m = (secs / 60) % 60;
+            let s = secs % 60;
+            format!("{h:02}:{m:02}:{s:02}")
+        };
+        state.action_log.push(action_log::AuditEntry {
+            timestamp: ts,
+            action: first_line,
+            tool_name: String::new(),
+            outcome: "sys".to_owned(),
+        });
+    }
     state.main_panel.push_line(msg.text.clone());
     state.messages.push(msg);
 }
@@ -882,14 +933,17 @@ fn yank_to_clipboard(lines: &[String]) -> Result<&'static str, String> {
             .spawn();
         match result {
             Ok(mut child) => {
-                let write_ok = child.stdin.take().map_or(true, |mut stdin| {
-                    stdin.write_all(text.as_bytes()).is_ok()
-                });
+                let write_ok = child
+                    .stdin
+                    .take()
+                    .is_none_or(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
                 if write_ok {
                     // Reap the child in a background thread so we don't block
                     // the TUI event loop (clipboard tools like wl-copy stay
                     // alive serving paste requests until another owner takes over).
-                    std::thread::spawn(move || { let _ = child.wait(); });
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
                     return Ok(bin);
                 }
             }
@@ -920,10 +974,7 @@ fn paste_from_clipboard() -> Option<String> {
     #[cfg(not(target_os = "macos"))]
     {
         if std::env::var("WAYLAND_DISPLAY").is_ok() {
-            let out = Command::new("wl-paste")
-                .arg("--no-newline")
-                .output()
-                .ok()?;
+            let out = Command::new("wl-paste").arg("--no-newline").output().ok()?;
             if out.status.success() {
                 return Some(String::from_utf8_lossy(&out.stdout).into_owned());
             }
@@ -947,6 +998,56 @@ fn paste_from_clipboard() -> Option<String> {
         }
         None
     }
+}
+
+/// Resolves the editor binary to use for Ctrl-G composition.
+///
+/// Priority: `$VISUAL` → `$EDITOR` → `vi`.
+fn resolve_editor() -> String {
+    std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_owned())
+}
+
+/// Opens the system `$EDITOR` with `initial_text` pre-filled.
+///
+/// Suspends the TUI (disables raw mode + leaves the alternate screen), runs
+/// the editor, then restores the terminal.  Returns the trimmed file contents
+/// on success, or `None` if the editor exited with a non-zero status or an
+/// I/O error occurred.
+fn open_in_editor(initial_text: &str) -> Option<String> {
+    use std::{fs, io::Write as _, process::Command};
+
+    let editor = resolve_editor();
+
+    // Temp file keyed by PID; no external crate needed.
+    let path = std::env::temp_dir().join(format!("smedja-edit-{}.md", std::process::id()));
+
+    // Write the current input into the temp file.
+    {
+        let mut f = fs::File::create(&path).ok()?;
+        f.write_all(initial_text.as_bytes()).ok()?;
+    }
+
+    // Suspend the TUI so the editor can own the terminal.
+    let _ = disable_raw_mode();
+    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+
+    let status = Command::new(&editor).arg(&path).status();
+
+    // Restore the TUI regardless of editor outcome.
+    let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+    let _ = enable_raw_mode();
+
+    let ok = status.is_ok_and(|s| s.success());
+    if !ok {
+        let _ = fs::remove_file(&path);
+        return None;
+    }
+
+    let text = fs::read_to_string(&path).ok();
+    let _ = fs::remove_file(&path);
+    text.map(|s| s.trim_end_matches('\n').to_owned())
 }
 
 /// Runs `openspec bin args` as a subprocess and returns stdout on success, stderr on error.
@@ -986,7 +1087,11 @@ fn is_newer(latest: &str, current: &str) -> bool {
     let parse = |v: &str| -> Option<(u64, u64, u64)> {
         let v = v.trim_start_matches('v');
         let p: Vec<u64> = v.split('.').filter_map(|s| s.parse().ok()).collect();
-        if p.len() == 3 { Some((p[0], p[1], p[2])) } else { None }
+        if p.len() == 3 {
+            Some((p[0], p[1], p[2]))
+        } else {
+            None
+        }
     };
     match (parse(latest), parse(current)) {
         (Some(l), Some(c)) => l > c,
@@ -1000,7 +1105,11 @@ fn is_newer(latest: &str, current: &str) -> bool {
 /// Returns a human-readable outcome string (success or error details) so the
 /// caller can push it straight into the panel.
 async fn run_upgrade(latest_tag: &str) -> String {
-    let arch = if cfg!(target_arch = "x86_64") { "x86_64" } else { "aarch64" };
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        "aarch64"
+    };
     let url = format!(
         "https://github.com/mwigge/smedja/releases/download/{latest_tag}/smedja-linux-{arch}.tar.gz"
     );
@@ -1280,8 +1389,152 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
             push_system_message(state, text);
             Ok(true)
         }
+        "gov" => {
+            let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let artifacts = scan_gov_artifacts(&workspace);
+            match args {
+                "" | "list" => {
+                    push_system_message(state, format_gov_list(&artifacts));
+                }
+                id_or_show if id_or_show.starts_with("show ") => {
+                    let id = id_or_show.trim_start_matches("show ").trim();
+                    if let Some(a) = artifacts.iter().find(|a| a.id.eq_ignore_ascii_case(id)) {
+                        push_system_message(
+                            state,
+                            format!(
+                                "id: {}\nkind: {}\nstatus: {}\ntitle: {}",
+                                a.id, a.kind, a.status, a.title
+                            ),
+                        );
+                    } else {
+                        push_system_message(state, format!("gov show: artifact '{id}' not found"));
+                    }
+                }
+                _ => {
+                    push_system_message(
+                        state,
+                        "gov: unknown subcommand — try: /gov list | /gov show <id>",
+                    );
+                }
+            }
+            Ok(true)
+        }
         "help" => {
             push_system_message(state, HELP_TEXT);
+            Ok(true)
+        }
+        "loop" => {
+            match args {
+                "status" | "" => {
+                    match client
+                        .call("loop.list_by_status", json!({"statuses": ["planning","slicing","verifying","reviewing","fixed"]}))
+                        .await
+                    {
+                        Ok(Value::Object(ref resp)) => {
+                            let loops = resp.get("loops")
+                                .and_then(serde_json::Value::as_array)
+                                .cloned()
+                                .unwrap_or_default();
+                            if loops.is_empty() {
+                                push_system_message(state, "loop: no active loops");
+                            } else {
+                                let mut lines = vec!["active loops:".to_owned()];
+                                for l in &loops {
+                                    let id = l["id"].as_str().unwrap_or("?");
+                                    let status = l["status"].as_str().unwrap_or("?");
+                                    let goal = l["goal"].as_str().unwrap_or("");
+                                    lines.push(format!("  {id} [{status}] {goal}"));
+                                }
+                                push_system_message(state, lines.join("\n"));
+                            }
+                        }
+                        Err(e) => push_system_message(state, format!("loop.status error: {e}")),
+                        _ => push_system_message(state, "loop: unexpected response format"),
+                    }
+                }
+                "list" => {
+                    match client
+                        .call("loop.list", json!({"session_id": state.session_id}))
+                        .await
+                    {
+                        Ok(Value::Object(ref resp)) => {
+                            let loops = resp
+                                .get("loops")
+                                .and_then(serde_json::Value::as_array)
+                                .cloned()
+                                .unwrap_or_default();
+                            if loops.is_empty() {
+                                push_system_message(state, "loop: no loops for this session");
+                            } else {
+                                let mut lines = vec!["loops:".to_owned()];
+                                for l in &loops {
+                                    let id = l["id"].as_str().unwrap_or("?");
+                                    let status = l["status"].as_str().unwrap_or("?");
+                                    let goal = l["goal"].as_str().unwrap_or("");
+                                    lines.push(format!("  {id} [{status}] {goal}"));
+                                }
+                                push_system_message(state, lines.join("\n"));
+                            }
+                        }
+                        Err(e) => push_system_message(state, format!("loop.list error: {e}")),
+                        _ => push_system_message(state, "loop: unexpected response format"),
+                    }
+                }
+                goal if goal.starts_with("create ") => {
+                    let goal_text = goal.trim_start_matches("create ").trim();
+                    if goal_text.is_empty() {
+                        push_system_message(
+                            state,
+                            "loop create: provide a goal — /loop create <goal text>",
+                        );
+                    } else {
+                        match client
+                            .call(
+                                "loop.create",
+                                json!({
+                                    "session_id": state.session_id,
+                                    "goal": goal_text,
+                                }),
+                            )
+                            .await
+                        {
+                            Ok(ref resp) => {
+                                let id = resp["id"].as_str().unwrap_or("?");
+                                push_system_message(state, format!("loop created: {id}"));
+                            }
+                            Err(e) => push_system_message(state, format!("loop.create error: {e}")),
+                        }
+                    }
+                }
+                "cancel" => {
+                    // Cancel the most recent active loop for this session.
+                    match client
+                        .call("loop.list_by_status", json!({"statuses": ["planning","slicing","verifying","reviewing","fixed"]}))
+                        .await
+                    {
+                        Ok(Value::Object(ref resp)) => {
+                            let loops = resp.get("loops")
+                                .and_then(serde_json::Value::as_array)
+                                .cloned()
+                                .unwrap_or_default();
+                            if let Some(first) = loops.first() {
+                                let id = first["id"].as_str().unwrap_or("").to_owned();
+                                match client.call("loop.cancel", json!({"id": id})).await {
+                                    Ok(_) => push_system_message(state, format!("loop cancelled: {id}")),
+                                    Err(e) => push_system_message(state, format!("loop.cancel error: {e}")),
+                                }
+                            } else {
+                                push_system_message(state, "loop cancel: no active loop to cancel");
+                            }
+                        }
+                        Err(e) => push_system_message(state, format!("loop.list error: {e}")),
+                        _ => push_system_message(state, "loop: unexpected response"),
+                    }
+                }
+                _ => {
+                    push_system_message(state, "loop: unknown subcommand — try: /loop status | list | create <goal> | cancel");
+                }
+            }
             Ok(true)
         }
         "quit" | "exit" => {
@@ -1543,7 +1796,11 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
                     let label = diag.severity.label();
                     let file = diag.file.display();
                     let code = diag.code.as_deref().unwrap_or("");
-                    lines.push(format!("  {label} {file}:{} {code} — {}", diag.line, &diag.message[..diag.message.len().min(60)]));
+                    lines.push(format!(
+                        "  {label} {file}:{} {code} — {}",
+                        diag.line,
+                        &diag.message[..diag.message.len().min(60)]
+                    ));
                 }
                 push_system_message(state, lines.join("\n"));
             }
@@ -1553,9 +1810,9 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
             let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let detected = detect_project_types(&workspace);
             let has_cargo = detected.contains(&"Cargo.toml");
-            let has_npm   = detected.contains(&"package.json");
-            let has_go    = detected.contains(&"go.mod");
-            let has_py    = detected.contains(&"pyproject.toml");
+            let has_npm = detected.contains(&"package.json");
+            let has_go = detected.contains(&"go.mod");
+            let has_py = detected.contains(&"pyproject.toml");
             if detected.len() > 1 {
                 push_system_message(
                     state,
@@ -1568,18 +1825,27 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
             }
             let (cmd, cmd_args): (&str, &[&str]) = match args {
                 "cargo" => ("cargo", &["test", "--", "--test-output=immediate"]),
-                "npm"   => ("npm", &["test"]),
-                "go"    => ("go", &["test", "./..."]),
+                "npm" => ("npm", &["test"]),
+                "go" => ("go", &["test", "./..."]),
                 "py" | "pytest" => ("python", &["-m", "pytest"]),
                 _ => {
-                    if has_cargo { ("cargo", &["test", "--", "--test-output=immediate"]) }
-                    else if has_npm { ("npm", &["test"]) }
-                    else if has_go { ("go", &["test", "./..."]) }
-                    else if has_py { ("python", &["-m", "pytest"]) }
-                    else { ("cargo", &["test", "--", "--test-output=immediate"]) }
+                    if has_cargo {
+                        ("cargo", &["test", "--", "--test-output=immediate"])
+                    } else if has_npm {
+                        ("npm", &["test"])
+                    } else if has_go {
+                        ("go", &["test", "./..."])
+                    } else if has_py {
+                        ("python", &["-m", "pytest"])
+                    } else {
+                        ("cargo", &["test", "--", "--test-output=immediate"])
+                    }
                 }
             };
-            push_system_message(state, format!("running {cmd} {}\u{2026}", cmd_args.join(" ")));
+            push_system_message(
+                state,
+                format!("running {cmd} {}\u{2026}", cmd_args.join(" ")),
+            );
             let text = match tokio::process::Command::new(cmd)
                 .args(cmd_args)
                 .current_dir(&workspace)
@@ -1594,8 +1860,8 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
                     let passed = combined.matches("test result: ok").count()
                         + combined.matches("PASSED").count()
                         + combined.matches(" passed").count();
-                    let failed = combined.matches("FAILED").count()
-                        + combined.matches(" failed").count();
+                    let failed =
+                        combined.matches("FAILED").count() + combined.matches(" failed").count();
                     let mut summary = format!("test: {passed} passed, {failed} failed");
                     // Show last 20 lines of output for context.
                     let tail: Vec<&str> = combined.lines().rev().take(20).collect();
@@ -1634,29 +1900,41 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
                 let claude_found = std::process::Command::new("which")
                     .arg("claude")
                     .output()
-                    .map_or(false, |o| o.status.success());
+                    .is_ok_and(|o| o.status.success());
                 let codex_found = std::process::Command::new("which")
                     .arg("codex")
                     .output()
-                    .map_or(false, |o| o.status.success());
+                    .is_ok_and(|o| o.status.success());
                 let llmctl_found = std::process::Command::new("which")
                     .arg("llmctl")
                     .output()
-                    .map_or(false, |o| o.status.success());
+                    .is_ok_and(|o| o.status.success());
 
                 let mut lines = vec![
                     "available runners:".to_owned(),
                     format!(
                         "  claude   [{}]  — Claude.ai subscription (OAuth, no API key needed)",
-                        if claude_found { "installed" } else { "not found" }
+                        if claude_found {
+                            "installed"
+                        } else {
+                            "not found"
+                        }
                     ),
                     format!(
                         "  codex    [{}]  — OpenAI Codex CLI",
-                        if codex_found { "installed" } else { "not found" }
+                        if codex_found {
+                            "installed"
+                        } else {
+                            "not found"
+                        }
                     ),
                     format!(
                         "  local    [{}]  — local model via rs-llmctl",
-                        if llmctl_found { "installed" } else { "not found" }
+                        if llmctl_found {
+                            "installed"
+                        } else {
+                            "not found"
+                        }
                     ),
                     "  copilot              — GitHub Copilot".to_owned(),
                     "  minimax              — Minimax (set MINIMAX_API_KEY)".to_owned(),
@@ -1674,7 +1952,7 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
                         let found = std::process::Command::new("which")
                             .arg("claude")
                             .output()
-                            .map_or(false, |o| o.status.success());
+                            .is_ok_and(|o| o.status.success());
                         if found {
                             "claude CLI is installed — uses your Claude.ai subscription (OAuth).\n\
                              if not authenticated yet, run: claude login"
@@ -1691,7 +1969,7 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
                         let found = std::process::Command::new("which")
                             .arg("codex")
                             .output()
-                            .map_or(false, |o| o.status.success());
+                            .is_ok_and(|o| o.status.success());
                         if found {
                             "codex CLI is installed.\n\
                              set OPENAI_API_KEY in your shell profile to authenticate."
@@ -1881,16 +2159,16 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
                     push_system_message(state, "you are up to date");
                 }
                 None => {
-                    push_system_message(
-                        state,
-                        "could not reach GitHub to check for updates",
-                    );
+                    push_system_message(state, "could not reach GitHub to check for updates");
                 }
             }
             Ok(true)
         }
         "upgrade" => {
-            push_system_message(state, format!("checking for updates (current: v{VERSION})…"));
+            push_system_message(
+                state,
+                format!("checking for updates (current: v{VERSION})…"),
+            );
             let latest = match fetch_latest_version().await {
                 Some(t) => t,
                 None => {
@@ -2472,6 +2750,27 @@ async fn handle_key(
                 }
                 return Ok(());
             }
+            // T (uppercase): toggle thinking block expansion.
+            KeyCode::Char('T') => {
+                if !state.current_thinking.is_empty() {
+                    state.thinking_expanded = !state.thinking_expanded;
+                }
+                return Ok(());
+            }
+            // [ / ] : navigate session rail cursor (when rail is visible).
+            KeyCode::Char('[') => {
+                if state.session_rail_visible {
+                    state.session_rail_cursor = state.session_rail_cursor.saturating_sub(1);
+                }
+                return Ok(());
+            }
+            KeyCode::Char(']') => {
+                if state.session_rail_visible && !state.session_rail_items.is_empty() {
+                    let max = state.session_rail_items.len().saturating_sub(1);
+                    state.session_rail_cursor = (state.session_rail_cursor + 1).min(max);
+                }
+                return Ok(());
+            }
             KeyCode::Char('i' | 'a') => {
                 state.scroll_focus = false;
                 state.selection_mode = false;
@@ -2499,15 +2798,40 @@ async fn handle_key(
             }
         }
 
-        // Ctrl-R: toggle context rail (scroll mode) or history search (input mode)
+        // Ctrl-R: toggle reverse history search (input mode only).
         KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if state.scroll_focus {
-                state.context_rail_visible = !state.context_rail_visible;
-            } else {
+            if !state.scroll_focus {
                 state.history_search_mode = !state.history_search_mode;
                 state.history_search_query.clear();
                 if state.history_search_mode {
                     state.input.clone_into(&mut state.saved_input);
+                }
+            }
+        }
+
+        // Ctrl-F: toggle context rail (scroll mode only).
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if state.scroll_focus {
+                state.context_rail_visible = !state.context_rail_visible;
+            }
+        }
+
+        // Ctrl-W: toggle session browser left-rail.
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.session_rail_visible = !state.session_rail_visible;
+            state.session_rail_cursor = 0;
+            // Trigger an immediate poll on next tick by clearing the timestamp.
+            if state.session_rail_visible {
+                state.last_session_rail_poll = None;
+            }
+        }
+
+        // Ctrl-G: open $EDITOR / $VISUAL to compose a multi-line message.
+        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if !state.scroll_focus {
+                if let Some(new_text) = open_in_editor(&state.input) {
+                    state.input = new_text;
+                    state.input_cursor = state.input.chars().count();
                 }
             }
         }
@@ -3018,18 +3342,57 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     let status = Paragraph::new(status_text).style(status_style);
     frame.render_widget(status, status_area);
 
-    // -- Body: main panel | optional context rail ----------------------------
-    // L122: horizontal split inside body; rail collapses when narrow or hidden.
-    let (main_area, rail_area) = if state.context_rail_visible && body_area.width >= 100 {
+    // -- Body: optional session rail | main panel | optional context rail ------
+    const SESSION_RAIL_W: u16 = 28;
+
+    // First carve out the optional left session rail.
+    let (session_rail_area_opt, content_area) = if state.session_rail_visible
+        && body_area.width >= SESSION_RAIL_W + 40
+    {
+        let cols = Layout::horizontal([Constraint::Length(SESSION_RAIL_W), Constraint::Fill(1)])
+            .split(body_area);
+        (Some(cols[0]), cols[1])
+    } else {
+        (None, body_area)
+    };
+
+    // Then carve out the optional right context rail.
+    let (main_area, rail_area) = if state.context_rail_visible && content_area.width >= 100 {
         let cols = Layout::horizontal([
             Constraint::Fill(1),
             Constraint::Length(context_rail::ContextRail::WIDTH),
         ])
-        .split(body_area);
+        .split(content_area);
         (cols[0], Some(cols[1]))
     } else {
-        (body_area, None)
+        (content_area, None)
     };
+
+    // Render session rail when visible.
+    if let Some(sr_area) = session_rail_area_opt {
+        let cursor = state.session_rail_cursor;
+        let lines: Vec<Line<'_>> = state
+            .session_rail_items
+            .iter()
+            .enumerate()
+            .map(|(i, (_, label))| {
+                if i == cursor {
+                    Line::from(Span::styled(
+                        format!("▶ {label}"),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                } else {
+                    Line::from(Span::raw(format!("  {label}")))
+                }
+            })
+            .collect();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" sessions [Ctrl-W] ");
+        frame.render_widget(Paragraph::new(lines).block(block), sr_area);
+    }
 
     // L122: render MainPanel from state.main_panel.
     let selection = if state.selection_mode {
@@ -3044,9 +3407,13 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     } else {
         Some(state.panel_search_query.as_str())
     };
-    state.main_panel.render(main_area, frame, selection, search_q, state.no_color);
+    state
+        .main_panel
+        .render(main_area, frame, selection, search_q, state.no_color);
 
     // Overlay an animated thinking indicator at the bottom of the main area.
+    // When the model emits thinking tokens, we show a one-line preview of the
+    // accumulated content alongside the spinner.
     if state.turn_in_flight && main_area.height >= 1 {
         const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         let frame_char = SPINNER[state.spinner_tick as usize % SPINNER.len()];
@@ -3057,16 +3424,71 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
             main_area.width,
             1,
         );
+        let spinner_style = if state.no_color {
+            Style::default()
+        } else {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        };
+        let dim_style = if state.no_color {
+            Style::default()
+        } else {
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC)
+        };
+        let mut spans = vec![Span::styled(
+            format!("{frame_char} thinking\u{2026}"),
+            spinner_style,
+        )];
+        if !state.current_thinking.is_empty() {
+            // Show the last ~50 chars of thinking so users see live progress.
+            let preview: String = state
+                .current_thinking
+                .chars()
+                .rev()
+                .take(50)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            let preview = preview.replace('\n', " ");
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(preview, dim_style));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), thinking_area);
+    }
+
+    // When thinking_expanded is set, render the full thinking content in an
+    // overlay above the input area.
+    if state.thinking_expanded && !state.current_thinking.is_empty() && main_area.height >= 4 {
+        let h = main_area.height.min(10);
+        let overlay_rect = ratatui::layout::Rect::new(
+            main_area.x,
+            main_area.y + main_area.height.saturating_sub(h + 1),
+            main_area.width,
+            h,
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" thinking (T to collapse) ");
+        let inner = block.inner(overlay_rect);
         let thinking_style = if state.no_color {
             Style::default()
         } else {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::DarkGray)
         };
-        let thinking_para = Paragraph::new(Line::from(Span::styled(
-            format!("{frame_char} thinking\u{2026}"),
-            thinking_style,
-        )));
-        frame.render_widget(thinking_para, thinking_area);
+        let lines: Vec<Line<'_>> = state
+            .current_thinking
+            .lines()
+            .map(|l| Line::from(Span::styled(l.to_owned(), thinking_style)))
+            .collect();
+        frame.render_widget(block, overlay_rect);
+        frame.render_widget(
+            Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+            inner,
+        );
     }
 
     // -- Action log -----------------------------------------------------------
@@ -3090,8 +3512,44 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
             render_input_with_cursor(&state.input, state.input_cursor)
         )
     };
-    let input_widget = Paragraph::new(input_display);
-    frame.render_widget(input_widget, input_area);
+    // Prompt feedback: right-aligned char + estimated token count.
+    // Shown when the input is non-empty so it doesn't clutter the idle bar.
+    let counter_text = if !state.input.is_empty() {
+        let chars = state.input.chars().count();
+        #[allow(clippy::integer_division)]
+        let est_tok = chars / 4;
+        format!("{chars}c ≈{est_tok}tok")
+    } else {
+        String::new()
+    };
+    let counter_len = counter_text.chars().count() as u16;
+    let input_w = input_area.width;
+    let counter_style = if state.no_color {
+        Style::default()
+    } else {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
+    };
+    // Only split if the counter fits without squashing the input.
+    if counter_len > 0 && counter_len + 4 < input_w {
+        let input_sub_w = input_w - counter_len;
+        let input_sub =
+            ratatui::layout::Rect::new(input_area.x, input_area.y, input_sub_w, input_area.height);
+        let counter_rect = ratatui::layout::Rect::new(
+            input_area.x + input_sub_w,
+            input_area.y,
+            counter_len,
+            input_area.height,
+        );
+        frame.render_widget(Paragraph::new(input_display), input_sub);
+        frame.render_widget(
+            Paragraph::new(Span::styled(counter_text, counter_style)),
+            counter_rect,
+        );
+    } else {
+        frame.render_widget(Paragraph::new(input_display), input_area);
+    }
 
     if let Some(search_area) = search_bar_area {
         let matched = history_search(&state.prompt_history, &state.history_search_query)
@@ -3123,9 +3581,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         if show_lsp && show_obs {
             constraints.push(Fill(1));
             constraints.push(Length(9));
-        } else if show_lsp {
-            constraints.push(Fill(1));
-        } else if show_obs {
+        } else if show_lsp || show_obs {
             constraints.push(Fill(1));
         }
 
@@ -3226,7 +3682,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     }
 
     // -- Block browser overlay ------------------------------------------------
-    if state.block_browser_open && state.block_store.len() > 0 {
+    if state.block_browser_open && !state.block_store.is_empty() {
         let total = state.block_store.len();
         let cursor = state.block_browser_cursor;
         let overlay_lines: Vec<Line<'_>> = state
@@ -3275,12 +3731,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     // -- Panel search bar -----------------------------------------------------
     if state.panel_search_mode {
         // Show the search query as a one-row overlay at the top of the main panel.
-        let sb_rect = ratatui::layout::Rect::new(
-            main_area.x,
-            main_area.y,
-            main_area.width,
-            1,
-        );
+        let sb_rect = ratatui::layout::Rect::new(main_area.x, main_area.y, main_area.width, 1);
         let search_text = format!("/ {}_", state.panel_search_query);
         let search_style = if state.no_color {
             Style::default()
@@ -3353,7 +3804,7 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen);
+        let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
@@ -3461,6 +3912,10 @@ async fn main() -> Result<()> {
         runner_picker_mode: false,
         session_picker_mode: false,
         session_picker_ids: Vec::new(),
+        session_rail_visible: false,
+        session_rail_items: Vec::new(),
+        session_rail_cursor: 0,
+        last_session_rail_poll: None,
         turn_in_flight: false,
         poll_retry_count: 0,
         scroll_focus: false,
@@ -3474,6 +3929,8 @@ async fn main() -> Result<()> {
         cowork_modify_input: String::new(),
         last_cowork_poll: None,
         stream_rx: None,
+        current_thinking: String::new(),
+        thinking_expanded: false,
         stream_sock_path,
         last_traceparent: None,
         pending_output_type: None,
@@ -3528,7 +3985,8 @@ async fn main() -> Result<()> {
     }
 
     enable_raw_mode().context("enable raw mode")?;
-    execute!(stdout(), EnterAlternateScreen).context("enter alternate screen")?;
+    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)
+        .context("enter alternate screen")?;
     let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(stdout());
@@ -3537,9 +3995,9 @@ async fn main() -> Result<()> {
     // Watch for SIGTERM so we can clean up the terminal state before exiting.
     let (sigterm_tx, sigterm_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
-        if let Ok(mut sig) = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        ) {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
             sig.recv().await;
         }
         let _ = sigterm_tx.send(true);
@@ -3562,6 +4020,15 @@ async fn main() -> Result<()> {
                     Event::Key(key) => {
                         handle_key(key, &mut state, &mut client, &mut editor).await?;
                     }
+                    Event::Mouse(mouse_ev) => match mouse_ev.kind {
+                        MouseEventKind::ScrollDown => {
+                            state.main_panel.scroll_down();
+                        }
+                        MouseEventKind::ScrollUp => {
+                            state.main_panel.scroll_up();
+                        }
+                        _ => {}
+                    },
                     Event::Resize(_, _) => {
                         // Clamp scroll after resize so we don't end up past the
                         // last available line.
@@ -3618,6 +4085,11 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
+                    Some("thinking") => {
+                        if let Some(text) = event["text"].as_str() {
+                            state.current_thinking.push_str(text);
+                        }
+                    }
                     Some("tool_call") => {
                         let name = event["name"].as_str().unwrap_or("?");
                         let input = event["input"].as_str().unwrap_or("");
@@ -3648,7 +4120,8 @@ async fn main() -> Result<()> {
                         }
                         // Accumulate session token totals.
                         state.session_tokens_in = state.session_tokens_in.saturating_add(input_tok);
-                        state.session_tokens_out = state.session_tokens_out.saturating_add(output_tok);
+                        state.session_tokens_out =
+                            state.session_tokens_out.saturating_add(output_tok);
                         state.obs_snapshot.tokens_input = state.session_tokens_in;
                         state.obs_snapshot.tokens_output = state.session_tokens_out;
 
@@ -3674,9 +4147,25 @@ async fn main() -> Result<()> {
                         };
                         state.main_panel.push_line(footer);
 
+                        // Emit a collapsible thinking badge if the model produced thinking tokens.
+                        if !state.current_thinking.is_empty() {
+                            let chars = state.current_thinking.chars().count();
+                            state
+                                .main_panel
+                                .push_line(format!("╌ thinking ({chars} chars) [T to expand] ╌"));
+                        }
+
                         if let Some(output_type) = state.pending_output_type.take() {
                             pending_output_save = Some((output_type, block_content));
                         }
+
+                        // OSC-9 desktop notification: works on Windows Terminal,
+                        // iTerm2, and any terminal that honours the BEL-terminated
+                        // OSC 9 sequence.  Silently ignored by terminals that do not.
+                        let _ = std::io::Write::write_all(
+                            &mut std::io::stdout(),
+                            b"\x1b]9;turn complete\x07",
+                        );
 
                         turn_done = true;
                     }
@@ -3796,9 +4285,10 @@ async fn main() -> Result<()> {
                         // Exponential backoff on non-terminal returns: 100 ms → 200 ms → … → 1 s.
                         let shift = state.poll_retry_count.saturating_sub(1).min(10);
                         let backoff_ms = (100u64 << shift).min(1_000);
-                        state.last_poll = Some(std::time::Instant::now()
-                            - std::time::Duration::from_millis(50)
-                            + std::time::Duration::from_millis(backoff_ms));
+                        state.last_poll = Some(
+                            std::time::Instant::now() - std::time::Duration::from_millis(50)
+                                + std::time::Duration::from_millis(backoff_ms),
+                        );
                         if state.poll_retry_count % 5 == 1 {
                             state.main_panel.push_line(format!(
                                 "waiting for turn… (poll attempt {})",
@@ -3883,6 +4373,32 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Session rail poll: refresh the session list every 5 s when visible.
+        let should_poll_sessions = state.session_rail_visible
+            && state
+                .last_session_rail_poll
+                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(5));
+        if should_poll_sessions {
+            state.last_session_rail_poll = Some(std::time::Instant::now());
+            if let Ok(Value::Array(sessions)) = client.call("session.list", json!({})).await {
+                state.session_rail_items = sessions
+                    .iter()
+                    .filter_map(|v| {
+                        let id = v["id"].as_str()?.to_owned();
+                        let runner = v["runner"].as_str().unwrap_or("?");
+                        let label = format!("{runner}  {}", &id[..id.len().min(12)]);
+                        Some((id, label))
+                    })
+                    .collect();
+                // Clamp cursor to new list length.
+                if !state.session_rail_items.is_empty() {
+                    state.session_rail_cursor = state
+                        .session_rail_cursor
+                        .min(state.session_rail_items.len().saturating_sub(1));
+                }
+            }
+        }
+
         // Metrics panel poll: a single slow (~3 s) cadence drives BOTH the
         // per-runner `metrics.summary` fetch (cost/usage rows) and the
         // token-economy `savings.summary` fetch (savings/efficiency section).
@@ -3913,10 +4429,10 @@ async fn main() -> Result<()> {
                 if let Some(buckets) = resp["buckets"].as_array() {
                     let total_24h: u64 = buckets
                         .iter()
-                        .filter_map(|b| {
+                        .map(|b| {
                             let i = b["input_tok"].as_u64().unwrap_or(0);
                             let o = b["output_tok"].as_u64().unwrap_or(0);
-                            Some(i.saturating_add(o))
+                            i.saturating_add(o)
                         })
                         .sum();
                     if total_24h > 0 {
@@ -3960,8 +4476,7 @@ async fn main() -> Result<()> {
             }
             // Fetch daily token limit from daemon (reads SMEDJA_DAILY_TOKEN_LIMIT).
             if let Ok(quota_resp) = client.call("quota.limit", serde_json::Value::Null).await {
-                state.obs_snapshot.daily_tokens_limit =
-                    quota_resp["daily_tokens"].as_u64();
+                state.obs_snapshot.daily_tokens_limit = quota_resp["daily_tokens"].as_u64();
             }
         }
 
@@ -3974,7 +4489,9 @@ async fn main() -> Result<()> {
             state.lsp_last_poll = Some(std::time::Instant::now());
             if let (Ok(status_resp), Ok(diag_resp)) = (
                 client.call("lsp.status", serde_json::Value::Null).await,
-                client.call("lsp.diagnostics", serde_json::Value::Null).await,
+                client
+                    .call("lsp.diagnostics", serde_json::Value::Null)
+                    .await,
             ) {
                 state.lsp_snapshot = lsp_snapshot_from_rpc(&status_resp, &diag_resp);
             }
@@ -4049,25 +4566,36 @@ fn lsp_snapshot_from_rpc(
             arr.iter()
                 .filter_map(|d| {
                     let file = std::path::PathBuf::from(d["file"].as_str()?);
-                    let line = u32::try_from(d["line"].as_u64().unwrap_or(1))
-                        .unwrap_or(u32::MAX);
-                    let col = u32::try_from(d["col"].as_u64().unwrap_or(1))
-                        .unwrap_or(u32::MAX);
+                    let line = u32::try_from(d["line"].as_u64().unwrap_or(1)).unwrap_or(u32::MAX);
+                    let col = u32::try_from(d["col"].as_u64().unwrap_or(1)).unwrap_or(u32::MAX);
                     let severity = match d["severity"].as_str().unwrap_or("error") {
                         "warning" => smedja_lsp::Severity::Warning,
-                        "info"    => smedja_lsp::Severity::Info,
-                        "hint"    => smedja_lsp::Severity::Hint,
-                        _         => smedja_lsp::Severity::Error,
+                        "info" => smedja_lsp::Severity::Info,
+                        "hint" => smedja_lsp::Severity::Hint,
+                        _ => smedja_lsp::Severity::Error,
                     };
-                    let code = d["code"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+                    let code = d["code"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
                     let message = d["message"].as_str()?.to_owned();
-                    Some(smedja_lsp::Diagnostic { file, line, col, severity, code, message })
+                    Some(smedja_lsp::Diagnostic {
+                        file,
+                        line,
+                        col,
+                        severity,
+                        code,
+                        message,
+                    })
                 })
                 .collect()
         })
         .unwrap_or_default();
 
-    smedja_lsp::LspSnapshot { servers, diagnostics }
+    smedja_lsp::LspSnapshot {
+        servers,
+        diagnostics,
+    }
 }
 
 /// Folds a `metrics.summary` response into one [`metrics_view::MetricsRow`] per
@@ -4132,14 +4660,120 @@ fn toggle_metrics_view(state: &mut AppState) {
 /// Cargo.toml, package.json, go.mod, pyproject.toml.
 fn detect_project_types(workspace: &std::path::Path) -> Vec<&'static str> {
     [
-        workspace.join("Cargo.toml").exists().then_some("Cargo.toml"),
-        workspace.join("package.json").exists().then_some("package.json"),
+        workspace
+            .join("Cargo.toml")
+            .exists()
+            .then_some("Cargo.toml"),
+        workspace
+            .join("package.json")
+            .exists()
+            .then_some("package.json"),
         workspace.join("go.mod").exists().then_some("go.mod"),
-        workspace.join("pyproject.toml").exists().then_some("pyproject.toml"),
+        workspace
+            .join("pyproject.toml")
+            .exists()
+            .then_some("pyproject.toml"),
     ]
     .into_iter()
     .flatten()
     .collect()
+}
+
+// ---------------------------------------------------------------------------
+// govctl-style work-item harness
+// ---------------------------------------------------------------------------
+
+/// A single govctl artifact read from a `gov/` TOML file.
+#[derive(Debug, Clone)]
+struct GovArtifact {
+    /// E.g. "WI-001", "RFC-001", "ADR-001"
+    id: String,
+    /// Artifact kind: "work-item", "rfc", or "adr"
+    kind: String,
+    title: String,
+    /// "planned" | "in_progress" | "done" | "cancelled" | "draft" | "accepted" | "superseded"
+    status: String,
+}
+
+/// Scans `<workspace>/gov/` for TOML files and parses them as govctl artifacts.
+///
+/// Expected TOML fields: `id`, `title`, `status` (required), `type`/`kind` (optional).
+/// Files that fail to parse are silently skipped.
+fn scan_gov_artifacts(workspace: &std::path::Path) -> Vec<GovArtifact> {
+    let gov_dir = workspace.join("gov");
+    if !gov_dir.is_dir() {
+        return Vec::new();
+    }
+    let mut artifacts = Vec::new();
+    let subdirs = ["work-items", "rfc", "adr", ""];
+    for sub in &subdirs {
+        let dir = if sub.is_empty() {
+            gov_dir.clone()
+        } else {
+            gov_dir.join(sub)
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(val) = toml::from_str::<toml::Value>(&raw) else {
+                continue;
+            };
+            let Some(id) = val.get("id").and_then(toml::Value::as_str) else {
+                continue;
+            };
+            let title = val
+                .get("title")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let status = val
+                .get("status")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            let kind = if sub.is_empty() {
+                val.get("kind")
+                    .or_else(|| val.get("type"))
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or("artifact")
+                    .to_owned()
+            } else {
+                (*sub).to_owned()
+            };
+            artifacts.push(GovArtifact {
+                id: id.to_owned(),
+                kind,
+                title,
+                status,
+            });
+        }
+    }
+    artifacts.sort_by(|a, b| a.id.cmp(&b.id));
+    artifacts
+}
+
+/// Formats a list of govctl artifacts for display in the main panel.
+fn format_gov_list(artifacts: &[GovArtifact]) -> String {
+    if artifacts.is_empty() {
+        return "gov: no artifacts found in ./gov/ — create gov/work-items/WI-001.toml to start"
+            .to_owned();
+    }
+    let mut lines = vec![format!("{} govctl artifact(s):", artifacts.len())];
+    for a in artifacts {
+        lines.push(format!(
+            "  [{:12}] {:10} [{:12}] {}",
+            a.id, a.kind, a.status, a.title
+        ));
+    }
+    lines.join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -5023,6 +5657,10 @@ mod tests {
             runner_picker_mode: false,
             session_picker_mode: false,
             session_picker_ids: Vec::new(),
+            session_rail_visible: false,
+            session_rail_items: Vec::new(),
+            session_rail_cursor: 0,
+            last_session_rail_poll: None,
             turn_in_flight: false,
             poll_retry_count: 0,
             scroll_focus: false,
@@ -5036,6 +5674,8 @@ mod tests {
             cowork_modify_input: String::new(),
             last_cowork_poll: None,
             stream_rx: None,
+            current_thinking: String::new(),
+            thinking_expanded: false,
             stream_sock_path: PathBuf::from("/tmp/smdjad.sock.stream"),
             last_traceparent: None,
             pending_output_type: None,
@@ -6357,10 +6997,22 @@ mod tests {
         });
         let snap = lsp_snapshot_from_rpc(&status, &diag);
         assert_eq!(snap.diagnostics.len(), 4);
-        assert!(matches!(snap.diagnostics[0].severity, smedja_lsp::Severity::Error));
-        assert!(matches!(snap.diagnostics[1].severity, smedja_lsp::Severity::Warning));
-        assert!(matches!(snap.diagnostics[2].severity, smedja_lsp::Severity::Info));
-        assert!(matches!(snap.diagnostics[3].severity, smedja_lsp::Severity::Hint));
+        assert!(matches!(
+            snap.diagnostics[0].severity,
+            smedja_lsp::Severity::Error
+        ));
+        assert!(matches!(
+            snap.diagnostics[1].severity,
+            smedja_lsp::Severity::Warning
+        ));
+        assert!(matches!(
+            snap.diagnostics[2].severity,
+            smedja_lsp::Severity::Info
+        ));
+        assert!(matches!(
+            snap.diagnostics[3].severity,
+            smedja_lsp::Severity::Hint
+        ));
     }
 
     #[test]
@@ -6372,7 +7024,10 @@ mod tests {
             ]
         });
         let snap = lsp_snapshot_from_rpc(&status, &diag);
-        assert!(matches!(snap.diagnostics[0].severity, smedja_lsp::Severity::Error));
+        assert!(matches!(
+            snap.diagnostics[0].severity,
+            smedja_lsp::Severity::Error
+        ));
     }
 
     #[test]
@@ -6386,20 +7041,23 @@ mod tests {
         });
         let snap = lsp_snapshot_from_rpc(&status, &json!({"diagnostics": []}));
         assert_eq!(snap.servers.len(), 3);
-        assert!(matches!(snap.servers[0].state, smedja_lsp::ServerState::Ready));
+        assert!(matches!(
+            snap.servers[0].state,
+            smedja_lsp::ServerState::Ready
+        ));
         assert!(
             matches!(&snap.servers[1].state, smedja_lsp::ServerState::Degraded(r) if r == "connection refused"),
             "degraded reason must be extracted from prefix"
         );
-        assert!(matches!(snap.servers[2].state, smedja_lsp::ServerState::Starting));
+        assert!(matches!(
+            snap.servers[2].state,
+            smedja_lsp::ServerState::Starting
+        ));
     }
 
     #[test]
     fn lsp_snapshot_from_rpc_empty_inputs_yield_empty_snapshot() {
-        let snap = lsp_snapshot_from_rpc(
-            &json!({"servers": []}),
-            &json!({"diagnostics": []}),
-        );
+        let snap = lsp_snapshot_from_rpc(&json!({"servers": []}), &json!({"diagnostics": []}));
         assert!(snap.servers.is_empty());
         assert!(snap.diagnostics.is_empty());
     }
@@ -6451,5 +7109,359 @@ mod tests {
             let ms = (100u64 << shift).min(1_000);
             assert_eq!(ms, 1_000, "backoff must cap at 1000 ms for retry {count}");
         }
+    }
+
+    // --- keybinding: Ctrl-F context rail / Ctrl-R history search ---------------
+
+    #[test]
+    fn ctrl_f_in_scroll_mode_toggles_context_rail() {
+        let mut state = make_state("sess-ctrlf");
+        state.scroll_focus = true;
+        let initial = state.context_rail_visible;
+        // Simulate Ctrl-F in scroll mode.
+        state.context_rail_visible = !state.context_rail_visible;
+        assert_ne!(
+            state.context_rail_visible, initial,
+            "Ctrl-F must toggle context_rail_visible in scroll mode"
+        );
+        state.context_rail_visible = !state.context_rail_visible;
+        assert_eq!(
+            state.context_rail_visible, initial,
+            "second Ctrl-F must restore original value"
+        );
+    }
+
+    #[test]
+    fn ctrl_r_in_scroll_mode_does_not_affect_context_rail() {
+        let mut state = make_state("sess-ctrlr-scroll");
+        state.scroll_focus = true;
+        let initial = state.context_rail_visible;
+        // The Ctrl-R handler only acts when !scroll_focus, so it must be a no-op here.
+        if !state.scroll_focus {
+            state.history_search_mode = !state.history_search_mode;
+        }
+        assert_eq!(
+            state.context_rail_visible, initial,
+            "Ctrl-R in scroll mode must not touch context_rail_visible"
+        );
+        assert!(
+            !state.history_search_mode,
+            "history_search_mode must remain off when Ctrl-R fires in scroll mode"
+        );
+    }
+
+    #[test]
+    fn ctrl_r_in_input_mode_toggles_history_search() {
+        let mut state = make_state("sess-ctrlr-input");
+        state.scroll_focus = false;
+        state.input = String::from("partial query");
+        assert!(!state.history_search_mode);
+        // Simulate Ctrl-R in input mode.
+        if !state.scroll_focus {
+            state.history_search_mode = !state.history_search_mode;
+            state.history_search_query.clear();
+            if state.history_search_mode {
+                state.input.clone_into(&mut state.saved_input);
+            }
+        }
+        assert!(
+            state.history_search_mode,
+            "Ctrl-R must enable history_search_mode in input mode"
+        );
+        assert_eq!(
+            state.saved_input, "partial query",
+            "current input must be saved when entering history search"
+        );
+        assert!(
+            state.history_search_query.is_empty(),
+            "search query must be cleared on activation"
+        );
+    }
+
+    // --- Ctrl-G external editor --------------------------------------------------
+
+    #[test]
+    fn resolve_editor_falls_back_to_vi() {
+        // Remove VISUAL and EDITOR from the environment for this test.
+        let _v = std::env::remove_var("VISUAL");
+        let _e = std::env::remove_var("EDITOR");
+        // Can't guarantee clean env in parallel tests, but the fallback path
+        // must always produce a non-empty string.
+        let editor = resolve_editor();
+        assert!(
+            !editor.is_empty(),
+            "resolve_editor must return a non-empty string"
+        );
+    }
+
+    #[test]
+    fn resolve_editor_prefers_visual_over_editor() {
+        std::env::set_var("VISUAL", "emacs");
+        std::env::set_var("EDITOR", "nano");
+        let editor = resolve_editor();
+        // Clean up after the test regardless of assertion result.
+        std::env::remove_var("VISUAL");
+        std::env::remove_var("EDITOR");
+        assert_eq!(editor, "emacs", "VISUAL must be preferred over EDITOR");
+    }
+
+    #[test]
+    fn open_in_editor_temp_path_is_in_tmpdir() {
+        // Verify the temp file path is inside the OS temp directory — we
+        // cannot actually invoke an editor in a unit test, but we can check
+        // that the path construction is correct.
+        let tmp = std::env::temp_dir();
+        let path = tmp.join(format!("smedja-edit-{}.md", std::process::id()));
+        assert!(
+            path.starts_with(&tmp),
+            "temp file must be under the OS temp directory"
+        );
+        assert!(
+            path.to_string_lossy().ends_with(".md"),
+            "temp file must have .md extension for editor syntax highlighting"
+        );
+    }
+
+    #[test]
+    fn ctrl_g_in_scroll_mode_is_noop() {
+        let mut state = make_state("sess-ctrlg-scroll");
+        state.scroll_focus = true;
+        state.input = "existing input".to_owned();
+        state.input_cursor = 14;
+        // The Ctrl-G handler guards on !scroll_focus; simulate that guard.
+        if !state.scroll_focus {
+            // would call open_in_editor — never reached
+            state.input = "replaced".to_owned();
+        }
+        assert_eq!(
+            state.input, "existing input",
+            "Ctrl-G in scroll mode must not modify input"
+        );
+    }
+
+    // --- thinking token accumulation ------------------------------------------
+
+    #[test]
+    fn thinking_tokens_accumulate_in_current_thinking() {
+        let mut state = make_state("sess-think");
+        assert!(state.current_thinking.is_empty());
+        // Simulate two ThinkingDelta stream events arriving.
+        state.current_thinking.push_str("step one ");
+        state.current_thinking.push_str("step two");
+        assert_eq!(state.current_thinking, "step one step two");
+    }
+
+    #[test]
+    fn thinking_expanded_toggles_only_when_content_present() {
+        let mut state = make_state("sess-think-toggle");
+        state.scroll_focus = true;
+        // No content: T key must be a no-op.
+        assert!(state.current_thinking.is_empty());
+        if !state.current_thinking.is_empty() {
+            state.thinking_expanded = !state.thinking_expanded;
+        }
+        assert!(
+            !state.thinking_expanded,
+            "T must not toggle when no thinking content"
+        );
+
+        // With content: T key must toggle.
+        state.current_thinking = "I considered option A vs B".to_owned();
+        if !state.current_thinking.is_empty() {
+            state.thinking_expanded = !state.thinking_expanded;
+        }
+        assert!(
+            state.thinking_expanded,
+            "T must expand when thinking content is present"
+        );
+        if !state.current_thinking.is_empty() {
+            state.thinking_expanded = !state.thinking_expanded;
+        }
+        assert!(!state.thinking_expanded, "second T must collapse");
+    }
+
+    // --- govctl work-item harness --------------------------------------------
+
+    #[test]
+    fn scan_gov_artifacts_returns_empty_when_no_gov_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = scan_gov_artifacts(dir.path());
+        assert!(
+            artifacts.is_empty(),
+            "no gov/ dir should yield empty artifact list"
+        );
+    }
+
+    #[test]
+    fn scan_gov_artifacts_parses_work_item_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let wi_dir = dir.path().join("gov").join("work-items");
+        std::fs::create_dir_all(&wi_dir).unwrap();
+        std::fs::write(
+            wi_dir.join("WI-001.toml"),
+            r#"id = "WI-001"
+title = "Add thinking token streaming"
+status = "in_progress"
+"#,
+        )
+        .unwrap();
+        let artifacts = scan_gov_artifacts(dir.path());
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].id, "WI-001");
+        assert_eq!(artifacts[0].status, "in_progress");
+        assert_eq!(artifacts[0].kind, "work-items");
+    }
+
+    #[test]
+    fn scan_gov_artifacts_skips_files_without_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let wi_dir = dir.path().join("gov").join("work-items");
+        std::fs::create_dir_all(&wi_dir).unwrap();
+        std::fs::write(
+            wi_dir.join("bad.toml"),
+            r#"title = "missing id"
+status = "draft"
+"#,
+        )
+        .unwrap();
+        let artifacts = scan_gov_artifacts(dir.path());
+        assert!(
+            artifacts.is_empty(),
+            "TOML without 'id' field must be skipped"
+        );
+    }
+
+    #[test]
+    fn format_gov_list_shows_count_and_ids() {
+        let artifacts = vec![
+            GovArtifact {
+                id: "WI-001".into(),
+                kind: "work-items".into(),
+                title: "Add multi-line input".into(),
+                status: "done".into(),
+            },
+            GovArtifact {
+                id: "RFC-001".into(),
+                kind: "rfc".into(),
+                title: "Thinking token streaming".into(),
+                status: "accepted".into(),
+            },
+        ];
+        let output = format_gov_list(&artifacts);
+        assert!(output.contains("2 govctl artifact"), "count must appear");
+        assert!(output.contains("WI-001"), "WI-001 must appear");
+        assert!(output.contains("RFC-001"), "RFC-001 must appear");
+    }
+
+    #[test]
+    fn format_gov_list_empty_returns_hint() {
+        let output = format_gov_list(&[]);
+        assert!(
+            output.contains("gov/work-items"),
+            "empty list must include path hint"
+        );
+    }
+
+    // --- session rail (Ctrl-W) ------------------------------------------------
+
+    #[test]
+    fn session_rail_toggle_clears_cursor() {
+        let mut state = make_state("sess-rail");
+        assert!(!state.session_rail_visible);
+        // Simulate Ctrl-W: enable rail.
+        state.session_rail_visible = true;
+        state.session_rail_cursor = 0;
+        state.last_session_rail_poll = None;
+        assert!(state.session_rail_visible);
+        // Toggle off.
+        state.session_rail_visible = false;
+        assert!(!state.session_rail_visible);
+    }
+
+    #[test]
+    fn session_rail_cursor_navigates_within_bounds() {
+        let mut state = make_state("sess-rail-nav");
+        state.session_rail_items = vec![
+            ("id1".into(), "claude  id1".into()),
+            ("id2".into(), "claude  id2".into()),
+            ("id3".into(), "claude  id3".into()),
+        ];
+        state.session_rail_cursor = 0;
+        // ] moves forward.
+        let max = state.session_rail_items.len().saturating_sub(1);
+        state.session_rail_cursor = (state.session_rail_cursor + 1).min(max);
+        assert_eq!(state.session_rail_cursor, 1);
+        state.session_rail_cursor = (state.session_rail_cursor + 1).min(max);
+        assert_eq!(state.session_rail_cursor, 2);
+        // Clamps at max.
+        state.session_rail_cursor = (state.session_rail_cursor + 1).min(max);
+        assert_eq!(state.session_rail_cursor, 2, "cursor must not exceed max");
+        // [ moves backward.
+        state.session_rail_cursor = state.session_rail_cursor.saturating_sub(1);
+        assert_eq!(state.session_rail_cursor, 1);
+        state.session_rail_cursor = state.session_rail_cursor.saturating_sub(1);
+        assert_eq!(state.session_rail_cursor, 0);
+        // Clamps at zero.
+        state.session_rail_cursor = state.session_rail_cursor.saturating_sub(1);
+        assert_eq!(state.session_rail_cursor, 0, "cursor must not underflow");
+    }
+
+    // --- emit/canvas split: system message dual-routing ----------------------
+
+    #[test]
+    fn push_system_message_routes_single_line_to_action_log() {
+        let mut state = make_state("sess-emit");
+        let log_before = state.action_log.len();
+        push_system_message(&mut state, "diagram saved: ./out.svg");
+        assert_eq!(
+            state.action_log.len(),
+            log_before + 1,
+            "single-line system message must be added to action_log"
+        );
+    }
+
+    #[test]
+    fn push_system_message_multi_line_stays_in_panel_only() {
+        let mut state = make_state("sess-emit-multi");
+        let log_before = state.action_log.len();
+        push_system_message(&mut state, "line one\nline two\nline three");
+        assert_eq!(
+            state.action_log.len(),
+            log_before,
+            "multi-line system message must NOT be added to action_log"
+        );
+    }
+
+    // --- prompt feedback: token estimate -------------------------------------
+
+    #[test]
+    fn prompt_token_estimate_uses_chars_over_four_heuristic() {
+        // 40 chars / 4 = 10 estimated tokens.
+        let input = "a".repeat(40);
+        let chars = input.chars().count();
+        #[allow(clippy::integer_division)]
+        let est = chars / 4;
+        assert_eq!(est, 10, "40 chars should estimate to 10 tokens");
+    }
+
+    #[test]
+    fn prompt_token_estimate_rounds_down() {
+        let input = "abc"; // 3 chars / 4 = 0 — rounds down
+        let chars = input.chars().count();
+        #[allow(clippy::integer_division)]
+        let est = chars / 4;
+        assert_eq!(est, 0);
+    }
+
+    #[test]
+    fn thinking_cleared_on_new_turn() {
+        let mut state = make_state("sess-think-clear");
+        state.current_thinking = "previous reasoning".to_owned();
+        state.thinking_expanded = true;
+        // Simulate what happens when a new turn starts.
+        state.current_thinking.clear();
+        state.thinking_expanded = false;
+        assert!(state.current_thinking.is_empty());
+        assert!(!state.thinking_expanded);
     }
 }

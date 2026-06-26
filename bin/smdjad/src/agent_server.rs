@@ -155,6 +155,9 @@ fn turn_event_to_agent_event(event: &TurnEvent) -> AgentEvent {
         },
         TurnEvent::AssistantDelta {
             content, turn_id, ..
+        }
+        | TurnEvent::ThinkingDelta {
+            content, turn_id, ..
         } => AgentEvent::StreamDelta {
             turn_id: turn_id.clone(),
             content: Some(content.clone()),

@@ -91,6 +91,23 @@ pub enum TurnEvent {
         correlation: CorrelationCtx,
     },
 
+    /// An incremental chunk of the model's internal reasoning (thinking tokens).
+    ///
+    /// Only emitted when the underlying model supports extended thinking.
+    /// The TUI accumulates these into a collapsible "thinking" block that is
+    /// shown while the turn is in flight and collapsed (but togglable) once
+    /// the turn completes.
+    ThinkingDelta {
+        /// The incremental thinking-token text chunk.
+        content: String,
+        /// Turn identifier; correlates this delta with the enclosing turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        /// Correlation context (trace, conversation, agent, status).
+        #[serde(flatten)]
+        correlation: CorrelationCtx,
+    },
+
     /// The turn completed successfully.
     Completed {
         /// Identifier for the session this turn belongs to.
@@ -420,5 +437,51 @@ mod tests {
         } else {
             panic!("TurnEvent::fail must produce TurnEvent::Failed");
         }
+    }
+
+    #[test]
+    fn thinking_delta_roundtrips_via_json() {
+        let ev = TurnEvent::ThinkingDelta {
+            content: "step one: reason about the problem".into(),
+            turn_id: Some("t-think".into()),
+            correlation: CorrelationCtx::default(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(
+            json.contains("ThinkingDelta"),
+            "variant tag must appear in JSON; got: {json}"
+        );
+        assert!(
+            json.contains("step one"),
+            "content must be serialised; got: {json}"
+        );
+        let decoded: TurnEvent = serde_json::from_str(&json).unwrap();
+        if let TurnEvent::ThinkingDelta {
+            content, turn_id, ..
+        } = decoded
+        {
+            assert_eq!(content, "step one: reason about the problem");
+            assert_eq!(turn_id.as_deref(), Some("t-think"));
+        } else {
+            panic!("wrong variant after roundtrip");
+        }
+    }
+
+    #[test]
+    fn thinking_delta_omits_none_fields() {
+        let ev = TurnEvent::ThinkingDelta {
+            content: "pondering".into(),
+            turn_id: None,
+            correlation: CorrelationCtx::default(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(
+            !json.contains("turn_id"),
+            "None turn_id must be omitted; got: {json}"
+        );
+        assert!(
+            !json.contains("trace_id"),
+            "None correlation fields must be omitted; got: {json}"
+        );
     }
 }

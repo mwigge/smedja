@@ -133,9 +133,9 @@ fn turn_id_of(event: &TurnEvent) -> Option<&str> {
         TurnEvent::Started { turn_id, .. }
         | TurnEvent::Completed { turn_id, .. }
         | TurnEvent::Failed { turn_id, .. } => Some(turn_id.as_str()),
-        TurnEvent::ToolCalled { turn_id, .. } | TurnEvent::AssistantDelta { turn_id, .. } => {
-            turn_id.as_deref()
-        }
+        TurnEvent::ToolCalled { turn_id, .. }
+        | TurnEvent::AssistantDelta { turn_id, .. }
+        | TurnEvent::ThinkingDelta { turn_id, .. } => turn_id.as_deref(),
     }
 }
 

@@ -54,9 +54,9 @@ impl<'a> LspPanel<'a> {
                 break;
             }
             let (dot, color) = match &server.state {
-                ServerState::Starting => ("\u{25cc}", Color::Yellow),   // ◌
-                ServerState::Ready => ("\u{25cf}", Color::Green),       // ●
-                ServerState::Degraded(_) => ("\u{2717}", Color::Red),   // ✗
+                ServerState::Starting => ("\u{25cc}", Color::Yellow), // ◌
+                ServerState::Ready => ("\u{25cf}", Color::Green),     // ●
+                ServerState::Degraded(_) => ("\u{2717}", Color::Red), // ✗
             };
             let name_max = w.saturating_sub(2); // dot + space
             let name = trunc_str(&server.name, name_max);
@@ -101,15 +101,9 @@ impl<'a> LspPanel<'a> {
         let warnings = snap.warning_count();
         if errors > 0 || warnings > 0 {
             lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{errors}E"),
-                    Style::default().fg(Color::Red),
-                ),
+                Span::styled(format!("{errors}E"), Style::default().fg(Color::Red)),
                 Span::raw(" "),
-                Span::styled(
-                    format!("{warnings}W"),
-                    Style::default().fg(Color::Yellow),
-                ),
+                Span::styled(format!("{warnings}W"), Style::default().fg(Color::Yellow)),
             ]));
         } else if !snap.servers.is_empty() && snap.diagnostics.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -118,25 +112,15 @@ impl<'a> LspPanel<'a> {
             )));
         }
 
-        let title = if snap.servers.is_empty() {
-            "lsp"
-        } else {
-            "lsp"
-        };
-
         frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title(title)),
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("lsp")),
             area,
         );
     }
 }
 
 fn trunc_str(s: &str, max: usize) -> &str {
-    &s[..s
-        .char_indices()
-        .nth(max)
-        .map_or(s.len(), |(i, _)| i)]
+    &s[..s.char_indices().nth(max).map_or(s.len(), |(i, _)| i)]
 }
 
 #[cfg(test)]
@@ -175,20 +159,16 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let snap = LspSnapshot {
-            servers: vec![
-                ServerStatus {
-                    name: "rust-analyzer".to_owned(),
-                    state: ServerState::Ready,
-                },
-            ],
+            servers: vec![ServerStatus {
+                name: "rust-analyzer".to_owned(),
+                state: ServerState::Ready,
+            }],
             diagnostics: vec![diag(Severity::Error, "src/main.rs", 42, "E0308")],
         };
         let panel = LspPanel::new(&snap);
         let backend = TestBackend::new(27, 8);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| panel.render(f.area(), f))
-            .unwrap();
+        terminal.draw(|f| panel.render(f.area(), f)).unwrap();
         let rendered: String = terminal
             .backend()
             .buffer()

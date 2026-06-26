@@ -77,6 +77,7 @@ impl ActionLog {
                 let outcome_color = match e.outcome.as_str() {
                     "ok" => Color::Green,
                     "error" => Color::Red,
+                    "sys" => Color::Cyan,
                     _ => Color::Yellow,
                 };
                 Line::from(vec![

@@ -6,6 +6,26 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.16.3] — 2026-06-26
+
+### Added
+
+- **Ctrl-F context rail** — context rail remapped from `Ctrl-R` to `Ctrl-F` (scroll mode); `Ctrl-R` is now exclusively reverse history search (input mode), eliminating the double-binding ambiguity.
+- **Ctrl-G external editor** — press `Ctrl-G` in input mode to open `$VISUAL` / `$EDITOR` / `vi` for multi-line message composition. The TUI suspends, the editor runs, and the file contents are loaded back into the input buffer on exit.
+- **ThinkingDelta TurnEvent** — new `TurnEvent::ThinkingDelta { content, turn_id, correlation }` variant in `smedja-bellows`; stream_server forwards it as `{"type":"thinking","text":"..."}` NDJSON. The TUI accumulates thinking tokens into `current_thinking`, shows a live 50-char preview alongside the spinner, and on completion emits a `╌ thinking (N chars) [T to expand] ╌` badge. Press `T` (shift-T) in scroll mode to expand/collapse the full thinking block.
+- **OSC-9 turn-complete notification** — emits `\e]9;turn complete\x07` on every `"done"` NDJSON event; picked up by Windows Terminal, iTerm2, and any OSC-9-capable terminal as a desktop notification.
+- **Prompt feedback indicator** — right-aligned `{N}c ≈{M}tok` character and estimated token count displayed in the input line while composing. Disappears when input is empty.
+- **Emit/canvas split** — single-line system messages are now also routed to the action log (the "emit" rail), styled as `sys` entries in cyan, implementing the SuperConsole dual-display pattern.
+- **`/loop` TUI command** — `/loop status`, `/loop list`, `/loop create <goal>`, `/loop cancel` manage loop runs via `loop.*` RPC methods.
+- **Session browser left-rail** — `Ctrl-W` toggles a 28-col session list panel on the left. The list refreshes every 5 s from `session.list`. Navigate with `[` / `]` in scroll mode.
+- **Mouse scroll support** — `EnableMouseCapture` is now active; `MouseEventKind::ScrollDown/Up` scroll the main panel. GPU terminal click-selection is suspended while the TUI is focused.
+- **`/gov` govctl harness** — reads TOML artifacts from `gov/work-items/`, `gov/rfc/`, `gov/adr/`. `/gov list` shows all artifacts with id/kind/status/title. `/gov show <id>` prints full detail.
+
+### Fixed
+
+- **`lsp_panel.rs` clippy** — removed dead-code `if/else` producing identical "lsp" blocks; `block` now hardcodes the title directly.
+- **`main.rs` clippy** — six `map_or(false, ...)` → `is_ok_and(...)`, one `map_or(true, ...)` → `is_none_or(...)`, redundant `else if` branches with identical bodies collapsed, `len() > 0` → `!is_empty()`, `filter_map(|b| Some(...))` → `map`.
+
 ## [0.16.2] — 2026-06-26
 
 ### Fixed
