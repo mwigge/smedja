@@ -6,6 +6,12 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.16.2] — 2026-06-26
+
+### Fixed
+
+- **`spawn_worker` contention** — removed `Arc<Mutex<JoinSet<()>>>` from the turn-dispatch hot path. `spawn_worker` now owns its `JoinSet` exclusively (no mutex, no Arc), eliminating lock contention that serialised every concurrent turn spawn. The function returns `JoinHandle<JoinSet<()>>`; at shutdown the channel is closed by dropping a retained `work_tx` clone, the handle is awaited to recover any remaining in-flight turns, and both the turn set and the loop `task_set` are drained together under the existing 30 s deadline. Loop tasks (`loop.run`) continue to use the separate `task_set` in `HandlerState` unchanged.
+
 ## [0.16.1] — 2026-06-26
 
 ### Fixed
