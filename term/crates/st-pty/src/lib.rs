@@ -1862,8 +1862,16 @@ mod tests {
         grid.resize(40, 12);
         // Leave alt screen — must not panic and must have correct dimensions.
         grid.leave_alt_screen();
-        assert_eq!(grid.cells.len(), 12, "restored cells must have new row count");
-        assert_eq!(grid.cells[0].len(), 40, "restored cells must have new col count");
+        assert_eq!(
+            grid.cells.len(),
+            12,
+            "restored cells must have new row count"
+        );
+        assert_eq!(
+            grid.cells[0].len(),
+            40,
+            "restored cells must have new col count"
+        );
     }
 
     // ── scroll on last row ────────────────────────────────────────────────────

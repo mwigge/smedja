@@ -1,0 +1,40 @@
+id     = "WI-005"
+title  = "Math rendering — $...$ LaTeX inline math to Unicode"
+status = "planned"
+priority = "P3"
+
+[detail]
+description = """
+When the assistant emits inline math wrapped in $...$, convert common LaTeX
+sequences to their Unicode equivalents before displaying in the main panel.
+
+Scope:
+  Greek letters: \alpha α, \beta β, \gamma γ, \delta δ, \epsilon ε,
+                 \zeta ζ, \eta η, \theta θ, \lambda λ, \mu μ, \nu ν,
+                 \pi π, \rho ρ, \sigma σ, \tau τ, \phi φ, \chi χ, \psi ψ, \omega ω,
+                 \Gamma Γ, \Delta Δ, \Theta Θ, \Lambda Λ, \Pi Π, \Sigma Σ, \Phi Φ, \Omega Ω
+  Operators:     \sum Σ, \prod Π, \int ∫, \sqrt √, \infty ∞, \partial ∂,
+                 \nabla ∇, \pm ±, \times ×, \cdot ·, \leq ≤, \geq ≥, \neq ≠,
+                 \approx ≈, \equiv ≡, \in ∈, \notin ∉, \subset ⊂, \cup ∪, \cap ∩
+  Arrows:        \to →, \leftarrow ←, \Rightarrow ⇒, \Leftarrow ⇐, \iff ⟺
+  Superscripts:  ^2 ², ^3 ³, ^n (kept as-is if no Unicode)
+  Subscripts:    _0 ₀ through _9 ₉
+
+Fallback: unrecognised sequences are left as-is (raw LaTeX preserved).
+Apply only inside $...$ delimiters; display dollar signs are stripped.
+
+Motivation: Hermes TUI renders LaTeX math to Unicode.
+"""
+
+source   = "Hermes agent TUI (post-v0.16.3 review)"
+estimate = "S"
+
+[acceptance]
+criteria = [
+  "push_line converts $E = mc^2$ to E = mc²",
+  "$\\alpha + \\beta$ renders as α + β",
+  "unrecognised sequences are passed through unchanged",
+  "math outside $...$ is not processed",
+  "double $$ (display math) also processed",
+  "tests cover Greek letters, operators, superscripts, fallback",
+]

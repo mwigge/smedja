@@ -673,7 +673,8 @@ impl Ingot {
 
     /// Checkpoints the WAL and rebuilds the database file to reclaim space.
     pub fn vacuum(&self) -> Result<(), IngotError> {
-        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
         Ok(())
     }
 
@@ -2142,17 +2143,26 @@ mod tests {
 
         // Prune sessions older than 0 days (cutoff = now → evicts anything in the past).
         let deleted = ingot.prune_old_sessions(0).unwrap();
-        assert_eq!(deleted, 1, "exactly the old complete session must be pruned");
+        assert_eq!(
+            deleted, 1,
+            "exactly the old complete session must be pruned"
+        );
 
         // Old session and its dependents must be gone.
-        assert!(ingot.get_session(&old_sess.id.to_string()).unwrap().is_none());
+        assert!(ingot
+            .get_session(&old_sess.id.to_string())
+            .unwrap()
+            .is_none());
         let tasks = ingot.list_tasks(None).unwrap();
         assert!(
             tasks.iter().all(|t| t.id != old_task.id),
             "task belonging to pruned session must be cascaded"
         );
         // New session and its task survive.
-        assert!(ingot.get_session(&new_sess.id.to_string()).unwrap().is_some());
+        assert!(ingot
+            .get_session(&new_sess.id.to_string())
+            .unwrap()
+            .is_some());
         assert!(tasks.iter().any(|t| t.id == new_task.id));
     }
 

@@ -1,0 +1,39 @@
+id     = "WI-004"
+title  = "/gov create and /gov transition — artifact mutation commands"
+status = "planned"
+priority = "P2"
+
+[detail]
+description = """
+Extend the /gov TUI command with write operations:
+
+  /gov create work-item <title>
+    Auto-increments WI-NNN, writes gov/work-items/WI-NNN.toml with
+    status=planned and the given title.
+
+  /gov create rfc <title>
+    Same pattern for RFC-NNN → gov/rfc/RFC-NNN.toml, status=draft.
+
+  /gov create adr <title>
+    Same pattern for ADR-NNN → gov/adr/ADR-NNN.toml, status=draft.
+
+  /gov transition <id> <status>
+    Reads the existing TOML, updates the `status` field, writes it back.
+    Valid transitions are validated against the kind's allowed statuses.
+
+Motivation: govctl's full lifecycle includes create + transition.  /gov is currently
+read-only.
+"""
+
+source   = "govctl-org/govctl (post-v0.16.3 review)"
+estimate = "S"
+
+[acceptance]
+criteria = [
+  "/gov create work-item 'title' creates WI-NNN.toml with status=planned",
+  "auto-increment finds the next free NNN across existing files",
+  "/gov create rfc/adr uses correct prefix and default status",
+  "/gov transition WI-001 in_progress updates the status field in the file",
+  "unknown status values are rejected with an error message",
+  "tests: create first item, create Nth item (increment), transition, invalid status",
+]

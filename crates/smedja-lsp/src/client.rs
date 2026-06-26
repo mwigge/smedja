@@ -161,10 +161,7 @@ impl LspClient {
     /// Each `textDocument/publishDiagnostics` notification is parsed and sent
     /// through `diag_tx`. Server-side requests (e.g. `window/workDoneProgress/create`)
     /// receive a generic null response so the server does not stall.
-    pub(crate) async fn run(
-        &mut self,
-        diag_tx: mpsc::Sender<Vec<Diagnostic>>,
-    ) -> Result<()> {
+    pub(crate) async fn run(&mut self, diag_tx: mpsc::Sender<Vec<Diagnostic>>) -> Result<()> {
         let workspace = self.workspace.clone();
 
         loop {

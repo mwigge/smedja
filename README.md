@@ -344,7 +344,7 @@ Deny sends the reason back as a tool error — the agent re-plans from there. Mo
 
 ### Context Rail
 
-`Ctrl-R` opens a right panel showing context slot fill live:
+`Ctrl-F` (scroll/normal mode) opens a right panel showing context slot fill live:
 
 <div align="center">
   <img src="assets/diagrams/readme-context-rail.png" alt="context rail showing live context slot fill" width="760" />
@@ -564,34 +564,89 @@ Inside the TUI, `/resume` opens an interactive picker listing resumable sessions
 
 ## TUI Reference
 
+See [`docs/tui.md`](docs/tui.md) for the complete manual. Quick reference below.
+
 ### Slash Commands
 
 | Command | What it does |
 |---------|-------------|
+| `/agent [id]` | Run a named agent; omit id to list available agents |
+| `/approve [id]` | Approve a pending cowork item; omit id to list pending |
+| `/briefing` | Show the session briefing |
+| `/clear` | Clear the message display (keeps session data) |
+| `/drawio <slug>` | Generate a draw.io mxGraph XML diagram |
+| `/gov [subcommand]` | govctl artifact management — see `/gov help` |
+| `/health` | Check daemon connectivity |
 | `/help` | List all slash commands |
-| `/session` | Show current session ID and state |
-| `/resume [id] [turn]` | Reopen a prior session, optionally rewinding to a turn |
-| `/model [name]` | List models or hot-swap; local-runner aware |
-| `/cowork on\|off\|status` | Toggle cowork approval gate or query live state |
-| `/lsp` | Toggle the LSP diagnostic rail (`Ctrl-L`) |
-| `/test [cargo\|npm\|go\|py]` | Run the project's test suite; auto-detects manifest type; pass an arg to override in monorepos |
+| `/login` | Authenticate with the current runner |
+| `/loop [subcommand]` | Manage loop runs: `status \| list \| create <goal> \| cancel` |
+| `/lsp` | Show LSP server status and diagnostic summary |
+| `/metrics` | Show token usage and cost rollup |
+| `/model [name]` | List models or hot-swap; local-runner aware (`/model qwen3-14b` hot-swaps) |
+| `/pptx <slug>` | Generate a python-pptx presentation script |
+| `/quit` | Exit smedja-tui |
 | `/quota` | Show daily token usage vs. `SMEDJA_DAILY_TOKEN_LIMIT` |
-| `/version` | Show daemon and TUI versions |
-| `/upgrade` | Pull and install the latest release |
+| `/resume [id [turn]]` | Reopen a prior session; omit id for interactive picker; `turn` rewinds destructively |
+| `/review` | Send the current `git diff` for review |
+| `/spec` | Browse OpenSpec changes |
+| `/switch [runner]` | Switch AI runner interactively or directly |
+| `/takeover <runner>` | Fork the session to a new runner |
+| `/test [cargo\|npm\|go\|py]` | Run the project test suite; auto-detects manifest |
+| `/tier <t>` | Set tier: `local \| fast \| deep` |
+| `/version` | Print current version and check for a newer release |
+| `/upgrade` | Download and install the latest release in-place |
 
-### Key Bindings
+### Inline Context Fragments
+
+Fragments are expanded into your message before the turn runs:
+
+| Fragment | What it injects |
+|----------|----------------|
+| `@file <path>` | A workspace file's contents (path must stay inside the workspace) |
+| `@git` | `git status --short` and `git diff HEAD` |
+| `@branch` | The current branch name and upstream |
+| `@shell <cmd>` | A shell command's stdout (gated by cowork when enabled) |
+
+### Key Bindings — Input Mode
 
 | Key | Action |
 |-----|--------|
 | `Enter` | Submit message |
-| `↑ / ↓` | Navigate turn blocks |
-| `c` | Copy selected block |
-| `r` | Replay selected turn |
-| `Ctrl-T` | Toggle metrics overlay |
-| `Ctrl-R` | Toggle context-fill rail |
-| `Ctrl-L` | Toggle LSP diagnostic rail |
-| `Ctrl-O` | Toggle observability panel |
-| `Esc` | Cancel in-flight turn |
+| `↑` / `Ctrl-P` | Browse prompt history backwards |
+| `↓` / `Ctrl-N` | Browse prompt history forwards |
+| `Ctrl-R` | Toggle reverse history search |
+| `Ctrl-G` | Open `$EDITOR` / `$VISUAL` to compose a multi-line message |
+| `Ctrl-B` | Move cursor left one character |
+| `Ctrl-K` | Kill from cursor to end of line (push to kill ring) |
+| `Ctrl-U` | Kill from start of line to cursor (push to kill ring) |
+| `Ctrl-Y` | Yank most recent kill at cursor |
+| `Esc` | Enter scroll/normal mode |
+
+### Key Bindings — Scroll / Normal Mode
+
+| Key | Action |
+|-----|--------|
+| `i` / `a` | Return to input mode |
+| `j` / `k` | Scroll down / up |
+| `G` | Scroll to bottom |
+| `gg` | Scroll to top |
+| `v` | Start visual line-selection mode |
+| `y` | Yank current selection to clipboard |
+| `t` | Copy the W3C traceparent from the current block |
+| `T` | Expand / collapse the thinking block |
+| `[` / `]` | Move cursor up / down in the session rail |
+| `Esc` | Exit selection / return to input mode |
+
+### Panel Toggles (both modes unless noted)
+
+| Key | Panel |
+|-----|-------|
+| `Ctrl-A` | Role cockpit — active role, tier, runner, turn status |
+| `Ctrl-F` | Context fill rail (scroll mode only) |
+| `Ctrl-L` | LSP diagnostic panel |
+| `Ctrl-O` | Observability panel |
+| `Ctrl-T` | Metrics overlay |
+| `Ctrl-W` | Session browser left-rail |
 
 ### Environment Variables
 
@@ -603,11 +658,15 @@ Inside the TUI, `/resume` opens an interactive picker listing resumable sessions
 | `SMEDJA_SANDBOX_NETWORK` | `none` | Subprocess network policy: `none \| allowlist \| open` |
 | `SMEDJA_SANDBOX_READ_PATHS` | *(empty)* | Colon-separated extra paths appended to the sandbox read allow-list |
 | `SMEDJA_LOCAL_ENDPOINT` | `http://127.0.0.1:9090` | OpenAI-compatible local model endpoint |
-| `SMEDJA_LOCAL_SWAP_ENDPOINT` | same as above | Hot-swap endpoint (for llama-swap) |
+| `SMEDJA_LOCAL_SWAP_ENDPOINT` | same as `SMEDJA_LOCAL_ENDPOINT` | Hot-swap endpoint (for llama-swap) |
+| `SMEDJA_OTLP_ENDPOINT` | *(unset)* | OTLP collector endpoint; enables the OTel trace footer in the TUI when set |
+| `NO_COLOR` | *(unset)* | Disable all colour output when set to any value |
 
 ---
 
 ## Getting Started
+
+For a full walkthrough see [`docs/getting-started.md`](docs/getting-started.md).
 
 ```bash
 # 1. start the daemon (socket auto-placed at $XDG_RUNTIME_DIR/smdjad.sock)

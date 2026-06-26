@@ -7,7 +7,8 @@
 use std::collections::VecDeque;
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
+use crate::theme::palette;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -54,7 +55,9 @@ fn percentile(samples: &VecDeque<u64>, pct: usize) -> Option<u64> {
     let mut sorted: Vec<u64> = samples.iter().copied().collect();
     sorted.sort_unstable();
     // Index clamped to the last valid position.
-    let idx = ((pct * sorted.len()) / 100).saturating_sub(1).min(sorted.len() - 1);
+    let idx = ((pct * sorted.len()) / 100)
+        .saturating_sub(1)
+        .min(sorted.len() - 1);
     Some(sorted[idx])
 }
 
@@ -78,7 +81,7 @@ fn fmt_tok(n: u64) -> String {
     }
 }
 
-fn fill_bar(value: u64, max: u64, width: usize, color: Color) -> Line<'static> {
+fn fill_bar(value: u64, max: u64, width: usize, color: ratatui::style::Color) -> Line<'static> {
     if width == 0 {
         return Line::default();
     }
@@ -94,7 +97,7 @@ fn fill_bar(value: u64, max: u64, width: usize, color: Color) -> Line<'static> {
         Span::styled("\u{2588}".repeat(filled), Style::default().fg(color)),
         Span::styled(
             "\u{2591}".repeat(empty),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette().text_dim),
         ),
     ])
 }
@@ -115,6 +118,7 @@ impl<'a> ObsPanel<'a> {
             return;
         }
 
+        let p = palette();
         let snap = self.snapshot;
         let bar_w = (area.width as usize).saturating_sub(6).max(1);
         let mut lines: Vec<Line<'_>> = Vec::new();
@@ -123,16 +127,16 @@ impl<'a> ObsPanel<'a> {
         match (snap.p95_ms(), snap.p99_ms()) {
             (Some(p95), Some(p99)) => {
                 lines.push(Line::from(vec![
-                    Span::styled("p95", Style::default().fg(Color::DarkGray)),
+                    Span::styled("p95", Style::default().fg(p.text_dim)),
                     Span::raw(format!(" {:>5}  ", fmt_ms(p95))),
-                    Span::styled("p99", Style::default().fg(Color::DarkGray)),
+                    Span::styled("p99", Style::default().fg(p.text_dim)),
                     Span::raw(format!(" {}", fmt_ms(p99))),
                 ]));
             }
             _ => {
                 lines.push(Line::from(Span::styled(
                     "p95  \u{2014}   p99  \u{2014}",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(p.text_dim),
                 )));
             }
         }
@@ -140,29 +144,36 @@ impl<'a> ObsPanel<'a> {
         // ── Token throughput ─────────────────────────────────────────────────
         let total = snap.tokens_input + snap.tokens_output;
         lines.push(Line::from(vec![
-            Span::styled("tok ", Style::default().fg(Color::DarkGray)),
-            Span::styled(fmt_tok(total), Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled("  \u{2191}", Style::default().fg(Color::Green)),
+            Span::styled("tok ", Style::default().fg(p.text_dim)),
+            Span::styled(
+                fmt_tok(total),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  \u{2191}", Style::default().fg(p.success)),
             Span::raw(fmt_tok(snap.tokens_input)),
-            Span::styled(" \u{2193}", Style::default().fg(Color::Yellow)),
+            Span::styled(" \u{2193}", Style::default().fg(p.warn)),
             Span::raw(fmt_tok(snap.tokens_output)),
         ]));
 
         // ── Context fill bar ─────────────────────────────────────────────────
         if snap.context_window > 0 {
-            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
             let pct = ((snap.context_used as f64 / snap.context_window as f64) * 100.0) as u64;
             let color = if pct > 80 {
-                Color::Red
+                p.error
             } else if pct > 60 {
-                Color::Yellow
+                p.warn
             } else {
-                Color::Green
+                p.success
             };
             let mut bar = fill_bar(snap.context_used, snap.context_window, bar_w, color);
             bar.spans.push(Span::styled(
                 format!(" {pct:>3}%"),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(p.text_dim),
             ));
             lines.push(bar);
         }
@@ -173,16 +184,16 @@ impl<'a> ObsPanel<'a> {
                 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
                 let pct = ((used as f64 / limit as f64) * 100.0).min(100.0) as u64;
                 let color = if pct > 80 {
-                    Color::Red
+                    p.error
                 } else if pct > 60 {
-                    Color::Yellow
+                    p.warn
                 } else {
-                    Color::Cyan
+                    p.text
                 };
                 let mut bar = fill_bar(used, limit, bar_w, color);
                 bar.spans.push(Span::styled(
                     format!(" dy{pct:>2}%"),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(p.text_dim),
                 ));
                 lines.push(bar);
             }
@@ -190,34 +201,39 @@ impl<'a> ObsPanel<'a> {
 
         // ── Cost + efficiency ────────────────────────────────────────────────
         if snap.session_cost_usd > 0.0 || snap.efficiency_ratio > 0.0 {
-            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
             let eff_pct = (snap.efficiency_ratio * 100.0).round() as u64;
             lines.push(Line::from(vec![
-                Span::styled("\u{24}", Style::default().fg(Color::DarkGray)),
+                Span::styled("\u{24}", Style::default().fg(p.text_dim)),
                 Span::raw(format!("{:.3}", snap.session_cost_usd)),
-                Span::styled("  eff ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{eff_pct}%"),
-                    Style::default().fg(Color::Green),
-                ),
+                Span::styled("  eff ", Style::default().fg(p.text_dim)),
+                Span::styled(format!("{eff_pct}%"), Style::default().fg(p.success)),
             ]));
         }
 
         // ── Cache savings ────────────────────────────────────────────────────
         if snap.cache_saved > 0 {
             lines.push(Line::from(vec![
-                Span::styled("cache ", Style::default().fg(Color::DarkGray)),
+                Span::styled("cache ", Style::default().fg(p.text_dim)),
                 Span::styled(
                     fmt_tok(snap.cache_saved.max(0) as u64),
-                    Style::default().fg(Color::Green),
+                    Style::default().fg(p.success),
                 ),
                 Span::raw(" saved"),
             ]));
         }
 
         frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title("obs")),
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(p.border))
+                    .title(" obs "),
+            ),
             area,
         );
     }
@@ -311,6 +327,9 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect();
-        assert!(!rendered.contains("dy"), "daily bar must be hidden: {rendered}");
+        assert!(
+            !rendered.contains("dy"),
+            "daily bar must be hidden: {rendered}"
+        );
     }
 }

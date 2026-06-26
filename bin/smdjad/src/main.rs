@@ -487,65 +487,110 @@ fn build_router(
 
     router.register("ping", |_| async { Ok(json!("pong")) });
 
-    route!(router, "session.create",          state, handlers::session::create);
-    route!(router, "session.list",            state, handlers::session::list);
-    route!(router, "session.get",             state, handlers::session::get);
-    route!(router, "session.delete",          state, handlers::session::delete);
-    route!(router, "session.fork",            state, handlers::session::fork);
-    route!(router, "session.takeover",        state, handlers::session::takeover);
-    route!(router, "session.set_model",       state, handlers::session::set_model);
-    route!(router, "session.set_runner",      state, handlers::session::set_runner);
-    route!(router, "session.set_mode",        state, handlers::session::set_mode);
-    route!(router, "session.context",         state, handlers::session::context);
-    route!(router, "session.token_usage",     state, handlers::session::token_usage);
-    route!(router, "session.history",         state, handlers::session::history);
-    route!(router, "session.checkpoint.list", state, handlers::checkpoint::list);
-    route!(router, "session.rollback",        state, handlers::checkpoint::rollback);
-    route!(router, "session.compact",         state, handlers::checkpoint::compact);
-    route!(router, "session.cost",            state, handlers::cost::cost);
-    route!(router, "runner.list",             state, handlers::session::runner_list);
-    route!(router, "turn.submit",             state, handlers::turn::submit);
+    route!(router, "session.create", state, handlers::session::create);
+    route!(router, "session.list", state, handlers::session::list);
+    route!(router, "session.get", state, handlers::session::get);
+    route!(router, "session.delete", state, handlers::session::delete);
+    route!(router, "session.fork", state, handlers::session::fork);
+    route!(
+        router,
+        "session.takeover",
+        state,
+        handlers::session::takeover
+    );
+    route!(
+        router,
+        "session.set_model",
+        state,
+        handlers::session::set_model
+    );
+    route!(
+        router,
+        "session.set_runner",
+        state,
+        handlers::session::set_runner
+    );
+    route!(
+        router,
+        "session.set_mode",
+        state,
+        handlers::session::set_mode
+    );
+    route!(router, "session.context", state, handlers::session::context);
+    route!(
+        router,
+        "session.token_usage",
+        state,
+        handlers::session::token_usage
+    );
+    route!(router, "session.history", state, handlers::session::history);
+    route!(
+        router,
+        "session.checkpoint.list",
+        state,
+        handlers::checkpoint::list
+    );
+    route!(
+        router,
+        "session.rollback",
+        state,
+        handlers::checkpoint::rollback
+    );
+    route!(
+        router,
+        "session.compact",
+        state,
+        handlers::checkpoint::compact
+    );
+    route!(router, "session.cost", state, handlers::cost::cost);
+    route!(router, "runner.list", state, handlers::session::runner_list);
+    route!(router, "turn.submit", state, handlers::turn::submit);
     // Blocks until terminal status or 60 s deadline; event-driven, no poll.
-    route!(router, "turn.subscribe",          state, handlers::turn::subscribe);
-    route!(router, "task.get",                state, handlers::task::get);
-    route!(router, "task.list",               state, handlers::task::list);
-    route!(router, "task.create",             state, handlers::task::create);
-    route!(router, "task.close",              state, handlers::task::close);
-    route!(router, "task.parallel",           state, handlers::task::parallel);
-    route!(router, "task.cancel",             state, handlers::task::cancel);
-    route!(router, "metrics.summary",         state, handlers::metrics::summary);
-    route!(router, "savings.summary",         state, handlers::savings::summary);
-    route!(router, "cowork.set",              state, handlers::audit::set);
-    route!(router, "cowork.approve",          state, handlers::audit::approve);
-    route!(router, "cowork.deny",             state, handlers::audit::deny);
-    route!(router, "cowork.modify",           state, handlers::audit::modify);
-    route!(router, "cowork.pending",          state, handlers::audit::pending);
-    route!(router, "mcp.register",            state, handlers::mcp::register);
-    route!(router, "mcp.list",                state, handlers::mcp::list);
-    route!(router, "mcp.remove",              state, handlers::mcp::remove);
-    route!(router, "mcp.refresh",             state, handlers::mcp::refresh);
-    route!(router, "local.models",            state, handlers::local::models);
-    route!(router, "local.gpu",               state, handlers::local::gpu);
-    route!(router, "local.swap",              state, handlers::local::swap);
-    route!(router, "local.install",           state, handlers::local::install);
-    route!(router, "loop.create",             state, handlers::loops::create);
-    route!(router, "loop.status",             state, handlers::loops::status);
-    route!(router, "loop.cancel",             state, handlers::loops::cancel);
-    route!(router, "loop.list",               state, handlers::loops::list);
-    route!(router, "loop.retire",             state, handlers::loops::retire);
-    route!(router, "loop.list_by_status",     state, handlers::loops::list_by_status);
+    route!(router, "turn.subscribe", state, handlers::turn::subscribe);
+    route!(router, "task.get", state, handlers::task::get);
+    route!(router, "task.list", state, handlers::task::list);
+    route!(router, "task.create", state, handlers::task::create);
+    route!(router, "task.close", state, handlers::task::close);
+    route!(router, "task.parallel", state, handlers::task::parallel);
+    route!(router, "task.cancel", state, handlers::task::cancel);
+    route!(router, "metrics.summary", state, handlers::metrics::summary);
+    route!(router, "savings.summary", state, handlers::savings::summary);
+    route!(router, "cowork.set", state, handlers::audit::set);
+    route!(router, "cowork.approve", state, handlers::audit::approve);
+    route!(router, "cowork.deny", state, handlers::audit::deny);
+    route!(router, "cowork.modify", state, handlers::audit::modify);
+    route!(router, "cowork.pending", state, handlers::audit::pending);
+    route!(router, "mcp.register", state, handlers::mcp::register);
+    route!(router, "mcp.list", state, handlers::mcp::list);
+    route!(router, "mcp.remove", state, handlers::mcp::remove);
+    route!(router, "mcp.refresh", state, handlers::mcp::refresh);
+    route!(router, "local.models", state, handlers::local::models);
+    route!(router, "local.gpu", state, handlers::local::gpu);
+    route!(router, "local.swap", state, handlers::local::swap);
+    route!(router, "local.install", state, handlers::local::install);
+    route!(router, "loop.create", state, handlers::loops::create);
+    route!(router, "loop.status", state, handlers::loops::status);
+    route!(router, "loop.cancel", state, handlers::loops::cancel);
+    route!(router, "loop.list", state, handlers::loops::list);
+    route!(router, "loop.retire", state, handlers::loops::retire);
+    route!(
+        router,
+        "loop.list_by_status",
+        state,
+        handlers::loops::list_by_status
+    );
     // Drives the smedja-loop engine: policy hash, evaluator separation, slice pipeline.
-    route!(router, "loop.run",                state, handlers::loops::run);
-    route!(router, "audit.list",              state, handlers::audit::list);
+    route!(router, "loop.run", state, handlers::loops::run);
+    route!(router, "audit.list", state, handlers::audit::list);
     // Bounded read-only repo/PR/branch audit; returns findings + report.
-    route!(router, "audit.run",               state, handlers::auditor::run);
+    route!(router, "audit.run", state, handlers::auditor::run);
     // Resolves (role, complexity?) through the assayer.
-    route!(router, "agent.routing",           state, handlers::routing::routing);
-    route!(router, "lsp.status",              state, handlers::lsp::status);
-    route!(router, "lsp.diagnostics",         state, handlers::lsp::diagnostics);
-    route!(router, "graph.index",             state, handlers::graph::index);
-    route!(router, "graph.query",             state, handlers::graph::query);
-    route!(router, "vault.reembed",           state, handlers::vault::reembed);
+    route!(router, "agent.routing", state, handlers::routing::routing);
+    route!(router, "lsp.status", state, handlers::lsp::status);
+    route!(router, "lsp.diagnostics", state, handlers::lsp::diagnostics);
+    route!(router, "graph.index", state, handlers::graph::index);
+    route!(router, "graph.query", state, handlers::graph::query);
+    route!(router, "vault.reembed", state, handlers::vault::reembed);
 
     // quota.limit — reads SMEDJA_DAILY_TOKEN_LIMIT env var; no handler state needed.
     router.register("quota.limit", |_| async {

@@ -1,5 +1,6 @@
 pub mod action_log;
 mod blocks;
+pub mod code_widget;
 mod context_rail;
 mod cowork_widget;
 mod lsp_panel;
@@ -28,7 +29,8 @@ use crossterm::terminal::{
 use crossterm::{event, execute};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
+use crate::theme::palette;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Terminal;
@@ -167,7 +169,7 @@ slash commands:
   /briefing          — show session briefing
   /clear             — clear message display (keeps session data)
   /drawio <slug>     — generate draw.io diagram
-  /gov [list|show <id>] — browse govctl artifacts (gov/work-items/, gov/rfc/, gov/adr/)
+  /gov [list|show <id>|create work-item|rfc|adr <title>|transition <id> <status>] — govctl artifacts
   /health            — check daemon connectivity
   /help              — show this message
   /login             — authenticate with runner
@@ -200,12 +202,17 @@ keybindings (input mode):
   Down / Ctrl-N      — browse history forwards
   Ctrl-R             — toggle reverse history search
   Ctrl-G             — open $EDITOR / $VISUAL to compose a multi-line message
+  Ctrl-B             — move cursor left one character
+  Ctrl-K             — kill from cursor to end of line (push to kill ring)
+  Ctrl-U             — kill from start of line to cursor (push to kill ring)
+  Ctrl-Y             — yank most recent kill at cursor
 
 keybindings (scroll/normal mode):
   i / a              — return to input mode
   j / k              — scroll down / up
   G                  — scroll to bottom
   gg                 — scroll to top
+  Ctrl-A             — toggle role cockpit panel (active role/tier/turn status)
   Ctrl-F             — toggle context rail
   Ctrl-L             — toggle LSP diagnostic panel
   Ctrl-O             — toggle observability panel
@@ -220,6 +227,26 @@ keybindings (scroll/normal mode):
 note: scroll wheel scrolls the main panel; use v/y in scroll mode to copy text.
       mouse capture is active — the outer GPU terminal's click-selection is
       suspended while smedja-tui is focused.";
+
+/// Visibility state for all toggleable rail and overlay panels.
+///
+/// Grouped here so new panels only require adding one field instead of
+/// threading a top-level boolean through `AppState` and every test helper.
+#[derive(Debug, Default)]
+struct PanelVisibility {
+    /// Context rail (right, Ctrl-F).
+    context_rail: bool,
+    /// Metrics view overlay (Ctrl-T).
+    metrics: bool,
+    /// Session browser left-rail (Ctrl-W).
+    session_rail: bool,
+    /// LSP diagnostic panel (right rail, Ctrl-L).
+    lsp: bool,
+    /// Observability panel (right rail, Ctrl-O).
+    obs: bool,
+    /// Role cockpit panel (right rail, Ctrl-A).
+    role_cockpit: bool,
+}
 
 #[allow(clippy::struct_excessive_bools)] // AppState is a TUI dispatch table; enum-splitting would add indirection without clarity
 #[derive(Debug)]
@@ -256,10 +283,8 @@ struct AppState {
     diff_scroll: usize,
     /// Staging queue for batched tool dispatch.
     staging_queue: staging::StagingQueue,
-    /// Whether the context rail sidebar is visible.
-    context_rail_visible: bool,
-    /// Whether the metrics view panel is visible.
-    metrics_view_visible: bool,
+    /// Visibility state for all toggleable rail and overlay panels.
+    panels: PanelVisibility,
     /// Cached per-runner metrics snapshot for the latest rollup window.
     metrics_snapshot: Vec<metrics_view::MetricsRow>,
     /// Cached token-economy savings snapshot for the latest rollup window.
@@ -269,7 +294,7 @@ struct AppState {
     /// cadence). `None` forces an immediate fetch on the next tick.
     last_metrics_poll: Option<std::time::Instant>,
     /// Timestamp of the last obs-panel poll (session.cost + daily token total).
-    /// Independent of `metrics_view_visible` so the obs panel is always current.
+    /// Independent of `panels.metrics` so the obs panel is always current.
     last_obs_poll: Option<std::time::Instant>,
     /// Cumulative tokens used so far in this session (input + output).
     context_used: u64,
@@ -291,8 +316,6 @@ struct AppState {
     session_picker_mode: bool,
     /// Session ids parallel to `slash_completions` while the session picker is open.
     session_picker_ids: Vec<String>,
-    /// Whether the left-rail session browser is visible (Ctrl-W to toggle).
-    session_rail_visible: bool,
     /// Sessions shown in the left rail: (id, label) pairs.
     session_rail_items: Vec<(String, String)>,
     /// Cursor row within the session rail.
@@ -338,6 +361,10 @@ struct AppState {
     current_thinking: String,
     /// Whether the completed thinking block is expanded in the panel.
     thinking_expanded: bool,
+    /// Kill ring for Ctrl-K / Ctrl-U / Ctrl-Y input editing (max 16 entries).
+    kill_ring: VecDeque<String>,
+    /// Name of the agent/role active in the current in-flight turn (from CorrelationCtx).
+    active_agent_name: Option<String>,
     /// Path of the smdjad stream socket (`<rpc_sock>.stream`).
     stream_sock_path: PathBuf,
     /// W3C traceparent from the most recently completed turn.
@@ -373,12 +400,8 @@ struct AppState {
     lsp_last_poll: Option<std::time::Instant>,
     /// Most recent LSP snapshot (updated from RPC polls every 5 s).
     lsp_snapshot: smedja_lsp::LspSnapshot,
-    /// Whether the LSP diagnostic panel is visible in the right rail (Ctrl-L).
-    lsp_panel_visible: bool,
     /// Observability snapshot — updated from turn events + metrics polls.
     obs_snapshot: obs_panel::ObsSnapshot,
-    /// Whether the observability panel is visible in the right rail (Ctrl-O).
-    obs_panel_visible: bool,
     /// Last 50 turn round-trip latencies in ms, used for p95/p99 computation.
     latency_samples: VecDeque<u64>,
     /// Cumulative input tokens for this session (updated on each turn done event).
@@ -590,6 +613,7 @@ async fn submit(input: &str, state: &mut AppState, client: &mut Client) -> Resul
             state.last_poll = Some(std::time::Instant::now());
             state.current_thinking.clear();
             state.thinking_expanded = false;
+            state.active_agent_name = None;
 
             // Start streaming reader; events arrive via unbounded channel.
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -998,6 +1022,28 @@ fn paste_from_clipboard() -> Option<String> {
         }
         None
     }
+}
+
+/// Returns the OSC-9 turn-complete notification byte sequence.
+///
+/// Supported by Windows Terminal, iTerm2, and any OSC-9-capable terminal.
+/// Silently ignored by terminals that do not implement OSC 9.
+fn osc9_turn_complete_bytes() -> &'static [u8] {
+    b"\x1b]9;turn complete\x07"
+}
+
+/// Writes the OSC-9 turn-complete notification to `w`.
+fn emit_osc9(w: &mut impl std::io::Write) -> std::io::Result<()> {
+    w.write_all(osc9_turn_complete_bytes())
+}
+
+/// Pushes `text` onto the kill ring, evicting the oldest entry when the ring
+/// is at capacity (16 entries).
+fn push_kill(ring: &mut VecDeque<String>, text: String) {
+    if ring.len() >= 16 {
+        ring.pop_front();
+    }
+    ring.push_back(text);
 }
 
 /// Resolves the editor binary to use for Ctrl-G composition.
@@ -1410,10 +1456,20 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
                         push_system_message(state, format!("gov show: artifact '{id}' not found"));
                     }
                 }
+                create_args if create_args.starts_with("create ") => {
+                    let rest = create_args.trim_start_matches("create ").trim();
+                    let msg = gov_create(&workspace, rest);
+                    push_system_message(state, msg);
+                }
+                transition_args if transition_args.starts_with("transition ") => {
+                    let rest = transition_args.trim_start_matches("transition ").trim();
+                    let msg = gov_transition(&workspace, rest);
+                    push_system_message(state, msg);
+                }
                 _ => {
                     push_system_message(
                         state,
-                        "gov: unknown subcommand — try: /gov list | /gov show <id>",
+                        "gov: unknown subcommand — try: /gov list | /gov show <id> | /gov create work-item <title> | /gov transition <id> <status>",
                     );
                 }
             }
@@ -2658,6 +2714,14 @@ async fn handle_key(
     }
 
     // ------------------------------------------------------------------
+    // Ctrl-A: toggle role cockpit panel (works in both input and scroll mode).
+    // ------------------------------------------------------------------
+    if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        state.panels.role_cockpit = !state.panels.role_cockpit;
+        return Ok(());
+    }
+
+    // ------------------------------------------------------------------
     // Ctrl-V: paste from system clipboard into the input buffer.
     // ------------------------------------------------------------------
     if key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -2759,13 +2823,13 @@ async fn handle_key(
             }
             // [ / ] : navigate session rail cursor (when rail is visible).
             KeyCode::Char('[') => {
-                if state.session_rail_visible {
+                if state.panels.session_rail {
                     state.session_rail_cursor = state.session_rail_cursor.saturating_sub(1);
                 }
                 return Ok(());
             }
             KeyCode::Char(']') => {
-                if state.session_rail_visible && !state.session_rail_items.is_empty() {
+                if state.panels.session_rail && !state.session_rail_items.is_empty() {
                     let max = state.session_rail_items.len().saturating_sub(1);
                     state.session_rail_cursor = (state.session_rail_cursor + 1).min(max);
                 }
@@ -2812,16 +2876,16 @@ async fn handle_key(
         // Ctrl-F: toggle context rail (scroll mode only).
         KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if state.scroll_focus {
-                state.context_rail_visible = !state.context_rail_visible;
+                state.panels.context_rail = !state.panels.context_rail;
             }
         }
 
         // Ctrl-W: toggle session browser left-rail.
         KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.session_rail_visible = !state.session_rail_visible;
+            state.panels.session_rail = !state.panels.session_rail;
             state.session_rail_cursor = 0;
             // Trigger an immediate poll on next tick by clearing the timestamp.
-            if state.session_rail_visible {
+            if state.panels.session_rail {
                 state.last_session_rail_poll = None;
             }
         }
@@ -2836,6 +2900,46 @@ async fn handle_key(
             }
         }
 
+        // Ctrl-K: kill from cursor to end of line; push onto kill ring (input mode only).
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if !state.scroll_focus {
+                let killed: String = state.input[state.input_cursor..].to_owned();
+                if !killed.is_empty() {
+                    state.input.drain(state.input_cursor..);
+                    push_kill(&mut state.kill_ring, killed);
+                }
+            }
+        }
+
+        // Ctrl-U: kill from start of line to cursor; push onto kill ring (input mode only).
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if !state.scroll_focus {
+                let killed: String = state.input[..state.input_cursor].to_owned();
+                if !killed.is_empty() {
+                    state.input.drain(..state.input_cursor);
+                    state.input_cursor = 0;
+                    push_kill(&mut state.kill_ring, killed);
+                }
+            }
+        }
+
+        // Ctrl-Y: yank most recent kill at cursor position (input mode only).
+        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if !state.scroll_focus {
+                if let Some(text) = state.kill_ring.back().cloned() {
+                    state.input.insert_str(state.input_cursor, &text);
+                    state.input_cursor += text.len();
+                }
+            }
+        }
+
+        // Ctrl-B: move cursor one character left (input mode only).
+        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if !state.scroll_focus && state.input_cursor > 0 {
+                state.input_cursor = prev_char_boundary(&state.input, state.input_cursor);
+            }
+        }
+
         // Ctrl-T: toggle the metrics view panel (read-only rollup snapshot).
         // Toggling on clears the poll cadence so the next tick fetches at once.
         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2844,12 +2948,12 @@ async fn handle_key(
 
         // Ctrl-L: toggle LSP diagnostic panel in the right rail.
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.lsp_panel_visible = !state.lsp_panel_visible;
+            state.panels.lsp = !state.panels.lsp;
         }
 
         // Ctrl-O: toggle observability panel in the right rail.
         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.obs_panel_visible = !state.obs_panel_visible;
+            state.panels.obs = !state.panels.obs;
         }
 
         KeyCode::Esc => {
@@ -3299,6 +3403,14 @@ async fn handle_key(
 #[allow(clippy::too_many_lines)] // single-pass frame layout; splitting is out of scope here
 fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     let area = frame.area();
+    let p = palette();
+
+    // Flood-fill the entire frame with the forge background so no terminal
+    // default colour bleeds through panel gaps or empty areas.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(p.bg)),
+        area,
+    );
 
     // L122: outer vertical split:
     //   row 0 = status bar (1 row)
@@ -3337,7 +3449,10 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     let status_style = if state.no_color {
         Style::default()
     } else {
-        Style::default().add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(p.text)
+            .bg(p.panel)
+            .add_modifier(Modifier::BOLD)
     };
     let status = Paragraph::new(status_text).style(status_style);
     frame.render_widget(status, status_area);
@@ -3346,7 +3461,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     const SESSION_RAIL_W: u16 = 28;
 
     // First carve out the optional left session rail.
-    let (session_rail_area_opt, content_area) = if state.session_rail_visible
+    let (session_rail_area_opt, content_area) = if state.panels.session_rail
         && body_area.width >= SESSION_RAIL_W + 40
     {
         let cols = Layout::horizontal([Constraint::Length(SESSION_RAIL_W), Constraint::Fill(1)])
@@ -3357,7 +3472,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     };
 
     // Then carve out the optional right context rail.
-    let (main_area, rail_area) = if state.context_rail_visible && content_area.width >= 100 {
+    let (main_area, rail_area) = if state.panels.context_rail && content_area.width >= 100 {
         let cols = Layout::horizontal([
             Constraint::Fill(1),
             Constraint::Length(context_rail::ContextRail::WIDTH),
@@ -3380,7 +3495,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
                     Line::from(Span::styled(
                         format!("▶ {label}"),
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(p.accent)
                             .add_modifier(Modifier::BOLD),
                     ))
                 } else {
@@ -3390,6 +3505,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
             .collect();
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_style(Style::default().fg(p.border_dim))
             .title(" sessions [Ctrl-W] ");
         frame.render_widget(Paragraph::new(lines).block(block), sr_area);
     }
@@ -3428,14 +3544,14 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
             Style::default()
         } else {
             Style::default()
-                .fg(Color::Yellow)
+                .fg(p.accent)
                 .add_modifier(Modifier::BOLD)
         };
         let dim_style = if state.no_color {
             Style::default()
         } else {
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(p.text_dim)
                 .add_modifier(Modifier::ITALIC)
         };
         let mut spans = vec![Span::styled(
@@ -3477,7 +3593,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         let thinking_style = if state.no_color {
             Style::default()
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(p.text_dim)
         };
         let lines: Vec<Line<'_>> = state
             .current_thinking
@@ -3528,7 +3644,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         Style::default()
     } else {
         Style::default()
-            .fg(Color::DarkGray)
+            .fg(p.text_dim)
             .add_modifier(Modifier::DIM)
     };
     // Only split if the counter fits without squashing the input.
@@ -3560,24 +3676,27 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         );
         let search_widget = Paragraph::new(search_text).style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(p.text)
                 .add_modifier(Modifier::DIM),
         );
         frame.render_widget(search_widget, search_area);
     }
 
-    // -- Right rail: context | LSP panel | obs panel -------------------------
-    // The rail is split vertically into 1–3 sections. Context (1 row) is always
-    // present; LSP and obs panels are individually toggled via Ctrl-L / Ctrl-O.
-    // When both are on, obs gets a fixed 9-row allocation and LSP fills the rest.
+    // -- Right rail: context | role cockpit | LSP panel | obs panel ----------
+    // The rail is split vertically into 1–4 sections. Context (1 row) is always
+    // present; role cockpit, LSP, and obs panels are individually toggled.
     if let Some(rail_rect) = rail_area {
         use Constraint::{Fill, Length};
 
-        let show_lsp = state.lsp_panel_visible;
-        let show_obs = state.obs_panel_visible;
+        let show_cockpit = state.panels.role_cockpit;
+        let show_lsp = state.panels.lsp;
+        let show_obs = state.panels.obs;
 
         // Build constraint list dynamically so Layout never gets zero-length.
         let mut constraints: Vec<Constraint> = vec![Length(1)]; // context row
+        if show_cockpit {
+            constraints.push(Length(6));
+        }
         if show_lsp && show_obs {
             constraints.push(Fill(1));
             constraints.push(Length(9));
@@ -3598,6 +3717,12 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         frame.render_widget(context_rail::ContextRail::new(slots), rail_chunks[ci]);
         ci += 1;
 
+        // ── Role cockpit panel ────────────────────────────────────────────
+        if show_cockpit && ci < rail_chunks.len() {
+            render_role_cockpit(frame, rail_chunks[ci], state);
+            ci += 1;
+        }
+
         // ── LSP panel ─────────────────────────────────────────────────────
         if show_lsp && ci < rail_chunks.len() {
             lsp_panel::LspPanel::new(&state.lsp_snapshot).render(rail_chunks[ci], frame);
@@ -3614,7 +3739,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     // Read-only snapshot panel, toggled via Ctrl-T. Rendered as a top-anchored
     // overlay on the right of the body so it does not disturb the main/rail
     // split; it draws from the cached snapshot, never fetching on the hot path.
-    if state.metrics_view_visible {
+    if state.panels.metrics {
         let width = metrics_view::MetricsView::WIDTH.min(body_area.width);
         let view = metrics_view::MetricsView::with_savings(
             state.metrics_snapshot.clone(),
@@ -3701,12 +3826,12 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
                     Line::from(Span::styled(
                         text,
                         Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::White)
+                            .fg(p.bg)
+                            .bg(p.text_bright)
                             .add_modifier(Modifier::BOLD),
                     ))
                 } else {
-                    Line::raw(text)
+                    Line::from(Span::styled(text, Style::default().fg(p.text)))
                 }
             })
             .collect();
@@ -3722,8 +3847,12 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         );
         frame.render_widget(Clear, bb_rect);
         frame.render_widget(
-            Paragraph::new(overlay_lines)
-                .block(Block::default().borders(Borders::ALL).title(bb_title)),
+            Paragraph::new(overlay_lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(p.border))
+                    .title(bb_title),
+            ),
             bb_rect,
         );
     }
@@ -3736,7 +3865,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         let search_style = if state.no_color {
             Style::default()
         } else {
-            Style::default().fg(Color::Black).bg(Color::Yellow)
+            Style::default().fg(p.bg).bg(p.text_bright)
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(search_text, search_style))),
@@ -3751,7 +3880,68 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
 }
 
 /// Renders the slash-command completion popup in the bottom portion of the screen.
+/// Renders the role cockpit panel showing current session role, tier, and
+/// in-flight turn status.  Displayed in the right rail when `Ctrl-A` is active.
+fn render_role_cockpit(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState) {
+    let p = palette();
+    let mode = state.mode.as_deref().unwrap_or("impl");
+    let tier = state.tier.as_deref().unwrap_or("fast");
+    let runner = &state.runner;
+
+    let in_flight = state.pending_task_id.is_some();
+    let status_symbol = if in_flight {
+        "● in-flight"
+    } else {
+        "○ idle"
+    };
+    let status_style = if in_flight {
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.text_dim)
+    };
+
+    // Tier colour follows the forge tier palette.
+    let tier_color = match tier {
+        "local" => p.local,
+        "deep" => p.deep,
+        _ => p.fast,
+    };
+
+    let active_name = state.active_agent_name.as_deref().unwrap_or(mode);
+
+    let lines: Vec<Line<'_>> = vec![
+        Line::from(vec![
+            Span::styled("role  ", Style::default().fg(p.text_dim)),
+            Span::styled(
+                active_name.to_owned(),
+                Style::default()
+                    .fg(p.text_bright)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("tier  ", Style::default().fg(p.text_dim)),
+            Span::styled(tier.to_owned(), Style::default().fg(tier_color)),
+        ]),
+        Line::from(vec![
+            Span::styled("runner", Style::default().fg(p.text_dim)),
+            Span::styled(format!(" {runner}"), Style::default().fg(p.text)),
+        ]),
+        Line::from(vec![
+            Span::styled("turn  ", Style::default().fg(p.text_dim)),
+            Span::styled(status_symbol.to_owned(), status_style),
+        ]),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.border))
+        .title(" cockpit [Ctrl-A] ");
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn render_slash_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState) {
+    let p = palette();
     let completions = &state.slash_completions;
     // Height = number of completions + 2 border rows, capped at available space.
     #[allow(clippy::cast_possible_truncation)]
@@ -3773,12 +3963,12 @@ fn render_slash_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, s
                 Line::from(Span::styled(
                     format!(" {c}"),
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::White)
+                        .fg(p.bg)
+                        .bg(p.text_bright)
                         .add_modifier(Modifier::BOLD),
                 ))
             } else {
-                Line::from(Span::raw(format!(" {c}")))
+                Line::from(Span::styled(format!(" {c}"), Style::default().fg(p.text)))
             }
         })
         .collect();
@@ -3791,7 +3981,14 @@ fn render_slash_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, s
         "commands"
     };
     frame.render_widget(Clear, popup_rect);
-    let popup = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
+    let popup = Paragraph::new(lines)
+        .style(Style::default().bg(p.panel))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(p.border))
+                .title(title),
+        );
     frame.render_widget(popup, popup_rect);
 }
 
@@ -3825,10 +4022,35 @@ fn init_tracing() {
     }
 }
 
+/// Loads optional `[tui.colors]` overrides from `~/.config/smedja/config.toml`.
+///
+/// Returns `None` if the file is absent, unreadable, or has no `[tui.colors]`
+/// section; in all cases the forge defaults apply.
+fn load_tui_colors() -> Option<crate::theme::TuiColorConfig> {
+    #[derive(serde::Deserialize, Default)]
+    struct TuiSection {
+        colors: Option<crate::theme::TuiColorConfig>,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct ConfigFile {
+        tui: Option<TuiSection>,
+    }
+
+    let home = std::env::var("HOME").ok()?;
+    let path = PathBuf::from(home)
+        .join(".config")
+        .join("smedja")
+        .join("config.toml");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let cfg: ConfigFile = toml::from_str(&text).ok()?;
+    cfg.tui?.colors
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)] // event loop + render + poll in a single binary entry point
 async fn main() -> Result<()> {
     init_tracing();
+    crate::theme::init_palette(load_tui_colors().as_ref());
 
     let cli = Cli::parse();
     let sock = socket_path(cli.sock);
@@ -3896,8 +4118,14 @@ async fn main() -> Result<()> {
         diff_overlay: None,
         diff_scroll: 0,
         staging_queue: staging::StagingQueue::new(),
-        context_rail_visible: true,
-        metrics_view_visible: false,
+        panels: PanelVisibility {
+            context_rail: true,
+            metrics: false,
+            session_rail: false,
+            lsp: true,
+            obs: true,
+            role_cockpit: false,
+        },
         metrics_snapshot: Vec::new(),
         savings_snapshot: metrics_view::SavingsSnapshot::default(),
         last_metrics_poll: None,
@@ -3912,7 +4140,6 @@ async fn main() -> Result<()> {
         runner_picker_mode: false,
         session_picker_mode: false,
         session_picker_ids: Vec::new(),
-        session_rail_visible: false,
         session_rail_items: Vec::new(),
         session_rail_cursor: 0,
         last_session_rail_poll: None,
@@ -3931,6 +4158,8 @@ async fn main() -> Result<()> {
         stream_rx: None,
         current_thinking: String::new(),
         thinking_expanded: false,
+        kill_ring: VecDeque::new(),
+        active_agent_name: None,
         stream_sock_path,
         last_traceparent: None,
         pending_output_type: None,
@@ -3949,9 +4178,7 @@ async fn main() -> Result<()> {
         openspec_bin: which::which("openspec").ok(),
         lsp_last_poll: None,
         lsp_snapshot: smedja_lsp::LspSnapshot::default(),
-        lsp_panel_visible: true,
         obs_snapshot: obs_panel::ObsSnapshot::default(),
-        obs_panel_visible: true,
         latency_samples: VecDeque::new(),
         session_tokens_in: 0,
         session_tokens_out: 0,
@@ -4085,6 +4312,11 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
+                    Some("started") => {
+                        if let Some(name) = event["agent_name"].as_str() {
+                            state.active_agent_name = Some(name.to_owned());
+                        }
+                    }
                     Some("thinking") => {
                         if let Some(text) = event["text"].as_str() {
                             state.current_thinking.push_str(text);
@@ -4159,13 +4391,7 @@ async fn main() -> Result<()> {
                             pending_output_save = Some((output_type, block_content));
                         }
 
-                        // OSC-9 desktop notification: works on Windows Terminal,
-                        // iTerm2, and any terminal that honours the BEL-terminated
-                        // OSC 9 sequence.  Silently ignored by terminals that do not.
-                        let _ = std::io::Write::write_all(
-                            &mut std::io::stdout(),
-                            b"\x1b]9;turn complete\x07",
-                        );
+                        let _ = emit_osc9(&mut std::io::stdout());
 
                         turn_done = true;
                     }
@@ -4374,7 +4600,7 @@ async fn main() -> Result<()> {
         }
 
         // Session rail poll: refresh the session list every 5 s when visible.
-        let should_poll_sessions = state.session_rail_visible
+        let should_poll_sessions = state.panels.session_rail
             && state
                 .last_session_rail_poll
                 .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(5));
@@ -4406,7 +4632,7 @@ async fn main() -> Result<()> {
         // fetch only mutates the cached snapshots — it never blocks the render,
         // mirroring the cowork poll's tolerant `if let Ok(...)` handling.
         if metrics_poll_due(
-            state.metrics_view_visible,
+            state.panels.metrics,
             state.last_metrics_poll,
             std::time::Instant::now(),
         ) {
@@ -4650,8 +4876,8 @@ fn metrics_poll_due(
 /// visible, clears `last_metrics_poll` so the next event-loop tick fetches
 /// immediately rather than waiting a full interval for the first paint.
 fn toggle_metrics_view(state: &mut AppState) {
-    state.metrics_view_visible = !state.metrics_view_visible;
-    if state.metrics_view_visible {
+    state.panels.metrics = !state.panels.metrics;
+    if state.panels.metrics {
         state.last_metrics_poll = None;
     }
 }
@@ -4760,6 +4986,127 @@ fn scan_gov_artifacts(workspace: &std::path::Path) -> Vec<GovArtifact> {
     artifacts
 }
 
+/// Creates a new govctl artifact TOML file in the appropriate subdirectory.
+///
+/// `rest` is the tail of `/gov create <rest>`, e.g. `work-item My title here`.
+/// Auto-increments the numeric suffix (WI-NNN, RFC-NNN, ADR-NNN) by scanning
+/// existing files.  Returns a human-readable outcome string.
+fn gov_create(workspace: &std::path::Path, rest: &str) -> String {
+    let (kind, prefix, subdir, default_status) = if let Some(title) = rest
+        .strip_prefix("work-item ")
+        .or_else(|| rest.strip_prefix("work-items "))
+    {
+        (title.trim(), "WI", "work-items", "planned")
+    } else if let Some(title) = rest.strip_prefix("rfc ") {
+        (title.trim(), "RFC", "rfc", "draft")
+    } else if let Some(title) = rest.strip_prefix("adr ") {
+        (title.trim(), "ADR", "adr", "draft")
+    } else {
+        return "gov create: unknown kind — try: work-item | rfc | adr".to_owned();
+    };
+
+    if kind.is_empty() {
+        return "gov create: title is required".to_owned();
+    }
+
+    let dir = workspace.join("gov").join(subdir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return format!("gov create: could not create {}: {e}", dir.display());
+    }
+
+    let next_n = (1u32..)
+        .find(|n| !dir.join(format!("{prefix}-{n:03}.toml")).exists())
+        .unwrap_or(1);
+    let id = format!("{prefix}-{next_n:03}");
+    let path = dir.join(format!("{id}.toml"));
+
+    let content =
+        format!("id     = \"{id}\"\ntitle  = \"{kind}\"\nstatus = \"{default_status}\"\n");
+    match std::fs::write(&path, content) {
+        Ok(()) => format!("gov: created {id} — {kind}"),
+        Err(e) => format!("gov create: write failed: {e}"),
+    }
+}
+
+/// Transitions a govctl artifact to a new status.
+///
+/// `rest` is `<id> <new-status>`.  Reads the existing TOML file, replaces the
+/// `status` line, and writes it back.  Returns a human-readable outcome string.
+fn gov_transition(workspace: &std::path::Path, rest: &str) -> String {
+    let valid_wi = ["planned", "in_progress", "done", "cancelled"];
+    let valid_rfc_adr = ["draft", "accepted", "rejected", "superseded"];
+
+    let mut parts = rest.splitn(2, ' ');
+    let id = match parts.next() {
+        Some(s) if !s.is_empty() => s,
+        _ => return "gov transition: usage: /gov transition <id> <status>".to_owned(),
+    };
+    let new_status = match parts.next() {
+        Some(s) if !s.is_empty() => s.trim(),
+        _ => return "gov transition: status is required".to_owned(),
+    };
+
+    let prefix = id.split('-').next().unwrap_or("");
+    let valid = if prefix == "WI" {
+        &valid_wi[..]
+    } else {
+        &valid_rfc_adr[..]
+    };
+    if !valid.contains(&new_status) {
+        return format!(
+            "gov transition: invalid status '{new_status}' for {prefix} — valid: {}",
+            valid.join(", ")
+        );
+    }
+
+    let subdirs = ["work-items", "rfc", "adr", ""];
+    let path = subdirs.iter().find_map(|sub| {
+        let dir = if sub.is_empty() {
+            workspace.join("gov")
+        } else {
+            workspace.join("gov").join(sub)
+        };
+        let p = dir.join(format!("{id}.toml"));
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
+    });
+
+    let path = match path {
+        Some(p) => p,
+        None => return format!("gov transition: artifact '{id}' not found"),
+    };
+
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => return format!("gov transition: read failed: {e}"),
+    };
+
+    let updated: String = raw
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("status") && line.contains('=') {
+                format!("status = \"{new_status}\"")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let updated = if raw.ends_with('\n') {
+        format!("{updated}\n")
+    } else {
+        updated
+    };
+
+    match std::fs::write(&path, updated) {
+        Ok(()) => format!("gov: {id} → {new_status}"),
+        Err(e) => format!("gov transition: write failed: {e}"),
+    }
+}
+
 /// Formats a list of govctl artifacts for display in the main panel.
 fn format_gov_list(artifacts: &[GovArtifact]) -> String {
     if artifacts.is_empty() {
@@ -4861,17 +5208,17 @@ mod tests {
     fn toggling_metrics_view_on_resets_last_metrics_poll() {
         let mut state = make_state("sess-metrics-toggle");
         state.last_metrics_poll = Some(std::time::Instant::now());
-        assert!(!state.metrics_view_visible);
+        assert!(!state.panels.metrics);
         // Toggle on → visible and the poll is cleared for an immediate fetch.
         toggle_metrics_view(&mut state);
-        assert!(state.metrics_view_visible, "toggle makes the panel visible");
+        assert!(state.panels.metrics, "toggle makes the panel visible");
         assert!(
             state.last_metrics_poll.is_none(),
             "toggle-on clears last_metrics_poll for an immediate fetch"
         );
         // Toggle off → hidden again.
         toggle_metrics_view(&mut state);
-        assert!(!state.metrics_view_visible, "second toggle hides the panel");
+        assert!(!state.panels.metrics, "second toggle hides the panel");
     }
 
     // --- metrics-live-fetch: live fetch populates/clears the snapshot ---
@@ -5641,8 +5988,14 @@ mod tests {
             diff_overlay: None,
             diff_scroll: 0,
             staging_queue: staging::StagingQueue::new(),
-            context_rail_visible: true,
-            metrics_view_visible: false,
+            panels: PanelVisibility {
+                context_rail: true,
+                metrics: false,
+                session_rail: false,
+                lsp: true,
+                obs: true,
+                role_cockpit: false,
+            },
             metrics_snapshot: Vec::new(),
             savings_snapshot: metrics_view::SavingsSnapshot::default(),
             last_metrics_poll: None,
@@ -5657,7 +6010,6 @@ mod tests {
             runner_picker_mode: false,
             session_picker_mode: false,
             session_picker_ids: Vec::new(),
-            session_rail_visible: false,
             session_rail_items: Vec::new(),
             session_rail_cursor: 0,
             last_session_rail_poll: None,
@@ -5676,6 +6028,8 @@ mod tests {
             stream_rx: None,
             current_thinking: String::new(),
             thinking_expanded: false,
+            kill_ring: VecDeque::new(),
+            active_agent_name: None,
             stream_sock_path: PathBuf::from("/tmp/smdjad.sock.stream"),
             last_traceparent: None,
             pending_output_type: None,
@@ -5693,9 +6047,7 @@ mod tests {
             openspec_bin: None,
             lsp_last_poll: None,
             lsp_snapshot: smedja_lsp::LspSnapshot::default(),
-            lsp_panel_visible: true,
             obs_snapshot: obs_panel::ObsSnapshot::default(),
-            obs_panel_visible: true,
             latency_samples: VecDeque::new(),
             session_tokens_in: 0,
             session_tokens_out: 0,
@@ -6674,13 +7026,13 @@ mod tests {
     fn ctrl_r_in_scroll_mode_toggles_context_rail() {
         let mut state = make_state("sess-ctrl-r-scroll");
         state.scroll_focus = true;
-        state.context_rail_visible = true;
+        state.panels.context_rail = true;
 
         // Simulate Ctrl-R in scroll mode
-        state.context_rail_visible = !state.context_rail_visible;
+        state.panels.context_rail = !state.panels.context_rail;
 
         assert!(
-            !state.context_rail_visible,
+            !state.panels.context_rail,
             "context rail must be toggled off"
         );
     }
@@ -6688,18 +7040,18 @@ mod tests {
     #[test]
     fn ctrl_t_toggles_metrics_view() {
         let mut state = make_state("sess-ctrl-t");
-        assert!(!state.metrics_view_visible, "metrics view starts hidden");
+        assert!(!state.panels.metrics, "metrics view starts hidden");
         // Simulate Ctrl-T.
-        state.metrics_view_visible = !state.metrics_view_visible;
-        assert!(state.metrics_view_visible, "Ctrl-T must show metrics view");
-        state.metrics_view_visible = !state.metrics_view_visible;
-        assert!(!state.metrics_view_visible, "Ctrl-T again must hide it");
+        state.panels.metrics = !state.panels.metrics;
+        assert!(state.panels.metrics, "Ctrl-T must show metrics view");
+        state.panels.metrics = !state.panels.metrics;
+        assert!(!state.panels.metrics, "Ctrl-T again must hide it");
     }
 
     #[test]
     fn metrics_view_panel_renders_per_runner_snapshot() {
         let mut state = make_state("sess-metrics-render");
-        state.metrics_view_visible = true;
+        state.panels.metrics = true;
         state.metrics_snapshot = vec![
             metrics_view::MetricsRow {
                 runner: "claude".into(),
@@ -7117,16 +7469,16 @@ mod tests {
     fn ctrl_f_in_scroll_mode_toggles_context_rail() {
         let mut state = make_state("sess-ctrlf");
         state.scroll_focus = true;
-        let initial = state.context_rail_visible;
+        let initial = state.panels.context_rail;
         // Simulate Ctrl-F in scroll mode.
-        state.context_rail_visible = !state.context_rail_visible;
+        state.panels.context_rail = !state.panels.context_rail;
         assert_ne!(
-            state.context_rail_visible, initial,
-            "Ctrl-F must toggle context_rail_visible in scroll mode"
+            state.panels.context_rail, initial,
+            "Ctrl-F must toggle panels.context_rail in scroll mode"
         );
-        state.context_rail_visible = !state.context_rail_visible;
+        state.panels.context_rail = !state.panels.context_rail;
         assert_eq!(
-            state.context_rail_visible, initial,
+            state.panels.context_rail, initial,
             "second Ctrl-F must restore original value"
         );
     }
@@ -7135,14 +7487,14 @@ mod tests {
     fn ctrl_r_in_scroll_mode_does_not_affect_context_rail() {
         let mut state = make_state("sess-ctrlr-scroll");
         state.scroll_focus = true;
-        let initial = state.context_rail_visible;
+        let initial = state.panels.context_rail;
         // The Ctrl-R handler only acts when !scroll_focus, so it must be a no-op here.
         if !state.scroll_focus {
             state.history_search_mode = !state.history_search_mode;
         }
         assert_eq!(
-            state.context_rail_visible, initial,
-            "Ctrl-R in scroll mode must not touch context_rail_visible"
+            state.panels.context_rail, initial,
+            "Ctrl-R in scroll mode must not touch panels.context_rail"
         );
         assert!(
             !state.history_search_mode,
@@ -7367,15 +7719,15 @@ status = "draft"
     #[test]
     fn session_rail_toggle_clears_cursor() {
         let mut state = make_state("sess-rail");
-        assert!(!state.session_rail_visible);
+        assert!(!state.panels.session_rail);
         // Simulate Ctrl-W: enable rail.
-        state.session_rail_visible = true;
+        state.panels.session_rail = true;
         state.session_rail_cursor = 0;
         state.last_session_rail_poll = None;
-        assert!(state.session_rail_visible);
+        assert!(state.panels.session_rail);
         // Toggle off.
-        state.session_rail_visible = false;
-        assert!(!state.session_rail_visible);
+        state.panels.session_rail = false;
+        assert!(!state.panels.session_rail);
     }
 
     #[test]
@@ -7463,5 +7815,192 @@ status = "draft"
         state.thinking_expanded = false;
         assert!(state.current_thinking.is_empty());
         assert!(!state.thinking_expanded);
+    }
+
+    // --- P3b: OSC-9 helper ---------------------------------------------------
+
+    #[test]
+    fn osc9_bytes_is_correct_sequence() {
+        let bytes = osc9_turn_complete_bytes();
+        assert_eq!(bytes, b"\x1b]9;turn complete\x07");
+    }
+
+    #[test]
+    fn emit_osc9_writes_to_vec() {
+        let mut buf: Vec<u8> = Vec::new();
+        emit_osc9(&mut buf).unwrap();
+        assert_eq!(buf, b"\x1b]9;turn complete\x07");
+    }
+
+    // --- P2a: kill ring -------------------------------------------------------
+
+    #[test]
+    fn ctrl_k_kills_to_eol() {
+        let mut state = make_state("sess-kill-k");
+        state.input = "hello world".to_owned();
+        state.input_cursor = 5; // cursor after "hello"
+        let killed: String = state.input[state.input_cursor..].to_owned();
+        state.input.drain(state.input_cursor..);
+        push_kill(&mut state.kill_ring, killed);
+        assert_eq!(state.input, "hello");
+        assert_eq!(state.kill_ring.back().map(String::as_str), Some(" world"));
+    }
+
+    #[test]
+    fn ctrl_u_kills_to_bol() {
+        let mut state = make_state("sess-kill-u");
+        state.input = "hello world".to_owned();
+        state.input_cursor = 5;
+        let killed: String = state.input[..state.input_cursor].to_owned();
+        state.input.drain(..state.input_cursor);
+        state.input_cursor = 0;
+        push_kill(&mut state.kill_ring, killed);
+        assert_eq!(state.input, " world");
+        assert_eq!(state.kill_ring.back().map(String::as_str), Some("hello"));
+    }
+
+    #[test]
+    fn ctrl_y_yanks_from_ring() {
+        let mut state = make_state("sess-yank");
+        state.input = "foo".to_owned();
+        state.input_cursor = 3;
+        push_kill(&mut state.kill_ring, " bar".to_owned());
+        // Yank
+        let text = state.kill_ring.back().cloned().unwrap();
+        state.input.insert_str(state.input_cursor, &text);
+        state.input_cursor += text.len();
+        assert_eq!(state.input, "foo bar");
+    }
+
+    #[test]
+    fn ctrl_b_moves_cursor_left() {
+        let mut state = make_state("sess-ctrl-b");
+        state.input = "abc".to_owned();
+        state.input_cursor = 3;
+        state.input_cursor = prev_char_boundary(&state.input, state.input_cursor);
+        assert_eq!(state.input_cursor, 2);
+    }
+
+    #[test]
+    fn kill_ring_evicts_oldest_at_capacity() {
+        let mut ring: VecDeque<String> = VecDeque::new();
+        for i in 0..17u32 {
+            push_kill(&mut ring, i.to_string());
+        }
+        assert_eq!(ring.len(), 16, "ring must not exceed 16 entries");
+        // Oldest entry (0) is evicted; front is "1".
+        assert_eq!(ring.front().map(String::as_str), Some("1"));
+    }
+
+    // --- P2b: /gov create + transition ----------------------------------------
+
+    #[test]
+    fn gov_create_work_item_creates_toml_with_planned_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let msg = gov_create(dir.path(), "work-item My first task");
+        assert!(
+            msg.contains("WI-001"),
+            "should report created id; got: {msg}"
+        );
+        let path = dir.path().join("gov/work-items/WI-001.toml");
+        assert!(
+            path.exists(),
+            "TOML file must be created at {}",
+            path.display()
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("planned"),
+            "status must be planned; got: {content}"
+        );
+    }
+
+    #[test]
+    fn gov_create_auto_increments_id() {
+        let dir = tempfile::tempdir().unwrap();
+        gov_create(dir.path(), "work-item First");
+        let msg = gov_create(dir.path(), "work-item Second");
+        assert!(
+            msg.contains("WI-002"),
+            "second item must get WI-002; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn gov_create_rfc_uses_draft_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let msg = gov_create(dir.path(), "rfc My RFC");
+        assert!(msg.contains("RFC-001"), "got: {msg}");
+        let content = std::fs::read_to_string(dir.path().join("gov/rfc/RFC-001.toml")).unwrap();
+        assert!(
+            content.contains("draft"),
+            "RFC default status must be draft; got: {content}"
+        );
+    }
+
+    #[test]
+    fn gov_transition_updates_status_in_file() {
+        let dir = tempfile::tempdir().unwrap();
+        gov_create(dir.path(), "work-item Test task");
+        let msg = gov_transition(dir.path(), "WI-001 in_progress");
+        assert!(
+            msg.contains("in_progress"),
+            "should confirm transition; got: {msg}"
+        );
+        let content =
+            std::fs::read_to_string(dir.path().join("gov/work-items/WI-001.toml")).unwrap();
+        assert!(
+            content.contains("\"in_progress\""),
+            "file must contain updated status; got: {content}"
+        );
+    }
+
+    #[test]
+    fn gov_transition_rejects_invalid_status() {
+        let dir = tempfile::tempdir().unwrap();
+        gov_create(dir.path(), "work-item Test task");
+        let msg = gov_transition(dir.path(), "WI-001 flying");
+        assert!(
+            msg.contains("invalid status"),
+            "must reject unknown status; got: {msg}"
+        );
+    }
+
+    // --- P1a: role cockpit ----------------------------------------------------
+
+    #[test]
+    fn role_cockpit_toggle_via_ctrl_a() {
+        let mut state = make_state("sess-cockpit");
+        assert!(!state.panels.role_cockpit, "cockpit hidden by default");
+        state.panels.role_cockpit = !state.panels.role_cockpit;
+        assert!(state.panels.role_cockpit, "toggle must show cockpit");
+        state.panels.role_cockpit = !state.panels.role_cockpit;
+        assert!(
+            !state.panels.role_cockpit,
+            "second toggle must hide cockpit"
+        );
+    }
+
+    #[test]
+    fn active_agent_name_captured_from_stream_started_event() {
+        let mut state = make_state("sess-agent");
+        let event = serde_json::json!({"type": "started", "agent_name": "review"});
+        if let Some(name) = event["agent_name"].as_str() {
+            state.active_agent_name = Some(name.to_owned());
+        }
+        assert_eq!(state.active_agent_name.as_deref(), Some("review"));
+    }
+
+    // --- P4: PanelVisibility default ------------------------------------------
+
+    #[test]
+    fn panel_visibility_startup_defaults_match_make_state() {
+        let state = make_state("sess-panels");
+        assert!(state.panels.context_rail, "context rail visible by default");
+        assert!(!state.panels.metrics, "metrics hidden by default");
+        assert!(!state.panels.session_rail, "session rail hidden by default");
+        assert!(state.panels.lsp, "LSP visible by default");
+        assert!(state.panels.obs, "obs visible by default");
+        assert!(!state.panels.role_cockpit, "cockpit hidden by default");
     }
 }

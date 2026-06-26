@@ -1,0 +1,35 @@
+id     = "WI-002"
+title  = "CodeWidget — tree-sitter composable code block widget"
+status = "planned"
+priority = "P1"
+
+[detail]
+description = """
+Extract the inline syntect highlighting from MainPanel.push_line into a proper
+ratatui Widget impl (code_widget.rs).  The widget owns scroll state so code blocks
+can be independently scrolled, and it can be placed anywhere in the layout — not
+just embedded in the scrolling message stream.
+
+Add tree-sitter parsing as an incremental second layer: use the existing workspace
+deps (tree-sitter-rust, tree-sitter-python, tree-sitter-go, tree-sitter-typescript)
+to annotate tokens with semantic types (keyword, string, comment, identifier) before
+applying color, replacing syntect's regex-based approach for languages where a
+tree-sitter grammar is available.
+
+Motivation: OpenTUI powers OpenCode in production with a first-class Code widget and
+Diff widget.  Smedja's inline syntect is a rendering hack, not a composable widget.
+"""
+
+source   = "OpenTUI / OpenCode (post-v0.16.3 review)"
+estimate = "L"
+
+[acceptance]
+criteria = [
+  "code_widget.rs exports CodeWidget implementing ratatui::widgets::Widget",
+  "CodeWidget accepts source, language, scroll_offset",
+  "syntect highlight path works for rust/python/go/typescript/js",
+  "tree-sitter parse path works for rust (as reference implementation)",
+  "main_panel.rs uses CodeWidget for fenced blocks",
+  "CodeWidget is independently scrollable (j/k when focused)",
+  "tests: render empty, render rust block, tree-sitter node types for keywords",
+]

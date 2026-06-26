@@ -497,10 +497,8 @@ impl ApplicationHandler<UserEvent> for App {
                         // process (e.g. ratatui TUI) clears and redraws after
                         // receiving SIGWINCH.  Keeps old content visible instead
                         // of showing a grey flash between clear and redraw.
-                        self.suppress_clear_until = Some(
-                            std::time::Instant::now()
-                                + std::time::Duration::from_millis(200),
-                        );
+                        self.suppress_clear_until =
+                            Some(std::time::Instant::now() + std::time::Duration::from_millis(200));
                     }
                 }
             }
@@ -599,7 +597,11 @@ impl ApplicationHandler<UserEvent> for App {
                             .collect();
                         let non_blank = cells.iter().filter(|c| c.ch != ' ').count();
                         drop(grid);
-                        debug!("update_cells: total={} non_blank={}", cells.len(), non_blank);
+                        debug!(
+                            "update_cells: total={} non_blank={}",
+                            cells.len(),
+                            non_blank
+                        );
 
                         // If all cells just went blank and we're inside the
                         // post-resize suppress window, skip this frame.  The
@@ -784,9 +786,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 renderer.resize(renderer.size);
                                 pty.dirty.store(true, Ordering::Release);
                             }
-                            Some(st_render::RenderError::Frame(
-                                wgpu::SurfaceError::Timeout,
-                            )) => {
+                            Some(st_render::RenderError::Frame(wgpu::SurfaceError::Timeout)) => {
                                 debug!("render: surface Timeout (vsync skip)");
                             }
                             _ => info!("render error: {}", e),
@@ -1029,7 +1029,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
-                debug!("MouseInput {:?} {:?} occluded={}", state, button, self.occluded);
+                debug!(
+                    "MouseInput {:?} {:?} occluded={}",
+                    state, button, self.occluded
+                );
                 if let Some(pty) = &mut self.pty {
                     let btn_code: u8 = match button {
                         MouseButton::Left => 0,
@@ -1062,7 +1065,10 @@ impl ApplicationHandler<UserEvent> for App {
                         (col, row, grid.mouse_mode, grid.mouse_sgr)
                     };
 
-                    debug!("MouseInput mode={:?} sgr={} col={} row={}", mode, sgr, col, row);
+                    debug!(
+                        "MouseInput mode={:?} sgr={} col={} row={}",
+                        mode, sgr, col, row
+                    );
                     if mode == st_pty::MouseMode::None {
                         debug!("MouseInput: mode=None, not forwarding to PTY");
                         return;
@@ -1458,14 +1464,7 @@ fn key_to_pty_bytes(key: &Key) -> Option<Vec<u8>> {
 /// terminals.  `col` and `row` are 0-based; the escape sequence uses 1-based.
 fn encode_mouse_sgr(col: u16, row: u16, button: u8, pressed: bool) -> Vec<u8> {
     let suffix = if pressed { b'M' } else { b'm' };
-    format!(
-        "\x1b[<{};{};{}{}",
-        button,
-        col + 1,
-        row + 1,
-        suffix as char
-    )
-    .into_bytes()
+    format!("\x1b[<{};{};{}{}", button, col + 1, row + 1, suffix as char).into_bytes()
 }
 
 /// Encodes a mouse event as an X10 sequence (`\x1b[M` + 3 bytes).
@@ -1642,12 +1641,30 @@ mod tests {
     fn named_keys_produce_correct_escape_sequences() {
         use super::key_to_pty_bytes;
         use winit::keyboard::{Key, NamedKey};
-        assert_eq!(key_to_pty_bytes(&Key::Named(NamedKey::Enter)), Some(b"\r".to_vec()));
-        assert_eq!(key_to_pty_bytes(&Key::Named(NamedKey::Backspace)), Some(b"\x7f".to_vec()));
-        assert_eq!(key_to_pty_bytes(&Key::Named(NamedKey::Tab)), Some(b"\t".to_vec()));
-        assert_eq!(key_to_pty_bytes(&Key::Named(NamedKey::ArrowUp)), Some(b"\x1b[A".to_vec()));
-        assert_eq!(key_to_pty_bytes(&Key::Named(NamedKey::ArrowDown)), Some(b"\x1b[B".to_vec()));
-        assert_eq!(key_to_pty_bytes(&Key::Named(NamedKey::Delete)), Some(b"\x1b[3~".to_vec()));
+        assert_eq!(
+            key_to_pty_bytes(&Key::Named(NamedKey::Enter)),
+            Some(b"\r".to_vec())
+        );
+        assert_eq!(
+            key_to_pty_bytes(&Key::Named(NamedKey::Backspace)),
+            Some(b"\x7f".to_vec())
+        );
+        assert_eq!(
+            key_to_pty_bytes(&Key::Named(NamedKey::Tab)),
+            Some(b"\t".to_vec())
+        );
+        assert_eq!(
+            key_to_pty_bytes(&Key::Named(NamedKey::ArrowUp)),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            key_to_pty_bytes(&Key::Named(NamedKey::ArrowDown)),
+            Some(b"\x1b[B".to_vec())
+        );
+        assert_eq!(
+            key_to_pty_bytes(&Key::Named(NamedKey::Delete)),
+            Some(b"\x1b[3~".to_vec())
+        );
     }
 
     #[test]

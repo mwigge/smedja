@@ -475,7 +475,10 @@ mod tests {
                 _slice_index: usize,
                 slice: &str,
             ) -> anyhow::Result<()> {
-                self.slices_seen.lock().unwrap_or_else(|e| e.into_inner()).push(slice.to_owned());
+                self.slices_seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(slice.to_owned());
                 Ok(())
             }
         }
