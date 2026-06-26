@@ -393,8 +393,14 @@ impl ApplicationHandler<UserEvent> for App {
         let scale_factor = window.scale_factor();
         #[allow(clippy::cast_possible_truncation)]
         let eff_font = self.config.font.size * scale_factor as f32;
+        // Reserve BOTH the bottom status bar and the top bar, matching
+        // Renderer::grid_height_px (used on resize). The top bar is always shown
+        // (app/session/cwd segments) and has the same height as the status bar;
+        // omitting it here gave the initial PTY ~1–2 rows too many, so the
+        // client's (ratatui) layout did not match the visible area until a
+        // resize happened to correct it — corrupting the top rows.
         let sb_h = status_bar_height_for_font(eff_font);
-        let grid_h = size.height.saturating_sub(sb_h);
+        let grid_h = size.height.saturating_sub(sb_h.saturating_mul(2));
         let (cols, rows) = st_glyph::pixel_size_to_grid(size.width, grid_h, eff_font);
 
         // Each pane gets a stable UUID injected as SMEDJA_TERM_PANE so smdjad
