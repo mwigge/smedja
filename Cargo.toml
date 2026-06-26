@@ -124,6 +124,7 @@ vte          = "0.13"
 walkdir            = "2"
 
 # GPU rendering (smedja terminal)
+etagere      = "0.2"
 wgpu         = "22"
 
 # binary detection

@@ -13,6 +13,7 @@ gpu-tests = []
 anyhow       = { workspace = true }
 bytemuck     = { version = "1", features = ["derive"] }
 cosmic-text  = { workspace = true }
+etagere      = { workspace = true }
 image        = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 parking_lot  = { workspace = true }
 st-config    = { path = "../st-config" }
