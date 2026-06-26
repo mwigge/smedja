@@ -2982,7 +2982,20 @@ fn render_role_cockpit(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, 
 
     let active_name = state.active_agent_name.as_deref().unwrap_or(mode);
 
+    // Prominent brand-coloured client badge: `◆ CLAUDE · deep`.
+    let client_color = crate::theme::runner_color(runner);
+    let client_label = crate::theme::runner_label(runner);
+
     let lines: Vec<Line<'_>> = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("\u{25C6} {client_label}"),
+                Style::default()
+                    .fg(client_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" \u{00B7} {tier}"), Style::default().fg(tier_color)),
+        ]),
         Line::from(vec![
             Span::styled("role  ", Style::default().fg(p.text_dim)),
             Span::styled(
@@ -2991,14 +3004,6 @@ fn render_role_cockpit(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, 
                     .fg(p.text_bright)
                     .add_modifier(Modifier::BOLD),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("tier  ", Style::default().fg(p.text_dim)),
-            Span::styled(tier.to_owned(), Style::default().fg(tier_color)),
-        ]),
-        Line::from(vec![
-            Span::styled("runner", Style::default().fg(p.text_dim)),
-            Span::styled(format!(" {runner}"), Style::default().fg(p.text)),
         ]),
         Line::from(vec![
             Span::styled("turn  ", Style::default().fg(p.text_dim)),
