@@ -105,7 +105,11 @@ pub fn render_status_bar_configured(
             fmt.split_whitespace()
                 .filter_map(|tok| {
                     let inner = tok.strip_prefix('{')?.strip_suffix('}')?;
-                    if all_keys.contains(&inner) { Some(inner) } else { None }
+                    if all_keys.contains(&inner) {
+                        Some(inner)
+                    } else {
+                        None
+                    }
                 })
                 .collect()
         } else {
@@ -119,11 +123,11 @@ pub fn render_status_bar_configured(
         .into_iter()
         .map(|key| match key {
             "input_mode" => segment_input_mode(ctx),
-            "runner"     => segment_runner(ctx),
-            "tier"       => segment_tier(ctx),
-            "mode"       => segment_mode(ctx),
-            "session"    => segment_session(ctx),
-            _            => String::new(),
+            "runner" => segment_runner(ctx),
+            "tier" => segment_tier(ctx),
+            "mode" => segment_mode(ctx),
+            "session" => segment_session(ctx),
+            _ => String::new(),
         })
         .filter(|s| !s.is_empty())
         .collect();

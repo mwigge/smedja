@@ -9,7 +9,8 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
+use crate::theme::palette;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget};
 
@@ -163,7 +164,7 @@ impl Widget for MetricsView {
                     // Highlight any runner with errors in red.
                     let has_error = self.rows.get(idx - 1).is_some_and(|row| row.errors > 0);
                     let style = if has_error {
-                        Style::default().fg(Color::Red)
+                        Style::default().fg(palette().error)
                     } else {
                         Style::default()
                     };

@@ -1,0 +1,34 @@
+id     = "WI-003"
+title  = "Kill ring + word navigation in input bar"
+status = "planned"
+priority = "P2"
+
+[detail]
+description = """
+Add Emacs-style kill ring to the TUI input bar:
+  Ctrl-K  — kill from cursor to end of line; push killed text onto the kill ring
+  Ctrl-U  — kill from start of line to cursor; push killed text onto the kill ring
+  Ctrl-Y  — yank (paste) the most recent kill at the cursor position
+  Alt-Y   — rotate the kill ring (cycle through prior kills) immediately after a yank
+  Ctrl-W  is already taken (session rail); skip
+  Ctrl-B / Ctrl-F  — move cursor left / right one character (complement to arrow keys)
+  Alt-B / Alt-F    — move cursor left / right one word
+
+Kill ring capacity: 16 entries (ring buffer, oldest evicted).
+
+Motivation: Symfony TUI EditorWidget has kill ring and word-navigation.  The current
+input bar has only end-of-line arrow navigation and history browse.
+"""
+
+source   = "Symfony TUI EditorWidget (post-v0.16.3 review)"
+estimate = "S"
+
+[acceptance]
+criteria = [
+  "Ctrl-K kills to EOL and pushes to ring",
+  "Ctrl-U kills to BOL and pushes to ring",
+  "Ctrl-Y yanks the latest ring entry at cursor",
+  "kill ring holds up to 16 entries, oldest evicted",
+  "Ctrl-B / Ctrl-F move cursor left / right",
+  "tests for each binding, ring overflow, yank-after-kill",
+]

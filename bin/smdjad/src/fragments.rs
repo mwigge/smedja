@@ -385,7 +385,10 @@ fn resolve_lsp(lsp: Option<&smedja_lsp::LspManager>) -> Resolved {
     } else {
         for d in &snap.diagnostics {
             let label = d.severity.label();
-            let code = d.code.as_deref().map_or_else(String::new, |c| format!(" {c}"));
+            let code = d
+                .code
+                .as_deref()
+                .map_or_else(String::new, |c| format!(" {c}"));
             lines.push(format!(
                 "  {label}{code}  {}:{}  {}",
                 d.file.display(),
@@ -689,8 +692,14 @@ mod tests {
     async fn shell_fragment_injects_output() {
         let ws = tempfile::tempdir().unwrap();
         let ws = ws.path().canonicalize().unwrap();
-        let out =
-            expand_with_caps("@shell echo hi", &ws, None, None, caps(1 << 20, 2_000, 1 << 20)).await;
+        let out = expand_with_caps(
+            "@shell echo hi",
+            &ws,
+            None,
+            None,
+            caps(1 << 20, 2_000, 1 << 20),
+        )
+        .await;
         assert!(out.contains("```shell echo hi\n"), "fenced header: {out}");
         assert!(out.contains("hi"), "command output injected: {out}");
     }

@@ -5,7 +5,8 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
+use crate::theme::palette;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
@@ -41,6 +42,7 @@ impl Widget for CoworkWidget<'_> {
         let Some(item) = self.items.first() else {
             return;
         };
+        let p = palette();
 
         let queue_suffix = if self.items.len() > 1 {
             format!("  +{} queued", self.items.len() - 1)
@@ -63,7 +65,7 @@ impl Widget for CoworkWidget<'_> {
                 Span::raw(" instruction: "),
                 Span::styled(
                     format!("{}_", self.modify_input),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(p.accent),
                 ),
             ])
         } else {
@@ -71,19 +73,19 @@ impl Widget for CoworkWidget<'_> {
                 Span::styled(
                     " [y] ",
                     Style::default()
-                        .fg(Color::Green)
+                        .fg(p.success)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("approve  "),
                 Span::styled(
                     "[n] ",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    Style::default().fg(p.error).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("deny  "),
                 Span::styled(
                     "[m] ",
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(p.accent)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("modify"),
@@ -93,11 +95,11 @@ impl Widget for CoworkWidget<'_> {
         let lines = vec![
             Line::from(Span::styled(
                 format!(" {args_truncated} "),
-                Style::default().fg(Color::White),
+                Style::default().fg(p.text_bright),
             )),
             Line::from(Span::styled(
                 format!(" {reasoning_truncated} "),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(p.text_dim),
             )),
             Line::from(""),
             footer_line,
@@ -105,11 +107,11 @@ impl Widget for CoworkWidget<'_> {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
+            .border_style(Style::default().fg(p.border))
             .title(Span::styled(
                 title,
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(p.text)
                     .add_modifier(Modifier::BOLD),
             ))
             .title_alignment(Alignment::Left);
@@ -117,6 +119,7 @@ impl Widget for CoworkWidget<'_> {
         // Clear the area first so the overlay is opaque.
         Clear.render(area, buf);
         Paragraph::new(Text::from(lines))
+            .style(Style::default().bg(p.panel))
             .block(block)
             .render(area, buf);
     }

@@ -74,9 +74,14 @@ pub(crate) async fn submit(state: HandlerState, params: Value) -> Result<Value, 
     // Expand inline context fragments (`@file`, `@git`, `@branch`, `@shell`,
     // `@clippy`, `@lsp`) against the session workspace before the prompt is
     // recorded, so the stored and executed prompt is the expanded text.
-    let content =
-        expand_submission(&ig, &state.gates, &session_id, content, Some(&state.lsp_manager))
-            .await;
+    let content = expand_submission(
+        &ig,
+        &state.gates,
+        &session_id,
+        content,
+        Some(&state.lsp_manager),
+    )
+    .await;
 
     let task_id = Uuid::new_v4();
     let task = Task {
@@ -111,7 +116,10 @@ pub(crate) async fn submit(state: HandlerState, params: Value) -> Result<Value, 
 
     // Also send directly to the worker via a dedicated mpsc channel so the
     // Started event cannot be dropped if the broadcast is temporarily full.
-    let _ = state.work_tx.send((session_id.clone(), task_id.to_string())).await;
+    let _ = state
+        .work_tx
+        .send((session_id.clone(), task_id.to_string()))
+        .await;
 
     Ok(json!({ "task_id": task_id }))
 }
@@ -182,9 +190,14 @@ mod tests {
         let sid = Uuid::new_v4().to_string();
         ig.create_session(session_at(&sid, &ws)).await.unwrap();
 
-        let expanded =
-            expand_submission(&ig, &empty_gates(), &sid, "look @file note.txt".to_owned(), None)
-                .await;
+        let expanded = expand_submission(
+            &ig,
+            &empty_gates(),
+            &sid,
+            "look @file note.txt".to_owned(),
+            None,
+        )
+        .await;
 
         assert!(
             expanded.contains("hello from file"),

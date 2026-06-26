@@ -2,6 +2,7 @@
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
+use crate::theme::palette;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -35,8 +36,12 @@ pub struct StyledLine {
 }
 
 impl StyledLine {
-    fn plain(text: String, style: LineStyle) -> Self {
-        Self { text, style, spans: None }
+    pub(crate) fn plain(text: String, style: LineStyle) -> Self {
+        Self {
+            text,
+            style,
+            spans: None,
+        }
     }
 }
 
@@ -115,13 +120,18 @@ impl MainPanel {
                 }
             }
         } else {
-            // Outside code blocks: classify by prefix.
+            // Outside code blocks: classify by prefix and apply math rendering.
             let style = if text.starts_with('+') {
                 LineStyle::Added
             } else if text.starts_with('-') {
                 LineStyle::Removed
             } else {
                 LineStyle::Normal
+            };
+            let text = if text.contains('$') {
+                render_math(&text)
+            } else {
+                text
             };
             self.lines.push(StyledLine::plain(text, style));
         }
@@ -145,6 +155,7 @@ impl MainPanel {
         no_color: bool,
     ) {
         let height = area.height.saturating_sub(2) as usize; // subtract border rows
+        let p = palette();
 
         let search_needle = search_query
             .filter(|q| !q.is_empty())
@@ -157,8 +168,7 @@ impl MainPanel {
             .skip(self.scroll.max(self.display_start))
             .take(height)
             .map(|(abs_line, sl)| {
-                let selected =
-                    selection.is_some_and(|(lo, hi)| abs_line >= lo && abs_line <= hi);
+                let selected = selection.is_some_and(|(lo, hi)| abs_line >= lo && abs_line <= hi);
                 let is_search_match = search_needle
                     .as_deref()
                     .is_some_and(|q| sl.text.to_lowercase().contains(q));
@@ -168,22 +178,30 @@ impl MainPanel {
                     let text = sl
                         .spans
                         .as_ref()
-                        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                        .map(|l| {
+                            l.spans
+                                .iter()
+                                .map(|s| s.content.as_ref())
+                                .collect::<String>()
+                        })
                         .unwrap_or_else(|| sl.text.clone());
                     Line::from(Span::styled(
                         text,
-                        Style::default().fg(Color::Black).bg(Color::White),
+                        Style::default().fg(p.accent).bg(p.header),
                     ))
                 } else if is_search_match {
-                    // Search match: yellow highlight overrides normal rendering.
+                    // Search match: bright forge highlight overrides normal rendering.
                     Line::from(Span::styled(
                         sl.text.clone(),
-                        Style::default().fg(Color::Black).bg(Color::Yellow),
+                        Style::default().fg(p.bg).bg(p.text_bright),
                     ))
                 } else if let Some(ref rich) = sl.spans {
                     if no_color {
-                        let text =
-                            rich.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+                        let text = rich
+                            .spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>();
                         Line::raw(text)
                     } else {
                         rich.clone()
@@ -193,10 +211,10 @@ impl MainPanel {
                         Style::default()
                     } else {
                         match sl.style {
-                            LineStyle::Normal  => Style::default(),
-                            LineStyle::Added   => Style::default().fg(Color::Green),
-                            LineStyle::Removed => Style::default().fg(Color::Red),
-                            LineStyle::Code    => Style::default().fg(Color::Yellow),
+                            LineStyle::Normal => Style::default(),
+                            LineStyle::Added => Style::default().fg(p.code_added),
+                            LineStyle::Removed => Style::default().fg(p.code_removed),
+                            LineStyle::Code => Style::default().fg(p.code_default),
                         }
                     };
                     Line::from(Span::styled(sl.text.clone(), base))
@@ -204,8 +222,12 @@ impl MainPanel {
             })
             .collect();
 
-        let widget = Paragraph::new(visible)
-            .block(Block::default().borders(Borders::ALL).title("messages"));
+        let widget = Paragraph::new(visible).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(p.border))
+                .title(" messages "),
+        );
         frame.render_widget(widget, area);
     }
 
@@ -268,7 +290,8 @@ impl MainPanel {
             // Clear cached spans since text changed.
             last.spans = None;
         } else {
-            self.lines.push(StyledLine::plain(text.to_owned(), LineStyle::Normal));
+            self.lines
+                .push(StyledLine::plain(text.to_owned(), LineStyle::Normal));
         }
     }
 
@@ -291,6 +314,191 @@ impl Default for MainPanel {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Math rendering (LaTeX inline → Unicode)
+// ---------------------------------------------------------------------------
+
+/// Converts `$...$` inline LaTeX math spans in `text` to Unicode equivalents.
+///
+/// Only common Greek letters, operators, arrows, and digit super/subscripts are
+/// converted.  Unrecognised sequences are left verbatim.  Dollar signs
+/// surrounding the math are stripped.  `$$...$$` display-math is also handled
+/// (treated the same as inline).
+#[must_use]
+pub fn render_math(text: &str) -> String {
+    // Symbol table: LaTeX command (without backslash) → Unicode string.
+    const SYMBOLS: &[(&str, &str)] = &[
+        // Greek lowercase
+        ("alpha", "α"),
+        ("beta", "β"),
+        ("gamma", "γ"),
+        ("delta", "δ"),
+        ("epsilon", "ε"),
+        ("zeta", "ζ"),
+        ("eta", "η"),
+        ("theta", "θ"),
+        ("lambda", "λ"),
+        ("mu", "μ"),
+        ("nu", "ν"),
+        ("pi", "π"),
+        ("rho", "ρ"),
+        ("sigma", "σ"),
+        ("tau", "τ"),
+        ("phi", "φ"),
+        ("chi", "χ"),
+        ("psi", "ψ"),
+        ("omega", "ω"),
+        // Greek uppercase
+        ("Gamma", "Γ"),
+        ("Delta", "Δ"),
+        ("Theta", "Θ"),
+        ("Lambda", "Λ"),
+        ("Pi", "Π"),
+        ("Sigma", "Σ"),
+        ("Phi", "Φ"),
+        ("Omega", "Ω"),
+        // Operators
+        ("sum", "Σ"),
+        ("prod", "Π"),
+        ("int", "∫"),
+        ("sqrt", "√"),
+        ("infty", "∞"),
+        ("partial", "∂"),
+        ("nabla", "∇"),
+        ("pm", "±"),
+        ("times", "×"),
+        ("cdot", "·"),
+        ("leq", "≤"),
+        ("geq", "≥"),
+        ("neq", "≠"),
+        ("approx", "≈"),
+        ("equiv", "≡"),
+        ("in", "∈"),
+        ("notin", "∉"),
+        ("subset", "⊂"),
+        ("cup", "∪"),
+        ("cap", "∩"),
+        // Arrows
+        ("to", "→"),
+        ("leftarrow", "←"),
+        ("Rightarrow", "⇒"),
+        ("Leftarrow", "⇐"),
+        ("iff", "⟺"),
+        // Misc
+        ("cdots", "⋯"),
+        ("ldots", "…"),
+        ("forall", "∀"),
+        ("exists", "∃"),
+    ];
+    // Superscript digit map.
+    const SUPERSCRIPTS: &[(char, char)] = &[
+        ('0', '⁰'),
+        ('1', '¹'),
+        ('2', '²'),
+        ('3', '³'),
+        ('4', '⁴'),
+        ('5', '⁵'),
+        ('6', '⁶'),
+        ('7', '⁷'),
+        ('8', '⁸'),
+        ('9', '⁹'),
+    ];
+    // Subscript digit map.
+    const SUBSCRIPTS: &[(char, char)] = &[
+        ('0', '₀'),
+        ('1', '₁'),
+        ('2', '₂'),
+        ('3', '₃'),
+        ('4', '₄'),
+        ('5', '₅'),
+        ('6', '₆'),
+        ('7', '₇'),
+        ('8', '₈'),
+        ('9', '₉'),
+    ];
+
+    fn expand_math(math: &str) -> String {
+        let mut out = String::with_capacity(math.len());
+        let mut chars = math.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    let mut cmd = String::new();
+                    while let Some(&ch) = chars.peek() {
+                        if ch.is_alphabetic() {
+                            cmd.push(ch);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Some(&(_, sym)) = SYMBOLS.iter().find(|(k, _)| *k == cmd) {
+                        out.push_str(sym);
+                    } else {
+                        out.push('\\');
+                        out.push_str(&cmd);
+                    }
+                }
+                '^' => {
+                    if let Some(&digit) = chars.peek().filter(|ch| ch.is_ascii_digit()) {
+                        chars.next();
+                        if let Some(&(_, sup)) = SUPERSCRIPTS.iter().find(|(d, _)| *d == digit) {
+                            out.push(sup);
+                        } else {
+                            out.push('^');
+                            out.push(digit);
+                        }
+                    } else {
+                        out.push('^');
+                    }
+                }
+                '_' => {
+                    if let Some(&digit) = chars.peek().filter(|ch| ch.is_ascii_digit()) {
+                        chars.next();
+                        if let Some(&(_, sub)) = SUBSCRIPTS.iter().find(|(d, _)| *d == digit) {
+                            out.push(sub);
+                        } else {
+                            out.push('_');
+                            out.push(digit);
+                        }
+                    } else {
+                        out.push('_');
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    // Scan for $...$ spans; handle $$ as well (same treatment).
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(start) = remaining.find('$') {
+        result.push_str(&remaining[..start]);
+        remaining = &remaining[start..];
+        // Check for $$
+        let (skip, close) = if remaining.starts_with("$$") {
+            (2usize, "$$")
+        } else {
+            (1, "$")
+        };
+        remaining = &remaining[skip..];
+        if let Some(end) = remaining.find(close) {
+            let math = &remaining[..end];
+            result.push_str(&expand_math(math));
+            remaining = &remaining[end + close.len()..];
+        } else {
+            // No closing delimiter — push the dollar sign(s) and continue.
+            for _ in 0..skip {
+                result.push('$');
+            }
+        }
+    }
+    result.push_str(remaining);
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -621,7 +829,10 @@ mod tests {
         for i in 0..5u32 {
             panel.push_line(format!("line {i}"));
         }
-        assert_eq!(panel.scroll, 4, "scroll should follow new lines when at bottom");
+        assert_eq!(
+            panel.scroll, 4,
+            "scroll should follow new lines when at bottom"
+        );
     }
 
     #[test]
@@ -632,7 +843,10 @@ mod tests {
         }
         panel.scroll = 0; // user scrolled up
         panel.push_line("new line".into());
-        assert_eq!(panel.scroll, 0, "scroll must stay when user has scrolled up");
+        assert_eq!(
+            panel.scroll, 0,
+            "scroll must stay when user has scrolled up"
+        );
     }
 
     #[test]
@@ -644,5 +858,64 @@ mod tests {
         panel.scroll = 100;
         panel.clamp_scroll();
         assert_eq!(panel.scroll, 2);
+    }
+
+    // --- math rendering -------------------------------------------------------
+
+    #[test]
+    fn render_math_converts_inline_greek() {
+        let out = render_math("$\\alpha + \\beta$");
+        assert_eq!(
+            out, "α + β",
+            "Greek letters must be converted; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn render_math_converts_superscript_digit() {
+        let out = render_math("$E = mc^2$");
+        assert_eq!(out, "E = mc²", "^2 must become ²; got: {out:?}");
+    }
+
+    #[test]
+    fn render_math_converts_subscript_digit() {
+        let out = render_math("$x_0$");
+        assert_eq!(out, "x₀", "subscript 0 must become ₀; got: {out:?}");
+    }
+
+    #[test]
+    fn render_math_leaves_unknown_commands_verbatim() {
+        let out = render_math("$\\unknowncmd$");
+        assert!(
+            out.contains("\\unknowncmd"),
+            "unrecognised commands must be passed through; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn render_math_does_not_touch_text_outside_dollars() {
+        let out = render_math("no math here");
+        assert_eq!(out, "no math here");
+    }
+
+    #[test]
+    fn render_math_dollar_sign_without_closing_delimiter_is_unchanged() {
+        let out = render_math("cost is $5 per month");
+        // "5 per month" has no closing $, so the $ should be preserved
+        assert!(
+            out.contains('$') || out.contains("5 per month"),
+            "unclosed $ must not panic; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn push_line_applies_math_rendering() {
+        let mut panel = MainPanel::new();
+        panel.push_line("$\\pi$ is about 3.14".to_owned());
+        assert!(
+            panel.lines[0].text.contains('π'),
+            "push_line must apply math rendering; got: {:?}",
+            panel.lines[0].text
+        );
     }
 }

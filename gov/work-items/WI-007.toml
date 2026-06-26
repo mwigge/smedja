@@ -1,0 +1,31 @@
+id     = "WI-007"
+title  = "PanelVisibility struct — group panel booleans out of AppState"
+status = "planned"
+priority = "P4"
+
+[detail]
+description = """
+AppState currently has 6 panel-visibility booleans as top-level fields:
+  context_rail_visible, metrics_view_visible, session_rail_visible,
+  lsp_panel_visible, obs_panel_visible, role_cockpit_visible (new in WI-001).
+
+Group them into a `PanelVisibility` struct so that:
+  - The struct is zero-cost (plain booleans, no indirection)
+  - Access reads as `state.panels.lsp` not `state.lsp_panel_visible`
+  - Adding new panels requires touching only the struct definition
+  - `PanelVisibility::default()` sets the startup defaults in one place
+
+Derive `Debug` and `Default` on `PanelVisibility`.
+"""
+
+source   = "internal code quality (post-v0.16.3 review)"
+estimate = "S"
+
+[acceptance]
+criteria = [
+  "PanelVisibility struct defined with 6 boolean fields",
+  "AppState has `panels: PanelVisibility` replacing the 6 individual fields",
+  "all read and write sites updated (grep for old field names returns 0 results)",
+  "PanelVisibility::default() matches the previous per-field defaults",
+  "tests still pass after rename (no logic change)",
+]

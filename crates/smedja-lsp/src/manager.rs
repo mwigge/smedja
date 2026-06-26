@@ -57,10 +57,20 @@ const SERVERS: &[ServerSpec] = &[
 
 /// Internal event sent from a per-server task to the aggregator.
 enum ServerEvent {
-    Starting { name: String },
-    Ready { name: String },
-    Degraded { name: String, reason: String },
-    Diagnostics { name: String, diags: Vec<Diagnostic> },
+    Starting {
+        name: String,
+    },
+    Ready {
+        name: String,
+    },
+    Degraded {
+        name: String,
+        reason: String,
+    },
+    Diagnostics {
+        name: String,
+        diags: Vec<Diagnostic>,
+    },
 }
 
 /// Manages one or more language server child processes and exposes their
@@ -84,7 +94,11 @@ impl LspManager {
     #[must_use]
     pub fn new() -> Self {
         let (tx, rx) = watch::channel(LspSnapshot::default());
-        Self { tx, rx, runner: std::sync::Mutex::new(None) }
+        Self {
+            tx,
+            rx,
+            runner: std::sync::Mutex::new(None),
+        }
     }
 
     /// Returns a clone of the watch receiver (cheap — shared ref-count).
@@ -119,10 +133,7 @@ impl LspManager {
 }
 
 async fn run_all(workspace: PathBuf, watch_tx: watch::Sender<LspSnapshot>) {
-    let available: Vec<&ServerSpec> = SERVERS
-        .iter()
-        .filter(|s| which(s.binary).is_ok())
-        .collect();
+    let available: Vec<&ServerSpec> = SERVERS.iter().filter(|s| which(s.binary).is_ok()).collect();
 
     if available.is_empty() {
         tracing::debug!("no LSP servers found on PATH");
@@ -215,7 +226,9 @@ async fn run_server(
 
     info!(server = %name, "LSP ready");
     let _ = event_tx
-        .send(ServerEvent::Ready { name: name.to_owned() })
+        .send(ServerEvent::Ready {
+            name: name.to_owned(),
+        })
         .await;
 
     let (diag_tx, mut diag_rx) = mpsc::channel::<Vec<Diagnostic>>(EVENT_CHANNEL_CAP);
@@ -247,10 +260,7 @@ async fn run_server(
 }
 
 /// Receives `ServerEvent`s and pushes updated `LspSnapshot` through `watch_tx`.
-async fn aggregate(
-    mut rx: mpsc::Receiver<ServerEvent>,
-    watch_tx: watch::Sender<LspSnapshot>,
-) {
+async fn aggregate(mut rx: mpsc::Receiver<ServerEvent>, watch_tx: watch::Sender<LspSnapshot>) {
     let mut states: HashMap<String, ServerState> = HashMap::new();
     let mut diag_map: HashMap<String, Vec<Diagnostic>> = HashMap::new();
 

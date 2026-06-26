@@ -1,0 +1,28 @@
+id     = "WI-001"
+title  = "Role cockpit panel — active role, tier, in-flight turn status during /loop"
+status = "planned"
+priority = "P1"
+
+[detail]
+description = """
+Show a right-rail panel (Ctrl-A to toggle) with one row per role/agent that is
+registered in the current session.  Each row shows: role name, tier (local/fast/deep),
+and live turn state (in-flight ● / waiting ◌ / idle ─).
+
+Motivation: during a /loop run the main panel shows only the merged assistant output;
+users can't see which role is currently active or whether a particular agent is stalled.
+This is the Quorum pattern (multi-LLM debate) applied to smedja's multi-role orchestration.
+"""
+
+source   = "awesome-tuis / Quorum pattern (post-v0.16.3 review)"
+estimate = "M"
+
+[acceptance]
+criteria = [
+  "Ctrl-A toggles the role cockpit panel in the right rail",
+  "panel shows mode, tier, runner for the current session",
+  "active agent_name from TurnEvent.CorrelationCtx is highlighted",
+  "in-flight indicator updates live during streaming turns",
+  "panel is hidden by default (not shown on startup)",
+  "tests: toggle, state transitions idle→in-flight→idle",
+]

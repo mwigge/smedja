@@ -75,8 +75,20 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
             {
                 let mut store = store_inner.lock().await;
                 match event {
-                    TurnEvent::Started { ref turn_id, .. } => {
+                    TurnEvent::Started {
+                        ref turn_id,
+                        ref correlation,
+                        ..
+                    } => {
                         store.insert(turn_id.clone(), VecDeque::new());
+                        // Emit a started event so the TUI can capture agent_name.
+                        if let Some(ref name) = correlation.agent_name {
+                            if let Some(buf) = store.get_mut(turn_id) {
+                                let line =
+                                    json!({"type": "started", "agent_name": name}).to_string();
+                                buf.push_back(line);
+                            }
+                        }
                     }
                     TurnEvent::AssistantDelta {
                         ref content,
@@ -99,8 +111,7 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                     } => {
                         let Some(tid) = turn_id else { continue };
                         if let Some(buf) = store.get_mut(tid) {
-                            let line =
-                                json!({"type": "thinking", "text": content}).to_string();
+                            let line = json!({"type": "thinking", "text": content}).to_string();
                             if buf.len() >= MAX_BUFFER_PER_TURN {
                                 buf.pop_front();
                             }
@@ -159,8 +170,8 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                     }
                 }
             } // lock released here
-            // Schedule buffer eviction after TTL so late-connecting stream
-            // clients can still replay the final event.
+              // Schedule buffer eviction after TTL so late-connecting stream
+              // clients can still replay the final event.
             if let Some(tid) = cleanup_tid {
                 let store_gc = Arc::clone(&store_inner);
                 tokio::spawn(async move {
@@ -370,7 +381,14 @@ fn turn_event_to_ndjson(
             let line = json!({"type": "error", "message": reason}).to_string();
             (Some(turn_id.clone()), line, true)
         }
-        TurnEvent::Started { .. } => (None, String::new(), false),
+        TurnEvent::Started { correlation, .. } => {
+            if let Some(ref name) = correlation.agent_name {
+                let line = json!({"type": "started", "agent_name": name}).to_string();
+                (None, line, false)
+            } else {
+                (None, String::new(), false)
+            }
+        }
     }
 }
 
@@ -540,6 +558,42 @@ mod tests {
         assert!(
             !store.lock().await.contains_key("t-ttl"),
             "buffer must be evicted after TTL"
+        );
+    }
+
+    #[test]
+    fn turn_event_to_ndjson_started_with_agent_name_emits_started_line() {
+        let event = TurnEvent::Started {
+            session_id: "s".into(),
+            turn_id: "t-start".into(),
+            correlation: CorrelationCtx {
+                agent_name: Some("review".into()),
+                ..CorrelationCtx::default()
+            },
+        };
+        let (_tid, line, terminal) = turn_event_to_ndjson(&event, "t-start");
+        assert!(
+            line.contains(r#""type":"started""#),
+            "started event must have type=started; got: {line}"
+        );
+        assert!(
+            line.contains("review"),
+            "agent_name must appear in started line; got: {line}"
+        );
+        assert!(!terminal, "started event is not terminal");
+    }
+
+    #[test]
+    fn turn_event_to_ndjson_started_without_agent_name_emits_empty() {
+        let event = TurnEvent::Started {
+            session_id: "s".into(),
+            turn_id: "t-no-agent".into(),
+            correlation: CorrelationCtx::default(),
+        };
+        let (_tid, line, _terminal) = turn_event_to_ndjson(&event, "t-no-agent");
+        assert!(
+            line.is_empty(),
+            "started without agent_name must emit empty line; got: {line}"
         );
     }
 

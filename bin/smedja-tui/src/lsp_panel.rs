@@ -5,7 +5,8 @@
 //! diagnostics that fit in the available height.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
+use crate::theme::palette;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -26,6 +27,7 @@ impl<'a> LspPanel<'a> {
             return;
         }
 
+        let p = palette();
         let snap = self.snapshot;
         let inner_h = area.height.saturating_sub(2) as usize; // subtract borders
         let w = area.width.saturating_sub(2) as usize;
@@ -36,15 +38,15 @@ impl<'a> LspPanel<'a> {
         if snap.servers.is_empty() {
             lines.push(Line::from(Span::styled(
                 "no servers found",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(p.text_dim),
             )));
             lines.push(Line::from(Span::styled(
                 "install rust-analyzer,",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(p.text_dim),
             )));
             lines.push(Line::from(Span::styled(
                 "gopls, or pyright",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(p.text_dim),
             )));
         }
 
@@ -54,9 +56,9 @@ impl<'a> LspPanel<'a> {
                 break;
             }
             let (dot, color) = match &server.state {
-                ServerState::Starting => ("\u{25cc}", Color::Yellow), // ◌
-                ServerState::Ready => ("\u{25cf}", Color::Green),     // ●
-                ServerState::Degraded(_) => ("\u{2717}", Color::Red), // ✗
+                ServerState::Starting => ("\u{25cc}", p.warn),    // ◌
+                ServerState::Ready => ("\u{25cf}", p.success),    // ●
+                ServerState::Degraded(_) => ("\u{2717}", p.error), // ✗
             };
             let name_max = w.saturating_sub(2); // dot + space
             let name = trunc_str(&server.name, name_max);
@@ -72,10 +74,10 @@ impl<'a> LspPanel<'a> {
 
         for diag in snap.diagnostics.iter().take(diag_rows) {
             let (label, color) = match diag.severity {
-                Severity::Error => ("E", Color::Red),
-                Severity::Warning => ("W", Color::Yellow),
-                Severity::Info => ("I", Color::Cyan),
-                Severity::Hint => ("H", Color::DarkGray),
+                Severity::Error => ("E", p.error),
+                Severity::Warning => ("W", p.warn),
+                Severity::Info => ("I", p.accent),
+                Severity::Hint => ("H", p.text_dim),
             };
             let file_name = diag
                 .file
@@ -101,19 +103,24 @@ impl<'a> LspPanel<'a> {
         let warnings = snap.warning_count();
         if errors > 0 || warnings > 0 {
             lines.push(Line::from(vec![
-                Span::styled(format!("{errors}E"), Style::default().fg(Color::Red)),
+                Span::styled(format!("{errors}E"), Style::default().fg(p.error)),
                 Span::raw(" "),
-                Span::styled(format!("{warnings}W"), Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{warnings}W"), Style::default().fg(p.warn)),
             ]));
         } else if !snap.servers.is_empty() && snap.diagnostics.is_empty() {
             lines.push(Line::from(Span::styled(
                 "clean",
-                Style::default().fg(Color::Green),
+                Style::default().fg(p.success),
             )));
         }
 
         frame.render_widget(
-            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("lsp")),
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(p.border))
+                    .title(" lsp "),
+            ),
             area,
         );
     }

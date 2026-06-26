@@ -1,0 +1,37 @@
+id     = "WI-006"
+title  = "OSC-9 unit test — abstract stdout write for testability"
+status = "planned"
+priority = "P3"
+
+[detail]
+description = """
+The OSC-9 turn-complete notification writes `\\e]9;turn complete\\x07` directly to
+stdout via `std::io::Write::write_all`.  This is correct but untestable — unit tests
+cannot capture stdout without process-level redirection.
+
+Extract a private helper:
+
+  fn osc9_turn_complete_bytes() -> &'static [u8] {
+      b"\\x1b]9;turn complete\\x07"
+  }
+
+  fn emit_osc9(w: &mut impl Write) -> std::io::Result<()> {
+      w.write_all(osc9_turn_complete_bytes())
+  }
+
+Test: assert `osc9_turn_complete_bytes()` returns the expected byte sequence and
+that `emit_osc9` writes it to a `Vec<u8>` in a unit test.
+
+The call site in the stream event loop changes to `let _ = emit_osc9(&mut stdout())`.
+"""
+
+source   = "internal hardening (post-v0.16.3 review)"
+estimate = "XS"
+
+[acceptance]
+criteria = [
+  "osc9_turn_complete_bytes returns b\"\\x1b]9;turn complete\\x07\"",
+  "emit_osc9 writes to a Vec<u8> in a unit test",
+  "call site uses emit_osc9(&mut stdout())",
+  "existing OSC-9 behaviour preserved (no regression)",
+]

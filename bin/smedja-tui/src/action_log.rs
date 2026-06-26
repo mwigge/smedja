@@ -3,7 +3,8 @@
 use std::collections::VecDeque;
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
+use crate::theme::palette;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -70,15 +71,16 @@ impl ActionLog {
             return;
         }
 
+        let p = palette();
         let lines: Vec<Line> = self
             .events
             .iter()
             .map(|e| {
                 let outcome_color = match e.outcome.as_str() {
-                    "ok" => Color::Green,
-                    "error" => Color::Red,
-                    "sys" => Color::Cyan,
-                    _ => Color::Yellow,
+                    "ok" => p.success,
+                    "error" => p.error,
+                    "sys" => p.accent,
+                    _ => p.warn,
                 };
                 Line::from(vec![
                     Span::raw(format!("{} ", e.timestamp)),

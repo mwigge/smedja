@@ -2,7 +2,8 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
+use crate::theme::palette;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget};
 
@@ -27,11 +28,12 @@ impl SlotStyle {
     }
 
     #[must_use]
-    pub fn color(self) -> Color {
+    pub fn color(self) -> ratatui::style::Color {
+        let p = palette();
         match self {
-            Self::Low => Color::Green,
-            Self::Medium => Color::Yellow,
-            Self::High => Color::Red,
+            Self::Low => p.success,
+            Self::Medium => p.warn,
+            Self::High => p.error,
         }
     }
 }
@@ -183,9 +185,10 @@ mod tests {
 
     #[test]
     fn color_thresholds_applied() {
-        assert_eq!(SlotStyle::from_pct(50.0).color(), Color::Green);
-        assert_eq!(SlotStyle::from_pct(70.0).color(), Color::Yellow);
-        assert_eq!(SlotStyle::from_pct(90.0).color(), Color::Red);
+        use crate::theme::{FORGE_ERROR, FORGE_SUCCESS, FORGE_WARN};
+        assert_eq!(SlotStyle::from_pct(50.0).color(), FORGE_SUCCESS);
+        assert_eq!(SlotStyle::from_pct(70.0).color(), FORGE_WARN);
+        assert_eq!(SlotStyle::from_pct(90.0).color(), FORGE_ERROR);
     }
 
     // --- smoke test equivalent (L68) ---
