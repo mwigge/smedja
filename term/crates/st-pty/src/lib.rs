@@ -700,9 +700,10 @@ impl CellGrid {
                 break;
             }
             // Drop the top region line. Only the screen-top region (top == 0)
-            // feeds scrollback; a non-top margin discards the line.
+            // of the PRIMARY screen feeds scrollback; a non-top margin or the
+            // alt screen discards the line (alt screens have no scrollback).
             let removed = self.cells.remove(top);
-            if top == 0 {
+            if top == 0 && !self.alt_screen {
                 let evicted = self.scrollback.len() >= self.max_scrollback;
                 if evicted {
                     self.scrollback.remove(0);
@@ -834,6 +835,8 @@ impl CellGrid {
             self.cursor = (0, 0);
             self.alt_screen = true;
             self.reset_scroll_region();
+            // The alt screen has no scrollback view — snap to the live screen.
+            self.scroll_offset = 0;
         }
     }
 
@@ -843,6 +846,7 @@ impl CellGrid {
             self.cursor = self.alt_cursor;
             self.alt_screen = false;
             self.reset_scroll_region();
+            self.scroll_offset = 0;
         }
     }
 
@@ -2892,6 +2896,18 @@ mod tests {
         // blank,B.
         let out = render_vt_snapshot(4, 4, b"A\r\nB\r\nC\r\nD\x1b[2;3r\x1b[2;1H\x1bM");
         assert_eq!(out, "A\n\nB\nD");
+    }
+
+    #[test]
+    fn alt_screen_does_not_feed_scrollback_and_snaps_scroll_offset() {
+        let mut grid = make_grid(4, 3);
+        grid.scroll_offset = 2; // pretend the primary screen was scrolled back
+        grid.enter_alt_screen();
+        assert_eq!(grid.scroll_offset, 0, "alt screen snaps to the live view");
+        // Scrolling within the alt screen must NOT pollute the primary
+        // scrollback (alt screens have no scrollback).
+        grid.scroll_up(2);
+        assert!(grid.scrollback.is_empty(), "alt-screen scroll feeds no scrollback");
     }
 
     #[test]

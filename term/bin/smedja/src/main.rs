@@ -610,7 +610,10 @@ impl ApplicationHandler<UserEvent> for App {
                         // row/col exactly as before — no behaviour change to the
                         // common path. Only when scrolled back do we stamp
                         // positions, since scrollback rows carry stale indices.
-                        let cells: Vec<st_render::Cell> = if grid.scroll_offset <= 0 {
+                        // The alt screen (full-screen apps like smedja-tui/vim)
+                        // has no scrollback view — always render the live grid
+                        // there, never a scrolled window.
+                        let cells: Vec<st_render::Cell> = if grid.scroll_offset <= 0 || grid.alt_screen {
                             grid.cells
                                 .iter()
                                 .flat_map(|row| row.iter().map(|c| render_cell(c, c.col, c.row)))
