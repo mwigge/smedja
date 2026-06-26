@@ -57,7 +57,12 @@ pub enum RenderError {
 // ── Cell ──────────────────────────────────────────────────────────────────────
 
 /// A single terminal cell to be rendered.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `fg`/`bg` are already resolved by the caller (inverse-video swap and dim
+/// scaling are applied upstream in the bridge), so the renderer only needs the
+/// glyph-shaping flags here: bold/italic pick the font variant, `wide` centres a
+/// double-width glyph over two columns, and underline/strikethrough draw rules.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Cell {
     /// The Unicode scalar displayed in this cell.
     pub ch: char,
@@ -69,6 +74,16 @@ pub struct Cell {
     pub col: u16,
     /// Row index (0-based).
     pub row: u16,
+    /// Use the bold font variant.
+    pub bold: bool,
+    /// Use the italic font variant.
+    pub italic: bool,
+    /// Draw an underline rule.
+    pub underline: bool,
+    /// Draw a strikethrough rule.
+    pub strikethrough: bool,
+    /// Leading cell of a double-width glyph (centre over two columns).
+    pub wide: bool,
 }
 
 /// A decorative overlay drawn over a block span.
@@ -1296,10 +1311,15 @@ impl Renderer {
     fn ensure_cell_glyphs(&mut self) {
         let font_size = self.config.font.size * self.scale_factor as f32;
         let font_size_key = font_size.to_bits();
-        // Collect cell chars first so the immutable borrow of self.cells does
-        // not overlap the mutable borrow of self.atlas inside the loop.
-        let cell_chars: Vec<char> = self.cells.iter().map(|c| c.ch).collect();
-        for cell_ch in cell_chars {
+        // Collect (char, bold, italic) first so the immutable borrow of
+        // self.cells does not overlap the mutable borrow of self.atlas. Bold and
+        // italic key separate atlas slots so the right font variant is shown.
+        let cell_glyphs: Vec<(char, bool, bool)> = self
+            .cells
+            .iter()
+            .map(|c| (c.ch, c.bold, c.italic))
+            .collect();
+        for (cell_ch, bold, italic) in cell_glyphs {
             if cell_ch == ' ' {
                 continue;
             }
@@ -1307,7 +1327,7 @@ impl Renderer {
             let in_alpha = self
                 .atlas
                 .glyphs
-                .contains_key(&(cell_ch, false, false, font_size_key));
+                .contains_key(&(cell_ch, bold, italic, font_size_key));
             let in_colour = self.atlas.colour_glyphs.contains_key(&cell_ch);
             if in_alpha || in_colour {
                 continue;
@@ -1319,8 +1339,8 @@ impl Renderer {
                 &self.queue,
                 cell_ch,
                 font_size,
-                false,
-                false,
+                bold,
+                italic,
             );
         }
 
@@ -1726,6 +1746,30 @@ impl Renderer {
                     color: c,
                 },
             ]);
+
+            // Underline / strikethrough rules drawn in the cell's foreground
+            // colour. NDC y0 is the top edge, y1 the bottom edge.
+            if cell.underline || cell.strikethrough {
+                let fg = cell.fg;
+                let t = 2.0 / self.size.height as f32; // ~1px thick in NDC
+                let mut rule = |ytop: f32, ybot: f32| {
+                    verts.extend_from_slice(&[
+                        BgVertex { position: [x0, ytop], color: fg },
+                        BgVertex { position: [x1, ytop], color: fg },
+                        BgVertex { position: [x0, ybot], color: fg },
+                        BgVertex { position: [x1, ytop], color: fg },
+                        BgVertex { position: [x1, ybot], color: fg },
+                        BgVertex { position: [x0, ybot], color: fg },
+                    ]);
+                };
+                if cell.underline {
+                    rule(y1 + t * 2.0, y1);
+                }
+                if cell.strikethrough {
+                    let ymid = (y0 + y1) / 2.0;
+                    rule(ymid + t, ymid - t);
+                }
+            }
         }
 
         // Block decoration borders (left 1px bar in #a9652f).
@@ -1914,7 +1958,7 @@ impl Renderer {
             let Some(&entry) = self
                 .atlas
                 .glyphs
-                .get(&(cell.ch, false, false, eff_font_key))
+                .get(&(cell.ch, cell.bold, cell.italic, eff_font_key))
             else {
                 tracing::warn!(ch = %cell.ch, "glyph atlas miss — cell skipped");
                 continue;
@@ -1924,10 +1968,12 @@ impl Renderer {
             let u1 = (entry.x + entry.w) as f32 / atlas_size_f;
             let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
 
+            // A double-width glyph is centred over two columns, not one.
+            let advance = if cell.wide { cw * 2.0 } else { cw };
             let top_off = self.top_bar_height_px() as f32;
             let baseline_y = f32::from(cell.row) * ch + ch * (2.0 / 3.0) + top_off;
             let glyph_top = baseline_y - entry.bearing_y as f32;
-            let glyph_left = f32::from(cell.col) * cw + (cw - entry.w as f32) / 2.0;
+            let glyph_left = f32::from(cell.col) * cw + (advance - entry.w as f32) / 2.0;
             let (x0, y0, x1, y1) = self.px_to_ndc(
                 glyph_left,
                 glyph_top,
@@ -2585,6 +2631,7 @@ mod tests {
             bg: [0.0, 0.0, 0.0, 1.0],
             col: 5,
             row: 3,
+            ..Cell::default()
         };
         assert_eq!(c.ch, 'A');
         assert_eq!(c.col, 5);

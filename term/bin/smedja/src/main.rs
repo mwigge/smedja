@@ -607,27 +607,19 @@ impl ApplicationHandler<UserEvent> for App {
                         let cells: Vec<st_render::Cell> = if grid.scroll_offset <= 0 {
                             grid.cells
                                 .iter()
-                                .flat_map(|row| {
-                                    row.iter().map(|c| st_render::Cell {
-                                        ch: c.ch,
-                                        fg: c.fg,
-                                        bg: c.bg,
-                                        col: c.col,
-                                        row: c.row,
-                                    })
-                                })
+                                .flat_map(|row| row.iter().map(|c| render_cell(c, c.col, c.row)))
                                 .collect()
                         } else {
                             grid.visible_rows(grid.scroll_offset)
                                 .iter()
                                 .enumerate()
                                 .flat_map(|(r, row)| {
-                                    row.iter().enumerate().map(move |(col, c)| st_render::Cell {
-                                        ch: c.ch,
-                                        fg: c.fg,
-                                        bg: c.bg,
-                                        col: u16::try_from(col).unwrap_or(u16::MAX),
-                                        row: u16::try_from(r).unwrap_or(u16::MAX),
+                                    row.iter().enumerate().map(move |(col, c)| {
+                                        render_cell(
+                                            c,
+                                            u16::try_from(col).unwrap_or(u16::MAX),
+                                            u16::try_from(r).unwrap_or(u16::MAX),
+                                        )
                                     })
                                 })
                                 .collect()
@@ -1551,6 +1543,36 @@ fn spawn_agent_bridge(state: SharedPaneState, agent_manager: SharedAgentManager,
 }
 
 // ── PTY key dispatch ──────────────────────────────────────────────────────────
+
+/// Converts a PTY grid cell into a renderer cell at `(col, row)`, resolving the
+/// style flags: inverse swaps fg/bg, dim scales the foreground, and the
+/// remaining flags (bold/italic/underline/strikethrough/wide) pass through for
+/// the renderer to apply.
+fn render_cell(c: &st_pty::Cell, col: u16, row: u16) -> st_render::Cell {
+    use st_pty::CellFlags;
+    let f = c.flags;
+    let (mut fg, mut bg) = (c.fg, c.bg);
+    if f.contains(CellFlags::INVERSE) {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    if f.contains(CellFlags::DIM) {
+        for ch in fg.iter_mut().take(3) {
+            *ch *= 0.6;
+        }
+    }
+    st_render::Cell {
+        ch: c.ch,
+        fg,
+        bg,
+        col,
+        row,
+        bold: f.contains(CellFlags::BOLD),
+        italic: f.contains(CellFlags::ITALIC),
+        underline: f.contains(CellFlags::UNDERLINE),
+        strikethrough: f.contains(CellFlags::STRIKETHROUGH),
+        wide: f.contains(CellFlags::WIDE),
+    }
+}
 
 /// Maps a winit logical key to the byte sequence to write to the PTY.
 ///

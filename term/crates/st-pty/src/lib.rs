@@ -31,6 +31,7 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use st_glyph::GlyphRegistry;
+use unicode_width::UnicodeWidthChar;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -50,6 +51,63 @@ pub enum PtyError {
 
 // ── Cell ──────────────────────────────────────────────────────────────────────
 
+/// Per-cell style and layout flags (bitset).
+///
+/// `WIDE` marks the leading cell of a double-width glyph (CJK/emoji); the cell
+/// to its right is a `WIDE_SPACER` placeholder the renderer skips. The rest are
+/// SGR style attributes carried per cell so the renderer can apply them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CellFlags(u16);
+
+impl CellFlags {
+    /// Leading cell of a 2-column (double-width) glyph.
+    pub const WIDE: Self = Self(1 << 0);
+    /// Trailing placeholder cell after a `WIDE` glyph (not drawn).
+    pub const WIDE_SPACER: Self = Self(1 << 1);
+    /// SGR 1 — bold.
+    pub const BOLD: Self = Self(1 << 2);
+    /// SGR 3 — italic.
+    pub const ITALIC: Self = Self(1 << 3);
+    /// SGR 4 — underline.
+    pub const UNDERLINE: Self = Self(1 << 4);
+    /// SGR 9 — strikethrough.
+    pub const STRIKETHROUGH: Self = Self(1 << 5);
+    /// SGR 2 — dim/faint.
+    pub const DIM: Self = Self(1 << 6);
+    /// SGR 7 — reverse video (swap fg/bg).
+    pub const INVERSE: Self = Self(1 << 7);
+
+    /// The empty flag set.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// Returns `true` when every bit in `other` is set.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Sets the bits in `other`.
+    pub fn insert(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+}
+
+impl std::ops::BitOr for CellFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for CellFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
 /// A single terminal cell.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cell {
@@ -65,6 +123,8 @@ pub struct Cell {
     pub row: u16,
     /// OSC 8 hyperlink URI, if any.
     pub url: Option<String>,
+    /// Style + layout flags ([`CellFlags`]).
+    pub flags: CellFlags,
 }
 
 impl Cell {
@@ -78,6 +138,7 @@ impl Cell {
             col,
             row,
             url: None,
+            flags: CellFlags::empty(),
         }
     }
 }
@@ -182,6 +243,9 @@ struct SgrState {
     bold: bool,
     italic: bool,
     underline: bool,
+    strikethrough: bool,
+    dim: bool,
+    inverse: bool,
     /// OSC 8 URL currently in scope.
     url: Option<String>,
 }
@@ -194,8 +258,37 @@ impl Default for SgrState {
             bold: false,
             italic: false,
             underline: false,
+            strikethrough: false,
+            dim: false,
+            inverse: false,
             url: None,
         }
+    }
+}
+
+impl SgrState {
+    /// Builds the per-cell [`CellFlags`] for the current style attributes.
+    fn cell_flags(&self) -> CellFlags {
+        let mut f = CellFlags::empty();
+        if self.bold {
+            f |= CellFlags::BOLD;
+        }
+        if self.italic {
+            f |= CellFlags::ITALIC;
+        }
+        if self.underline {
+            f |= CellFlags::UNDERLINE;
+        }
+        if self.strikethrough {
+            f |= CellFlags::STRIKETHROUGH;
+        }
+        if self.dim {
+            f |= CellFlags::DIM;
+        }
+        if self.inverse {
+            f |= CellFlags::INVERSE;
+        }
+        f
     }
 }
 
@@ -503,10 +596,32 @@ impl CellGrid {
             self.cursor.0 = 0;
             self.advance_row();
         }
+
+        // Display width: 2 for CJK/emoji, 1 otherwise. Zero-width (combining)
+        // marks are treated as width 1 for now — proper grapheme combining is
+        // deferred — and anything wider is clamped to 2.
+        let w: u16 = match UnicodeWidthChar::width(ch) {
+            Some(2) => 2,
+            _ => 1,
+        };
+
+        let (mut col, mut row) = self.cursor;
+        // A double-width glyph that won't fit in the final column wraps to the
+        // next line, leaving the last column blank (standard VT behaviour).
+        if w == 2 && col + 1 >= self.cols {
+            self.cursor.0 = 0;
+            self.advance_row();
+            col = self.cursor.0;
+            row = self.cursor.1;
+        }
+
         let fg = self.current_fg();
         let bg = self.current_bg();
         let url = self.sgr.url.clone();
-        let (col, row) = self.cursor;
+        let mut flags = self.sgr.cell_flags();
+        if w == 2 {
+            flags |= CellFlags::WIDE;
+        }
         if let Some(cell) = self
             .cells
             .get_mut(row as usize)
@@ -518,14 +633,36 @@ impl CellGrid {
                 bg,
                 col,
                 row,
-                url,
+                url: url.clone(),
+                flags,
             };
         }
-        // Advance cursor. At the final column, DEFER the wrap: keep the cursor
-        // on the last column and set the flag so the wrap only happens when the
-        // next printable char arrives (or is cancelled by a cursor move / CR).
-        let next_col = col + 1;
+        // The trailing half of a wide glyph is a non-drawn spacer cell.
+        if w == 2 {
+            let scol = col + 1;
+            if let Some(cell) = self
+                .cells
+                .get_mut(row as usize)
+                .and_then(|r| r.get_mut(scol as usize))
+            {
+                *cell = Cell {
+                    ch: ' ',
+                    fg,
+                    bg,
+                    col: scol,
+                    row,
+                    url,
+                    flags: CellFlags::WIDE_SPACER,
+                };
+            }
+        }
+
+        // Advance by the glyph width. If it reaches/overruns the final column,
+        // DEFER the wrap: park the cursor on the last occupied column so the
+        // wrap only happens on the next printable char (or a cursor move / CR).
+        let next_col = col + w;
         if next_col >= self.cols {
+            self.cursor.0 = col + w - 1;
             self.pending_wrap = true;
         } else {
             self.cursor.0 = next_col;
@@ -1176,11 +1313,19 @@ fn apply_sgr(grid: &mut CellGrid, params: &[u16]) {
         match params[i] {
             0 => grid.sgr.reset(),
             1 => grid.sgr.bold = true,
+            2 => grid.sgr.dim = true,
             3 => grid.sgr.italic = true,
             4 => grid.sgr.underline = true,
-            22 => grid.sgr.bold = false,
+            7 => grid.sgr.inverse = true,
+            9 => grid.sgr.strikethrough = true,
+            22 => {
+                grid.sgr.bold = false;
+                grid.sgr.dim = false;
+            }
             23 => grid.sgr.italic = false,
             24 => grid.sgr.underline = false,
+            27 => grid.sgr.inverse = false,
+            29 => grid.sgr.strikethrough = false,
             // Standard fg colours 30-37, bright fg 90-97.
             n @ 30..=37 => grid.sgr.fg = Color::Ansi((n - 30) as u8),
             39 => grid.sgr.fg = Color::Default,
@@ -1634,7 +1779,13 @@ pub fn snapshot_grid(grid: &CellGrid) -> String {
         .cells
         .iter()
         .map(|row| {
-            let s: String = row.iter().map(|c| c.ch).collect();
+            // Skip the trailing spacer of a wide glyph so the snapshot shows the
+            // actual text (e.g. "你好"), not "你 好 ".
+            let s: String = row
+                .iter()
+                .filter(|c| !c.flags.contains(CellFlags::WIDE_SPACER))
+                .map(|c| c.ch)
+                .collect();
             s.trim_end().to_owned()
         })
         .collect();
@@ -1770,11 +1921,7 @@ mod tests {
         let mut grid = make_grid(4, 2);
         grid.cells[0][0] = Cell {
             ch: 'A',
-            fg: DEFAULT_FG,
-            bg: DEFAULT_BG,
-            col: 0,
-            row: 0,
-            url: None,
+            ..Cell::blank(0, 0)
         };
         grid.scroll_up(1);
         assert_eq!(grid.scrollback.len(), 1);
@@ -2610,6 +2757,62 @@ mod tests {
     #[test]
     fn conformance_backspace_moves_cursor_left() {
         assert_eq!(render_vt_snapshot(8, 2, b"abc\x08X"), "abX");
+    }
+
+    #[test]
+    fn conformance_wide_char_occupies_two_cells() {
+        // A CJK glyph takes 2 columns: leading WIDE cell + WIDE_SPACER. The
+        // snapshot skips spacers, so "你好" reads back verbatim.
+        assert_eq!(render_vt_snapshot(8, 2, "你好".as_bytes()), "你好");
+        // After a width-2 glyph the cursor is at column 2, so the next ASCII
+        // char lands there.
+        assert_eq!(render_vt_snapshot(8, 2, "你x".as_bytes()), "你x");
+    }
+
+    #[test]
+    fn wide_char_sets_flags_and_spacer() {
+        let mut grid = make_grid(8, 2);
+        grid.put_char('世');
+        assert!(grid.cells[0][0].flags.contains(CellFlags::WIDE));
+        assert!(grid.cells[0][1].flags.contains(CellFlags::WIDE_SPACER));
+        assert_eq!(grid.cursor.0, 2, "cursor advances by 2");
+    }
+
+    #[test]
+    fn wide_char_wraps_when_it_would_overflow_last_column() {
+        // 3-col grid, cursor parked at the last column: a wide glyph wraps to the
+        // next row instead of splitting across the edge.
+        let mut grid = make_grid(3, 3);
+        grid.cursor = (2, 0);
+        grid.put_char('字');
+        assert_eq!(grid.cells[1][0].ch, '字', "wide glyph wrapped to next row");
+        assert!(grid.cells[1][0].flags.contains(CellFlags::WIDE));
+    }
+
+    #[test]
+    fn sgr_attributes_carry_onto_cells() {
+        let mut grid = make_grid(8, 2);
+        // bold; dim; italic; underline; strikethrough; inverse via CSI ... m,
+        // then a char that should carry all of them.
+        for code in [1u16, 2, 3, 4, 9, 7] {
+            apply_sgr(&mut grid, &[code]);
+        }
+        grid.put_char('A');
+        let f = grid.cells[0][0].flags;
+        for flag in [
+            CellFlags::BOLD,
+            CellFlags::DIM,
+            CellFlags::ITALIC,
+            CellFlags::UNDERLINE,
+            CellFlags::STRIKETHROUGH,
+            CellFlags::INVERSE,
+        ] {
+            assert!(f.contains(flag), "missing flag {flag:?}");
+        }
+        // SGR 0 resets; the next char is plain.
+        apply_sgr(&mut grid, &[0]);
+        grid.put_char('B');
+        assert_eq!(grid.cells[0][1].flags, CellFlags::empty());
     }
 
     #[test]

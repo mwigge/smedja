@@ -16,6 +16,7 @@ st-glyph     = { path = "../st-glyph" }
 thiserror    = { workspace = true }
 tokio        = { workspace = true }
 tracing      = { workspace = true }
+unicode-width = { workspace = true }
 vte          = { workspace = true }
 
 [dev-dependencies]
