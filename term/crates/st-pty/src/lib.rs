@@ -398,6 +398,10 @@ pub struct CellGrid {
     /// for full-screen apps (ratatui): an eager wrap on the bottom-right cell
     /// would scroll the whole grid and desync the client's diff.
     pending_wrap: bool,
+    /// Top margin of the scroll region (0-based, inclusive). DECSTBM.
+    scroll_top: u16,
+    /// Bottom margin of the scroll region (0-based, inclusive). DECSTBM.
+    scroll_bottom: u16,
     /// Scrollback lines (oldest first).
     pub scrollback: Vec<Vec<Cell>>,
     /// Maximum number of scrollback lines.
@@ -460,6 +464,8 @@ impl CellGrid {
             cells,
             cursor: (0, 0),
             pending_wrap: false,
+            scroll_top: 0,
+            scroll_bottom: rows.saturating_sub(1),
             scrollback: Vec::new(),
             max_scrollback: 10_000,
             alt_screen: false,
@@ -508,6 +514,10 @@ impl CellGrid {
         // Clamp cursor.
         self.cursor.0 = self.cursor.0.min(cols.saturating_sub(1));
         self.cursor.1 = self.cursor.1.min(rows.saturating_sub(1));
+        // Resetting the scroll region to the full screen on resize matches xterm.
+        self.scroll_top = 0;
+        self.scroll_bottom = rows.saturating_sub(1);
+        self.pending_wrap = false;
     }
 
     fn resize_cells(cells: &mut Vec<Vec<Cell>>, cols: u16, rows: u16) {
@@ -671,38 +681,45 @@ impl CellGrid {
 
     fn advance_row(&mut self) {
         self.pending_wrap = false;
-        let row = self.cursor.1 + 1;
-        if row >= self.rows {
+        if self.cursor.1 == self.scroll_bottom {
+            // At the bottom margin: scroll the region instead of moving past it.
             self.scroll_up(1);
-        } else {
-            self.cursor.1 = row;
+        } else if self.cursor.1 + 1 < self.rows {
+            self.cursor.1 += 1;
         }
     }
 
     fn scroll_up(&mut self, n: u16) {
+        let top = self.scroll_top as usize;
+        let bot = (self.scroll_bottom as usize).min(self.cells.len().saturating_sub(1));
+        if top > bot {
+            return;
+        }
         for _ in 0..n {
-            if !self.cells.is_empty() {
-                let old_row = self.cells.remove(0);
+            if bot >= self.cells.len() {
+                break;
+            }
+            // Drop the top region line. Only the screen-top region (top == 0)
+            // feeds scrollback; a non-top margin discards the line.
+            let removed = self.cells.remove(top);
+            if top == 0 {
                 let evicted = self.scrollback.len() >= self.max_scrollback;
                 if evicted {
                     self.scrollback.remove(0);
                 }
-                self.scrollback.push(old_row);
+                self.scrollback.push(removed);
                 // If history grew without evicting a line and we're scrolled
-                // back, bump the offset alongside the new line so the viewport
-                // stays anchored to the same content instead of drifting.
+                // back, bump the offset so the viewport stays anchored.
                 if !evicted && self.scroll_offset > 0 {
                     self.scroll_offset =
                         (self.scroll_offset + 1).min(self.max_scroll_offset());
                 }
             }
-            let new_row_idx = self.rows.saturating_sub(1);
-            let blank = blank_row(self.cols, new_row_idx);
-            self.cells.push(blank);
+            let blank = blank_row(self.cols, bot as u16);
+            self.cells.insert(bot, blank);
         }
         // Re-stamp row indices so the renderer positions every cell correctly
-        // after the shift.  Without this, shifted cells retain stale row values
-        // and are drawn at the wrong vertical position.
+        // after the shift.
         for (r, row) in self.cells.iter_mut().enumerate() {
             for cell in row.iter_mut() {
                 cell.row = r as u16;
@@ -712,10 +729,19 @@ impl CellGrid {
     }
 
     fn scroll_down(&mut self, n: u16) {
+        let top = self.scroll_top as usize;
+        let bot = (self.scroll_bottom as usize).min(self.cells.len().saturating_sub(1));
+        if top > bot {
+            return;
+        }
         for _ in 0..n {
-            self.cells.pop();
-            let blank = blank_row(self.cols, 0);
-            self.cells.insert(0, blank);
+            if bot >= self.cells.len() {
+                break;
+            }
+            // Reverse scroll within the region: drop the bottom line, blank top.
+            self.cells.remove(bot);
+            let blank = blank_row(self.cols, top as u16);
+            self.cells.insert(top, blank);
         }
         // Re-stamp row indices after shift (same reason as scroll_up).
         for (r, row) in self.cells.iter_mut().enumerate() {
@@ -807,6 +833,7 @@ impl CellGrid {
             self.cells = blank_grid(self.cols, self.rows);
             self.cursor = (0, 0);
             self.alt_screen = true;
+            self.reset_scroll_region();
         }
     }
 
@@ -815,7 +842,14 @@ impl CellGrid {
             self.cells = std::mem::take(&mut self.alt_cells);
             self.cursor = self.alt_cursor;
             self.alt_screen = false;
+            self.reset_scroll_region();
         }
+    }
+
+    /// Resets the DECSTBM scroll region to the full screen.
+    fn reset_scroll_region(&mut self) {
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows.saturating_sub(1);
     }
 
     fn move_cursor(&mut self, col: u16, row: u16) {
@@ -1122,32 +1156,46 @@ impl vte::Perform for VtHandler {
                     grid.kbd_flags_stack.push(new);
                 }
             }
-            // ── Line delete / insert ─────────────────────────────────────────
+            // ── Line delete / insert (within the scroll region) ──────────────
             'L' => {
-                // Insert lines above cursor.
+                // Insert blank lines at the cursor, pushing lines down to the
+                // bottom margin (lines below the margin are untouched).
                 let n = p.first().copied().unwrap_or(1).max(1);
                 let row = grid.cursor.1 as usize;
+                let bot = (grid.scroll_bottom as usize).min(grid.cells.len().saturating_sub(1));
                 let cols = grid.cols;
-                for _ in 0..n {
-                    if grid.cells.len() > row {
-                        grid.cells.pop();
-                        let blank = blank_row(cols, row as u16);
-                        grid.cells.insert(row, blank);
+                if row <= bot {
+                    for _ in 0..n {
+                        grid.cells.remove(bot);
+                        grid.cells.insert(row, blank_row(cols, row as u16));
                     }
                 }
             }
             'M' => {
-                // Delete lines from cursor.
+                // Delete lines at the cursor, pulling lines up from the bottom
+                // margin (lines below the margin are untouched).
                 let n = p.first().copied().unwrap_or(1).max(1);
                 let row = grid.cursor.1 as usize;
+                let bot = (grid.scroll_bottom as usize).min(grid.cells.len().saturating_sub(1));
                 let cols = grid.cols;
-                let rows = grid.rows;
-                for _ in 0..n {
-                    if row < grid.cells.len() {
+                if row <= bot {
+                    for _ in 0..n {
                         grid.cells.remove(row);
-                        let last_row = rows.saturating_sub(1);
-                        grid.cells.push(blank_row(cols, last_row));
+                        grid.cells.insert(bot, blank_row(cols, bot as u16));
                     }
+                }
+            }
+            // ── Scroll region (DECSTBM) ──────────────────────────────────────
+            'r' if intermediates.is_empty() => {
+                let top = p.first().copied().unwrap_or(1).max(1);
+                let bottom = p.get(1).copied().filter(|&b| b > 0).unwrap_or(grid.rows);
+                let top0 = top - 1;
+                let bot0 = bottom.saturating_sub(1).min(grid.rows.saturating_sub(1));
+                if top0 < bot0 {
+                    grid.scroll_top = top0;
+                    grid.scroll_bottom = bot0;
+                    // DECSTBM homes the cursor.
+                    grid.move_cursor(0, 0);
                 }
             }
             _ => {
@@ -1279,21 +1327,35 @@ impl vte::Perform for VtHandler {
                 }
             }
             b'D' => {
-                // Index: move cursor down one row, scroll if at last row.
-                let last_row = grid.rows.saturating_sub(1);
-                if grid.cursor.1 >= last_row {
-                    grid.scroll_up(1);
-                } else {
-                    grid.cursor.1 += 1;
-                }
+                // Index (IND): down one row, scrolling at the bottom margin.
+                grid.advance_row();
             }
             b'M' => {
-                // Reverse Index: move cursor up one row, scroll down if at first row.
-                if grid.cursor.1 == 0 {
+                // Reverse Index (RI): up one row, scrolling down at the top
+                // margin.
+                grid.pending_wrap = false;
+                if grid.cursor.1 == grid.scroll_top {
                     grid.scroll_down(1);
-                } else {
+                } else if grid.cursor.1 > 0 {
                     grid.cursor.1 -= 1;
                 }
+            }
+            b'E' => {
+                // Next Line (NEL): CR + IND.
+                grid.cursor.0 = 0;
+                grid.advance_row();
+            }
+            b'c' => {
+                // RIS — reset to initial state.
+                if grid.alt_screen {
+                    grid.leave_alt_screen();
+                }
+                grid.reset_scroll_region();
+                grid.sgr.reset();
+                grid.cursor = (0, 0);
+                grid.pending_wrap = false;
+                grid.cursor_visible = true;
+                grid.erase_display(2);
             }
             _ => {
                 debug!("unhandled ESC: 0x{:02x}", byte);
@@ -2813,6 +2875,33 @@ mod tests {
         apply_sgr(&mut grid, &[0]);
         grid.put_char('B');
         assert_eq!(grid.cells[0][1].flags, CellFlags::empty());
+    }
+
+    #[test]
+    fn conformance_scroll_region_ind_scrolls_only_the_region() {
+        // 4 rows A/B/C/D. DECSTBM region = rows 2..3 (B,C). Park the cursor on
+        // the bottom margin and IND (ESC D): B,C scroll up to C,blank; A and D
+        // (outside the region) are untouched.
+        let out = render_vt_snapshot(4, 4, b"A\r\nB\r\nC\r\nD\x1b[2;3r\x1b[3;1H\x1bD");
+        assert_eq!(out, "A\nC\n\nD");
+    }
+
+    #[test]
+    fn conformance_scroll_region_ri_reverse_scrolls_region() {
+        // Same region; park on the top margin and RI (ESC M): B,C scroll down to
+        // blank,B.
+        let out = render_vt_snapshot(4, 4, b"A\r\nB\r\nC\r\nD\x1b[2;3r\x1b[2;1H\x1bM");
+        assert_eq!(out, "A\n\nB\nD");
+    }
+
+    #[test]
+    fn scroll_region_resets_to_full_screen_on_resize() {
+        let mut grid = make_grid(4, 4);
+        grid.scroll_top = 1;
+        grid.scroll_bottom = 2;
+        grid.resize(4, 4);
+        assert_eq!(grid.scroll_top, 0);
+        assert_eq!(grid.scroll_bottom, 3);
     }
 
     #[test]
