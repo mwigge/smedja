@@ -32,7 +32,8 @@ use statusbar::{render_status_bar, ModuleCtx};
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, KeyboardEnhancementFlags,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -212,6 +213,8 @@ inline context fragments (expanded into your message before the turn runs):
 
 keybindings (input mode):
   Esc                — enter scroll/normal mode
+  Enter              — submit the message
+  Shift/Alt-Enter    — insert a newline (compose multi-line in place)
   Up / Ctrl-P        — browse history backwards
   Down / Ctrl-N      — browse history forwards
   Ctrl-R             — toggle reverse history search
@@ -1123,7 +1126,9 @@ fn open_in_editor(initial_text: &str) -> Option<String> {
         f.write_all(initial_text.as_bytes()).ok()?;
     }
 
-    // Suspend the TUI so the editor can own the terminal.
+    // Suspend the TUI so the editor can own the terminal. Pop our kitty
+    // keyboard flags first so the editor sees a clean legacy terminal.
+    let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     let _ = disable_raw_mode();
     let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
 
@@ -1132,6 +1137,13 @@ fn open_in_editor(initial_text: &str) -> Option<String> {
     // Restore the TUI regardless of editor outcome.
     let _ = execute!(std::io::stdout(), EnterAlternateScreen);
     let _ = enable_raw_mode();
+    let _ = execute!(
+        std::io::stdout(),
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        )
+    );
 
     let ok = status.is_ok_and(|s| s.success());
     if !ok {
@@ -2167,6 +2179,20 @@ async fn handle_key(
             }
         }
 
+        // Shift/Alt/Ctrl+Enter → insert a literal newline (multi-line compose),
+        // mirroring claude-cli / opencode. Requires the kitty keyboard protocol
+        // (pushed at startup) so the host terminal disambiguates the modifier.
+        KeyCode::Enter
+            if key.modifiers.intersects(
+                KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+            ) =>
+        {
+            if !state.scroll_focus {
+                state.input.insert(state.input_cursor, '\n');
+                state.input_cursor += 1;
+            }
+        }
+
         KeyCode::Enter => {
             // L128: multi-line continuation — trailing `\` means "continue".
             if state.input.ends_with('\\') {
@@ -3047,6 +3073,9 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // Pop the kitty keyboard flags we pushed at startup before tearing down
+        // raw mode / alt screen, so the host terminal is left in legacy state.
+        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
@@ -3268,6 +3297,17 @@ async fn main() -> Result<()> {
     enable_raw_mode().context("enable raw mode")?;
     execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)
         .context("enter alternate screen")?;
+    // Negotiate the kitty keyboard protocol so the host terminal emits CSI-u
+    // sequences: this is what lets us distinguish Shift+Enter from Enter and see
+    // Ctrl-modified keys reliably. Best-effort — terminals that don't support it
+    // ignore the push (and the TerminalGuard pops it on exit).
+    let _ = execute!(
+        stdout(),
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        )
+    );
 
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend).context("create terminal")?;
