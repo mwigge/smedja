@@ -306,6 +306,11 @@ pub struct GlyphEntry {
     /// Vertical offset from the baseline to the top edge of the bitmap
     /// (positive = above baseline). From `swash::Placement::top`.
     pub bearing_y: i32,
+    /// Alpha-atlas allocation handle (for deallocation on LRU eviction). `None`
+    /// for colour-atlas entries, which are bounded and never evicted.
+    pub id: Option<etagere::AllocId>,
+    /// Frame index when this glyph was last used — the LRU key.
+    pub last_used: u64,
 }
 
 /// GPU texture atlas for rasterised glyphs.
@@ -317,8 +322,13 @@ pub struct GlyphAtlas {
     pub texture: wgpu::Texture,
     /// View into [`Self::texture`].
     pub view: wgpu::TextureView,
-    /// CPU-side packer that tracks free regions.
-    pub packer: ShelfPacker,
+    /// Dynamic shelf allocator for the alpha atlas — supports per-glyph
+    /// deallocation, so a full atlas evicts only the least-recently-used glyphs
+    /// (not a full clear).
+    pub alpha_alloc: etagere::AtlasAllocator,
+    /// Monotonic frame counter; each glyph's `last_used` is stamped with it so
+    /// eviction never drops a glyph still on screen this frame.
+    pub frame: u64,
     /// Maps `(char, bold, italic, font_size_bits)` → per-glyph atlas entry.
     ///
     /// `font_size_bits` is `font_size.to_bits()` so that glyphs rasterised at
@@ -377,7 +387,11 @@ impl GlyphAtlas {
         Self {
             texture,
             view,
-            packer: ShelfPacker::new(ATLAS_SIZE),
+            alpha_alloc: etagere::AtlasAllocator::new(etagere::size2(
+                ATLAS_SIZE as i32,
+                ATLAS_SIZE as i32,
+            )),
+            frame: 0,
             glyphs: HashMap::new(),
             colour_texture,
             colour_view,
@@ -428,8 +442,9 @@ impl GlyphAtlas {
         }
 
         let key = (ch, bold, italic, font_size.to_bits());
-        if let Some(&entry) = self.glyphs.get(&key) {
-            return Some(entry);
+        if let Some(entry) = self.glyphs.get_mut(&key) {
+            entry.last_used = self.frame;
+            return Some(*entry);
         }
 
         // Rasterise the glyph using cosmic-text + swash.
@@ -499,21 +514,37 @@ impl GlyphAtlas {
             (vec![0u8], 1, 1, 0, 0)
         });
 
-        // Allocate a slot. If the atlas is full, evict everything and retry:
-        // the grid is re-warmed every frame by ensure_cell_glyphs, so dropping
-        // cached entries only costs a re-rasterise, not correctness. Without
-        // this the atlas would permanently skip every new glyph once full,
-        // leaving cells unpainted — which desyncs the client's (ratatui) diff
-        // into persistent on-screen corruption during long streaming turns.
-        let [x, y] = match self.packer.alloc(w, h) {
-            Some(slot) => slot,
-            None => {
-                tracing::debug!("glyph atlas full — evicting and rebuilding");
-                self.glyphs.clear();
-                self.packer = ShelfPacker::new(ATLAS_SIZE);
-                self.packer.alloc(w, h)?
+        // Allocate a slot. When the atlas is full, evict the least-recently-used
+        // glyph that is NOT in use this frame and retry — incremental LRU rather
+        // than a full clear. ensure_cell_glyphs stamps every on-screen glyph's
+        // `last_used` to the current frame, so an in-use glyph is never dropped.
+        // If nothing is evictable the glyph is skipped (returns None) for this
+        // frame; it is re-warmed next frame once room frees up.
+        let alloc = loop {
+            if let Some(a) = self.alpha_alloc.allocate(etagere::size2(w as i32, h as i32)) {
+                break a;
+            }
+            let victim = self
+                .glyphs
+                .iter()
+                .filter(|(_, e)| e.id.is_some() && e.last_used < self.frame)
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, e)| (*k, e.id));
+            match victim {
+                Some((vkey, Some(vid))) => {
+                    self.alpha_alloc.deallocate(vid);
+                    self.glyphs.remove(&vkey);
+                }
+                _ => {
+                    tracing::debug!("glyph atlas full and nothing evictable — skipping glyph");
+                    return None;
+                }
             }
         };
+        #[allow(clippy::cast_sign_loss)]
+        let x = alloc.rectangle.min.x as u32;
+        #[allow(clippy::cast_sign_loss)]
+        let y = alloc.rectangle.min.y as u32;
 
         queue.write_texture(
             wgpu::ImageCopyTexture {
@@ -542,6 +573,8 @@ impl GlyphAtlas {
             h,
             bearing_x,
             bearing_y,
+            id: Some(alloc.id),
+            last_used: self.frame,
         };
         self.glyphs.insert(key, entry);
         Some(entry)
@@ -616,6 +649,8 @@ impl GlyphAtlas {
             h: height,
             bearing_x: 0,
             bearing_y: i32::try_from(height).unwrap_or(0),
+            id: None,
+            last_used: 0,
         };
         self.colour_glyphs.insert(ch, entry);
         Some(entry)
@@ -1281,7 +1316,10 @@ impl Renderer {
         if (self.scale_factor - sf).abs() > f64::EPSILON {
             self.scale_factor = sf;
             self.atlas.glyphs.clear();
-            self.atlas.packer = ShelfPacker::new(ATLAS_SIZE);
+            self.atlas.alpha_alloc = etagere::AtlasAllocator::new(etagere::size2(
+                ATLAS_SIZE as i32,
+                ATLAS_SIZE as i32,
+            ));
         }
     }
 
@@ -1309,8 +1347,11 @@ impl Renderer {
     /// encoder is created, so that [`wgpu::Queue::write_texture`] completes
     /// before the draw calls are submitted.
     fn ensure_cell_glyphs(&mut self) {
+        // New frame: every glyph touched below is stamped with this counter so
+        // LRU eviction can tell on-screen glyphs from stale ones.
+        self.atlas.frame = self.atlas.frame.wrapping_add(1);
+
         let font_size = self.config.font.size * self.scale_factor as f32;
-        let font_size_key = font_size.to_bits();
         // Collect (char, bold, italic) first so the immutable borrow of
         // self.cells does not overlap the mutable borrow of self.atlas. Bold and
         // italic key separate atlas slots so the right font variant is shown.
@@ -1320,85 +1361,41 @@ impl Renderer {
             .map(|c| (c.ch, c.bold, c.italic))
             .collect();
         for (cell_ch, bold, italic) in cell_glyphs {
-            if cell_ch == ' ' {
-                continue;
-            }
-            // Already warmed in either atlas? (fast HashMap checks).
-            let in_alpha = self
-                .atlas
-                .glyphs
-                .contains_key(&(cell_ch, bold, italic, font_size_key));
-            let in_colour = self.atlas.colour_glyphs.contains_key(&cell_ch);
-            if in_alpha || in_colour {
-                continue;
-            }
-            // get_or_insert routes registered PUA codepoints to the colour
-            // atlas and everything else to the font atlas.
-            let _ = self.atlas.get_or_insert(
-                &self.device,
-                &self.queue,
-                cell_ch,
-                font_size,
-                bold,
-                italic,
-            );
+            self.touch_or_warm(cell_ch, font_size, bold, italic);
         }
 
-        // Warm glyphs for status-bar segment text at the status-bar font size.
-        // Using a separate font size key prevents status-bar glyphs (small) from
-        // evicting or poisoning terminal-grid glyph cache entries (large).
+        // Status-bar and top-bar segments render at a smaller font key. They are
+        // touched every frame too, so they can never be evicted while visible.
         let sb_font_size = self.status_bar_height_px() as f32 * 0.65;
-        let sb_font_size_key = sb_font_size.to_bits();
         let sb_chars: Vec<char> = self
             .status_bar_segments
             .iter()
+            .chain(self.top_bar_segments.iter())
             .flat_map(|seg| seg.text.chars())
-            .filter(|&c| c != ' ')
             .collect();
         for ch in sb_chars {
-            if !self
-                .atlas
-                .glyphs
-                .contains_key(&(ch, false, false, sb_font_size_key))
-            {
-                let _ = self.atlas.get_or_insert(
-                    &self.device,
-                    &self.queue,
-                    ch,
-                    sb_font_size,
-                    false,
-                    false,
-                );
-            }
+            self.touch_or_warm(ch, sb_font_size, false, false);
         }
+    }
 
-        // Warm glyphs for the TOP-bar segments too — they render at the same
-        // small font key as the status bar. Without this every top-bar cell
-        // whose glyph isn't already cached misses the atlas and is skipped on
-        // every frame (the "glyph atlas miss — top-bar cell skipped" spam), so
-        // the title/cwd render unreliably.
-        let tb_chars: Vec<char> = self
-            .top_bar_segments
-            .iter()
-            .flat_map(|seg| seg.text.chars())
-            .filter(|&c| c != ' ')
-            .collect();
-        for ch in tb_chars {
-            if !self
-                .atlas
-                .glyphs
-                .contains_key(&(ch, false, false, sb_font_size_key))
-            {
-                let _ = self.atlas.get_or_insert(
-                    &self.device,
-                    &self.queue,
-                    ch,
-                    sb_font_size,
-                    false,
-                    false,
-                );
-            }
+    /// Stamps an on-screen glyph's `last_used` to the current frame, rasterising
+    /// and uploading it on first sight. Spaces and registered PUA colour glyphs
+    /// are no-ops (the latter live in the bounded, never-evicted colour atlas).
+    fn touch_or_warm(&mut self, ch: char, font_size: f32, bold: bool, italic: bool) {
+        if ch == ' ' {
+            return;
         }
+        let key = (ch, bold, italic, font_size.to_bits());
+        if let Some(entry) = self.atlas.glyphs.get_mut(&key) {
+            entry.last_used = self.atlas.frame;
+            return;
+        }
+        if self.atlas.colour_glyphs.contains_key(&ch) {
+            return;
+        }
+        let _ = self
+            .atlas
+            .get_or_insert(&self.device, &self.queue, ch, font_size, bold, italic);
     }
 
     /// Sets the block decorations for the next render pass.
@@ -2533,6 +2530,8 @@ mod tests {
             h: 12,
             bearing_x: 0,
             bearing_y: 10,
+            id: None,
+            last_used: 0,
         };
         let mut map: HashMap<(char, bool, bool, u32), GlyphEntry> = HashMap::new();
         map.insert(('A', false, false, sz), entry(0));
@@ -2579,6 +2578,8 @@ mod tests {
             h: 12,
             bearing_x: 0,
             bearing_y: 10,
+            id: None,
+            last_used: 0,
         };
         let mut glyphs: HashMap<(char, bool, bool, u32), GlyphEntry> = HashMap::new();
         glyphs.insert(('A', false, false, sz), entry(0));
@@ -2905,5 +2906,24 @@ mod tests {
             ..BackgroundConfig::default()
         };
         assert!(bg.load_image().is_err(), "loading a missing file must fail");
+    }
+
+    #[test]
+    fn etagere_allocate_then_deallocate_frees_a_slot() {
+        // Validates the allocate→full→deallocate→reallocate contract the glyph
+        // atlas LRU eviction relies on (CPU-only, no GPU device needed).
+        use etagere::{size2, AtlasAllocator};
+        let mut a = AtlasAllocator::new(size2(32, 32));
+        let mut ids = Vec::new();
+        while let Some(al) = a.allocate(size2(16, 16)) {
+            ids.push(al.id);
+        }
+        assert!(!ids.is_empty(), "atlas should fit at least one 16×16 slot");
+        // Atlas is now full for 16×16; free the first and a new one must fit.
+        a.deallocate(ids[0]);
+        assert!(
+            a.allocate(size2(16, 16)).is_some(),
+            "deallocating a slot must free room for a new allocation"
+        );
     }
 }
