@@ -484,7 +484,21 @@ impl GlyphAtlas {
             (vec![0u8], 1, 1, 0, 0)
         });
 
-        let [x, y] = self.packer.alloc(w, h)?;
+        // Allocate a slot. If the atlas is full, evict everything and retry:
+        // the grid is re-warmed every frame by ensure_cell_glyphs, so dropping
+        // cached entries only costs a re-rasterise, not correctness. Without
+        // this the atlas would permanently skip every new glyph once full,
+        // leaving cells unpainted — which desyncs the client's (ratatui) diff
+        // into persistent on-screen corruption during long streaming turns.
+        let [x, y] = match self.packer.alloc(w, h) {
+            Some(slot) => slot,
+            None => {
+                tracing::debug!("glyph atlas full — evicting and rebuilding");
+                self.glyphs.clear();
+                self.packer = ShelfPacker::new(ATLAS_SIZE);
+                self.packer.alloc(w, h)?
+            }
+        };
 
         queue.write_texture(
             wgpu::ImageCopyTexture {
