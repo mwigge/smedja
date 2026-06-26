@@ -747,7 +747,7 @@ async fn main() -> anyhow::Result<()> {
                 info!(endpoint = %endpoint, "trace destination: OTLP exporter");
             }
             Err(e) => {
-                warn!(error = %e, endpoint = %endpoint, "failed to install OTLP exporter; trace destination: structured logs only");
+                error!(error = %e, endpoint = %endpoint, "failed to install OTLP exporter; trace destination: structured logs only");
             }
         }
     } else {
@@ -948,6 +948,24 @@ async fn main() -> anyhow::Result<()> {
     // Single provider-session map, constructed once and threaded to every
     // handler and the orchestrator (replaces the former OnceLock singleton).
     let provider_sessions: orchestrator::ProviderSessions = Arc::new(Mutex::new(HashMap::new()));
+
+    // Background GC: cap the provider_sessions map at 10 000 entries.  Each
+    // entry is soft state (cleared sessions reconnect cleanly on the next turn),
+    // so a full clear is safe. The GC task wakes every 5 minutes.
+    {
+        let ps = Arc::clone(&provider_sessions);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                let mut map = ps.lock().await;
+                let n = map.len();
+                if n > 10_000 {
+                    map.clear();
+                    tracing::info!("provider_sessions: cleared {n} entries (cap exceeded)");
+                }
+            }
+        });
+    }
 
     // Single cross-turn cache-aligner map, keyed by `(session_id, runner)` and
     // threaded exactly like `provider_sessions`, so each persisted aligner
@@ -1172,6 +1190,9 @@ async fn main() -> anyhow::Result<()> {
         })
         .await;
     }
+
+    // Allow stream connections to flush their final `done` lines after turns complete.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     info!("smdjad stopped");
     if let Some(ref p) = pid_path {

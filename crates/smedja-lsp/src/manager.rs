@@ -175,8 +175,16 @@ async fn run_all(workspace: PathBuf, watch_tx: watch::Sender<LspSnapshot>) {
     aggregate(event_rx, watch_tx).await;
 }
 
+/// Delay (seconds) between recovery-probe attempts after the restart cap is hit.
+const RECOVERY_PROBE_SECS: u64 = 300; // 5 minutes
+
 /// Runs a server task and restarts it up to `MAX_RESTART_ATTEMPTS` times with
 /// exponential backoff when it exits unexpectedly.
+///
+/// After exhausting all restart attempts, the task enters a recovery-probe loop:
+/// it waits 5 minutes, resets the attempt counter, and tries to restart the
+/// server again. This handles the case where a transient system condition (OOM,
+/// missing binary on a newly-mounted volume) clears itself over time.
 async fn run_server_with_restart(
     name: String,
     binary: &str,
@@ -184,21 +192,44 @@ async fn run_server_with_restart(
     workspace: &Path,
     event_tx: mpsc::Sender<ServerEvent>,
 ) {
-    for attempt in 0..=MAX_RESTART_ATTEMPTS {
-        if attempt > 0 {
-            let delay = RESTART_DELAYS_SECS[(attempt - 1) as usize];
-            warn!(server = %name, attempt, delay_secs = delay, "LSP server restarting");
-            let _ = event_tx
-                .send(ServerEvent::Starting { name: name.clone() })
-                .await;
-            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+    loop {
+        // Inner restart loop: attempt up to MAX_RESTART_ATTEMPTS restarts.
+        for attempt in 0..=MAX_RESTART_ATTEMPTS {
+            if attempt > 0 {
+                let delay = RESTART_DELAYS_SECS[(attempt - 1) as usize];
+                warn!(server = %name, attempt, delay_secs = delay, "LSP server restarting");
+                let _ = event_tx
+                    .send(ServerEvent::Starting { name: name.clone() })
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            }
+            run_server(&name, binary, args, workspace, event_tx.clone()).await;
+            if event_tx.is_closed() {
+                return;
+            }
         }
-        run_server(&name, binary, args, workspace, event_tx.clone()).await;
+
+        // Restart cap exhausted — schedule a recovery probe.
+        tracing::error!(
+            server = %name,
+            "LSP server restart cap reached; scheduling {RECOVERY_PROBE_SECS}s recovery probe"
+        );
+        let _ = event_tx
+            .send(ServerEvent::Degraded {
+                name: name.clone(),
+                reason: "restart cap reached; will retry in 5 minutes".to_owned(),
+            })
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_secs(RECOVERY_PROBE_SECS)).await;
+
         if event_tx.is_closed() {
-            break;
+            return;
         }
+
+        tracing::info!(server = %name, "LSP server recovery probe: attempting restart");
+        // Loop back to the inner restart loop with a fresh attempt counter.
     }
-    warn!(server = %name, "LSP server gave up after all restart attempts; staying degraded");
 }
 
 /// Runs a single server lifecycle: spawn → handshake → notification loop.

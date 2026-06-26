@@ -81,27 +81,6 @@ pub(crate) fn list_by_session(
     Ok(rows?)
 }
 
-/// Returns the sum of all `input_tok` and `output_tok` values for `session_id`.
-///
-/// Returns `(0, 0)` when no snapshots exist.
-///
-/// # Errors
-///
-/// Returns [`IngotError::Db`] if the query fails.
-#[allow(dead_code)] // reserved for future cost-estimator integration
-pub(crate) fn cumulative_totals(
-    conn: &rusqlite::Connection,
-    session_id: &str,
-) -> Result<(i64, i64), IngotError> {
-    let result = conn.query_row(
-        "SELECT COALESCE(SUM(input_tok), 0), COALESCE(SUM(output_tok), 0) \
-         FROM turn_token_snapshots WHERE session_id = ?1",
-        rusqlite::params![session_id],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-    )?;
-    Ok(result)
-}
-
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenSnapshot> {
     let id_str: String = row.get(0)?;
     let id = Uuid::parse_str(&id_str).map_err(|e| {

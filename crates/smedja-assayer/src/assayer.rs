@@ -59,16 +59,19 @@ impl Assayer {
             runner: Runner::Local,
             tier: Tier::Local,
             model: None,
+            tools: vec![],
         };
         let claude_deep = || Route {
             runner: Runner::Claude,
             tier: Tier::Deep,
             model: None,
+            tools: vec![],
         };
         let claude_fast = || Route {
             runner: Runner::Claude,
             tier: Tier::Fast,
             model: None,
+            tools: vec![],
         };
 
         Self {
@@ -124,6 +127,7 @@ impl Assayer {
                     runner: Runner::Local,
                     tier: Tier::Local,
                     model: None,
+                    tools: vec![],
                 },
                 |r| r.route.clone(),
             )
@@ -187,6 +191,7 @@ mod tests {
             runner: Runner::Local,
             tier: Tier::Local,
             model: None,
+            tools: vec![],
         }
     }
 
@@ -195,6 +200,7 @@ mod tests {
             runner: Runner::Claude,
             tier: Tier::Deep,
             model: None,
+            tools: vec![],
         }
     }
 
@@ -203,6 +209,7 @@ mod tests {
             runner: Runner::Claude,
             tier: Tier::Fast,
             model: None,
+            tools: vec![],
         }
     }
 
@@ -313,6 +320,7 @@ mod tests {
                 runner: Runner::Codex,
                 tier: Tier::Fast,
                 model: None,
+                tools: vec![],
             },
         )];
         let assayer = Assayer::from_rules(rules);
@@ -320,6 +328,7 @@ mod tests {
             runner: Runner::Codex,
             tier: Tier::Fast,
             model: None,
+            tools: vec![],
         };
         assert_eq!(assayer.route(AgentRole::Impl, Complexity::Simple), expected);
         assert_eq!(assayer.route(AgentRole::Impl, Complexity::Coding), expected);
@@ -341,6 +350,7 @@ mod tests {
                     runner: Runner::Copilot,
                     tier: Tier::Deep,
                     model: None,
+                    tools: vec![],
                 },
             ),
             RoutingRule::new(
@@ -350,6 +360,7 @@ mod tests {
                     runner: Runner::Local,
                     tier: Tier::Local,
                     model: None,
+                    tools: vec![],
                 },
             ),
         ];
@@ -361,6 +372,7 @@ mod tests {
                 runner: Runner::Copilot,
                 tier: Tier::Deep,
                 model: None,
+                tools: vec![],
             }
         );
         // Simple/Coding should fall through to the wildcard.
@@ -412,6 +424,7 @@ mod tests {
                 runner: Runner::Codex,
                 tier: Tier::Fast,
                 model: Some("codex-mini".to_string()),
+                tools: vec![],
             },
         )];
         let assayer = Assayer::from_rules(rules);

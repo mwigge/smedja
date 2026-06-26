@@ -50,7 +50,25 @@ cp target/release/{smdjad,smj,smedja-tui,smedja} ~/.local/bin/
 
 ---
 
-## 2. Start the daemon
+## 2. Configure a provider
+
+smedja needs an LLM provider to generate responses. The easiest way to get started is with Anthropic's API:
+
+```sh
+export ANTHROPIC_API_KEY=sk-ant-...   # add to ~/.bashrc or ~/.zshrc to persist
+```
+
+Or, to use a local model via an OpenAI-compatible server (Ollama, llama-swap, etc.):
+
+```sh
+export SMEDJA_LOCAL_ENDPOINT=http://127.0.0.1:11434/v1
+```
+
+smdjad will automatically detect and use a configured provider. If no provider is configured, turns will fail with a DEGRADED status — check `smj status` or the TUI status bar for provider health.
+
+---
+
+## 3. Start the daemon
 
 ```sh
 smdjad
@@ -62,7 +80,7 @@ Override the socket path with `--sock` or `SMEDJA_SOCK`.
 
 ---
 
-## 3. Open the TUI
+## 5. Open the TUI
 
 ```sh
 smedja-tui
@@ -88,7 +106,7 @@ The TUI creates a fresh session and connects to the daemon. You'll see the statu
 
 ---
 
-## 4. Send your first message
+## 6. Send your first message
 
 Type in the input bar at the bottom of the TUI and press `Enter`. The daemon routes the turn to the configured provider and streams the reply into the main panel.
 
@@ -101,7 +119,7 @@ Each turn renders as a **TurnBlock** with a header line showing:
 
 ---
 
-## 5. Basic session workflow
+## 7. Basic session workflow
 
 ```sh
 # Start a fresh session with the review agent
@@ -128,7 +146,7 @@ Inside the TUI:
 
 ---
 
-## 6. Workspace setup
+## 8. Workspace setup
 
 Run once per repo to create the `.smedja/` config directory and index the code graph:
 
@@ -141,7 +159,7 @@ See [`docs/configuration.md`](configuration.md) for the full config reference.
 
 ---
 
-## 7. Next steps
+## 9. Next steps
 
 - [`docs/tui.md`](tui.md) — complete TUI command and keybinding reference
 - [`docs/smj.md`](smj.md) — smj CLI reference

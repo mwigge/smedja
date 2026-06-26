@@ -106,6 +106,12 @@ fn retrieve_store() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
     STORE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
+/// Insertion-order tracker for the retrieve store LRU eviction.
+fn retrieve_store_order() -> &'static tokio::sync::Mutex<std::collections::VecDeque<String>> {
+    static ORDER: OnceLock<tokio::sync::Mutex<std::collections::VecDeque<String>>> = OnceLock::new();
+    ORDER.get_or_init(|| tokio::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
 /// Vault namespace under which full uncompressed command output is teed for
 /// recovery via the `smedja_retrieve` tool.
 pub(crate) const FILTER_RECOVERY_NAMESPACE: &str = "filter-recovery";
@@ -162,7 +168,14 @@ async fn filter_command_output(
     let hash = content_hash(&result);
     {
         let mut store = retrieve_store().lock().await;
+        let mut order = retrieve_store_order().lock().await;
         store.insert(hash.clone(), result.clone());
+        order.push_back(hash.clone());
+        if store.len() > 512 {
+            if let Some(oldest) = order.pop_front() {
+                store.remove(&oldest);
+            }
+        }
     }
     tee_to_vault(&hash, &result, vault).await;
 
@@ -279,6 +292,27 @@ pub(crate) fn parse_tool_call(text: &str) -> Option<(String, String)> {
     Some((tool_name, input))
 }
 
+/// Returns `true` when the workspace `[tools]` config has `confirm_edits = true`.
+///
+/// Reads `<workspace>/.smedja/workspace.toml`.  A missing or unparseable file
+/// resolves to `false` so startup is never blocked by config trouble.
+fn is_confirm_edits_enabled(workspace: &std::path::Path) -> bool {
+    #[derive(serde::Deserialize, Default)]
+    struct WorkspaceToml {
+        tools: Option<ToolsSection>,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct ToolsSection {
+        confirm_edits: Option<bool>,
+    }
+    let path = workspace.join(".smedja").join("workspace.toml");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| toml::from_str::<WorkspaceToml>(&s).ok())
+        .and_then(|c| c.tools?.confirm_edits)
+        .unwrap_or(false)
+}
+
 /// Executes the named tool with the given JSON input string.
 ///
 /// Supported tools: `bash`, `run_command`, `read_file`, `list_files`, vault tools,
@@ -319,6 +353,21 @@ pub(crate) async fn execute_tool(
                     "smedja.security.data_access_blocked: write outside workspace rejected"
                 );
                 return err;
+            }
+        }
+    }
+
+    // confirm_edits gate: when the workspace [tools] config has confirm_edits = true,
+    // edit_file calls are flagged for cowork approval before writing. The full async
+    // cowork approval gate is a roadmap item; the current release logs and proceeds so
+    // that the config surface is live and the hook point is in place.
+    if tool_name == "edit_file" {
+        if let Some(path_str) = input.get("path").and_then(Value::as_str) {
+            if is_confirm_edits_enabled(workspace) {
+                tracing::info!(
+                    path = path_str,
+                    "confirm_edits: edit_file proceeding (full cowork gate is in roadmap)"
+                );
             }
         }
     }
@@ -613,7 +662,11 @@ pub(crate) async fn execute_tool(
                 .and_then(|n| u32::try_from(n).ok())
                 .unwrap_or(60);
             if let Ok(cfg) = smedja_sre::SreConfig::from_env() {
-                let client = reqwest::Client::new();
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .connect_timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap_or_default();
                 match smedja_sre::otel_query(&client, &cfg, service, filter, range).await {
                     Ok(v) => serde_json::to_string(&v).unwrap_or_default(),
                     Err(e) => format!("error: {e}"),
@@ -630,7 +683,11 @@ pub(crate) async fn execute_tool(
                 .and_then(|n| u32::try_from(n).ok())
                 .unwrap_or(60);
             if let Ok(cfg) = smedja_sre::SreConfig::from_env() {
-                let client = reqwest::Client::new();
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .connect_timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap_or_default();
                 match smedja_sre::metric_query(&client, &cfg, promql, range).await {
                     Ok(v) => serde_json::to_string(&v).unwrap_or_default(),
                     Err(e) => format!("error: {e}"),
@@ -651,7 +708,11 @@ pub(crate) async fn execute_tool(
                 .and_then(|n| u32::try_from(n).ok())
                 .unwrap_or(100);
             if let Ok(cfg) = smedja_sre::SreConfig::from_env() {
-                let client = reqwest::Client::new();
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .connect_timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap_or_default();
                 match smedja_sre::log_tail(&client, &cfg, service, filter, lines).await {
                     Ok(v) => serde_json::to_string(&v).unwrap_or_default(),
                     Err(e) => format!("error: {e}"),
@@ -1858,6 +1919,61 @@ mod tests {
         assert!(
             similarity > 0.0,
             "cosine similarity between query and stored entry must be > 0, got {similarity}"
+        );
+    }
+
+    // ── is_confirm_edits_enabled ──────────────────────────────────────────────
+
+    #[test]
+    fn confirm_edits_defaults_to_false_when_no_workspace_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !super::is_confirm_edits_enabled(dir.path()),
+            "missing workspace.toml must resolve to false"
+        );
+    }
+
+    #[test]
+    fn confirm_edits_false_when_key_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let smedja = dir.path().join(".smedja");
+        std::fs::create_dir_all(&smedja).unwrap();
+        std::fs::write(smedja.join("workspace.toml"), "[workspace]\nname = \"x\"\n").unwrap();
+        assert!(
+            !super::is_confirm_edits_enabled(dir.path()),
+            "missing [tools] key must resolve to false"
+        );
+    }
+
+    #[test]
+    fn confirm_edits_true_when_enabled_in_workspace_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let smedja = dir.path().join(".smedja");
+        std::fs::create_dir_all(&smedja).unwrap();
+        std::fs::write(
+            smedja.join("workspace.toml"),
+            "[tools]\nconfirm_edits = true\n",
+        )
+        .unwrap();
+        assert!(
+            super::is_confirm_edits_enabled(dir.path()),
+            "confirm_edits = true must be detected"
+        );
+    }
+
+    #[test]
+    fn confirm_edits_false_when_explicitly_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let smedja = dir.path().join(".smedja");
+        std::fs::create_dir_all(&smedja).unwrap();
+        std::fs::write(
+            smedja.join("workspace.toml"),
+            "[tools]\nconfirm_edits = false\n",
+        )
+        .unwrap();
+        assert!(
+            !super::is_confirm_edits_enabled(dir.path()),
+            "confirm_edits = false must resolve to false"
         );
     }
 }

@@ -101,7 +101,16 @@ description = "optional description"
 [graph]
 # Additional directories to index (relative to workspace root)
 extra_paths = ["shared/", "libs/"]
+
+[tools]
+confirm_edits = false   # set true to enable the edit_file cowork-approval gate
 ```
+
+### `[tools]`
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `confirm_edits` | `false` | When `true`, `edit_file` tool calls emit a cowork approval request before writing. Full async gate is roadmap; current release logs and proceeds. |
 
 ---
 
@@ -161,6 +170,8 @@ The `[x]` items are already-completed — the loop skips them and only drives `[
 | `SMEDJA_SOCK` | `$XDG_RUNTIME_DIR/smdjad.sock` | Daemon socket path |
 | `SMEDJA_DAILY_TOKEN_LIMIT` | *(unset)* | Daily token budget; displayed in `/quota` |
 | `SMEDJA_OTLP_ENDPOINT` | *(unset)* | OTLP collector endpoint; enables trace footer in TUI |
+| `SMEDJA_TIMELINE_URL` | *(unset)* | URL template for trace deep-links; `{id}` is replaced with the traceparent trace ID |
+| `SMEDJA_LOG_FORMAT` | `text` | Log output format: `text` or `json` |
 | `NO_COLOR` | *(unset)* | Disable colour output when set to any value |
 
 ### Sandbox

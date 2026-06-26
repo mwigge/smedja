@@ -29,7 +29,7 @@ use tokio::sync::Mutex;
 use smedja_bellows::{Dispatcher, TurnEvent};
 
 /// Maximum NDJSON lines buffered per turn before the oldest are discarded.
-const MAX_BUFFER_PER_TURN: usize = 2048;
+const MAX_BUFFER_PER_TURN: usize = 8192;
 
 /// Maximum seconds to wait for a turn to start emitting events after a stream
 /// connection arrives.  If the `task_id` is valid but the turn has not yet fired
@@ -54,6 +54,26 @@ pub type DeltaStore = Arc<Mutex<HashMap<String, VecDeque<String>>>>;
 /// (`Completed` or `Failed`) the buffer entry is retained so late-connecting
 /// stream clients can still replay it; callers should call
 /// [`cleanup_turn`](cleanup_turn) after a short delay to reclaim memory.
+
+/// Appends `line` to `buf`, enforcing `MAX_BUFFER_PER_TURN`.
+///
+/// When the buffer is full, the oldest entry is evicted. If no overflow
+/// marker exists at the front, one is inserted (consuming another slot so
+/// the total never exceeds `MAX_BUFFER_PER_TURN`).
+fn evict_and_push(buf: &mut std::collections::VecDeque<String>, line: String) {
+    if buf.len() >= MAX_BUFFER_PER_TURN {
+        buf.pop_front();
+        let needs_overflow = buf.front().map_or(true, |l| !l.contains("buffer_overflow"));
+        if needs_overflow {
+            // Pop one more to make room for the overflow marker so total stays ≤ cap.
+            buf.pop_front();
+            let overflow = serde_json::json!({"type":"buffer_overflow","lost":1}).to_string();
+            buf.push_front(overflow);
+        }
+    }
+    buf.push_back(line);
+}
+
 #[must_use]
 pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
     let store: DeltaStore = Arc::new(Mutex::new(HashMap::new()));
@@ -98,10 +118,7 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                         let Some(tid) = turn_id else { continue };
                         if let Some(buf) = store.get_mut(tid) {
                             let line = json!({"type": "delta", "text": content}).to_string();
-                            if buf.len() >= MAX_BUFFER_PER_TURN {
-                                buf.pop_front();
-                            }
-                            buf.push_back(line);
+                            evict_and_push(buf, line);
                         }
                     }
                     TurnEvent::ThinkingDelta {
@@ -112,10 +129,7 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                         let Some(tid) = turn_id else { continue };
                         if let Some(buf) = store.get_mut(tid) {
                             let line = json!({"type": "thinking", "text": content}).to_string();
-                            if buf.len() >= MAX_BUFFER_PER_TURN {
-                                buf.pop_front();
-                            }
-                            buf.push_back(line);
+                            evict_and_push(buf, line);
                         }
                     }
                     TurnEvent::ToolCalled {
@@ -129,10 +143,7 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                             let line =
                                 json!({"type": "tool_call", "name": tool_name, "input": input_summary})
                                     .to_string();
-                            if buf.len() >= MAX_BUFFER_PER_TURN {
-                                buf.pop_front();
-                            }
-                            buf.push_back(line);
+                            evict_and_push(buf, line);
                         }
                     }
                     TurnEvent::Completed {
@@ -216,6 +227,9 @@ pub async fn serve(listener: UnixListener, store: DeltaStore, dispatcher: Arc<Di
         let sem = Arc::clone(&semaphore);
         tokio::spawn(async move {
             let Ok(permit) = sem.acquire_owned().await else {
+                let (_, mut writer) = tokio::io::split(stream);
+                let msg = serde_json::json!({"type":"error","message":"at_capacity"}).to_string() + "\n";
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, msg.as_bytes()).await;
                 return;
             };
             handle_stream_connection(stream, store, dispatcher).await;
@@ -436,7 +450,9 @@ mod tests {
 
     #[tokio::test]
     async fn delta_buffer_caps_at_max_per_turn() {
-        let dispatcher = Arc::new(Dispatcher::new(4096));
+        // Dispatcher capacity must exceed MAX_BUFFER_PER_TURN so the background
+        // subscriber never lags and the Started event is never dropped.
+        let dispatcher = Arc::new(Dispatcher::new(MAX_BUFFER_PER_TURN + 256));
         let store = spawn_delta_buffer(&dispatcher);
 
         dispatcher.publish(TurnEvent::Started {
