@@ -14,7 +14,7 @@ provides=('smedja')
 
 source_x86_64=("smedja-linux-x86_64.tar.gz::https://github.com/mwigge/smedja/releases/download/v${pkgver}/smedja-linux-x86_64.tar.gz")
 source_aarch64=("smedja-linux-aarch64.tar.gz::https://github.com/mwigge/smedja/releases/download/v${pkgver}/smedja-linux-aarch64.tar.gz")
-sha256sums_x86_64=('716027dd5c276a59e757d55e0134c382329f75e7a04305614bcc84dfa30381b3')
+sha256sums_x86_64=('14192b44d5b3ef4a13d422b06844020ec1ba33ce76c07689e55811b49154f12f')
 sha256sums_aarch64=('SKIP')
 
 package() {
