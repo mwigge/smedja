@@ -8,7 +8,7 @@
 //! The pure-formatting helpers in this module are only called from within
 //! `dispatch_slash`; they live here to keep `main.rs` focused on wiring.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -86,6 +86,123 @@ pub(crate) fn format_local_model_list(v: &serde_json::Value) -> String {
         lines.push(format!("  {id} [{fit}]{marker}"));
     }
     lines.join("\n")
+}
+
+/// Renders a `session.history` response as a compact, readable memory listing:
+/// one entry per stored turn (user prompt + assistant reply previews) plus an
+/// audit-trail count. Used by `/memory`.
+pub(crate) fn format_memory(history: &Value, context: Option<&Value>, sid: &str) -> String {
+    let short: String = sid.chars().take(8).collect();
+    let mut lines = vec![format!("\u{25a4} memory · session {short}")];
+
+    // Short-term working set + semantic vault (from session.context).
+    if let Some(ctx) = context {
+        let used = ctx.get("used_tok").and_then(Value::as_u64).unwrap_or(0);
+        let window = ctx.get("window_tok").and_then(Value::as_u64).unwrap_or(0);
+        let warm = ctx.get("vault_warm_count").and_then(Value::as_u64).unwrap_or(0);
+        let cold = ctx.get("vault_cold_count").and_then(Value::as_u64).unwrap_or(0);
+        let pct = used.saturating_mul(100).checked_div(window).unwrap_or(0);
+        lines.push(format!(
+            "  short-term · context {used}/{window} tok ({pct}%)"
+        ));
+        lines.push(format!(
+            "  vault · {warm} warm + {cold} cold semantic entries"
+        ));
+    }
+
+    let turns = history.get("turns").and_then(Value::as_array);
+    match turns {
+        Some(turns) if !turns.is_empty() => {
+            lines.push(format!("{} stored turn(s) — long-term memory:", turns.len()));
+            for t in turns {
+                let n = t.get("turn_n").and_then(Value::as_u64).unwrap_or(0);
+                let msgs = t.get("messages").and_then(Value::as_array);
+                let (mut user, mut asst) = (String::new(), String::new());
+                if let Some(msgs) = msgs {
+                    for m in msgs {
+                        let role = m.get("role").and_then(Value::as_str).unwrap_or("");
+                        let content = m.get("content").and_then(Value::as_str).unwrap_or("");
+                        let preview: String = content.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let preview: String = preview.chars().take(72).collect();
+                        if role == "user" && user.is_empty() {
+                            user = preview;
+                        } else if role == "assistant" && asst.is_empty() {
+                            asst = preview;
+                        }
+                    }
+                }
+                lines.push(format!("  #{n} \u{25b8} {user}"));
+                if !asst.is_empty() {
+                    lines.push(format!("      \u{21b3} {asst}"));
+                }
+            }
+        }
+        _ => lines.push("  (no stored turns yet — memory fills as turns complete)".to_owned()),
+    }
+
+    if let Some(audit) = history.get("audit").and_then(Value::as_array) {
+        if !audit.is_empty() {
+            lines.push(format!("{} audit event(s) in the tool/turn trail", audit.len()));
+        }
+    }
+    lines.push("tip: /memory <session_id> views another session's memory".to_owned());
+    lines.join("\n")
+}
+
+/// Home directory (`$HOME`, falling back to `.`).
+fn home_dir() -> PathBuf {
+    std::env::var("HOME").map_or_else(|_| PathBuf::from("."), PathBuf::from)
+}
+
+/// Lists skill names in `dir`: `<name>.md` → `name`, `<name>/SKILL.md` → `name`.
+pub(crate) fn list_skill_dir(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                if path.join("SKILL.md").exists() {
+                    if let Some(n) = path.file_name().and_then(|s| s.to_str()) {
+                        out.push(n.to_owned());
+                    }
+                }
+            } else if path.extension().and_then(|s| s.to_str()) == Some("md") {
+                if let Some(n) = path.file_stem().and_then(|s| s.to_str()) {
+                    out.push(n.to_owned());
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Copies every `*.md` from `src` into the workspace skills dir `dst`, creating
+/// `dst` as needed. Returns a status string.
+pub(crate) fn install_skills_dir(src: &Path, dst: &Path) -> String {
+    if !src.is_dir() {
+        return format!("skills: {} is not a directory", src.display());
+    }
+    if std::fs::create_dir_all(dst).is_err() {
+        return "skills: cannot create .smedja/skills".to_owned();
+    }
+    let mut n = 0u32;
+    if let Ok(rd) = std::fs::read_dir(src) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("md") {
+                if let Some(name) = p.file_name() {
+                    if std::fs::copy(&p, dst.join(name)).is_ok() {
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+    format!(
+        "\u{2713} installed {n} skill file(s) into {} — auto-injected next turn",
+        dst.display()
+    )
 }
 
 pub(crate) fn format_agents_table(v: &serde_json::Value) -> String {
@@ -186,6 +303,120 @@ pub(crate) async fn dispatch_slash(
             push_system_message(state, text);
             Ok(true)
         }
+        // `/memory` lists this session's stored memory (the long-term turn
+        // history); `/memory <session_id>` views ANOTHER session's memory — e.g.
+        // a new runner (codex) inspecting work a prior runner (claude) left
+        // behind. This is the cross-client memory hand-off surface.
+        "memory" => {
+            let sid = if args.is_empty() {
+                state.session_id.clone()
+            } else {
+                args.to_owned()
+            };
+            let ctx = client
+                .call("session.context", json!({ "session_id": sid }))
+                .await
+                .ok();
+            let text = match client
+                .call("session.history", json!({ "session_id": sid }))
+                .await
+            {
+                Ok(v) => format_memory(&v, ctx.as_ref(), &sid),
+                Err(e) => format!("memory: session.history error: {e}"),
+            };
+            push_system_message(state, text);
+            Ok(true)
+        }
+        // `/index [path]` builds the code graph for the workspace (defaults to the
+        // TUI's working directory, NOT the daemon's). The graph is auto-injected
+        // into the agent's context once built.
+        "index" => {
+            let workspace = if args.is_empty() {
+                std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            } else {
+                args.to_owned()
+            };
+            push_system_message(state, format!("indexing code graph: {workspace}\u{2026}"));
+            let text = match client
+                .call("graph.index", json!({ "workspace": workspace }))
+                .await
+            {
+                Ok(v) => {
+                    let n = v.get("indexed").and_then(Value::as_u64).unwrap_or(0);
+                    let ws = v
+                        .get("workspace")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&workspace);
+                    state.graph_symbols = usize::try_from(n).ok();
+                    format!(
+                        "\u{25c6} code graph: {n} symbols indexed ({ws}) — auto-injected into agent context"
+                    )
+                }
+                Err(e) => format!("graph.index error: {e}"),
+            };
+            push_system_message(state, text);
+            Ok(true)
+        }
+        // `/skills` lists available skills (global ~/.claude/skills + workspace
+        // .smedja/skills); `/skills add <dir>` copies *.md from a directory into
+        // the workspace skills folder. Skills are auto-injected into agent context.
+        // `/tools` lists recent tool calls with fuller args than the inline card
+        // — the always-works backup to right-clicking a card for the overlay.
+        "tools" => {
+            if state.tool_details.is_empty() {
+                push_system_message(state, "no tool calls this session yet");
+                return Ok(true);
+            }
+            let mut lines = vec![format!(
+                "\u{2692} {} tool call(s) — right-click a card for full args",
+                state.tool_details.len()
+            )];
+            let start = state.tool_details.len().saturating_sub(12);
+            for (i, (_, name, full)) in state.tool_details.iter().enumerate().skip(start) {
+                let preview: String = full
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(160)
+                    .collect();
+                lines.push(format!("  [{i}] {name} \u{00b7} {preview}"));
+            }
+            push_system_message(state, lines.join("\n"));
+            Ok(true)
+        }
+        "skills" | "skill" => {
+            let global_dir = home_dir().join(".claude").join("skills");
+            let ws_dir = std::env::current_dir()
+                .unwrap_or_default()
+                .join(".smedja")
+                .join("skills");
+            if let Some(add_path) = args.strip_prefix("add ") {
+                let text = install_skills_dir(Path::new(add_path.trim()), &ws_dir);
+                push_system_message(state, text);
+                return Ok(true);
+            }
+            let global = list_skill_dir(&global_dir);
+            let ws = list_skill_dir(&ws_dir);
+            let fmt = |v: &[String]| {
+                if v.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    v.join(", ")
+                }
+            };
+            let text = [
+                "\u{2692} skills (auto-injected into agent context)".to_owned(),
+                format!("  global  ~/.claude/skills : {}", fmt(&global)),
+                format!("  work .smedja/skills      : {}", fmt(&ws)),
+                "add: /skills add <dir>  (copies *.md into .smedja/skills)".to_owned(),
+            ]
+            .join("\n");
+            push_system_message(state, text);
+            Ok(true)
+        }
         "agent" => {
             if args.is_empty() {
                 let result = client.call("runner.list", json!({})).await;
@@ -257,7 +488,7 @@ pub(crate) async fn dispatch_slash(
                 transition_args if transition_args.starts_with("transition ") => {
                     let rest = transition_args.trim_start_matches("transition ").trim();
                     // Validate status before delegating to gov_transition.
-                    let status_arg = rest.splitn(2, ' ').nth(1).unwrap_or("").trim();
+                    let status_arg = rest.split_once(' ').map(|x| x.1).unwrap_or("").trim();
                     const VALID_WI_STATUSES: &[&str] =
                         &["planned", "in_progress", "done", "cancelled"];
                     const VALID_DOC_STATUSES: &[&str] =
@@ -864,9 +1095,15 @@ pub(crate) async fn dispatch_slash(
                                   authenticate via the copilot CLI or VS Code extension."
                         .to_owned(),
                     "minimax" => {
-                        "set MINIMAX_API_KEY=<your-key> in your shell profile.".to_owned()
+                        state.secret_var = Some("MINIMAX_API_KEY".to_owned());
+                        "paste your Minimax API key then Enter — input is hidden · Esc to cancel"
+                            .to_owned()
                     }
-                    "berget" => "set BERGET_API_KEY=<your-key> in your shell profile.".to_owned(),
+                    "berget" => {
+                        state.secret_var = Some("BERGET_API_KEY".to_owned());
+                        "paste your Berget API key then Enter — input is hidden · Esc to cancel"
+                            .to_owned()
+                    }
                     other => format!(
                         "unknown runner: {other}\nvalid: claude, codex, local, copilot, minimax, berget"
                     ),
@@ -931,6 +1168,13 @@ pub(crate) async fn dispatch_slash(
                         .to_owned();
                     state.runner.clone_from(&canonical);
                     push_system_message(state, format!("runner switched to {canonical}"));
+                    // Show the existing session memory the new runner picks up.
+                    if let Ok(hist) = client
+                        .call("session.history", json!({ "session_id": session_id }))
+                        .await
+                    {
+                        push_system_message(state, format_memory(&hist, None, &session_id));
+                    }
                 }
                 Err(e) => push_system_message(state, format!("session.set_runner error: {e}")),
             }
@@ -972,6 +1216,14 @@ pub(crate) async fn dispatch_slash(
                             &new_session_id[..8.min(new_session_id.len())]
                         ),
                     );
+                    // Surface the memory the new runner inherits so the hand-off
+                    // is transparent (e.g. codex seeing claude's prior work).
+                    if let Ok(hist) = client
+                        .call("session.history", json!({ "session_id": new_session_id }))
+                        .await
+                    {
+                        push_system_message(state, format_memory(&hist, None, &new_session_id));
+                    }
                 }
                 Err(e) => push_system_message(state, format!("session.takeover error: {e}")),
             }

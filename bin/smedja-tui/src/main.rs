@@ -27,7 +27,7 @@ use std::io::stdout;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use statusbar::{render_status_bar, ModuleCtx};
+use statusbar::ModuleCtx;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -41,8 +41,8 @@ use crossterm::terminal::{
 use crossterm::{event, execute};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Modifier, Style};
-use crate::theme::palette;
+use ratatui::style::{Color, Modifier, Style};
+use crate::theme::{palette, runner_color, runner_label};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Terminal;
@@ -156,9 +156,11 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/gov",
     "/health",
     "/help",
+    "/index",
     "/login",
     "/loop",
     "/lsp",
+    "/memory",
     "/metrics",
     "/model",
     "/pptx",
@@ -167,11 +169,13 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/resume",
     "/review",
     "/session",
+    "/skills",
     "/spec",
     "/switch",
     "/takeover",
     "/test",
     "/tier",
+    "/tools",
     "/upgrade",
     "/version",
 ];
@@ -189,7 +193,9 @@ slash commands:
   /help              — show this message
   /login             — authenticate with runner
   /loop [status|list|create <goal>|cancel] — manage loop runs
+  /index [path]      — build the code graph for the workspace (auto-injected into context)
   /lsp               — show LSP server status and diagnostic summary
+  /memory [session]  — list stored memory (turn history); pass a session id to view another's
   /metrics           — show token usage and cost
   /model [name]      — show or set model (local runner: lists GPU fit / hot-swaps)
   /pptx <slug>       — generate PowerPoint
@@ -198,9 +204,11 @@ slash commands:
   /resume [id [turn]] — resume a session (omit id for interactive picker; turn rewinds)
   /review            — send git diff for review
   /spec              — browse OpenSpec changes
+  /skills [add <dir>] — list skills (~/.claude/skills + .smedja/skills) or add a directory
   /switch [runner]   — switch AI runner (omit for interactive picker)
   /takeover <runner> — fork session to new runner
   /test              — run cargo test and show a pass/fail summary
+  /tools             — list recent tool calls (right-click a tool card for full args)
   /tier <t>          — set tier (local|fast|deep)
   /version           — print current version and check for a newer release
   /upgrade           — download and install the latest release in-place
@@ -235,6 +243,7 @@ keybindings (scroll/normal mode):
   Ctrl-O             — toggle observability panel
   Ctrl-W             — toggle session browser (left rail)
   [ / ]              — move cursor up / down in session rail
+  mouse drag         — mark lines in the messages panel; release copies them
   v                  — start line selection (visual mode)
   y                  — yank selection to clipboard
   t                  — copy traceparent
@@ -242,9 +251,8 @@ keybindings (scroll/normal mode):
   /                  — search panel text (type to filter, Esc to clear)
   Esc                — exit selection / return to input
 
-note: scroll wheel scrolls the main panel; use v/y in scroll mode to copy text.
-      mouse capture is active — the outer GPU terminal's click-selection is
-      suspended while smedja-tui is focused.";
+note: scroll wheel scrolls the main panel; drag the mouse over messages to mark
+      and copy, or use v/y in scroll mode. Long messages wrap to the panel width.";
 
 /// Visibility state for all toggleable rail and overlay panels.
 ///
@@ -277,6 +285,23 @@ pub(crate) struct AppState {
     messages: Vec<Message>,
     input: String,
     quit: bool,
+    /// True after one Ctrl-C with an empty input — a second consecutive Ctrl-C
+    /// confirms quit. Reset by any other key so quitting is always deliberate.
+    quit_armed: bool,
+    /// Symbol count from the last `/index` this session (`None` = not indexed
+    /// here yet). Surfaced as a code-graph status under the LSP panel.
+    graph_symbols: Option<usize>,
+    /// Tool-call detail log: `(card_line_index, tool_name, full_input)`. Backs
+    /// right-click expansion of a tool card and the `/tools` inspector.
+    tool_details: Vec<(usize, String, String)>,
+    /// The currently-running tool card awaiting its result: `(line, name,
+    /// input_summary)`. Resolved to ✓/✗ when the result arrives.
+    pending_tool: Option<(usize, String, String)>,
+    /// When `Some(env_var)`, the input bar is in masked secret-entry mode (e.g.
+    /// pasting an API key during login). Input renders as dots and Enter saves
+    /// the value to the secrets file under this env-var name instead of sending
+    /// a turn. `Esc` cancels.
+    secret_var: Option<String>,
     /// Task ID of an in-flight turn being polled for a response.
     pending_task_id: Option<String>,
     /// Timestamp of the last poll attempt.
@@ -342,6 +367,10 @@ pub(crate) struct AppState {
     last_session_rail_poll: Option<std::time::Instant>,
     /// True while a turn is awaiting a streaming response.
     turn_in_flight: bool,
+    /// True once the assistant author chip + fresh line for the current turn have
+    /// been emitted, so streamed deltas land on their own line (not merged into
+    /// the preceding "queued"/user line) and the chip is shown exactly once.
+    assistant_open: bool,
     /// Number of consecutive unexpected (non-done) poll responses received.
     ///
     /// Used to rate-limit the "waiting for turn…" status message so it does not
@@ -349,12 +378,12 @@ pub(crate) struct AppState {
     poll_retry_count: u32,
     /// Whether the messages panel has scroll focus (input bar is inactive).
     scroll_focus: bool,
-    /// Whether visual line-selection mode is active within the messages panel.
+    /// Whether selection mode is active within the messages panel.
     selection_mode: bool,
-    /// Anchor line index for the current selection (0 = oldest line).
-    selection_anchor: usize,
-    /// Moving end line index for the current selection.
-    selection_end: usize,
+    /// Anchor `(line, char_col)` of the current selection.
+    selection_anchor: (usize, usize),
+    /// Moving end `(line, char_col)` of the current selection.
+    selection_end: (usize, usize),
     /// First `g` press received; waiting for a second `g` to jump to top.
     g_pending: bool,
     /// Byte offset of the insertion cursor within `input`.
@@ -608,7 +637,13 @@ pub(crate) async fn submit(input: &str, state: &mut AppState, client: &mut Clien
         role: Role::User,
         text: text.clone(),
     };
+    // Author chip + message body. Reset the assistant chip latch so the next
+    // response emits its own "▌ <runner>" boundary on a fresh line.
+    state
+        .main_panel
+        .push_styled_line(author_chip("you", palette().accent, state.no_color));
     state.main_panel.push_line(user_msg.text.clone());
+    state.assistant_open = false;
     state.messages.push(user_msg);
     state.turn_n += 1;
     state.turn_submitted_at = Some(std::time::Instant::now());
@@ -639,17 +674,39 @@ pub(crate) async fn submit(input: &str, state: &mut AppState, client: &mut Clien
             let tid = task_id.clone();
             tokio::spawn(start_stream_reader(sock, tid, tx));
 
-            format!("queued (task: {task_id})")
+            // "queued" is operational noise — route it to the actions log, not
+            // the message box (keeps the conversation clean).
+            push_action_log(state, format!("queued (task: {task_id})"));
+            None
         }
-        Err(ref e) => format!("error: {e}"),
+        Err(ref e) => Some(format!("error: {e}")),
     };
-    let sys_msg = Message {
-        role: Role::System,
-        text: reply,
-    };
-    state.main_panel.push_line(sys_msg.text.clone());
-    state.messages.push(sys_msg);
+    // Only genuine errors surface in the message panel now.
+    if let Some(text) = reply {
+        let sys_msg = Message {
+            role: Role::System,
+            text,
+        };
+        state.main_panel.push_line(sys_msg.text.clone());
+        state.messages.push(sys_msg);
+    }
     Ok(())
+}
+
+/// Appends a single operational entry to the actions log (the "emit" rail),
+/// timestamped, without touching the message panel.
+fn push_action_log(state: &mut AppState, action: impl Into<String>) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let ts = format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+    state.action_log.push(action_log::AuditEntry {
+        timestamp: ts,
+        action: action.into(),
+        tool_name: String::new(),
+        outcome: "sys".to_owned(),
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -679,7 +736,10 @@ fn classify_turn_error(msg: &str) -> (&'static str, &'static str) {
     } else if lower.contains("quota") || lower.contains("429") {
         ("QUOTA EXCEEDED", "Daily quota reached; check smj cost")
     } else if lower.contains("timeout") || lower.contains("timed out") {
-        ("TIMEOUT", "Turn exceeded the time limit; try a shorter prompt")
+        (
+            "TIMEOUT",
+            "Turn hit the wall-clock cap (default 900s; raise with SMEDJA_TURN_TIMEOUT_S)",
+        )
     } else if lower.contains("network") || lower.contains("connection") || lower.contains("connect") {
         ("NETWORK ERROR", "Check network connectivity and provider endpoint")
     } else {
@@ -716,6 +776,205 @@ pub(crate) fn push_system_message(state: &mut AppState, text: impl Into<String>)
     }
     state.main_panel.push_line(msg.text.clone());
     state.messages.push(msg);
+}
+
+/// Maps a tool name to a compact `(glyph, short-label)` pair so cards stay tidy
+/// — e.g. the verbose "ToolSearch" becomes "⌕ search". Unknown tools fall back
+/// to a lowercased, length-capped name.
+fn tool_glyph_label(name: &str) -> (&'static str, String) {
+    match name {
+        "Bash" | "bash" | "shell" => ("⌘", "bash".to_owned()),
+        "Read" | "read" => ("◇", "read".to_owned()),
+        "Write" | "write" => ("✎", "write".to_owned()),
+        "Edit" | "edit" | "MultiEdit" | "Update" => ("✎", "edit".to_owned()),
+        "Grep" | "grep" | "search_files" => ("⌕", "grep".to_owned()),
+        "Glob" | "glob" | "find" => ("⌕", "glob".to_owned()),
+        "ToolSearch" => ("⌕", "search".to_owned()),
+        "WebFetch" | "fetch" => ("⬇", "fetch".to_owned()),
+        "WebSearch" => ("⌕", "web".to_owned()),
+        "Task" | "Agent" => ("◈", "agent".to_owned()),
+        "TodoWrite" => ("☑", "todo".to_owned()),
+        "NotebookEdit" => ("✎", "notebook".to_owned()),
+        other => {
+            let s: String = other.to_lowercase().chars().take(14).collect();
+            ("▶", s)
+        }
+    }
+}
+
+/// Builds a one-line tool-call card — `<status> <glyph> <label>  <summary>`.
+/// `status` is the progress glyph: a spinner frame while running, `✓` on success,
+/// `✗` on error. glyph+label are accented/bold and the summary dimmed.
+fn tool_call_card(name: &str, input: &str, no_color: bool, status: char) -> Line<'static> {
+    let (glyph, label) = tool_glyph_label(name);
+    let (status_style, head_style, arg_style) = if no_color {
+        (
+            Style::default(),
+            Style::default().add_modifier(Modifier::BOLD),
+            Style::default(),
+        )
+    } else {
+        let p = palette();
+        let st = match status {
+            '\u{2713}' => Style::default().fg(p.code_added),   // ✓
+            '\u{2717}' => Style::default().fg(p.code_removed), // ✗
+            _ => Style::default().fg(p.text_dim),
+        };
+        (
+            st,
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(p.text_dim),
+        )
+    };
+    let mut spans = vec![
+        Span::styled(format!("{status} "), status_style),
+        Span::styled(format!("{glyph} {label}"), head_style),
+    ];
+    if !input.is_empty() {
+        spans.push(Span::styled(format!("  {input}"), arg_style));
+    }
+    Line::from(spans)
+}
+
+/// Saves a secret (e.g. an API key pasted during login) to
+/// `~/.config/smedja/secrets.env` under `var`, replacing any existing line for
+/// that variable, and chmods the file to 0600. Returns a status string that
+/// never contains the secret value.
+fn save_secret(var: &str, value: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
+    let dir = std::path::PathBuf::from(home).join(".config").join("smedja");
+    let path = dir.join("secrets.env");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return "login: cannot create ~/.config/smedja".to_owned();
+    }
+    let prefix = format!("{var}=");
+    let mut lines: Vec<String> = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.starts_with(&prefix))
+        .map(str::to_owned)
+        .collect();
+    lines.push(format!("{var}={value}"));
+    let body = format!("{}\n", lines.join("\n"));
+    if std::fs::write(&path, body).is_err() {
+        return format!("login: failed to write {}", path.display());
+    }
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    format!(
+        "\u{2713} saved {var} to {} (0600). Activate: add\n  EnvironmentFile=%h/.config/smedja/secrets.env\nto the smdjad unit, then: systemctl --user restart smdjad",
+        path.display()
+    )
+}
+
+/// Formats a tool call's full arguments into overlay lines, pretty-printing the
+/// JSON input when possible. Used by right-click expansion and `/tools`.
+pub(crate) fn format_tool_detail(name: &str, full: &str) -> Vec<String> {
+    let mut lines = vec![format!("tool: {name}"), String::new()];
+    let pretty = serde_json::from_str::<serde_json::Value>(full)
+        .ok()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        .unwrap_or_else(|| full.to_owned());
+    lines.extend(pretty.lines().map(str::to_owned));
+    lines.push(String::new());
+    lines.push("(Esc to close)".to_owned());
+    lines
+}
+
+/// Builds an author chip line (`▌ you` / `▌ claude`) marking a turn boundary so
+/// messages have clear authorship. Pushed on its own line; the message body
+/// follows beneath it.
+fn author_chip(label: &str, color: Color, no_color: bool) -> Line<'static> {
+    let style = if no_color {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    };
+    Line::from(Span::styled(format!("▌ {label}"), style))
+}
+
+/// Builds the starship-style segmented status line: a mode pip, a runner chip
+/// (brand-coloured), tier, mode, and a dim session id, separated by thin dots.
+/// Colour-segmented rather than powerline-glyph based, so it needs no Nerd Font.
+fn status_bar_line(ctx: &ModuleCtx<'_>, no_color: bool) -> Line<'static> {
+    let p = palette();
+    let plain = no_color;
+    let dim = if plain {
+        Style::default()
+    } else {
+        Style::default().fg(p.text_dim).bg(p.panel)
+    };
+    let sep = || Span::styled(" · ", dim);
+    let chip = |text: String, color: Color, bold: bool| {
+        let mut s = if plain {
+            Style::default()
+        } else {
+            Style::default().fg(color).bg(p.panel)
+        };
+        if bold {
+            s = s.add_modifier(Modifier::BOLD);
+        }
+        Span::styled(text, s)
+    };
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    // Mode pip — input vs scroll.
+    let (pip, pip_label) = if ctx.input_mode {
+        ("●", "INSERT")
+    } else {
+        ("◆", "SCROLL")
+    };
+    spans.push(chip(format!("{pip} {pip_label}"), p.accent, true));
+
+    if let Some(runner) = ctx.runner {
+        spans.push(sep());
+        spans.push(chip(
+            format!("◆ {}", runner_label(runner)),
+            runner_color(runner),
+            true,
+        ));
+    }
+    if let Some(tier) = ctx.tier {
+        spans.push(sep());
+        let c = match tier {
+            "local" => p.local,
+            "deep" => p.deep,
+            _ => p.fast,
+        };
+        spans.push(chip(tier.to_owned(), c, false));
+    }
+    if let Some(mode) = ctx.mode {
+        spans.push(sep());
+        spans.push(chip(mode.to_owned(), p.text, false));
+    }
+    spans.push(sep());
+    spans.push(chip(
+        ctx.session_id.chars().take(8).collect::<String>(),
+        p.text_dim,
+        false,
+    ));
+    if ctx.pending {
+        spans.push(chip("  ⟳".to_owned(), p.accent, true));
+    }
+    Line::from(spans)
+}
+
+/// A dim, right-aligned discoverability hint for the status row — surfaces the
+/// few entry points (slash commands + the rail toggles) so they are not
+/// keybind-only knowledge.
+fn status_hint_line(no_color: bool) -> Line<'static> {
+    let p = palette();
+    let style = if no_color {
+        Style::default()
+    } else {
+        Style::default().fg(p.text_dim).bg(p.panel)
+    };
+    Line::from(Span::styled(
+        "/help · ^W sessions · ^O obs · ^L lsp ".to_owned(),
+        style,
+    ))
 }
 
 /// Seeds the view from a `session.history` response, replaying prior turns.
@@ -1486,6 +1745,14 @@ async fn handle_key(
     client: &mut Client,
     editor: &mut rustyline::DefaultEditor,
 ) -> Result<()> {
+    // Any key other than Ctrl-C disarms the quit confirmation so the two presses
+    // must be consecutive.
+    let is_ctrl_c =
+        key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+    if !is_ctrl_c {
+        state.quit_armed = false;
+    }
+
     // ------------------------------------------------------------------
     // Cowork gate widget intercepts keys when there are pending approvals.
     // ------------------------------------------------------------------
@@ -1805,7 +2072,11 @@ async fn handle_key(
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 if state.selection_mode {
-                    state.selection_end += 1;
+                    // Keyboard selection is whole-line: extend by a line, snapping
+                    // the end column to that line's length.
+                    let next = (state.selection_end.0 + 1)
+                        .min(state.main_panel.len().saturating_sub(1));
+                    state.selection_end = (next, state.main_panel.line_char_len(next));
                 } else {
                     state.main_panel.scroll_down();
                 }
@@ -1814,7 +2085,8 @@ async fn handle_key(
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 if state.selection_mode {
-                    state.selection_end = state.selection_end.saturating_sub(1);
+                    let prev = state.selection_end.0.saturating_sub(1);
+                    state.selection_end = (prev, state.main_panel.line_char_len(prev));
                 } else {
                     state.main_panel.scroll_up();
                 }
@@ -1837,21 +2109,22 @@ async fn handle_key(
             }
             KeyCode::Char('v') if !state.selection_mode => {
                 state.selection_mode = true;
-                state.selection_anchor = state.main_panel.scroll;
-                state.selection_end = state.main_panel.scroll;
+                let l = state.main_panel.scroll;
+                state.selection_anchor = (l, 0);
+                state.selection_end = (l, state.main_panel.line_char_len(l));
                 state.g_pending = false;
                 return Ok(());
             }
             KeyCode::Char('y') if state.selection_mode => {
-                let lo = state.selection_anchor.min(state.selection_end);
-                let hi = state.selection_anchor.max(state.selection_end);
-                let lines = state.main_panel.lines_text(lo, hi);
-                let count = lines.len();
-                let msg = match yank_to_clipboard(&lines) {
+                let text = state
+                    .main_panel
+                    .selection_text(state.selection_anchor, state.selection_end);
+                let count = text.lines().count().max(1);
+                let msg = match yank_to_clipboard(std::slice::from_ref(&text)) {
                     Ok(_) => format!("\u{2713} {count} lines copied to clipboard"),
                     Err(e) => e,
                 };
-                state.clipboard = Some(lines.join("\n"));
+                state.clipboard = Some(text);
                 state.selection_mode = false;
                 push_system_message(state, msg);
                 return Ok(());
@@ -1914,10 +2187,18 @@ async fn handle_key(
 
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Some(ref text) = state.clipboard.clone() {
-                let _ = yank_to_clipboard(std::slice::from_ref(text));
-            } else {
+            // Ctrl-C is non-destructive: clear an in-progress input, otherwise
+            // require a SECOND consecutive Ctrl-C to actually quit (so an accidental
+            // press never drops you to a blank terminal). Copy is mouse / v-y.
+            if !state.input.is_empty() {
+                state.input.clear();
+                state.input_cursor = 0;
+                state.quit_armed = false;
+            } else if state.quit_armed {
                 state.quit = true;
+            } else {
+                state.quit_armed = true;
+                push_system_message(state, "press Ctrl-C again to exit smedja-tui");
             }
         }
 
@@ -2016,7 +2297,12 @@ async fn handle_key(
         }
 
         KeyCode::Esc => {
-            if state.panel_search_mode {
+            if state.secret_var.take().is_some() {
+                // Cancel masked secret entry; discard whatever was typed.
+                state.input.clear();
+                state.input_cursor = 0;
+                push_system_message(state, "login: cancelled");
+            } else if state.panel_search_mode {
                 state.panel_search_mode = false;
                 state.panel_search_query.clear();
             } else if state.diff_overlay.is_some() {
@@ -2084,100 +2370,10 @@ async fn handle_key(
             }
         }
 
-        KeyCode::Char('b') => {
-            // Toggle block browser.
-            state.block_browser_open = !state.block_browser_open;
-            if state.block_browser_open {
-                state.block_browser_cursor = 0;
-            }
-        }
-
-        KeyCode::Char('c') => {
-            if state.block_browser_open {
-                // Copy selected block text to in-memory clipboard.
-                if let Some(block) = state.block_store.blocks().nth(state.block_browser_cursor) {
-                    state.clipboard = Some(block.render_lines(80).join("\n"));
-                }
-            } else {
-                state.input.insert(state.input_cursor, 'c');
-                state.input_cursor += 1;
-            }
-        }
-
-        KeyCode::Char('r') => {
-            if state.block_browser_open {
-                // Resubmit the selected block's first user-visible content.
-                // Extract the content string while the borrow on block_store is
-                // limited to this scope so the mutable borrow for submit() can
-                // follow.
-                let content: Option<String> = {
-                    let cursor = state.block_browser_cursor;
-                    state
-                        .block_store
-                        .blocks()
-                        .nth(cursor)
-                        .map(|b| b.content.clone())
-                        .filter(|c| !c.is_empty())
-                };
-                if let Some(content) = content {
-                    submit(&content, state, client).await?;
-                }
-            } else {
-                state.input.insert(state.input_cursor, 'r');
-                state.input_cursor += 1;
-            }
-        }
-
-        KeyCode::Char('D') => {
-            // Full diff overlay for first tool_call with a diff in selected block.
-            if state.block_browser_open {
-                if let Some(block) = state.block_store.blocks().nth(state.block_browser_cursor) {
-                    let diff_lines: Option<Vec<String>> = block
-                        .tool_calls
-                        .iter()
-                        .enumerate()
-                        .find_map(|(i, entry)| {
-                            entry
-                                .diff
-                                .as_ref()
-                                .map(|d| (i, d.lines().map(str::to_owned).collect::<Vec<_>>()))
-                        })
-                        .map(|(i, lines)| {
-                            state.diff_scroll = 0;
-                            // Return sentinel index + lines; capture i via closure.
-                            let _ = i;
-                            lines
-                        });
-                    // Find the tool entry index separately.
-                    let entry_idx = block
-                        .tool_calls
-                        .iter()
-                        .position(|e| e.diff.is_some())
-                        .unwrap_or(0);
-                    if let Some(lines) = diff_lines {
-                        state.diff_overlay = Some((entry_idx, lines));
-                        state.diff_scroll = 0;
-                    }
-                }
-            }
-        }
-
-        KeyCode::Char('d') => {
-            // Toggle inline diff overlay (up to 20 lines).
-            if state.diff_overlay.is_some() {
-                state.diff_overlay = None;
-            } else if state.block_browser_open {
-                if let Some(block) = state.block_store.blocks().nth(state.block_browser_cursor) {
-                    if let Some(lines) = block.inline_diff(0, 20) {
-                        state.diff_overlay = Some((0, lines));
-                        state.diff_scroll = 0;
-                    }
-                }
-            } else {
-                state.input.insert(state.input_cursor, 'd');
-                state.input_cursor += 1;
-            }
-        }
+        // NOTE: the keyboard "block browser" (bare b/c/r/d/D) was removed — those
+        // letters now type normally via the catch-all `Char(c)` arm below. Browse
+        // with the arrow keys / mouse wheel; mark & copy with the mouse;
+        // Shift+Enter for a newline.
 
         // Shift/Alt/Ctrl+Enter → insert a literal newline (multi-line compose),
         // mirroring claude-cli / opencode. Requires the kitty keyboard protocol
@@ -2194,6 +2390,20 @@ async fn handle_key(
         }
 
         KeyCode::Enter => {
+            // Masked secret entry (API key paste): save to the secrets file under
+            // the pending env-var name; never echo or send it as a turn.
+            if let Some(var) = state.secret_var.take() {
+                let key = std::mem::take(&mut state.input);
+                state.input_cursor = 0;
+                let msg = if key.trim().is_empty() {
+                    "login: empty key — cancelled".to_owned()
+                } else {
+                    save_secret(&var, key.trim())
+                };
+                push_system_message(state, msg);
+                return Ok(());
+            }
+
             // L128: multi-line continuation — trailing `\` means "continue".
             if state.input.ends_with('\\') {
                 // Strip the trailing backslash and append a newline continuation.
@@ -2518,17 +2728,23 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         pending: state.pending_task_id.is_some(),
         input_mode: !state.scroll_focus,
     };
-    let status_text = render_status_bar(&ctx);
-    let status_style = if state.no_color {
+    // Starship-style segmented status line (left), with a dim discoverability
+    // hint right-aligned over the same row. Paint the panel background first so
+    // both passes share it.
+    let status_bg = if state.no_color {
         Style::default()
     } else {
-        Style::default()
-            .fg(p.text)
-            .bg(p.panel)
-            .add_modifier(Modifier::BOLD)
+        Style::default().bg(p.panel)
     };
-    let status = Paragraph::new(status_text).style(status_style);
-    frame.render_widget(status, status_area);
+    frame.render_widget(
+        Paragraph::new(status_bar_line(&ctx, state.no_color)).style(status_bg),
+        status_area,
+    );
+    frame.render_widget(
+        Paragraph::new(status_hint_line(state.no_color))
+            .alignment(ratatui::layout::Alignment::Right),
+        status_area,
+    );
 
     // -- Body: optional session rail | main panel | optional context rail ------
     const SESSION_RAIL_W: u16 = 28;
@@ -2585,9 +2801,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
 
     // L122: render MainPanel from state.main_panel.
     let selection = if state.selection_mode {
-        let lo = state.selection_anchor.min(state.selection_end);
-        let hi = state.selection_anchor.max(state.selection_end);
-        Some((lo, hi))
+        Some((state.selection_anchor, state.selection_end))
     } else {
         None
     };
@@ -2686,7 +2900,11 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
 
     // -- Input area -----------------------------------------------------------
     // L128: show continuation prefix when input contains a newline.
-    let input_display = if state.input.contains('\n') {
+    let input_display = if let Some(ref var) = state.secret_var {
+        // Masked secret entry — never echo the value (e.g. an API key).
+        let dots = "\u{2022}".repeat(state.input.chars().count());
+        format!("{var} (hidden): {dots}\u{2588}")
+    } else if state.input.contains('\n') {
         // Show the last logical line with the cursor placed correctly within it.
         let prefix_len = state.input.rfind('\n').map_or(0, |i| i + 1);
         let cursor_in_line = state.input_cursor.saturating_sub(prefix_len);
@@ -2798,7 +3016,9 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
 
         // ── LSP panel ─────────────────────────────────────────────────────
         if show_lsp && ci < rail_chunks.len() {
-            lsp_panel::LspPanel::new(&state.lsp_snapshot).render(rail_chunks[ci], frame);
+            lsp_panel::LspPanel::new(&state.lsp_snapshot)
+                .with_graph(state.graph_symbols)
+                .render(rail_chunks[ci], frame);
             ci += 1;
         }
 
@@ -2875,7 +3095,8 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
             .collect();
 
         let diff_widget =
-            Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title("diff"));
+            Paragraph::new(visible)
+                .block(Block::default().borders(Borders::ALL).title(" tool detail "));
         frame.render_widget(diff_widget, overlay_rect);
     }
 
@@ -3234,6 +3455,11 @@ async fn main() -> Result<()> {
         messages: Vec::new(),
         input: String::new(),
         quit: false,
+        quit_armed: false,
+        graph_symbols: None,
+        tool_details: Vec::new(),
+        pending_tool: None,
+        secret_var: None,
         pending_task_id: None,
         last_poll: None,
         turn_n: 0,
@@ -3272,11 +3498,12 @@ async fn main() -> Result<()> {
         session_rail_cursor: 0,
         last_session_rail_poll: None,
         turn_in_flight: false,
+        assistant_open: false,
         poll_retry_count: 0,
         scroll_focus: false,
         selection_mode: false,
-        selection_anchor: 0,
-        selection_end: 0,
+        selection_anchor: (0, 0),
+        selection_end: (0, 0),
         g_pending: false,
         input_cursor: 0,
         pending_cowork: Vec::new(),
@@ -3398,6 +3625,72 @@ async fn main() -> Result<()> {
                         MouseEventKind::ScrollUp => {
                             state.main_panel.scroll_up();
                         }
+                        // Left press inside the messages panel starts a
+                        // character-precise drag selection at the clicked column.
+                        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                            if let Some(pos) =
+                                state.main_panel.pos_at(mouse_ev.column, mouse_ev.row)
+                            {
+                                // Selection renders from `selection_mode` alone —
+                                // do NOT switch into scroll/keyboard mode, so the
+                                // user can keep typing while/after marking.
+                                state.selection_mode = true;
+                                state.selection_anchor = pos;
+                                state.selection_end = pos;
+                            }
+                        }
+                        // Right-click on a tool card → expand its full args in an
+                        // overlay (left-drag still selects; no conflict).
+                        MouseEventKind::Down(crossterm::event::MouseButton::Right) => {
+                            if let Some((line, _)) =
+                                state.main_panel.pos_at(mouse_ev.column, mouse_ev.row)
+                            {
+                                if let Some((_, name, full)) = state
+                                    .tool_details
+                                    .iter()
+                                    .find(|(l, _, _)| *l == line)
+                                    .cloned()
+                                {
+                                    state.diff_overlay =
+                                        Some((0, format_tool_detail(&name, &full)));
+                                    state.diff_scroll = 0;
+                                }
+                            }
+                        }
+                        // Dragging extends the selection to the cell under cursor.
+                        MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                            if state.selection_mode {
+                                if let Some(pos) =
+                                    state.main_panel.pos_at(mouse_ev.column, mouse_ev.row)
+                                {
+                                    state.selection_end = pos;
+                                }
+                            }
+                        }
+                        // Release copies the marked text (only if an actual range
+                        // was dragged — a bare click just places the anchor and is
+                        // dismissed without clobbering the clipboard).
+                        MouseEventKind::Up(crossterm::event::MouseButton::Left)
+                            if state.selection_mode => {
+                                if state.selection_anchor == state.selection_end {
+                                    state.selection_mode = false;
+                                } else {
+                                    let text = state.main_panel.selection_text(
+                                        state.selection_anchor,
+                                        state.selection_end,
+                                    );
+                                    let count = text.lines().count().max(1);
+                                    let msg = match yank_to_clipboard(std::slice::from_ref(&text)) {
+                                        Ok(_) => {
+                                            format!("\u{2713} {count} lines copied to clipboard")
+                                        }
+                                        Err(e) => e,
+                                    };
+                                    state.clipboard = Some(text);
+                                    state.selection_mode = false;
+                                    push_system_message(&mut state, msg);
+                                }
+                            }
                         _ => {}
                     },
                     Event::Resize(_, _) => {
@@ -3444,6 +3737,32 @@ async fn main() -> Result<()> {
                 match event["type"].as_str() {
                     Some("delta") => {
                         if let Some(text) = event["text"].as_str() {
+                            // First delta of the turn: emit the assistant author
+                            // chip on its own line so the response never merges
+                            // into the preceding line (which broke ```fences →
+                            // syntax highlighting), and start a fresh body line.
+                            if !state.assistant_open {
+                                let color = theme::runner_color(&state.runner);
+                                let label = theme::runner_label(&state.runner).to_lowercase();
+                                state.main_panel.push_styled_line(author_chip(
+                                    &label,
+                                    color,
+                                    state.no_color,
+                                ));
+                                state.main_panel.push_line(String::new());
+                                state.assistant_open = true;
+                            }
+                            // A tool-result marker (↳) resolves the running tool
+                            // card to ✓ (ok) or ✗ (error).
+                            if text.contains('\u{21b3}') {
+                                if let Some((idx, name, inp)) = state.pending_tool.take() {
+                                    let ok = !text.contains("error");
+                                    let glyph = if ok { '\u{2713}' } else { '\u{2717}' };
+                                    let card =
+                                        tool_call_card(&name, &inp, state.no_color, glyph);
+                                    state.main_panel.replace_styled_line(idx, card);
+                                }
+                            }
                             // Split on newlines so each line is a separate panel entry.
                             let mut remaining = text;
                             loop {
@@ -3452,6 +3771,10 @@ async fn main() -> Result<()> {
                                     if !chunk.is_empty() {
                                         state.main_panel.push_delta(chunk);
                                     }
+                                    // The line is now complete — classify it
+                                    // (syntax-highlight code, colour diffs) then
+                                    // open a fresh tail line for the next chunk.
+                                    state.main_panel.finalize_last_line();
                                     state.main_panel.push_line(String::new());
                                     remaining = &remaining[pos + 1..];
                                     if let Some(ref mut block) = state.current_block {
@@ -3483,14 +3806,35 @@ async fn main() -> Result<()> {
                     Some("tool_call") => {
                         let name = event["name"].as_str().unwrap_or("?");
                         let input = event["input"].as_str().unwrap_or("");
-                        let line = format!("▶ {name}({input})");
-                        state.main_panel.push_line(line.clone());
+                        let full = event["full"].as_str().unwrap_or(input);
+                        // Card starts "running" (◷); resolved to ✓/✗ when its
+                        // result arrives.
+                        let card = tool_call_card(name, input, state.no_color, '\u{25f7}');
+                        state.main_panel.push_styled_line(card);
+                        // Record the card's line + full args for right-click
+                        // expansion and the /tools inspector.
+                        let line_idx = state.main_panel.len().saturating_sub(1);
+                        state.tool_details.push((
+                            line_idx,
+                            name.to_owned(),
+                            full.to_owned(),
+                        ));
+                        state.pending_tool = Some((line_idx, name.to_owned(), input.to_owned()));
                         if let Some(ref mut block) = state.current_block {
-                            block.push_text(&line);
+                            block.push_text(&format!("▶ {name}: {input}"));
                             block.push_text("\n");
                         }
                     }
                     Some("done") => {
+                        // Classify the final streamed line (responses needn't end
+                        // with a newline) and close the assistant block.
+                        state.main_panel.finalize_last_line();
+                        state.assistant_open = false;
+                        // Any tool still marked "running" at turn end is settled.
+                        if let Some((idx, name, inp)) = state.pending_tool.take() {
+                            let card = tool_call_card(&name, &inp, state.no_color, '\u{2713}');
+                            state.main_panel.replace_styled_line(idx, card);
+                        }
                         let output_tok = event["output_tok"].as_u64().unwrap_or(0);
                         let input_tok = event["input_tok"].as_u64().unwrap_or(0);
                         let tp = event["traceparent"].as_str().map(str::to_owned);
@@ -4348,6 +4692,129 @@ pub(crate) fn format_gov_list(artifacts: &[GovArtifact]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn format_memory_lists_turns_with_previews() {
+        let history = json!({
+            "turns": [
+                { "turn_n": 1, "messages": [
+                    {"role": "user", "content": "write a counter"},
+                    {"role": "assistant", "content": "here is the code"}
+                ]}
+            ],
+            "audit": [ {"x": 1} ]
+        });
+        let ctx = json!({ "used_tok": 50, "window_tok": 200, "vault_warm_count": 3, "vault_cold_count": 7 });
+        let out = crate::slash::format_memory(&history, Some(&ctx), "abcd1234ef");
+        assert!(out.contains("memory"), "{out}");
+        assert!(out.contains("abcd1234"), "{out}"); // short session id
+        assert!(out.contains("write a counter"), "{out}");
+        assert!(out.contains("here is the code"), "{out}");
+        assert!(out.contains("1 audit event"), "{out}");
+        assert!(out.contains("/memory <session_id>"), "{out}");
+        // Short-term context + vault summary present.
+        assert!(out.contains("50/200 tok (25%)"), "{out}");
+        assert!(out.contains("3 warm + 7 cold"), "{out}");
+    }
+
+    #[test]
+    fn skills_listing_and_install_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A source dir with two skill .md files + a non-md file.
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("alpha.md"), "skill a").unwrap();
+        std::fs::write(src.join("beta.md"), "skill b").unwrap();
+        std::fs::write(src.join("notes.txt"), "ignore").unwrap();
+        // Directory-form skill.
+        let gamma = src.join("gamma");
+        std::fs::create_dir_all(&gamma).unwrap();
+        std::fs::write(gamma.join("SKILL.md"), "skill g").unwrap();
+
+        let names = crate::slash::list_skill_dir(&src);
+        assert!(names.contains(&"alpha".to_owned()), "{names:?}");
+        assert!(names.contains(&"gamma".to_owned()), "{names:?}"); // dir/SKILL.md
+        assert!(!names.iter().any(|n| n == "notes"), "{names:?}"); // .txt ignored
+
+        let dst = tmp.path().join(".smedja").join("skills");
+        let msg = crate::slash::install_skills_dir(&src, &dst);
+        assert!(msg.contains("installed 2 skill file"), "{msg}"); // alpha.md + beta.md
+        assert!(dst.join("alpha.md").exists());
+    }
+
+    #[test]
+    fn format_memory_handles_empty_history() {
+        let out = crate::slash::format_memory(&json!({ "turns": [] }), None, "sess0001");
+        assert!(out.contains("no stored turns"), "{out}");
+    }
+
+    #[test]
+    fn tool_glyph_label_compacts_verbose_names() {
+        let (g, l) = tool_glyph_label("ToolSearch");
+        assert_eq!((g, l.as_str()), ("⌕", "search"));
+        let (_, bash) = tool_glyph_label("Bash");
+        assert_eq!(bash, "bash");
+        // Unknown tool → lowercased, capped.
+        let (g2, l2) = tool_glyph_label("SomeReallyLongToolName");
+        assert_eq!(g2, "▶");
+        assert!(l2.chars().count() <= 14);
+    }
+
+    #[test]
+    fn status_bar_line_segments_runner_tier_session() {
+        let ctx = ModuleCtx {
+            session_id: "abcd1234ef",
+            mode: Some("impl"),
+            tier: Some("deep"),
+            runner: Some("claude-cli"),
+            pending: false,
+            input_mode: true,
+        };
+        let text: String = status_bar_line(&ctx, true)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("INSERT"), "{text}");
+        assert!(text.contains("CLAUDE"), "{text}"); // runner_label uppercases
+        assert!(text.contains("deep"), "{text}");
+        assert!(text.contains("abcd1234"), "{text}"); // 8-char session id
+    }
+
+    #[test]
+    fn status_hint_advertises_real_entry_points() {
+        let text: String = status_hint_line(true)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("/help"), "{text}");
+        assert!(text.contains("^W"), "{text}");
+    }
+
+    #[test]
+    fn format_tool_detail_pretty_prints_json_args() {
+        let lines = format_tool_detail("Bash", r#"{"command":"ls -la","timeout":5}"#);
+        let joined = lines.join("\n");
+        assert!(joined.contains("tool: Bash"), "{joined}");
+        assert!(joined.contains("\"command\""), "{joined}"); // pretty JSON
+        assert!(joined.contains("ls -la"), "{joined}");
+        assert!(joined.contains("Esc to close"), "{joined}");
+        // Non-JSON falls back to raw.
+        let raw = format_tool_detail("X", "not json");
+        assert!(raw.join("\n").contains("not json"));
+    }
+
+    #[test]
+    fn tool_call_card_shows_glyph_label_and_summary() {
+        let line = tool_call_card("Bash", "find . -type f", true, '\u{2713}');
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("bash"), "{text}");
+        assert!(text.contains("find . -type f"), "{text}");
+        assert!(text.contains('\u{2713}'), "{text}"); // status glyph present
+        // No raw JSON braces leak into the card.
+        assert!(!text.contains('{'), "{text}");
+    }
+
     // --- metrics-live-fetch: pure JSON→rows mapper ---
 
     #[test]
@@ -5193,6 +5660,11 @@ mod tests {
             messages: Vec::new(),
             input: String::new(),
             quit: false,
+            quit_armed: false,
+            graph_symbols: None,
+            tool_details: Vec::new(),
+            pending_tool: None,
+            secret_var: None,
             pending_task_id: None,
             last_poll: None,
             turn_n: 0,
@@ -5231,11 +5703,12 @@ mod tests {
             session_rail_cursor: 0,
             last_session_rail_poll: None,
             turn_in_flight: false,
+            assistant_open: false,
             poll_retry_count: 0,
             scroll_focus: false,
             selection_mode: false,
-            selection_anchor: 0,
-            selection_end: 0,
+            selection_anchor: (0, 0),
+            selection_end: (0, 0),
             g_pending: false,
             input_cursor: 0,
             pending_cowork: Vec::new(),
@@ -5749,8 +6222,8 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(
-            content.contains("anthropic"),
-            "status bar must render the runner; got: {content}"
+            content.contains("ANTHROPIC"),
+            "status bar must render the runner label; got: {content}"
         );
     }
 
@@ -5791,8 +6264,8 @@ mod tests {
         }
         state.scroll_focus = true;
         state.selection_mode = true;
-        state.selection_anchor = 3;
-        state.selection_end = 6;
+        state.selection_anchor = (3, 0);
+        state.selection_end = (6, 0);
         state.main_panel.scroll = 3;
 
         // Simulate the Esc path: selection_mode cleared, scroll unchanged.
@@ -6074,8 +6547,8 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(
-            content.contains("[I]"),
-            "status bar must show [I] when scroll_focus=false; got: {content}"
+            content.contains("INSERT"),
+            "status bar must show INSERT when scroll_focus=false; got: {content}"
         );
     }
 
@@ -6090,8 +6563,8 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(
-            content.contains("[N]"),
-            "status bar must show [N] when scroll_focus=true; got: {content}"
+            content.contains("SCROLL"),
+            "status bar must show SCROLL when scroll_focus=true; got: {content}"
         );
     }
 
@@ -6752,8 +7225,8 @@ mod tests {
     #[test]
     fn resolve_editor_falls_back_to_vi() {
         // Remove VISUAL and EDITOR from the environment for this test.
-        let _v = std::env::remove_var("VISUAL");
-        let _e = std::env::remove_var("EDITOR");
+        std::env::remove_var("VISUAL");
+        std::env::remove_var("EDITOR");
         // Can't guarantee clean env in parallel tests, but the fallback path
         // must always produce a non-empty string.
         let editor = resolve_editor();

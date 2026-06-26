@@ -310,13 +310,6 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    fn snap_with_latency(samples: &[u64]) -> ObsSnapshot {
-        ObsSnapshot {
-            latency_samples: samples.iter().copied().collect(),
-            ..ObsSnapshot::default()
-        }
-    }
-
     #[test]
     fn percentile_empty_returns_none() {
         let empty: VecDeque<u64> = VecDeque::new();

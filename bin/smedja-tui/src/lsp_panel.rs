@@ -14,12 +14,25 @@ use smedja_lsp::{LspSnapshot, ServerState, Severity};
 
 pub struct LspPanel<'a> {
     pub snapshot: &'a LspSnapshot,
+    /// Code-graph symbol count from this session's last `/index`, shown as a
+    /// footer line so graph status sits directly under the LSP panel.
+    graph_symbols: Option<usize>,
 }
 
 impl<'a> LspPanel<'a> {
     #[must_use]
     pub fn new(snapshot: &'a LspSnapshot) -> Self {
-        Self { snapshot }
+        Self {
+            snapshot,
+            graph_symbols: None,
+        }
+    }
+
+    /// Attaches the code-graph symbol count (from `/index`) to the footer.
+    #[must_use]
+    pub fn with_graph(mut self, graph_symbols: Option<usize>) -> Self {
+        self.graph_symbols = graph_symbols;
+        self
     }
 
     pub fn render(&self, area: Rect, frame: &mut Frame) {
@@ -112,6 +125,21 @@ impl<'a> LspPanel<'a> {
                 "clean",
                 Style::default().fg(p.success),
             )));
+        }
+
+        // ── Code-graph footer ───────────────────────────────────────────────
+        if lines.len() < inner_h {
+            let graph = match self.graph_symbols {
+                Some(n) => Span::styled(
+                    format!("\u{2317} graph: {n} symbols"),
+                    Style::default().fg(p.accent),
+                ),
+                None => Span::styled(
+                    "\u{2317} graph: /index to build",
+                    Style::default().fg(p.text_dim),
+                ),
+            };
+            lines.push(Line::from(graph));
         }
 
         frame.render_widget(

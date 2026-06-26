@@ -8,6 +8,10 @@ After=network.target graphical-session.target
 # is actually ready to serve.
 Type=notify
 ExecStartPre=-/bin/mkdir -p %h/.config/smedja %h/.local/share/smedja
+# Provider API keys pasted via the TUI `/login` masked entry are written here
+# (0600). The leading `-` makes the file optional, so the daemon still starts
+# when no keys have been saved.
+EnvironmentFile=-%h/.config/smedja/secrets.env
 ExecStart=%h/.local/bin/smdjad
 Restart=on-failure
 RestartSec=5s
@@ -18,22 +22,25 @@ KillMode=mixed
 Environment=XDG_RUNTIME_DIR=/run/user/%U
 
 # ── Sandboxing ────────────────────────────────────────────────────────────
-# ProtectHome=read-only locks down $HOME, but smdjad legitimately needs to
-# write its config, state (ingot DB), and runtime socket/secret. ReadWritePaths
-# punches holes back through ProtectSystem/ProtectHome for exactly those dirs:
-#   %h/.config/smedja        — config (prices.toml, etc.)
-#   %h/.local/share/smedja   — ingot DB and durable state
-#   %t                       — $XDG_RUNTIME_DIR (= /run/user/%U): socket, pid, secret
-# Everything else under $HOME stays read-only. CapabilityBoundingSet= is empty
-# (all capabilities dropped); RestrictAddressFamilies allows the UNIX control
-# socket plus outbound IPv4/IPv6 for LLM/OTLP traffic.
-NoNewPrivileges=yes
+# smdjad's whole job is to run coding agents (claude-cli, codex, opencode) and
+# their tools. Those children must read/run/EDIT in the user's workspace and
+# must initialise their OWN command sandboxes (claude-cli sandboxes Bash via a
+# user-namespace/bubblewrap setup). systemd unit hardening is inherited by every
+# child, so an aggressive profile (ProtectSystem=strict + ProtectHome=read-only
+# + NoNewPrivileges=yes) breaks them with "sandbox setup fails on a read-only
+# filesystem" — the agent can't run a single command.
+#
+# Command isolation is therefore delegated to the layer designed for it:
+# smedja's per-tool sandbox (landlock/seatbelt/docker) and the provider's own
+# sandbox. The unit keeps only protection that does NOT strangle children:
+#   * ProtectSystem=full — /usr, /boot, /efi, /etc stay read-only; the user's
+#     workspace under $HOME stays writable so agents can read/edit code.
+#   * NoNewPrivileges=no — required so nested agent sandboxes can initialise.
+#   * PrivateTmp=yes — private, writable /tmp for the daemon process tree.
 PrivateTmp=yes
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=%h/.config/smedja %h/.local/share/smedja %t
+ProtectSystem=full
+NoNewPrivileges=no
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-CapabilityBoundingSet=
 
 [Install]
 WantedBy=default.target

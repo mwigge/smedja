@@ -223,13 +223,19 @@ pub(crate) async fn drain_stream(
                 cache_read_tokens = cache_read_tokens.max(c);
             }
             Some(Ok(Delta::ToolCall { name, input })) => {
-                let input_summary: String = input.to_string().chars().take(120).collect();
-                let line = format!("▶ {name}({input_summary})");
-                full_response.push_str(&line);
-                full_response.push('\n');
+                // A human-readable one-line summary (the command, path, pattern…)
+                // instead of raw truncated JSON.
+                let input_summary = summarize_tool_input(&input);
+                full_response.push_str(&format!("▶ {name}: {input_summary}\n"));
+                // The full input (capped) backs the on-demand detail view.
+                let full_input: String = input.to_string().chars().take(4096).collect();
+                // Publish ONLY the structured tool_call event; the UI renders the
+                // card from it. Previously we ALSO published the same line as an
+                // AssistantDelta, so every tool call rendered twice.
                 dispatcher.publish(TurnEvent::ToolCalled {
                     tool_name: name,
                     input_summary,
+                    full_input: Some(full_input),
                     turn_id: turn_id.map(str::to_owned),
                     correlation: CorrelationCtx {
                         operation_name: Some(tel::OPERATION_EXECUTE_TOOL.to_owned()),
@@ -237,21 +243,20 @@ pub(crate) async fn drain_stream(
                     },
                     tool_call_id: None,
                 });
-                dispatcher.publish(TurnEvent::AssistantDelta {
-                    content: line,
-                    turn_id: turn_id.map(str::to_owned),
-                    correlation: correlation.clone(),
-                });
             }
             Some(Ok(Delta::ToolResult {
-                tool_use_id,
+                tool_use_id: _,
                 content,
             })) => {
-                let line = format!("✓ {tool_use_id} -> {} chars", content.chars().count());
+                // A readable result summary (status + first-line preview) instead
+                // of the opaque `✓ <tool_use_id> -> N chars`. Newline-framed so it
+                // lands on its own line in the message panel rather than merging
+                // into the surrounding assistant text.
+                let line = summarize_tool_result(&content);
                 full_response.push_str(&line);
                 full_response.push('\n');
                 dispatcher.publish(TurnEvent::AssistantDelta {
-                    content: line,
+                    content: format!("\n{line}\n"),
                     turn_id: turn_id.map(str::to_owned),
                     correlation: correlation.clone(),
                 });
@@ -285,6 +290,73 @@ pub(crate) async fn drain_stream(
     ))
 }
 
+/// Collapses a string to a single trimmed line and caps it at `max` display
+/// chars with an ellipsis — for compact tool summaries.
+fn truncate_summary(s: &str, max: usize) -> String {
+    let one_line: String = s.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
+    let trimmed = one_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if trimmed.chars().count() > max {
+        let cut: String = trimmed.chars().take(max).collect();
+        format!("{cut}…")
+    } else {
+        trimmed
+    }
+}
+
+/// Distils a tool-call input JSON value into a human one-liner: the most
+/// meaningful field (command / path / pattern / query / url …) when present,
+/// else a compact `key=value` join. Keeps tool cards readable instead of dumping
+/// raw truncated JSON.
+fn summarize_tool_input(input: &serde_json::Value) -> String {
+    const KEYS: &[&str] = &[
+        "command",
+        "file_path",
+        "path",
+        "pattern",
+        "query",
+        "url",
+        "description",
+        "prompt",
+    ];
+    if let Some(obj) = input.as_object() {
+        for k in KEYS {
+            if let Some(v) = obj.get(*k).and_then(serde_json::Value::as_str) {
+                return truncate_summary(v, 100);
+            }
+        }
+        let parts: Vec<String> = obj
+            .iter()
+            .take(4)
+            .map(|(k, v)| match v {
+                serde_json::Value::String(s) => format!("{k}={s}"),
+                other => format!("{k}={other}"),
+            })
+            .collect();
+        if !parts.is_empty() {
+            return truncate_summary(&parts.join(" "), 100);
+        }
+    }
+    truncate_summary(&input.to_string(), 100)
+}
+
+/// Summarises a tool result as `↳ <status> · <first-line preview>` (or a char
+/// count when there is no textual preview), classifying obvious failures.
+fn summarize_tool_result(content: &str) -> String {
+    let lc = content.trim_start().to_lowercase();
+    let status = if lc.starts_with("error") || lc.starts_with("permission denied") {
+        "error"
+    } else {
+        "ok"
+    };
+    let first = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let preview = truncate_summary(first, 100);
+    if preview.is_empty() {
+        format!("↳ {status} · {} chars", content.chars().count())
+    } else {
+        format!("↳ {status} · {preview}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use smedja_adapter::AdapterError;
@@ -293,6 +365,32 @@ mod tests {
 
     fn error_stream(err: AdapterError) -> smedja_adapter::DeltaStream {
         Box::pin(futures_util::stream::iter(vec![Err(err)]))
+    }
+
+    #[test]
+    fn summarize_tool_input_prefers_meaningful_field() {
+        let v = serde_json::json!({"command": "find . -type f", "timeout": 5});
+        assert_eq!(summarize_tool_input(&v), "find . -type f");
+        let v2 = serde_json::json!({"file_path": "/a/b.rs"});
+        assert_eq!(summarize_tool_input(&v2), "/a/b.rs");
+    }
+
+    #[test]
+    fn summarize_tool_input_falls_back_to_key_values() {
+        let v = serde_json::json!({"foo": "bar", "n": 3});
+        let s = summarize_tool_input(&v);
+        assert!(s.contains("foo=bar"), "{s}");
+    }
+
+    #[test]
+    fn summarize_tool_result_classifies_and_previews() {
+        let ok = summarize_tool_result("hello world\nmore");
+        assert!(ok.starts_with("↳ ok · hello world"), "{ok}");
+        let err = summarize_tool_result("error: nope");
+        assert!(err.starts_with("↳ error ·"), "{err}");
+        // No textual preview → fall back to a char count, never a tool_use_id.
+        let empty = summarize_tool_result("");
+        assert!(empty.starts_with("↳ ok · 0 chars"), "{empty}");
     }
 
     #[tokio::test]

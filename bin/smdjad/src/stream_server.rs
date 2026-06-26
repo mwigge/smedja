@@ -46,15 +46,6 @@ const DELTA_TTL_SECS: u64 = 60;
 /// connection for that turn before it switches to live Bellows events.
 pub type DeltaStore = Arc<Mutex<HashMap<String, VecDeque<String>>>>;
 
-/// Create a new empty [`DeltaStore`] and spawn the background subscriber that
-/// populates it from the Bellows dispatcher.
-///
-/// The background task subscribes to `dispatcher` and appends NDJSON-formatted
-/// event lines to the per-turn buffer.  When a turn reaches a terminal state
-/// (`Completed` or `Failed`) the buffer entry is retained so late-connecting
-/// stream clients can still replay it; callers should call
-/// [`cleanup_turn`](cleanup_turn) after a short delay to reclaim memory.
-
 /// Appends `line` to `buf`, enforcing `MAX_BUFFER_PER_TURN`.
 ///
 /// When the buffer is full, the oldest entry is evicted. If no overflow
@@ -63,7 +54,7 @@ pub type DeltaStore = Arc<Mutex<HashMap<String, VecDeque<String>>>>;
 fn evict_and_push(buf: &mut std::collections::VecDeque<String>, line: String) {
     if buf.len() >= MAX_BUFFER_PER_TURN {
         buf.pop_front();
-        let needs_overflow = buf.front().map_or(true, |l| !l.contains("buffer_overflow"));
+        let needs_overflow = buf.front().is_none_or(|l| !l.contains("buffer_overflow"));
         if needs_overflow {
             // Pop one more to make room for the overflow marker so total stays ≤ cap.
             buf.pop_front();
@@ -74,6 +65,14 @@ fn evict_and_push(buf: &mut std::collections::VecDeque<String>, line: String) {
     buf.push_back(line);
 }
 
+/// Create a new empty [`DeltaStore`] and spawn the background subscriber that
+/// populates it from the Bellows dispatcher.
+///
+/// The background task subscribes to `dispatcher` and appends NDJSON-formatted
+/// event lines to the per-turn buffer.  When a turn reaches a terminal state
+/// (`Completed` or `Failed`) the buffer entry is retained so late-connecting
+/// stream clients can still replay it; callers should call
+/// [`cleanup_turn`](cleanup_turn) after a short delay to reclaim memory.
 #[must_use]
 pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
     let store: DeltaStore = Arc::new(Mutex::new(HashMap::new()));
@@ -135,14 +134,14 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                     TurnEvent::ToolCalled {
                         ref tool_name,
                         ref input_summary,
+                        ref full_input,
                         ref turn_id,
                         ..
                     } => {
                         let Some(tid) = turn_id else { continue };
                         if let Some(buf) = store.get_mut(tid) {
-                            let line =
-                                json!({"type": "tool_call", "name": tool_name, "input": input_summary})
-                                    .to_string();
+                            let line = json!({"type": "tool_call", "name": tool_name, "input": input_summary, "full": full_input})
+                                .to_string();
                             evict_and_push(buf, line);
                         }
                     }
@@ -289,11 +288,15 @@ async fn handle_stream_connection(
     }
 
     // Forward live events filtered to this turn's task_id.
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(STREAM_TIMEOUT_SECS);
-
+    //
+    // This is an IDLE timeout, reset on every received event — not a cap on the
+    // whole turn. A long agentic turn (a repo-wide review, many tool calls)
+    // legitimately streams for minutes; only a genuinely stalled stream (no
+    // event for STREAM_TIMEOUT_SECS) should error out. The overall turn budget is
+    // enforced separately by the orchestrator's wall-clock cap.
     loop {
-        let event = match tokio::time::timeout_at(deadline, rx.recv()).await {
+        let idle = std::time::Duration::from_secs(STREAM_TIMEOUT_SECS);
+        let event = match tokio::time::timeout(idle, rx.recv()).await {
             Ok(Ok(ev)) => ev,
             Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
                 tracing::warn!(
@@ -305,7 +308,11 @@ async fn handle_stream_connection(
             }
             Ok(Err(broadcast::error::RecvError::Closed)) => break,
             Err(_elapsed) => {
-                let msg = json!({"type":"error","message":"stream timed out"}).to_string();
+                let msg = json!({
+                    "type": "error",
+                    "message": format!("stream stalled: no events for {STREAM_TIMEOUT_SECS}s")
+                })
+                .to_string();
                 let _ = write_line(&mut writer, &msg).await;
                 break;
             }
@@ -357,11 +364,12 @@ fn turn_event_to_ndjson(
         TurnEvent::ToolCalled {
             tool_name,
             input_summary,
+            full_input,
             turn_id,
             ..
         } => {
-            let line =
-                json!({"type": "tool_call", "name": tool_name, "input": input_summary}).to_string();
+            let line = json!({"type": "tool_call", "name": tool_name, "input": input_summary, "full": full_input})
+                .to_string();
             (turn_id.clone(), line, false)
         }
         TurnEvent::Completed {

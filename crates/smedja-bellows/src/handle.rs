@@ -105,6 +105,7 @@ impl TurnHandle {
         self.dispatcher.publish(TurnEvent::ToolCalled {
             tool_name: tool_name.into(),
             input_summary: input_summary.into(),
+            full_input: None,
             turn_id: Some(self.turn_id.clone()),
             correlation: self.correlation(),
             tool_call_id,

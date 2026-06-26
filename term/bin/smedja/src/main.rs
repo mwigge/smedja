@@ -393,14 +393,13 @@ impl ApplicationHandler<UserEvent> for App {
         let scale_factor = window.scale_factor();
         #[allow(clippy::cast_possible_truncation)]
         let eff_font = self.config.font.size * scale_factor as f32;
-        // Reserve BOTH the bottom status bar and the top bar, matching
-        // Renderer::grid_height_px (used on resize). The top bar is always shown
-        // (app/session/cwd segments) and has the same height as the status bar;
-        // omitting it here gave the initial PTY ~1–2 rows too many, so the
-        // client's (ratatui) layout did not match the visible area until a
-        // resize happened to correct it — corrupting the top rows.
+        // Reserve only the bottom status bar (there is no top bar anymore),
+        // matching Renderer::grid_height_px (top_bar_height_px() == 0). Reserving
+        // a phantom top row here would give the initial PTY one row too few, so
+        // the client's (ratatui) layout would not match the visible area until a
+        // resize corrected it.
         let sb_h = status_bar_height_for_font(eff_font);
-        let grid_h = size.height.saturating_sub(sb_h.saturating_mul(2));
+        let grid_h = size.height.saturating_sub(sb_h);
         let (cols, rows) = st_glyph::pixel_size_to_grid(size.width, grid_h, eff_font);
 
         // Each pane gets a stable UUID injected as SMEDJA_TERM_PANE so smdjad
@@ -612,11 +611,24 @@ impl ApplicationHandler<UserEvent> for App {
                         // positions, since scrollback rows carry stale indices.
                         // The alt screen (full-screen apps like smedja-tui/vim)
                         // has no scrollback view — always render the live grid
-                        // there, never a scrolled window.
+                        // there, never a scrolled window. Position every cell by
+                        // its grid INDEX, not its stored .row/.col fields: those
+                        // can go stale after row shifts (scroll regions, IL/DL),
+                        // and the renderer positions by the field — a stale value
+                        // draws the cell at the wrong Y, overlapping the top rows.
                         let cells: Vec<st_render::Cell> = if grid.scroll_offset <= 0 || grid.alt_screen {
                             grid.cells
                                 .iter()
-                                .flat_map(|row| row.iter().map(|c| render_cell(c, c.col, c.row)))
+                                .enumerate()
+                                .flat_map(|(r, row)| {
+                                    row.iter().enumerate().map(move |(c, cell)| {
+                                        render_cell(
+                                            cell,
+                                            u16::try_from(c).unwrap_or(u16::MAX),
+                                            u16::try_from(r).unwrap_or(u16::MAX),
+                                        )
+                                    })
+                                })
                                 .collect()
                         } else {
                             grid.visible_rows(grid.scroll_offset)
@@ -747,7 +759,13 @@ impl ApplicationHandler<UserEvent> for App {
                         .as_ref()
                         .and_then(|c| c.git_branch_symbol.clone());
 
+                    // App / session / cwd used to live in a separate TOP bar that
+                    // stole the first grid row and collided with full-screen apps'
+                    // own top row. They now lead the single bottom status bar.
                     let mut sb_modules: Vec<Box<dyn st_statusbar::StatusModule>> = vec![
+                        Box::new(st_statusbar::AppNameModule),
+                        Box::new(st_statusbar::SessionIdModule),
+                        Box::new(st_statusbar::CwdModule),
                         Box::new(st_statusbar::TierModule),
                         Box::new(st_statusbar::ModelModule),
                         Box::new(st_statusbar::TokensModule),
@@ -778,15 +796,9 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     renderer.set_status_bar_segments(&segments);
 
-                    // Build top-bar segments and push them to the renderer.
-                    let top_modules: Vec<Box<dyn st_statusbar::StatusModule>> = vec![
-                        Box::new(st_statusbar::AppNameModule),
-                        Box::new(st_statusbar::SessionIdModule),
-                        Box::new(st_statusbar::CwdModule),
-                    ];
-                    let top_segments =
-                        st_statusbar::render_status_bar_parallel(&top_modules, &sb_ctx, 8);
-                    renderer.set_top_bar_segments(&top_segments);
+                    // No top bar: keep it empty so top_bar_height_px() == 0 and the
+                    // first grid row is given back to the foreground app.
+                    renderer.set_top_bar_segments(&[]);
 
                     // Update window title.
                     let title = build_window_title(
@@ -800,18 +812,28 @@ impl ApplicationHandler<UserEvent> for App {
                     }
 
                     // Snapshot agent session content and push to renderer.
+                    //
+                    // The agent-block overlay paints over the top grid rows (no
+                    // top-bar offset). That is fine for the base shell, but when a
+                    // full-screen app owns the alt screen (smedja-tui, vim, less),
+                    // it owns every cell — the overlay would corrupt its top rows.
+                    // Suppress it there.
+                    let alt_screen = pty.grid.lock().alt_screen;
                     if let Ok(mgr) = self.agent_manager.0.try_lock() {
-                        let blocks: Vec<st_render::AgentBlockView> = mgr
-                            .sessions()
-                            .enumerate()
-                            .map(|(i, session)| st_render::AgentBlockView {
-                                start_row: u16::try_from(i * 4).unwrap_or(u16::MAX),
-                                model: session.model.clone(),
-                                content_lines: session.content_lines(),
-                                approval_pending: session.approval
-                                    == st_agent::ApprovalState::Pending,
-                            })
-                            .collect();
+                        let blocks: Vec<st_render::AgentBlockView> = if alt_screen {
+                            Vec::new()
+                        } else {
+                            mgr.sessions()
+                                .enumerate()
+                                .map(|(i, session)| st_render::AgentBlockView {
+                                    start_row: u16::try_from(i * 4).unwrap_or(u16::MAX),
+                                    model: session.model.clone(),
+                                    content_lines: session.content_lines(),
+                                    approval_pending: session.approval
+                                        == st_agent::ApprovalState::Pending,
+                                })
+                                .collect()
+                        };
                         renderer.set_agent_blocks(&blocks);
                     }
 
@@ -1212,7 +1234,17 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // When the child program (the dashboard / shell) exits, close the
+        // terminal instead of leaving a dead, grey-blank grid on screen.
+        if self
+            .pty
+            .as_ref()
+            .is_some_and(|p| p.exited.load(Ordering::Acquire))
+        {
+            event_loop.exit();
+            return;
+        }
         // Always request a redraw — stopping on occluded causes the compositor
         // to show grey when the window is unfocused (it shows its fallback
         // background when the app stops presenting frames).

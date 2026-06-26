@@ -1,7 +1,7 @@
 //! `MainPanel` widget — scrollable message area with diff-aware line styling.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use crate::theme::palette;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -9,6 +9,44 @@ use ratatui::Frame;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
+use unicode_width::UnicodeWidthChar;
+
+/// Hard-wraps a styled [`Line`] into one or more visual rows, each at most
+/// `width` display columns, splitting spans at column boundaries while
+/// preserving each span's style. An empty line yields a single empty row.
+///
+/// Hard (column) wrapping — not word wrapping — keeps the visual-row count exact
+/// and independent of `ratatui`'s internal (feature-gated) layout measurement, so
+/// the panel's scroll/follow math stays in sync with what is drawn.
+fn wrap_line_to(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut cur_w = 0usize;
+    for span in &line.spans {
+        let style = span.style;
+        let mut chunk = String::new();
+        for ch in span.content.chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if cur_w + cw > width && cur_w > 0 {
+                if !chunk.is_empty() {
+                    rows.last_mut()
+                        .unwrap()
+                        .push(Span::styled(std::mem::take(&mut chunk), style));
+                }
+                rows.push(Vec::new());
+                cur_w = 0;
+            }
+            chunk.push(ch);
+            cur_w += cw;
+        }
+        if !chunk.is_empty() {
+            rows.last_mut()
+                .unwrap()
+                .push(Span::styled(chunk, style));
+        }
+    }
+    rows.into_iter().map(Line::from).collect()
+}
 
 /// Visual style classification for a single rendered line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +83,204 @@ impl StyledLine {
     }
 }
 
+/// True for unified-diff header/hunk lines whose syntax is specific enough to
+/// recognise outside a fenced block without false-positiving on prose. Content
+/// (`+`/`-`) lines are intentionally excluded — bare `+`/`-` outside a diff is
+/// handled by the existing add/remove classification.
+fn is_diff_marker(text: &str) -> bool {
+    if text.starts_with("@@ ") && text[3..].contains("@@") {
+        return true;
+    }
+    if text.starts_with("diff --git ") {
+        return true;
+    }
+    // `--- path` / `+++ path`: require a path-like first token so prose such as
+    // "--- a thought ---" is not mistaken for a diff file header.
+    for pre in ["--- ", "+++ "] {
+        if let Some(rest) = text.strip_prefix(pre) {
+            let tok = rest.split_whitespace().next().unwrap_or("");
+            if tok.contains('/') || tok == "/dev/null" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Parses inline markdown in a prose line — `` `code` ``, `**bold**`, `*italic*`
+/// — into styled spans, returning `None` when there is no markup (so the common
+/// path stays a cheap plain line). Conservative to avoid false positives: emphasis
+/// markers must hug non-space text (CommonMark flanking), so `a * b` and bullet
+/// `* item` are left alone. The returned line's flattened text drops the markers,
+/// matching what is displayed (and what gets copied).
+fn inline_markdown_spans(text: &str) -> Option<Line<'static>> {
+    let p = palette();
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut i = 0usize;
+    let mut found = false;
+
+    let nonspace = |c: char| !c.is_whitespace();
+
+    while i < n {
+        let c = chars[i];
+        // `inline code`
+        if c == '`' {
+            if let Some(close) = (i + 1..n).find(|&j| chars[j] == '`') {
+                if close > i + 1 {
+                    if !buf.is_empty() {
+                        spans.push(Span::raw(std::mem::take(&mut buf)));
+                    }
+                    let code: String = chars[i + 1..close].iter().collect();
+                    spans.push(Span::styled(code, Style::default().fg(p.code_default)));
+                    i = close + 1;
+                    found = true;
+                    continue;
+                }
+            }
+        }
+        // **bold**
+        if c == '*' && i + 1 < n && chars[i + 1] == '*' && i + 2 < n && nonspace(chars[i + 2]) {
+            let mut j = i + 2;
+            let mut close = None;
+            while j + 1 < n {
+                if chars[j] == '*' && chars[j + 1] == '*' && nonspace(chars[j - 1]) {
+                    close = Some(j);
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(close) = close {
+                if !buf.is_empty() {
+                    spans.push(Span::raw(std::mem::take(&mut buf)));
+                }
+                let inner: String = chars[i + 2..close].iter().collect();
+                spans.push(Span::styled(inner, Style::default().add_modifier(Modifier::BOLD)));
+                i = close + 2;
+                found = true;
+                continue;
+            }
+        }
+        // *italic*
+        if c == '*' && i + 1 < n && nonspace(chars[i + 1]) {
+            if let Some(close) = (i + 1..n).find(|&j| chars[j] == '*' && nonspace(chars[j - 1])) {
+                if close > i + 1 {
+                    if !buf.is_empty() {
+                        spans.push(Span::raw(std::mem::take(&mut buf)));
+                    }
+                    let inner: String = chars[i + 1..close].iter().collect();
+                    spans.push(Span::styled(
+                        inner,
+                        Style::default().add_modifier(Modifier::ITALIC),
+                    ));
+                    i = close + 1;
+                    found = true;
+                    continue;
+                }
+            }
+        }
+        buf.push(c);
+        i += 1;
+    }
+    if !buf.is_empty() {
+        spans.push(Span::raw(buf));
+    }
+    if found {
+        Some(Line::from(spans))
+    } else {
+        None
+    }
+}
+
+/// True for a markdown table row — a trimmed line that starts with `|` and has
+/// at least one more `|`. Requiring a leading pipe avoids false-positiving on
+/// prose that merely contains a pipe.
+fn is_table_row(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with('|') && t.get(1..).is_some_and(|rest| rest.contains('|'))
+}
+
+/// Splits a table row into trimmed cell texts (outer pipes stripped).
+fn table_cells(text: &str) -> Vec<String> {
+    let t = text.trim();
+    let inner = t.strip_prefix('|').unwrap_or(t);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    inner.split('|').map(|c| c.trim().to_owned()).collect()
+}
+
+/// Renders a markdown table row: a `|---|` delimiter row becomes a horizontal
+/// rule, any other row becomes its cells joined by a dim `│`. (Columns are not
+/// auto-aligned across rows — a per-line pass that streams cleanly.)
+fn table_row_spans(text: &str) -> Line<'static> {
+    let p = palette();
+    let sep = Style::default().fg(p.border);
+    let cells = table_cells(text);
+    let is_delim = !cells.is_empty()
+        && cells.iter().all(|c| {
+            c.contains('-') && c.chars().all(|ch| ch == '-' || ch == ':' || ch.is_whitespace())
+        });
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if is_delim {
+        for (i, c) in cells.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled("┼", sep));
+            }
+            spans.push(Span::styled("─".repeat(c.chars().count().max(3)), sep));
+        }
+    } else {
+        for (i, c) in cells.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" │ ", sep));
+            }
+            spans.push(Span::raw(c.clone()));
+        }
+    }
+    Line::from(spans)
+}
+
+/// Renders one line of a unified diff the "card" way: a coloured left gutter bar
+/// for added/removed/context lines, bold dim file/meta headers, and an accented
+/// hunk (`@@ … @@`) header. Display-only — the panel keeps the original text for
+/// selection/copy, so the gutter never pollutes yanked content.
+fn diff_line_spans(text: &str) -> Line<'static> {
+    let p = palette();
+    let header = Style::default().fg(p.text_dim).add_modifier(Modifier::BOLD);
+    let hunk = Style::default().fg(p.accent).add_modifier(Modifier::BOLD);
+
+    if text.starts_with("@@") {
+        return Line::from(Span::styled(text.to_owned(), hunk));
+    }
+    if text.starts_with("diff --git")
+        || text.starts_with("index ")
+        || text.starts_with("--- ")
+        || text.starts_with("+++ ")
+        || text.starts_with("rename ")
+        || text.starts_with("similarity ")
+        || text.starts_with("new file")
+        || text.starts_with("deleted file")
+    {
+        return Line::from(Span::styled(text.to_owned(), header));
+    }
+    let body = if text.starts_with('+') {
+        Style::default().fg(p.code_added)
+    } else if text.starts_with('-') {
+        Style::default().fg(p.code_removed)
+    } else {
+        Style::default().fg(p.text_dim)
+    };
+    let bar = if text.starts_with('+') || text.starts_with('-') {
+        "▎"
+    } else {
+        " "
+    };
+    Line::from(vec![
+        Span::styled(bar, body),
+        Span::styled(text.to_owned(), body),
+    ])
+}
+
 /// Scrollable panel displaying styled message lines.
 #[derive(Debug)]
 pub struct MainPanel {
@@ -53,10 +289,68 @@ pub struct MainPanel {
     pub scroll: usize,
     /// Watermark set by `/clear`; lines before this index are not rendered.
     pub display_start: usize,
+    /// When `true`, the view stays pinned to the newest content (the streaming
+    /// default). Manual scroll-up clears it; scrolling back to the bottom re-arms
+    /// it. `scroll` is only consulted as the top anchor when `follow` is `false`.
+    follow: bool,
     /// Whether the next pushed line should be treated as code.
     in_code_block: bool,
     /// Language tag from the opening fence (e.g. "rust"), empty if none.
     code_lang: String,
+    /// Inner (border-excluded) rect of the last render — for mouse hit-testing.
+    last_inner: Rect,
+    /// Logical line index for each visual row drawn in the last render window,
+    /// so a mouse `y` maps back to the line it sits on (accounts for wrapping).
+    row_logical: Vec<usize>,
+    /// `(char_start, char_end)` offsets into the logical line's text for each
+    /// visual row drawn, so a mouse `x` maps to a character column (wrap-aware).
+    row_charbounds: Vec<(usize, usize)>,
+}
+
+/// Returns the `[a, b)` character range of `line`'s `text` that falls inside the
+/// `(anchor, end)` selection, or `None` when nothing on this line is selected.
+/// Endpoints are `(line, char_col)`; order-independent.
+fn selected_subrange(
+    selection: Option<((usize, usize), (usize, usize))>,
+    line: usize,
+    text: &str,
+) -> Option<(usize, usize)> {
+    let (anc, end) = selection?;
+    let (lo, hi) = if anc <= end { (anc, end) } else { (end, anc) };
+    if line < lo.0 || line > hi.0 {
+        return None;
+    }
+    let len = text.chars().count();
+    let a = if line == lo.0 { lo.1.min(len) } else { 0 };
+    let b = if line == hi.0 { hi.1.min(len) } else { len };
+    if a < b {
+        Some((a, b))
+    } else {
+        None
+    }
+}
+
+/// Hard-wraps `text` to `width` display columns (matching [`wrap_line_to`]) and
+/// returns the `(char_start, char_end)` range of each visual row. Used to map a
+/// mouse column to a character offset for partial-line selection.
+fn text_row_bounds(text: &str, width: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    let mut rows: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    let mut idx = 0usize;
+    let mut cur_w = 0usize;
+    for ch in text.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cur_w + cw > width && cur_w > 0 {
+            rows.push((start, idx));
+            start = idx;
+            cur_w = 0;
+        }
+        cur_w += cw;
+        idx += 1;
+    }
+    rows.push((start, idx));
+    rows
 }
 
 impl MainPanel {
@@ -67,8 +361,12 @@ impl MainPanel {
             lines: Vec::new(),
             scroll: 0,
             display_start: 0,
+            follow: true,
             in_code_block: false,
             code_lang: String::new(),
+            last_inner: Rect::new(0, 0, 0, 0),
+            row_logical: Vec::new(),
+            row_charbounds: Vec::new(),
         }
     }
 
@@ -77,6 +375,7 @@ impl MainPanel {
     pub fn clear_display(&mut self) {
         self.display_start = self.lines.len();
         self.scroll = self.lines.len();
+        self.follow = true;
     }
 
     /// Pushes a line of text, classifying its style automatically.
@@ -89,8 +388,24 @@ impl MainPanel {
     ///
     /// Auto-scrolls to follow new content when the view is already at the bottom.
     pub fn push_line(&mut self, text: String) {
-        // Track whether we're at the bottom before pushing so we can auto-scroll.
-        let was_at_bottom = self.scroll + 1 >= self.lines.len();
+
+        // Tool-result meta lines ("↳ ok · …") render dim and on their own line,
+        // never as code/diff — short-circuit before fence/prefix classification.
+        if !self.in_code_block && text.starts_with('↳') {
+            let spans = Line::from(Span::styled(
+                text.clone(),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            self.lines.push(StyledLine {
+                text,
+                style: LineStyle::Normal,
+                spans: Some(spans),
+            });
+            if self.follow {
+                self.scroll = self.lines.len().saturating_sub(1);
+            }
+            return;
+        }
 
         // Detect fence boundaries (``` with optional language tag).
         if text.trim_start().starts_with("```") {
@@ -108,7 +423,17 @@ impl MainPanel {
             }
         } else if self.in_code_block {
             // Inside a fenced block: apply syntect if we know the language.
-            if self.code_lang.is_empty() {
+            if self.code_lang.eq_ignore_ascii_case("diff")
+                || self.code_lang.eq_ignore_ascii_case("patch")
+            {
+                // Diff blocks get the gutter/header "card" treatment.
+                let spans = diff_line_spans(&text);
+                self.lines.push(StyledLine {
+                    text,
+                    style: LineStyle::Code,
+                    spans: Some(spans),
+                });
+            } else if self.code_lang.is_empty() {
                 self.lines.push(StyledLine::plain(text, LineStyle::Code));
             } else {
                 let lang = self.code_lang.clone();
@@ -119,6 +444,24 @@ impl MainPanel {
                     self.lines.extend(highlighted);
                 }
             }
+        } else if is_diff_marker(&text) {
+            // Standalone diff header/hunk outside a fence — specific enough syntax
+            // to style without false-positiving on prose.
+            let spans = diff_line_spans(&text);
+            self.lines.push(StyledLine {
+                text,
+                style: LineStyle::Normal,
+                spans: Some(spans),
+            });
+        } else if is_table_row(&text) {
+            // Markdown table row → cell separators / header rule. Keep the raw
+            // markdown as the backing text so copy yields clean source.
+            let spans = table_row_spans(&text);
+            self.lines.push(StyledLine {
+                text,
+                style: LineStyle::Normal,
+                spans: Some(spans),
+            });
         } else {
             // Outside code blocks: classify by prefix and apply math rendering.
             let style = if text.starts_with('+') {
@@ -133,11 +476,72 @@ impl MainPanel {
             } else {
                 text
             };
-            self.lines.push(StyledLine::plain(text, style));
+            // Inline markdown (bold/italic/`code`) only on plain prose lines —
+            // diff +/- lines keep their flat add/remove colour.
+            if matches!(style, LineStyle::Normal) {
+                if let Some(line) = inline_markdown_spans(&text) {
+                    let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                    self.lines.push(StyledLine {
+                        text: flat,
+                        style: LineStyle::Normal,
+                        spans: Some(line),
+                    });
+                } else {
+                    self.lines.push(StyledLine::plain(text, style));
+                }
+            } else {
+                self.lines.push(StyledLine::plain(text, style));
+            }
         }
 
-        if was_at_bottom {
+        if self.follow {
             self.scroll = self.lines.len().saturating_sub(1);
+        }
+    }
+
+    /// Pushes a pre-styled line (e.g. a tool-call card) as its own message line,
+    /// bypassing automatic classification. The flattened text backs selection and
+    /// search; `spans` carries the rendering.
+    pub fn push_styled_line(&mut self, line: Line<'static>) {
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        self.lines.push(StyledLine {
+            text,
+            style: LineStyle::Normal,
+            spans: Some(line),
+        });
+        if self.follow {
+            self.scroll = self.lines.len().saturating_sub(1);
+        }
+    }
+
+    /// Replaces the styled content of line `idx` in place (e.g. updating a tool
+    /// card from "running" to "done"). No-op if `idx` is out of range.
+    pub fn replace_styled_line(&mut self, idx: usize, line: Line<'static>) {
+        if let Some(slot) = self.lines.get_mut(idx) {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            *slot = StyledLine {
+                text,
+                style: LineStyle::Normal,
+                spans: Some(line),
+            };
+        }
+    }
+
+    /// Re-runs full classification (fence/syntect/diff/math) on the last line.
+    ///
+    /// Streaming appends raw text to the tail line via [`push_delta`], which does
+    /// not classify. Call this when a line completes (a newline arrives) so
+    /// streamed code blocks get syntax-highlighted and diff lines get coloured —
+    /// the same treatment [`push_line`] gives non-streamed content.
+    pub fn finalize_last_line(&mut self) {
+        if let Some(last) = self.lines.pop() {
+            // A line that already carries explicit spans (a card, a result meta
+            // line, or already-highlighted code) is left as-is.
+            if last.spans.is_some() {
+                self.lines.push(last);
+                return;
+            }
+            self.push_line(last.text);
         }
     }
 
@@ -147,88 +551,184 @@ impl MainPanel {
     /// `search_query` highlights lines containing the query text (yellow background).
     /// `no_color` strips all colours when the `NO_COLOR` env var is set.
     pub fn render(
-        &self,
+        &mut self,
         area: Rect,
         frame: &mut Frame,
-        selection: Option<(usize, usize)>,
+        selection: Option<((usize, usize), (usize, usize))>,
         search_query: Option<&str>,
         no_color: bool,
     ) {
-        let height = area.height.saturating_sub(2) as usize; // subtract border rows
+        let inner_w = area.width.saturating_sub(2) as usize; // subtract border cols
+        let inner_h = area.height.saturating_sub(2) as usize; // subtract border rows
         let p = palette();
 
         let search_needle = search_query
             .filter(|q| !q.is_empty())
             .map(|q| q.to_lowercase());
 
-        let visible: Vec<Line<'_>> = self
-            .lines
-            .iter()
-            .enumerate()
-            .skip(self.scroll.max(self.display_start))
-            .take(height)
-            .map(|(abs_line, sl)| {
-                let selected = selection.is_some_and(|(lo, hi)| abs_line >= lo && abs_line <= hi);
-                let is_search_match = search_needle
-                    .as_deref()
-                    .is_some_and(|q| sl.text.to_lowercase().contains(q));
-
-                if selected {
-                    // Selection always overrides spans — flatten to a single styled span.
-                    let text = sl
-                        .spans
-                        .as_ref()
-                        .map(|l| {
-                            l.spans
-                                .iter()
-                                .map(|s| s.content.as_ref())
-                                .collect::<String>()
-                        })
-                        .unwrap_or_else(|| sl.text.clone());
-                    Line::from(Span::styled(
-                        text,
-                        Style::default().fg(p.accent).bg(p.header),
-                    ))
-                } else if is_search_match {
-                    // Search match: bright forge highlight overrides normal rendering.
-                    Line::from(Span::styled(
-                        sl.text.clone(),
-                        Style::default().fg(p.bg).bg(p.text_bright),
-                    ))
-                } else if let Some(ref rich) = sl.spans {
-                    if no_color {
-                        let text = rich
-                            .spans
-                            .iter()
-                            .map(|s| s.content.as_ref())
-                            .collect::<String>();
-                        Line::raw(text)
-                    } else {
-                        rich.clone()
-                    }
-                } else {
-                    let base = if no_color {
-                        Style::default()
-                    } else {
-                        match sl.style {
-                            LineStyle::Normal => Style::default(),
-                            LineStyle::Added => Style::default().fg(p.code_added),
-                            LineStyle::Removed => Style::default().fg(p.code_removed),
-                            LineStyle::Code => Style::default().fg(p.code_default),
-                        }
-                    };
-                    Line::from(Span::styled(sl.text.clone(), base))
+        // Style one logical line into a single ratatui `Line` (selection / search
+        // / cached rich spans / prefix classification), matching the previous
+        // per-line rendering — applied before wrapping so styling survives it.
+        let style_line = |abs_line: usize, sl: &StyledLine| -> Line<'static> {
+            // Character-precise selection: split this line's text into
+            // pre / selected / post spans (the selected span reverse-styled).
+            if let Some((a, b)) = selected_subrange(selection, abs_line, &sl.text) {
+                let chars: Vec<char> = sl.text.chars().collect();
+                let hl = Style::default().fg(p.accent).bg(p.header);
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                let pre: String = chars[..a].iter().collect();
+                if !pre.is_empty() {
+                    spans.push(Span::raw(pre));
                 }
-            })
-            .collect();
+                spans.push(Span::styled(chars[a..b].iter().collect::<String>(), hl));
+                let post: String = chars[b..].iter().collect();
+                if !post.is_empty() {
+                    spans.push(Span::raw(post));
+                }
+                return Line::from(spans);
+            }
+            let is_search_match = search_needle
+                .as_deref()
+                .is_some_and(|q| sl.text.to_lowercase().contains(q));
 
-        let widget = Paragraph::new(visible).block(
+            if is_search_match {
+                Line::from(Span::styled(
+                    sl.text.clone(),
+                    Style::default().fg(p.bg).bg(p.text_bright),
+                ))
+            } else if let Some(ref rich) = sl.spans {
+                if no_color {
+                    let text = rich.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+                    Line::raw(text)
+                } else {
+                    rich.clone()
+                }
+            } else {
+                let base = if no_color {
+                    Style::default()
+                } else {
+                    match sl.style {
+                        LineStyle::Normal => Style::default(),
+                        LineStyle::Added => Style::default().fg(p.code_added),
+                        LineStyle::Removed => Style::default().fg(p.code_removed),
+                        LineStyle::Code => Style::default().fg(p.code_default),
+                    }
+                };
+                Line::from(Span::styled(sl.text.clone(), base))
+            }
+        };
+
+        // Wrap every visible logical line into visual rows, tracking the visual
+        // offset at which the `scroll` anchor line begins (used when not
+        // following the bottom) and the logical line behind each visual row (for
+        // mouse hit-testing).
+        let mut visual: Vec<Line<'static>> = Vec::new();
+        let mut visual_logical: Vec<usize> = Vec::new();
+        let mut visual_bounds: Vec<(usize, usize)> = Vec::new();
+        let mut scroll_visual_start = 0usize;
+        for (abs_line, sl) in self.lines.iter().enumerate().skip(self.display_start) {
+            if abs_line == self.scroll {
+                scroll_visual_start = visual.len();
+            }
+            let styled = style_line(abs_line, sl);
+            let bounds = text_row_bounds(&sl.text, inner_w);
+            let end_char = sl.text.chars().count();
+            for (i, vrow) in wrap_line_to(&styled, inner_w).into_iter().enumerate() {
+                visual.push(vrow);
+                visual_logical.push(abs_line);
+                // Styled rows can exceed text rows (e.g. diff gutter) — clamp.
+                visual_bounds.push(bounds.get(i).copied().unwrap_or((end_char, end_char)));
+            }
+        }
+
+        let total = visual.len();
+        let max_off = total.saturating_sub(inner_h);
+        let start = if self.follow {
+            max_off
+        } else {
+            scroll_visual_start.min(max_off)
+        };
+        let end = (start + inner_h).min(total);
+        let window: Vec<Line<'static>> = visual.get(start..end).unwrap_or(&[]).to_vec();
+
+        // Cache the inner rect and the per-visual-row → logical-line map so a
+        // later mouse click can resolve which message line it landed on.
+        self.last_inner = Rect::new(
+            area.x.saturating_add(1),
+            area.y.saturating_add(1),
+            inner_w as u16,
+            inner_h as u16,
+        );
+        self.row_logical = visual_logical.get(start..end).unwrap_or(&[]).to_vec();
+        self.row_charbounds = visual_bounds.get(start..end).unwrap_or(&[]).to_vec();
+
+        let widget = Paragraph::new(window).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(p.border))
                 .title(" messages "),
         );
         frame.render_widget(widget, area);
+    }
+
+    /// Maps a terminal `(x, y)` cell — as delivered by a mouse event — to a
+    /// `(logical_line, char_column)` position in the last render, or `None` when
+    /// the point is outside the inner area / past the last drawn row. Wrap-aware:
+    /// `x` resolves to the character offset within the clicked visual row, and a
+    /// click past the end of a row's text clamps to that row's last character.
+    #[must_use]
+    pub fn pos_at(&self, x: u16, y: u16) -> Option<(usize, usize)> {
+        let r = self.last_inner;
+        if r.width == 0 || r.height == 0 || x < r.x || y < r.y || y >= r.y + r.height {
+            return None;
+        }
+        let row = (y - r.y) as usize;
+        let line = *self.row_logical.get(row)?;
+        let (cs, ce) = *self.row_charbounds.get(row)?;
+        let text = &self.lines.get(line)?.text;
+        let col_disp = usize::from(x.saturating_sub(r.x));
+        let mut acc = 0usize;
+        let mut col = cs;
+        for ch in text.chars().skip(cs).take(ce.saturating_sub(cs)) {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if acc + cw > col_disp {
+                break;
+            }
+            acc += cw;
+            col += 1;
+        }
+        Some((line, col.min(ce)))
+    }
+
+    /// Number of characters in logical line `idx` (0 if out of range) — lets the
+    /// keyboard visual mode select whole lines by column.
+    #[must_use]
+    pub fn line_char_len(&self, idx: usize) -> usize {
+        self.lines.get(idx).map_or(0, |l| l.text.chars().count())
+    }
+
+    /// Extracts the text covered by a `(anchor, end)` character selection, joining
+    /// across lines with newlines. Order-independent.
+    #[must_use]
+    pub fn selection_text(&self, anchor: (usize, usize), end: (usize, usize)) -> String {
+        let (lo, hi) = if anchor <= end { (anchor, end) } else { (end, anchor) };
+        let mut out = String::new();
+        for line in lo.0..=hi.0 {
+            let Some(sl) = self.lines.get(line) else {
+                continue;
+            };
+            let chars: Vec<char> = sl.text.chars().collect();
+            let len = chars.len();
+            let a = if line == lo.0 { lo.1.min(len) } else { 0 };
+            let b = if line == hi.0 { hi.1.min(len) } else { len };
+            if a < b {
+                out.extend(&chars[a..b]);
+            }
+            if line != hi.0 {
+                out.push('\n');
+            }
+        }
+        out
     }
 
     /// Returns the number of stored lines.
@@ -244,6 +744,8 @@ impl MainPanel {
     }
 
     pub fn scroll_up(&mut self) {
+        // Any manual upward scroll detaches from the bottom-follow.
+        self.follow = false;
         self.scroll = self.scroll.saturating_sub(1).max(self.display_start);
     }
 
@@ -252,13 +754,19 @@ impl MainPanel {
         if self.scroll < max {
             self.scroll += 1;
         }
+        // Reaching the bottom re-arms follow so new content tracks again.
+        if self.scroll >= max {
+            self.follow = true;
+        }
     }
 
     pub fn scroll_to_top(&mut self) {
+        self.follow = false;
         self.scroll = self.display_start;
     }
 
     pub fn scroll_to_bottom(&mut self) {
+        self.follow = true;
         self.scroll = self.lines.len().saturating_sub(1);
     }
 
@@ -623,6 +1131,199 @@ mod tests {
         assert_eq!(visible[0].text, "line 5");
     }
 
+    #[test]
+    fn wrap_splits_long_line_into_rows() {
+        let line = Line::from("abcdefghij"); // 10 display cols
+        let rows = wrap_line_to(&line, 4);
+        assert_eq!(rows.len(), 3); // 4 + 4 + 2
+        let joined: String = rows
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(joined, "abcdefghij");
+    }
+
+    #[test]
+    fn wrap_preserves_span_style() {
+        let line = Line::from(Span::styled("abcdef", Style::default().fg(Color::Red)));
+        let rows = wrap_line_to(&line, 3);
+        assert_eq!(rows.len(), 2);
+        for r in &rows {
+            for s in &r.spans {
+                assert_eq!(s.style.fg, Some(Color::Red));
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_empty_line_is_single_row() {
+        assert_eq!(wrap_line_to(&Line::from(String::new()), 10).len(), 1);
+    }
+
+    #[test]
+    fn finalize_classifies_streamed_diff_line() {
+        let mut panel = MainPanel::new();
+        panel.push_line(String::new()); // tail partial line
+        panel.push_delta("+added line"); // streamed text, unclassified
+        panel.finalize_last_line();
+        assert_eq!(panel.lines.last().unwrap().style, LineStyle::Added);
+        assert_eq!(panel.lines.last().unwrap().text, "+added line");
+    }
+
+    #[test]
+    fn finalize_preserves_already_styled_card() {
+        let mut panel = MainPanel::new();
+        panel.push_styled_line(Line::from(Span::raw("⌘ bash")));
+        panel.finalize_last_line();
+        let last = panel.lines.last().unwrap();
+        assert_eq!(last.text, "⌘ bash");
+        assert!(last.spans.is_some(), "card spans must survive finalize");
+    }
+
+    #[test]
+    fn push_styled_line_backs_text_with_flattened_spans() {
+        let mut panel = MainPanel::new();
+        panel.push_styled_line(Line::from(vec![Span::raw("⌘ bash"), Span::raw("  find .")]));
+        let last = panel.lines.last().unwrap();
+        assert_eq!(last.text, "⌘ bash  find .");
+        assert!(last.spans.is_some());
+    }
+
+    #[test]
+    fn tool_result_meta_line_renders_dim_spans() {
+        let mut panel = MainPanel::new();
+        panel.push_line("↳ ok · 107 chars".into());
+        assert!(panel.lines.last().unwrap().spans.is_some());
+    }
+
+    #[test]
+    fn is_diff_marker_recognizes_headers_not_prose() {
+        assert!(is_diff_marker("@@ -1,2 +1,3 @@"));
+        assert!(is_diff_marker("diff --git a/x b/x"));
+        assert!(is_diff_marker("--- a/x.rs"));
+        assert!(is_diff_marker("+++ /dev/null"));
+        assert!(!is_diff_marker("--- a thought --- continued"));
+        assert!(!is_diff_marker("hello world"));
+        assert!(!is_diff_marker("+content")); // bare +/- handled elsewhere
+    }
+
+    #[test]
+    fn diff_fence_styles_hunk_and_content_with_clean_copy_text() {
+        let mut panel = MainPanel::new();
+        panel.push_line("```diff".into());
+        panel.push_line("@@ -1,2 +1,3 @@".into());
+        panel.push_line("+added".into());
+        panel.push_line(" context".into());
+        panel.push_line("```".into());
+
+        let hunk = panel.lines.iter().find(|l| l.text.starts_with("@@")).unwrap();
+        assert!(hunk.spans.is_some(), "hunk header should be styled");
+        let added = panel.lines.iter().find(|l| l.text == "+added").unwrap();
+        assert!(added.spans.is_some(), "added line should carry gutter spans");
+        // Gutter is display-only — the backing text stays clean for copy/yank.
+        assert_eq!(added.text, "+added");
+    }
+
+    #[test]
+    fn inline_markdown_styles_and_strips_markers() {
+        // Bold/italic/code produce spans; flattened text drops the markers.
+        let line = inline_markdown_spans("use **bold** and `code` here").unwrap();
+        let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(flat, "use bold and code here");
+        // No markup → None (cheap plain path preserved).
+        assert!(inline_markdown_spans("just plain prose").is_none());
+        // Flanking guard: spaced asterisks (multiplication / bullets) are not italic.
+        assert!(inline_markdown_spans("a * b * c").is_none());
+    }
+
+    #[test]
+    fn inline_markdown_line_keeps_clean_copy_text() {
+        let mut panel = MainPanel::new();
+        panel.push_line("a **strong** word".into());
+        let last = panel.lines.last().unwrap();
+        assert!(last.spans.is_some());
+        assert_eq!(last.text, "a strong word"); // markers stripped for copy
+    }
+
+    #[test]
+    fn table_rows_render_cells_and_delimiter_rule() {
+        assert!(is_table_row("| a | b |"));
+        assert!(!is_table_row("no pipes here"));
+        assert!(!is_table_row("trailing pipe a |")); // no leading pipe
+        assert_eq!(table_cells("| a | b |"), vec!["a".to_owned(), "b".to_owned()]);
+
+        let mut panel = MainPanel::new();
+        panel.push_line("| Name | Age |".into());
+        panel.push_line("|------|-----|".into());
+        panel.push_line("| Ann  | 30  |".into());
+        // All three rendered as styled lines; copy text stays the raw markdown.
+        for sl in panel.lines.iter() {
+            assert!(sl.spans.is_some());
+        }
+        assert_eq!(panel.lines[0].text, "| Name | Age |");
+    }
+
+    #[test]
+    fn standalone_hunk_header_is_styled() {
+        let mut panel = MainPanel::new();
+        panel.push_line("@@ -10,3 +10,4 @@ fn main()".into());
+        assert!(panel.lines.last().unwrap().spans.is_some());
+    }
+
+    #[test]
+    fn scroll_up_detaches_follow_and_bottom_rearms() {
+        let mut panel = MainPanel::new();
+        for i in 0..10u32 {
+            panel.push_line(format!("line {i}"));
+        }
+        assert!(panel.follow, "streaming default is follow");
+        panel.scroll_up();
+        assert!(!panel.follow, "manual scroll-up detaches follow");
+        for _ in 0..20 {
+            panel.scroll_down();
+        }
+        assert!(panel.follow, "returning to the bottom re-arms follow");
+    }
+
+    #[test]
+    fn render_wraps_long_line_and_hit_tests() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut panel = MainPanel::new();
+        panel.push_line("x".repeat(20)); // one long logical line
+        let mut term = Terminal::new(TestBackend::new(12, 8)).unwrap(); // inner width 10
+        term.draw(|f| {
+            let area = f.area();
+            panel.render(area, f, None, None, false);
+        })
+        .unwrap();
+
+        // 20 cols / inner-10 → 2 visual rows, both mapping to logical line 0.
+        assert_eq!(panel.pos_at(1, 1).map(|(l, _)| l), Some(0));
+        assert_eq!(panel.pos_at(1, 2).map(|(l, _)| l), Some(0));
+        // Second visual row starts at char offset 10 within the logical line.
+        assert_eq!(panel.pos_at(1, 2), Some((0, 10)));
+        // First row, leftmost cell → char 0.
+        assert_eq!(panel.pos_at(1, 1), Some((0, 0)));
+        // The border cell (0,0) is outside the inner area.
+        assert_eq!(panel.pos_at(0, 0), None);
+    }
+
+    #[test]
+    fn selection_text_extracts_partial_and_multiline() {
+        let mut panel = MainPanel::new();
+        panel.push_line("hello world".into()); // line 0
+        panel.push_line("second line".into()); // line 1
+        // Partial within one line: chars [0,5) of line 0 → "hello".
+        assert_eq!(panel.selection_text((0, 0), (0, 5)), "hello");
+        // Order-independent.
+        assert_eq!(panel.selection_text((0, 5), (0, 0)), "hello");
+        // Across lines: from line0 col6 to line1 col6 → "world\nsecond".
+        assert_eq!(panel.selection_text((0, 6), (1, 6)), "world\nsecond");
+    }
+
     // L121: plain line → LineStyle::Normal
     #[test]
     fn plain_line_yields_normal_style() {
@@ -841,10 +1542,11 @@ mod tests {
         for i in 0..5u32 {
             panel.push_line(format!("line {i}"));
         }
-        panel.scroll = 0; // user scrolled up
+        panel.scroll_up(); // user scrolls up → detaches bottom-follow
+        let before = panel.scroll;
         panel.push_line("new line".into());
         assert_eq!(
-            panel.scroll, 0,
+            panel.scroll, before,
             "scroll must stay when user has scrolled up"
         );
     }

@@ -23,5 +23,7 @@ fn main() {
         .read_to_end(&mut bytes)
         .expect("read stdin");
 
+    let stale = st_pty::render_vt_stale_cell_count(cols, rows, &bytes);
+    eprintln!("stale-cell count (row/col field != grid index): {stale}");
     println!("{}", st_pty::render_vt_snapshot(cols, rows, &bytes));
 }
