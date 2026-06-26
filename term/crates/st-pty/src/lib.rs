@@ -341,6 +341,13 @@ pub struct CellGrid {
     pub synchronized_output: bool,
     /// Decoded clipboard text to be written, drained by the reader thread after each batch.
     pub pending_clipboard_write: Option<String>,
+    /// Kitty keyboard protocol enhancement flags, managed as a stack (one entry
+    /// per `CSI > flags u` push). The top is the active flag set; an empty stack
+    /// means legacy encoding (no enhancement). See [`CellGrid::kbd_flags`].
+    pub kbd_flags_stack: Vec<u8>,
+    /// Bytes queued to write back to the PTY master — e.g. the kitty keyboard
+    /// protocol query response (`CSI ? flags u`). Drained by the host each frame.
+    pub pending_responses: Vec<u8>,
 }
 
 impl CellGrid {
@@ -374,7 +381,18 @@ impl CellGrid {
             focus_events: false,
             synchronized_output: false,
             pending_clipboard_write: None,
+            kbd_flags_stack: Vec::new(),
+            pending_responses: Vec::new(),
         }
+    }
+
+    /// Returns the active kitty keyboard protocol flags, or `0` when the stack
+    /// is empty (legacy encoding). Bit 1 = disambiguate escape codes, bit 2 =
+    /// report event types, bit 4 = report alternate keys, bit 8 = report all
+    /// keys as escape codes, bit 16 = report associated text.
+    #[must_use]
+    pub fn kbd_flags(&self) -> u8 {
+        self.kbd_flags_stack.last().copied().unwrap_or(0)
     }
 
     /// Resizes the grid.  Content is preserved where possible.
@@ -865,6 +883,44 @@ impl vte::Perform for VtHandler {
                 2026 => grid.synchronized_output = false,
                 _ => {}
             },
+            // ── Kitty keyboard protocol ──────────────────────────────────────
+            // Query current flags: respond with `CSI ? <flags> u`.
+            'u' if intermediates == [b'?'] => {
+                let flags = grid.kbd_flags();
+                let resp = format!("\x1b[?{flags}u");
+                grid.pending_responses.extend_from_slice(resp.as_bytes());
+            }
+            // Push flags onto the stack (`CSI > flags u`, default 1).
+            'u' if intermediates == [b'>'] => {
+                #[allow(clippy::cast_possible_truncation)]
+                let flags = p.first().copied().unwrap_or(1) as u8;
+                grid.kbd_flags_stack.push(flags);
+            }
+            // Pop N entries (`CSI < N u`, default 1).
+            'u' if intermediates == [b'<'] => {
+                let n = p.first().copied().unwrap_or(1).max(1) as usize;
+                for _ in 0..n {
+                    grid.kbd_flags_stack.pop();
+                }
+            }
+            // Set current flags (`CSI = flags ; mode u`): mode 1=all, 2=set
+            // bits, 3=clear bits (default 1).
+            'u' if intermediates == [b'='] => {
+                #[allow(clippy::cast_possible_truncation)]
+                let flags = p.first().copied().unwrap_or(0) as u8;
+                let mode = p.get(1).copied().unwrap_or(1);
+                let cur = grid.kbd_flags();
+                let new = match mode {
+                    2 => cur | flags,
+                    3 => cur & !flags,
+                    _ => flags,
+                };
+                if let Some(top) = grid.kbd_flags_stack.last_mut() {
+                    *top = new;
+                } else {
+                    grid.kbd_flags_stack.push(new);
+                }
+            }
             // ── Line delete / insert ─────────────────────────────────────────
             'L' => {
                 // Insert lines above cursor.
@@ -1984,6 +2040,52 @@ mod tests {
             Some("my terminal title"),
             "OSC 0 should set the window title"
         );
+    }
+
+    fn feed(handler: &mut VtHandler, parser: &mut vte::Parser, seq: &[u8]) {
+        for &byte in seq {
+            parser.advance(handler, byte);
+        }
+    }
+
+    #[test]
+    fn kitty_push_sets_flags_and_pop_clears() {
+        let grid = Arc::new(Mutex::new(make_grid(80, 24)));
+        let mut handler = make_handler(Arc::clone(&grid));
+        let mut parser = vte::Parser::new();
+        // Push DISAMBIGUATE_ESCAPE_CODES (1).
+        feed(&mut handler, &mut parser, b"\x1b[>1u");
+        assert_eq!(grid.lock().kbd_flags(), 1, "push should set active flags");
+        // Pop restores legacy (0).
+        feed(&mut handler, &mut parser, b"\x1b[<u");
+        assert_eq!(grid.lock().kbd_flags(), 0, "pop should clear active flags");
+    }
+
+    #[test]
+    fn kitty_query_queues_response() {
+        let grid = Arc::new(Mutex::new(make_grid(80, 24)));
+        let mut handler = make_handler(Arc::clone(&grid));
+        let mut parser = vte::Parser::new();
+        feed(&mut handler, &mut parser, b"\x1b[>5u"); // flags = 5
+        feed(&mut handler, &mut parser, b"\x1b[?u"); // query
+        let resp = std::mem::take(&mut grid.lock().pending_responses);
+        assert_eq!(
+            resp,
+            b"\x1b[?5u".to_vec(),
+            "query should report the active flags"
+        );
+    }
+
+    #[test]
+    fn kitty_set_mode_2_sets_bits_mode_3_clears() {
+        let grid = Arc::new(Mutex::new(make_grid(80, 24)));
+        let mut handler = make_handler(Arc::clone(&grid));
+        let mut parser = vte::Parser::new();
+        feed(&mut handler, &mut parser, b"\x1b[>1u"); // base flags = 1
+        feed(&mut handler, &mut parser, b"\x1b[=4;2u"); // set bit 4
+        assert_eq!(grid.lock().kbd_flags(), 5);
+        feed(&mut handler, &mut parser, b"\x1b[=1;3u"); // clear bit 1
+        assert_eq!(grid.lock().kbd_flags(), 4);
     }
 
     #[test]
