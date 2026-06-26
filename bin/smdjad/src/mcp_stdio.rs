@@ -399,4 +399,55 @@ mod tests {
         let result = transport.call_tool("greet", &json!({})).await.unwrap();
         assert!(result.contains("via-stdio"), "got: {result}");
     }
+
+    // --- allowlist guard tests -----------------------------------------------
+
+    #[tokio::test]
+    async fn spawn_rejects_shell_metacharacters() {
+        // Each of these must be rejected before any process is spawned.
+        for bad in &[
+            "echo hello; rm -rf /",
+            "echo hello | cat",
+            "echo `id`",
+            "echo $HOME",
+            "echo hello > /tmp/x",
+            "echo hello & echo bye",
+        ] {
+            let client = McpStdioClient::new(bad);
+            let err = client
+                .list_tools()
+                .await
+                .expect_err("metachar command must be rejected");
+            assert!(
+                err.contains("disallowed character"),
+                "expected disallowed-character error for {bad:?}; got: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_binary_not_on_path() {
+        let client = McpStdioClient::new("smedja-nonexistent-binary-xyz-99999");
+        let err = client
+            .list_tools()
+            .await
+            .expect_err("missing binary must be rejected");
+        assert!(
+            err.contains("not on PATH"),
+            "expected not-on-PATH error; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_absolute_path_that_does_not_exist() {
+        let client = McpStdioClient::new("/nonexistent/binary/path/smedja-test-xyz");
+        let err = client
+            .list_tools()
+            .await
+            .expect_err("missing absolute binary must be rejected");
+        assert!(
+            err.contains("not found"),
+            "expected not-found error; got: {err}"
+        );
+    }
 }

@@ -1551,20 +1551,11 @@ async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) 
         }
         "test" => {
             let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            // Detect project type by manifest presence; report when multiple are found.
-            let has_cargo = workspace.join("Cargo.toml").exists();
-            let has_npm   = workspace.join("package.json").exists();
-            let has_go    = workspace.join("go.mod").exists();
-            let has_py    = workspace.join("pyproject.toml").exists();
-            let detected: Vec<&str> = [
-                has_cargo.then_some("Cargo.toml"),
-                has_npm.then_some("package.json"),
-                has_go.then_some("go.mod"),
-                has_py.then_some("pyproject.toml"),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
+            let detected = detect_project_types(&workspace);
+            let has_cargo = detected.contains(&"Cargo.toml");
+            let has_npm   = detected.contains(&"package.json");
+            let has_go    = detected.contains(&"go.mod");
+            let has_py    = detected.contains(&"pyproject.toml");
             if detected.len() > 1 {
                 push_system_message(
                     state,
@@ -3803,7 +3794,8 @@ async fn main() -> Result<()> {
                     Ok(_) => {
                         state.poll_retry_count += 1;
                         // Exponential backoff on non-terminal returns: 100 ms → 200 ms → … → 1 s.
-                        let backoff_ms = (100u64 << state.poll_retry_count.saturating_sub(1)).min(1_000);
+                        let shift = state.poll_retry_count.saturating_sub(1).min(10);
+                        let backoff_ms = (100u64 << shift).min(1_000);
                         state.last_poll = Some(std::time::Instant::now()
                             - std::time::Duration::from_millis(50)
                             + std::time::Duration::from_millis(backoff_ms));
@@ -4134,6 +4126,20 @@ fn toggle_metrics_view(state: &mut AppState) {
     if state.metrics_view_visible {
         state.last_metrics_poll = None;
     }
+}
+
+/// Returns the manifest file names present in `workspace`, in detection order:
+/// Cargo.toml, package.json, go.mod, pyproject.toml.
+fn detect_project_types(workspace: &std::path::Path) -> Vec<&'static str> {
+    [
+        workspace.join("Cargo.toml").exists().then_some("Cargo.toml"),
+        workspace.join("package.json").exists().then_some("package.json"),
+        workspace.join("go.mod").exists().then_some("go.mod"),
+        workspace.join("pyproject.toml").exists().then_some("pyproject.toml"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -6334,5 +6340,116 @@ mod tests {
         );
         assert!(!remove, "resolved:false must retain the item");
         assert_eq!(message, "item not found: bash");
+    }
+
+    // --- lsp_snapshot_from_rpc -----------------------------------------------
+
+    #[test]
+    fn lsp_snapshot_from_rpc_decodes_all_severity_strings() {
+        let status = json!({"servers": []});
+        let diag = json!({
+            "diagnostics": [
+                {"file": "a.rs", "line": 1, "col": 1, "severity": "error",   "message": "e"},
+                {"file": "a.rs", "line": 2, "col": 1, "severity": "warning", "message": "w"},
+                {"file": "a.rs", "line": 3, "col": 1, "severity": "info",    "message": "i"},
+                {"file": "a.rs", "line": 4, "col": 1, "severity": "hint",    "message": "h"},
+            ]
+        });
+        let snap = lsp_snapshot_from_rpc(&status, &diag);
+        assert_eq!(snap.diagnostics.len(), 4);
+        assert!(matches!(snap.diagnostics[0].severity, smedja_lsp::Severity::Error));
+        assert!(matches!(snap.diagnostics[1].severity, smedja_lsp::Severity::Warning));
+        assert!(matches!(snap.diagnostics[2].severity, smedja_lsp::Severity::Info));
+        assert!(matches!(snap.diagnostics[3].severity, smedja_lsp::Severity::Hint));
+    }
+
+    #[test]
+    fn lsp_snapshot_from_rpc_unknown_severity_defaults_to_error() {
+        let status = json!({"servers": []});
+        let diag = json!({
+            "diagnostics": [
+                {"file": "x.rs", "line": 1, "col": 1, "severity": "banana", "message": "x"}
+            ]
+        });
+        let snap = lsp_snapshot_from_rpc(&status, &diag);
+        assert!(matches!(snap.diagnostics[0].severity, smedja_lsp::Severity::Error));
+    }
+
+    #[test]
+    fn lsp_snapshot_from_rpc_decodes_server_states() {
+        let status = json!({
+            "servers": [
+                {"name": "ra",     "state": "ready"},
+                {"name": "gopls",  "state": "degraded: connection refused"},
+                {"name": "py",     "state": "starting"},
+            ]
+        });
+        let snap = lsp_snapshot_from_rpc(&status, &json!({"diagnostics": []}));
+        assert_eq!(snap.servers.len(), 3);
+        assert!(matches!(snap.servers[0].state, smedja_lsp::ServerState::Ready));
+        assert!(
+            matches!(&snap.servers[1].state, smedja_lsp::ServerState::Degraded(r) if r == "connection refused"),
+            "degraded reason must be extracted from prefix"
+        );
+        assert!(matches!(snap.servers[2].state, smedja_lsp::ServerState::Starting));
+    }
+
+    #[test]
+    fn lsp_snapshot_from_rpc_empty_inputs_yield_empty_snapshot() {
+        let snap = lsp_snapshot_from_rpc(
+            &json!({"servers": []}),
+            &json!({"diagnostics": []}),
+        );
+        assert!(snap.servers.is_empty());
+        assert!(snap.diagnostics.is_empty());
+    }
+
+    // --- detect_project_types ------------------------------------------------
+
+    #[test]
+    fn detect_project_types_returns_cargo_when_only_cargo_toml_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(detect_project_types(dir.path()), vec!["Cargo.toml"]);
+    }
+
+    #[test]
+    fn detect_project_types_returns_all_present_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let types = detect_project_types(dir.path());
+        assert_eq!(types.len(), 2);
+        assert!(types.contains(&"Cargo.toml"));
+        assert!(types.contains(&"package.json"));
+    }
+
+    #[test]
+    fn detect_project_types_returns_empty_for_no_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(detect_project_types(dir.path()).is_empty());
+    }
+
+    // --- poll backoff --------------------------------------------------------
+
+    #[test]
+    fn poll_backoff_shift_never_overflows() {
+        // Verify the clamped shift cannot produce a u64 overflow for any retry
+        // count up to and including the give-up threshold (60).
+        for count in 0u32..=60 {
+            let shift = count.saturating_sub(1).min(10);
+            let _ = (100u64 << shift).min(1_000);
+        }
+    }
+
+    #[test]
+    fn poll_backoff_caps_at_1000ms() {
+        // At retry=4 the raw shift (3) gives 800 ms; at retry=5 (shift=4) the
+        // raw value 1600 ms clamps to 1000 ms and stays there.
+        for count in 5u32..=60 {
+            let shift = count.saturating_sub(1).min(10);
+            let ms = (100u64 << shift).min(1_000);
+            assert_eq!(ms, 1_000, "backoff must cap at 1000 ms for retry {count}");
+        }
     }
 }
