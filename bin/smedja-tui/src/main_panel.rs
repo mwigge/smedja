@@ -4,7 +4,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use crate::theme::palette;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
@@ -222,14 +222,12 @@ impl MainPanel {
             })
             .collect();
 
-        let widget = Paragraph::new(visible)
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(p.border))
-                    .title(" messages "),
-            );
+        let widget = Paragraph::new(visible).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(p.border))
+                .title(" messages "),
+        );
         frame.render_widget(widget, area);
     }
 
