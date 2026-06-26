@@ -320,6 +320,49 @@ pub fn runner_label(runner: &str) -> String {
     runner_key(runner).to_ascii_uppercase()
 }
 
+/// Curated, colourblind-aware accent palette for per-agent identity. Picked for
+/// mutual distinctness on the dark forge background. Used ONLY as accents (left
+/// borders, badge pips) — never to recolour body text, which is what made the
+/// milliways per-agent colouring hard to read.
+const AGENT_PALETTE: [Color; 6] = [
+    Color::Rgb(0x6C, 0xB6, 0xFF), // sky
+    Color::Rgb(0x9D, 0xD6, 0x7D), // green
+    Color::Rgb(0xF2, 0xB6, 0x6D), // amber
+    Color::Rgb(0xD6, 0x8C, 0xE0), // orchid
+    Color::Rgb(0x6F, 0xD6, 0xC4), // teal
+    Color::Rgb(0xF2, 0x8C, 0x8C), // salmon
+];
+
+/// Deterministic accent colour for an agent/role name — stable across runs so
+/// an agent keeps the same colour everywhere it appears (FNV-1a over the
+/// lowercased name into [`AGENT_PALETTE`]).
+#[must_use]
+pub fn agent_color(name: &str) -> Color {
+    let mut hash: u32 = 2_166_136_261;
+    for b in name.trim().to_ascii_lowercase().bytes() {
+        hash ^= u32::from(b);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    AGENT_PALETTE[(hash as usize) % AGENT_PALETTE.len()]
+}
+
+/// Returns a readable foreground (near-black or bright forge text) for text
+/// drawn on the coloured `bg`, chosen by Rec. 601 luma. The auto-contrast trick
+/// borrowed from semos-labs/glyph so badge text stays legible on any accent.
+#[must_use]
+pub fn contrast_fg(bg: Color) -> Color {
+    if let Color::Rgb(r, g, b) = bg {
+        let luma = 0.299 * f64::from(r) + 0.587 * f64::from(g) + 0.114 * f64::from(b);
+        if luma > 140.0 {
+            FORGE_BG
+        } else {
+            FORGE_TEXT_BRIGHT
+        }
+    } else {
+        FORGE_TEXT_BRIGHT
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,6 +391,26 @@ mod tests {
         assert_eq!(runner_label("codex-cli"), "CODEX");
         assert_eq!(runner_label("copilot"), "COPILOT");
         assert_eq!(runner_label("  MiniMax  "), "MINIMAX");
+    }
+
+    #[test]
+    fn agent_color_is_deterministic_and_in_palette() {
+        // Same name → same colour every time (stable identity).
+        assert_eq!(agent_color("reviewer"), agent_color("reviewer"));
+        assert_eq!(agent_color("Reviewer"), agent_color("reviewer"), "case-insensitive");
+        // Result is always one of the curated palette entries.
+        assert!(AGENT_PALETTE.contains(&agent_color("planner")));
+        assert!(AGENT_PALETTE.contains(&agent_color("implementer")));
+    }
+
+    #[test]
+    fn contrast_fg_picks_dark_on_light_and_bright_on_dark() {
+        assert_eq!(contrast_fg(Color::Rgb(240, 240, 240)), FORGE_BG, "dark text on light bg");
+        assert_eq!(
+            contrast_fg(Color::Rgb(20, 20, 20)),
+            FORGE_TEXT_BRIGHT,
+            "bright text on dark bg"
+        );
     }
 
     #[test]
