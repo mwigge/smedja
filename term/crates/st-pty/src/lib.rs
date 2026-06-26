@@ -421,22 +421,53 @@ impl CellGrid {
         }
     }
 
-    /// Returns a slice of rows visible at the given scroll offset.
+    /// Returns the `rows` rows visible at the given scroll-back `offset`.
     ///
-    /// `offset` 0 means the live screen.  Positive values scroll back into
-    /// scrollback history.
+    /// The full terminal buffer is conceptually `scrollback ++ cells`. `offset`
+    /// 0 is the live screen (the last `rows` rows = `cells`); a positive offset
+    /// shifts the viewport up by that many lines into history, so the window can
+    /// straddle the scrollback/live boundary (the top from scrollback, the
+    /// bottom from the live screen). `offset` is clamped to the available
+    /// history. Fewer than `rows` rows are returned only when the live screen
+    /// itself is shorter than `rows`.
     #[must_use]
-    pub fn visible_rows(&self, offset: i32) -> &[Vec<Cell>] {
+    pub fn visible_rows(&self, offset: i32) -> Vec<&Vec<Cell>> {
+        let rows = self.rows as usize;
         if offset <= 0 {
-            return &self.cells;
+            return self.cells.iter().collect();
         }
-        let skip = offset as usize;
-        let total = self.scrollback.len();
-        if skip >= total {
-            return &self.scrollback[..];
+        let sb = self.scrollback.len();
+        let skip = (offset as usize).min(sb);
+        // Window over the combined buffer: [sb - skip .. sb - skip + rows].
+        let start = sb - skip;
+        let mut out: Vec<&Vec<Cell>> = Vec::with_capacity(rows);
+        for i in start..start + rows {
+            if i < sb {
+                out.push(&self.scrollback[i]);
+            } else if let Some(row) = self.cells.get(i - sb) {
+                out.push(row);
+            }
         }
-        &self.scrollback
-            [total.saturating_sub(skip + self.rows as usize)..total.saturating_sub(skip)]
+        out
+    }
+
+    /// Maximum scroll-back offset (number of history lines available).
+    #[must_use]
+    pub fn max_scroll_offset(&self) -> i32 {
+        i32::try_from(self.scrollback.len()).unwrap_or(i32::MAX)
+    }
+
+    /// Adjusts `scroll_offset` by `delta` lines (positive = into history),
+    /// clamped to `[0, max_scroll_offset()]`. Returns `true` if it changed.
+    pub fn scroll_by(&mut self, delta: i32) -> bool {
+        let max = self.max_scroll_offset();
+        let next = (self.scroll_offset + delta).clamp(0, max);
+        if next != self.scroll_offset {
+            self.scroll_offset = next;
+            true
+        } else {
+            false
+        }
     }
 
     // ── internal screen mutations ─────────────────────────────────────────────
@@ -499,10 +530,18 @@ impl CellGrid {
         for _ in 0..n {
             if !self.cells.is_empty() {
                 let old_row = self.cells.remove(0);
-                if self.scrollback.len() >= self.max_scrollback {
+                let evicted = self.scrollback.len() >= self.max_scrollback;
+                if evicted {
                     self.scrollback.remove(0);
                 }
                 self.scrollback.push(old_row);
+                // If history grew without evicting a line and we're scrolled
+                // back, bump the offset alongside the new line so the viewport
+                // stays anchored to the same content instead of drifting.
+                if !evicted && self.scroll_offset > 0 {
+                    self.scroll_offset =
+                        (self.scroll_offset + 1).min(self.max_scroll_offset());
+                }
             }
             let new_row_idx = self.rows.saturating_sub(1);
             let blank = blank_row(self.cols, new_row_idx);
@@ -1619,6 +1658,68 @@ mod tests {
             grid.scroll_up(1);
         }
         assert!(grid.scrollback.len() <= 2);
+    }
+
+    /// Stamps `cells[row][0]` with `ch` so a row is identifiable in assertions.
+    fn mark(grid: &mut CellGrid, row: usize, ch: char) {
+        grid.cells[row][0] = Cell {
+            ch,
+            ..Cell::blank(0, row as u16)
+        };
+    }
+
+    #[test]
+    fn visible_rows_offset_zero_is_live_screen() {
+        let mut grid = make_grid(4, 2);
+        mark(&mut grid, 0, 'L');
+        let view = grid.visible_rows(0);
+        assert_eq!(view.len(), 2);
+        assert_eq!(view[0][0].ch, 'L', "offset 0 shows the live screen");
+    }
+
+    #[test]
+    fn visible_rows_straddles_scrollback_and_live() {
+        // 2-row screen. Push rows 'A' then 'B' into scrollback; live screen
+        // then holds the post-scroll blanks with 'C' marked on the top row.
+        let mut grid = make_grid(4, 2);
+        mark(&mut grid, 0, 'A');
+        grid.scroll_up(1); // 'A' -> scrollback[0]
+        mark(&mut grid, 0, 'B');
+        grid.scroll_up(1); // 'B' -> scrollback[1]
+        mark(&mut grid, 0, 'C'); // live top row
+        assert_eq!(grid.scrollback.len(), 2);
+        // Offset 1: window shows [scrollback[1]='B', live[0]='C'].
+        let view = grid.visible_rows(1);
+        assert_eq!(view.len(), 2);
+        assert_eq!(view[0][0].ch, 'B', "top of view from scrollback");
+        assert_eq!(view[1][0].ch, 'C', "bottom of view from live screen");
+    }
+
+    #[test]
+    fn scroll_by_clamps_to_history_bounds() {
+        let mut grid = make_grid(4, 2);
+        for _ in 0..3 {
+            grid.scroll_up(1);
+        }
+        assert_eq!(grid.max_scroll_offset(), 3);
+        assert!(grid.scroll_by(100)); // clamps to 3
+        assert_eq!(grid.scroll_offset, 3);
+        assert!(!grid.scroll_by(10), "already at max, no change");
+        assert!(grid.scroll_by(-100)); // clamps to 0
+        assert_eq!(grid.scroll_offset, 0);
+        assert!(!grid.scroll_by(-1), "already at live, no change");
+    }
+
+    #[test]
+    fn scroll_up_anchors_viewport_when_history_grows() {
+        let mut grid = make_grid(4, 2);
+        grid.scroll_up(1); // history = 1
+        grid.scroll_by(1); // viewing the single history line (offset 1)
+        assert_eq!(grid.scroll_offset, 1);
+        // New output scrolls another line into history; offset bumps to keep the
+        // same content in view.
+        grid.scroll_up(1);
+        assert_eq!(grid.scroll_offset, 2, "offset tracks history growth");
     }
 
     #[test]

@@ -27,7 +27,7 @@ use clap::{Parser, Subcommand};
 use tracing::{debug, error, info};
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, KeyEvent, Modifiers, MouseButton, WindowEvent},
+    event::{ElementState, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{Key, NamedKey},
     window::{Window, WindowId},
@@ -600,16 +600,21 @@ impl ApplicationHandler<UserEvent> for App {
                     if dirty && !sync_active {
                         pty.dirty.store(false, Ordering::Release);
                         let grid = pty.grid.lock();
+                        // Render the viewport at the current scroll-back offset
+                        // (0 = live screen). Row/col are stamped from the cell's
+                        // position in the visible window, not the cell's stored
+                        // indices, so scrolled-in scrollback rows land correctly.
                         let cells: Vec<st_render::Cell> = grid
-                            .cells
+                            .visible_rows(grid.scroll_offset)
                             .iter()
-                            .flat_map(|row| {
-                                row.iter().map(|c| st_render::Cell {
+                            .enumerate()
+                            .flat_map(|(r, row)| {
+                                row.iter().enumerate().map(move |(col, c)| st_render::Cell {
                                     ch: c.ch,
                                     fg: c.fg,
                                     bg: c.bg,
-                                    col: c.col,
-                                    row: c.row,
+                                    col: u16::try_from(col).unwrap_or(u16::MAX),
+                                    row: u16::try_from(r).unwrap_or(u16::MAX),
                                 })
                             })
                             .collect();
@@ -992,6 +997,15 @@ impl ApplicationHandler<UserEvent> for App {
                     let kbd_flags = pty.grid.lock().kbd_flags();
                     let bytes = encode_key(&logical_key, shift, alt, ctrl, sup, kbd_flags);
                     if let Some(data) = bytes {
+                        // Typing snaps the viewport back to the live screen so
+                        // input is always visible.
+                        {
+                            let mut grid = pty.grid.lock();
+                            if grid.scroll_offset != 0 {
+                                grid.scroll_offset = 0;
+                                pty.dirty.store(true, Ordering::Release);
+                            }
+                        }
                         // Write errors are non-fatal; PTY may have exited.
                         if let Err(e) = pty.write_input(&data) {
                             debug!("PTY write error: {}", e);
@@ -1106,6 +1120,71 @@ impl ApplicationHandler<UserEvent> for App {
                     };
                     if let Err(e) = pty.write_input(&bytes) {
                         debug!("PTY mouse write error: {}", e);
+                    }
+                }
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Number of lines scrolled (positive = wheel up = into history).
+                let lines: i32 = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
+                    MouseScrollDelta::PixelDelta(pos) => {
+                        let sf = self.renderer.as_ref().map_or(1.0_f64, |r| r.scale_factor);
+                        #[allow(clippy::cast_possible_truncation)]
+                        let eff_font = self.config.font.size * sf as f32;
+                        let line_h = f64::from(st_glyph::line_height(eff_font).max(1.0));
+                        (pos.y / line_h).round() as i32
+                    }
+                };
+                if lines == 0 {
+                    return;
+                }
+                if let Some(pty) = &mut self.pty {
+                    // When an application is in a mouse-reporting mode, forward
+                    // the wheel as SGR/X10 button 64 (up) / 65 (down) so it can
+                    // scroll its own viewport. Otherwise scroll the terminal's
+                    // local scrollback buffer.
+                    let (mode, sgr, col, row) = {
+                        let grid = pty.grid.lock();
+                        let sf = self.renderer.as_ref().map_or(1.0_f64, |r| r.scale_factor);
+                        #[allow(clippy::cast_possible_truncation)]
+                        let eff_font = self.config.font.size * sf as f32;
+                        let top_bar_h = self.renderer.as_ref().map_or(0, |r| r.top_bar_height_px());
+                        let phys_x = (self.cursor_pos.0 * sf) as u32;
+                        let phys_y = (self.cursor_pos.1 * sf) as u32;
+                        let grid_y = phys_y.saturating_sub(top_bar_h);
+                        let cw = st_glyph::char_advance_width(eff_font).max(1.0);
+                        let ch = st_glyph::line_height(eff_font).max(1.0);
+                        #[allow(clippy::cast_possible_truncation)]
+                        let col = ((phys_x as f32 / cw) as u16).min(grid.cols.saturating_sub(1));
+                        #[allow(clippy::cast_possible_truncation)]
+                        let row = ((grid_y as f32 / ch) as u16).min(grid.rows.saturating_sub(1));
+                        (grid.mouse_mode, grid.mouse_sgr, col, row)
+                    };
+
+                    if mode == st_pty::MouseMode::None {
+                        // Local scrollback. Positive lines scroll up into history.
+                        let changed = pty.grid.lock().scroll_by(lines);
+                        if changed {
+                            pty.dirty.store(true, Ordering::Release);
+                            if let Some(w) = self.windows.get(&window_id) {
+                                w.request_redraw();
+                            }
+                        }
+                    } else {
+                        let btn: u8 = if lines > 0 { 64 } else { 65 };
+                        let mut data = Vec::new();
+                        for _ in 0..lines.abs() {
+                            let bytes = if sgr {
+                                encode_mouse_sgr(col, row, btn, true)
+                            } else {
+                                encode_mouse_x10(col, row, btn)
+                            };
+                            data.extend_from_slice(&bytes);
+                        }
+                        if let Err(e) = pty.write_input(&data) {
+                            debug!("PTY wheel write error: {}", e);
+                        }
                     }
                 }
             }
