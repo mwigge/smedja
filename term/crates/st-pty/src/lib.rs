@@ -299,6 +299,12 @@ pub struct CellGrid {
     pub cells: Vec<Vec<Cell>>,
     /// Cursor position as `(col, row)`.
     pub cursor: (u16, u16),
+    /// Deferred-wrap (last-column) flag. Set after a glyph is written to the
+    /// final column; the actual line wrap is postponed until the *next*
+    /// printable character. This matches xterm/DEC behaviour and is essential
+    /// for full-screen apps (ratatui): an eager wrap on the bottom-right cell
+    /// would scroll the whole grid and desync the client's diff.
+    pending_wrap: bool,
     /// Scrollback lines (oldest first).
     pub scrollback: Vec<Vec<Cell>>,
     /// Maximum number of scrollback lines.
@@ -360,6 +366,7 @@ impl CellGrid {
             rows,
             cells,
             cursor: (0, 0),
+            pending_wrap: false,
             scrollback: Vec::new(),
             max_scrollback: 10_000,
             alt_screen: false,
@@ -489,6 +496,13 @@ impl CellGrid {
     }
 
     fn put_char(&mut self, ch: char) {
+        // Consume a deferred wrap from the previous last-column write before
+        // placing this glyph (xterm last-column behaviour).
+        if self.pending_wrap {
+            self.pending_wrap = false;
+            self.cursor.0 = 0;
+            self.advance_row();
+        }
         let fg = self.current_fg();
         let bg = self.current_bg();
         let url = self.sgr.url.clone();
@@ -507,17 +521,19 @@ impl CellGrid {
                 url,
             };
         }
-        // Advance cursor; wrap at column boundary.
+        // Advance cursor. At the final column, DEFER the wrap: keep the cursor
+        // on the last column and set the flag so the wrap only happens when the
+        // next printable char arrives (or is cancelled by a cursor move / CR).
         let next_col = col + 1;
         if next_col >= self.cols {
-            self.cursor.0 = 0;
-            self.advance_row();
+            self.pending_wrap = true;
         } else {
             self.cursor.0 = next_col;
         }
     }
 
     fn advance_row(&mut self) {
+        self.pending_wrap = false;
         let row = self.cursor.1 + 1;
         if row >= self.rows {
             self.scroll_up(1);
@@ -666,6 +682,7 @@ impl CellGrid {
     }
 
     fn move_cursor(&mut self, col: u16, row: u16) {
+        self.pending_wrap = false;
         self.cursor = (
             col.min(self.cols.saturating_sub(1)),
             row.min(self.rows.saturating_sub(1)),
@@ -810,6 +827,7 @@ impl vte::Perform for VtHandler {
         let mut grid = self.grid.lock();
         match byte {
             b'\r' => {
+                grid.pending_wrap = false;
                 grid.cursor.0 = 0;
             }
             b'\n' | 0x0b | 0x0c => {
@@ -817,12 +835,14 @@ impl vte::Perform for VtHandler {
             }
             b'\t' => {
                 // Advance to next tab stop (every 8 columns).
+                grid.pending_wrap = false;
                 let col = grid.cursor.0;
                 let next = ((col / 8) + 1) * 8;
                 grid.cursor.0 = next.min(grid.cols.saturating_sub(1));
             }
             0x08 => {
                 // Backspace
+                grid.pending_wrap = false;
                 if grid.cursor.0 > 0 {
                     grid.cursor.0 -= 1;
                 }
@@ -849,6 +869,11 @@ impl vte::Perform for VtHandler {
             .iter()
             .map(|sub| sub.first().copied().unwrap_or(0))
             .collect();
+
+        // Any explicit cursor movement cancels a deferred last-column wrap.
+        if matches!(action, 'A' | 'B' | 'C' | 'D' | 'G' | 'H' | 'f' | 'd') {
+            grid.pending_wrap = false;
+        }
 
         match action {
             // ── Cursor movement ──────────────────────────────────────────────
@@ -1630,8 +1655,60 @@ mod tests {
         let mut grid = make_grid(4, 4);
         grid.cursor = (3, 0);
         grid.put_char('X');
-        // After placing at col 3 (last), cursor should wrap to (0, 1).
-        assert_eq!(grid.cursor, (0, 1));
+        // Deferred wrap: after the last-column write the cursor stays on row 0
+        // with the pending-wrap flag set; the wrap happens on the next char.
+        assert_eq!(grid.cursor, (3, 0));
+        assert!(grid.pending_wrap);
+        grid.put_char('Y');
+        assert_eq!(grid.cursor, (1, 1), "next char wraps to row 1");
+    }
+
+    #[test]
+    fn deferred_wrap_does_not_advance_on_last_column() {
+        let mut grid = make_grid(4, 3);
+        for ch in ['a', 'b', 'c', 'd'] {
+            grid.put_char(ch);
+        }
+        // Last-column write defers: still on row 0, no scroll.
+        assert_eq!(grid.cursor.1, 0, "no premature row advance");
+        assert!(grid.pending_wrap, "pending-wrap flag set");
+        assert!(grid.scrollback.is_empty(), "no premature scroll");
+        // The next printable char performs the wrap.
+        grid.put_char('e');
+        assert_eq!(grid.cursor, (1, 1), "wrapped to start of next row");
+        assert_eq!(grid.cells[1][0].ch, 'e');
+        assert!(!grid.pending_wrap);
+    }
+
+    #[test]
+    fn bottom_right_write_does_not_eagerly_scroll() {
+        // This is the ratatui corruption case: writing the bottom-right cell must
+        // NOT scroll the grid (an eager wrap would).
+        let mut grid = make_grid(4, 2);
+        grid.cursor = (0, 1);
+        for ch in ['w', 'x', 'y', 'z'] {
+            grid.put_char(ch);
+        }
+        assert!(grid.pending_wrap);
+        assert!(
+            grid.scrollback.is_empty(),
+            "bottom-right write must not scroll the grid"
+        );
+        assert_eq!(grid.cells[1][3].ch, 'z', "last cell written in place");
+    }
+
+    #[test]
+    fn cursor_move_cancels_pending_wrap() {
+        let mut grid = make_grid(4, 2);
+        for ch in ['a', 'b', 'c', 'd'] {
+            grid.put_char(ch);
+        }
+        assert!(grid.pending_wrap);
+        grid.move_cursor(0, 0); // reposition cancels the deferred wrap
+        assert!(!grid.pending_wrap);
+        grid.put_char('X');
+        assert_eq!(grid.cells[0][0].ch, 'X', "overwrites, no wrap");
+        assert_eq!(grid.cursor, (1, 0));
     }
 
     #[test]
