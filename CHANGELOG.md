@@ -6,6 +6,18 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.16.1] — 2026-06-26
+
+### Fixed
+
+- **Test coverage: MCP stdio allowlist** — three unit tests now assert that `McpStdioClient::spawn` returns an error for commands containing shell metacharacters (`;`, `|`, `` ` ``, `$`, `>`, `&`), for relative binary names not on PATH, and for absolute paths that do not exist. A regression in the injection guard can no longer ship silently.
+- **Test coverage: DB prune + vacuum** — three unit tests on an in-memory SQLite fixture verify `prune_old_sessions` cascades through `tasks` and `audit_events`, preserves recent complete sessions, and never touches active sessions regardless of age. `vacuum()` is also exercised.
+- **Test coverage: `lsp_snapshot_from_rpc`** — four unit tests cover all four severity strings (`error`/`warning`/`info`/`hint`), unknown severity defaulting to `Error`, all three server states (`ready`/`degraded: <reason>`/`starting`), and empty inputs.
+- **Test coverage: `detect_project_types`** — extracted as a pure function; three unit tests cover Cargo-only, multi-manifest, and empty-directory workspaces.
+- **Test coverage: DeltaStore TTL** — a `start_paused = true` tokio test advances the clock past `DELTA_TTL_SECS` and asserts the buffer entry is evicted. Requires `tokio/test-util` added to smdjad dev-dependencies.
+- **Test coverage: poll backoff** — two unit tests verify the clamped shift expression never overflows for any retry count 0–60 and caps at 1 000 ms for retry ≥ 5.
+- **Bug: poll backoff shift overflow** — `100u64 << poll_retry_count.saturating_sub(1)` could overflow in debug builds at `poll_retry_count ≥ 64`; fixed to `let shift = count.saturating_sub(1).min(10); 100u64 << shift` — overflows impossible, cap unchanged.
+
 ## [0.16.0] — 2026-06-25
 
 ### Added

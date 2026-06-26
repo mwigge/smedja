@@ -2096,4 +2096,90 @@ mod tests {
         assert_eq!(fails.len(), 1);
         assert_eq!(fails[0].status.as_deref(), Some("error"));
     }
+
+    // --- prune_old_sessions + vacuum -----------------------------------------
+
+    fn make_session(status: &str, updated_at: smedja_types::Timestamp) -> crate::session::Session {
+        crate::session::Session {
+            id: uuid::Uuid::new_v4(),
+            created_at: updated_at,
+            updated_at,
+            status: status.to_owned(),
+            title: String::new(),
+            cowork_mode: false,
+            task_id: None,
+            mode: None,
+            workspace_root: None,
+            model_override: None,
+            runner_override: None,
+        }
+    }
+
+    #[test]
+    fn prune_old_sessions_removes_stale_terminal_sessions_and_cascades() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        // Old complete session (timestamp year 2001) — must be pruned.
+        let old_ts = smedja_types::Timestamp::from_secs_f64(1_000_000_000.0);
+        let old_sess = make_session("complete", old_ts);
+        ingot.create_session(&old_sess).unwrap();
+
+        // Recent active session — must survive (wrong status).
+        let new_sess = make_session("active", smedja_types::Timestamp::now());
+        ingot.create_session(&new_sess).unwrap();
+
+        // Dependent rows for old session.
+        let mut old_task = make_task("old-task");
+        old_task.session_id = Some(old_sess.id.to_string());
+        ingot.create_task(&old_task).unwrap();
+        let mut old_ev = make_audit_event(&old_sess.id.to_string());
+        old_ev.id = uuid::Uuid::new_v4();
+        ingot.insert_audit_event(&old_ev).unwrap();
+
+        // Dependent rows for new session.
+        let mut new_task = make_task("new-task");
+        new_task.session_id = Some(new_sess.id.to_string());
+        ingot.create_task(&new_task).unwrap();
+
+        // Prune sessions older than 0 days (cutoff = now → evicts anything in the past).
+        let deleted = ingot.prune_old_sessions(0).unwrap();
+        assert_eq!(deleted, 1, "exactly the old complete session must be pruned");
+
+        // Old session and its dependents must be gone.
+        assert!(ingot.get_session(&old_sess.id.to_string()).unwrap().is_none());
+        let tasks = ingot.list_tasks(None).unwrap();
+        assert!(
+            tasks.iter().all(|t| t.id != old_task.id),
+            "task belonging to pruned session must be cascaded"
+        );
+        // New session and its task survive.
+        assert!(ingot.get_session(&new_sess.id.to_string()).unwrap().is_some());
+        assert!(tasks.iter().any(|t| t.id == new_task.id));
+    }
+
+    #[test]
+    fn prune_old_sessions_preserves_recent_complete_sessions() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let sess = make_session("complete", smedja_types::Timestamp::now());
+        ingot.create_session(&sess).unwrap();
+        // Prune sessions older than 30 days — brand-new session must survive.
+        let deleted = ingot.prune_old_sessions(30).unwrap();
+        assert_eq!(deleted, 0);
+        assert!(ingot.get_session(&sess.id.to_string()).unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_old_sessions_does_not_prune_active_sessions_regardless_of_age() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let old_ts = smedja_types::Timestamp::from_secs_f64(1_000_000_000.0);
+        let sess = make_session("active", old_ts);
+        ingot.create_session(&sess).unwrap();
+        let deleted = ingot.prune_old_sessions(0).unwrap();
+        assert_eq!(deleted, 0, "active sessions must never be pruned");
+    }
+
+    #[test]
+    fn vacuum_completes_without_error() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        ingot.vacuum().unwrap();
+    }
 }

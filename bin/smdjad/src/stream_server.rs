@@ -477,4 +477,48 @@ mod tests {
             "expected traceparent in done line; got: {line}"
         );
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn delta_buffer_evicts_after_ttl() {
+        let dispatcher = Arc::new(Dispatcher::new(64));
+        let store = spawn_delta_buffer(&dispatcher);
+
+        dispatcher.publish(TurnEvent::Started {
+            session_id: "sess".into(),
+            turn_id: "t-ttl".into(),
+            correlation: CorrelationCtx::default(),
+        });
+        dispatcher.publish(TurnEvent::AssistantDelta {
+            content: "hello".into(),
+            turn_id: Some("t-ttl".into()),
+            correlation: CorrelationCtx::default(),
+        });
+        dispatcher.publish(TurnEvent::Completed {
+            session_id: "sess".into(),
+            turn_id: "t-ttl".into(),
+            output_tokens: 1,
+            input_tokens: None,
+            traceparent: None,
+            correlation: CorrelationCtx::default(),
+        });
+
+        // Let the event-loop task process all queued events.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Buffer exists immediately after the terminal event.
+        assert!(
+            store.lock().await.contains_key("t-ttl"),
+            "buffer must persist before TTL expires"
+        );
+
+        // Advance the clock past the TTL so the GC task fires.
+        tokio::time::advance(std::time::Duration::from_secs(DELTA_TTL_SECS + 1)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            !store.lock().await.contains_key("t-ttl"),
+            "buffer must be evicted after TTL"
+        );
+    }
 }
