@@ -3369,6 +3369,11 @@ async fn main() -> Result<()> {
         let _ = sigterm_tx.send(true);
     });
 
+    // Periodically force a full repaint so any cell that desynced between
+    // ratatui's diff and the host terminal grid (observed as stale content
+    // lingering in the top rows) is rewritten. The repaint is atomic thanks to
+    // the synchronized-output bracket below, so it does not flicker.
+    let mut last_full_repaint = std::time::Instant::now();
     loop {
         // Collect all ready crossterm events before drawing — one render per batch.
         let event_available =
@@ -3417,6 +3422,14 @@ async fn main() -> Result<()> {
         // streaming redraws are parsed and rendered half-applied, tearing the
         // message area into overlapping garbage.
         let _ = execute!(stdout(), crossterm::terminal::BeginSynchronizedUpdate);
+        // Force a full redraw a few times a second to self-heal any diff/grid
+        // desync (clear() erases the screen + discards ratatui's prev-buffer so
+        // the next draw emits every cell). Kept inside the synchronized-update
+        // bracket so the erase+redraw is presented atomically — no flicker.
+        if last_full_repaint.elapsed() >= Duration::from_millis(500) {
+            let _ = terminal.clear();
+            last_full_repaint = std::time::Instant::now();
+        }
         terminal.draw(|f| render(f, &mut state))?;
         let _ = execute!(stdout(), crossterm::terminal::EndSynchronizedUpdate);
 
