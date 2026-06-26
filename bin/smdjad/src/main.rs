@@ -308,12 +308,12 @@ async fn run_turn(
     .await;
 }
 
-/// Subscribes to [`TurnEvent::Started`] and spawns a [`run_turn`] task for each
-/// into the shared `task_set`.
+/// Subscribes to [`TurnEvent::Started`] and spawns a [`run_turn`] task for each.
 ///
-/// Completed tasks are reaped from the set as they finish (via `try_join_next`)
-/// so the set is bounded by the number of *in-flight* tasks rather than every
-/// task ever spawned. The same set is drained at shutdown.
+/// Owns its `JoinSet` exclusively — no shared mutex. Finished tasks are reaped
+/// via `try_join_next` so the set size tracks only *in-flight* work. When
+/// `work_rx` closes (all senders dropped), the worker exits its loop and
+/// returns the set so the caller can drain any remaining tasks at shutdown.
 ///
 /// Started events arrive via a dedicated `work_rx` mpsc channel (sent by the
 /// `turn.submit` handler) rather than the broadcast, so they cannot be dropped
@@ -330,14 +330,14 @@ fn spawn_worker(
     embedder: Arc<dyn embedder_port::Embedder>,
     provider_sessions: orchestrator::ProviderSessions,
     cache_aligners: orchestrator::CacheAligners,
-    task_set: Arc<Mutex<tokio::task::JoinSet<()>>>,
     mut work_rx: tokio::sync::mpsc::Receiver<(String, String)>,
-) {
+) -> tokio::task::JoinHandle<tokio::task::JoinSet<()>> {
     tokio::spawn(async move {
+        let mut set = tokio::task::JoinSet::new();
         loop {
             let (session_id, turn_id) = match work_rx.recv().await {
                 Some(pair) => pair,
-                None => break, // sender dropped — daemon shutting down
+                None => break, // all senders dropped — daemon shutting down
             };
             let ig = ingot.clone();
             let dp = Arc::clone(&dispatcher);
@@ -349,7 +349,6 @@ fn spawn_worker(
             let em = Arc::clone(&embedder);
             let ps = Arc::clone(&provider_sessions);
             let ca = Arc::clone(&cache_aligners);
-            let mut set = task_set.lock().await;
             set.spawn(run_turn(
                 ig, dp, session_id, turn_id, g, pl, as_, pt, vt, em, ps, ca,
             ));
@@ -357,7 +356,8 @@ fn spawn_worker(
             while set.try_join_next().is_some() {}
             tracing::debug!(in_flight = set.len(), "turn spawned");
         }
-    });
+        set
+    })
 }
 
 /// Returns `true` when `addr` falls in a range the daemon must never reach
@@ -927,6 +927,10 @@ async fn main() -> anyhow::Result<()> {
     // Started is never dropped under high delta/diagnostic load (capacity 256
     // is a hard upper bound on concurrent in-flight turns).
     let (work_tx, work_rx) = tokio::sync::mpsc::channel::<(String, String)>(256);
+    // Retain one sender clone so we can close the channel explicitly at shutdown
+    // by dropping it — at that point every handler-held clone has also been
+    // dropped (server dropped on select! exit), which closes work_rx.
+    let work_tx_shutdown = work_tx.clone();
 
     let router = build_router(
         &ingot,
@@ -946,7 +950,7 @@ async fn main() -> anyhow::Result<()> {
         work_tx,
     );
 
-    spawn_worker(
+    let worker_handle = spawn_worker(
         ingot.clone(),
         Arc::clone(&dispatcher),
         Arc::clone(&gates),
@@ -957,7 +961,6 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&embedder),
         Arc::clone(&provider_sessions),
         Arc::clone(&cache_aligners),
-        Arc::clone(&task_set),
         work_rx,
     );
 
@@ -1102,18 +1105,27 @@ async fn main() -> anyhow::Result<()> {
     // up, so mid-stream work can complete (or fail cleanly) rather than being
     // silently abandoned. A 30 s deadline prevents indefinite blocking; tasks
     // still running at the deadline are dropped (aborted) when the set is.
-    {
-        let mut set = std::mem::take(&mut *task_set.lock().await);
-        if !set.is_empty() {
-            info!(
-                count = set.len(),
-                "waiting for in-flight turns and loops to finish (up to 30 s)"
-            );
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                while set.join_next().await.is_some() {}
-            })
-            .await;
-        }
+    //
+    // Turn tasks: close the work channel (drop our retained sender clone; the
+    // server's handler clones were already dropped when the serve() future was
+    // cancelled above). Awaiting the worker handle gives back its private JoinSet
+    // containing any turns that were spawned but haven't finished yet.
+    drop(work_tx_shutdown);
+    let mut turn_set = worker_handle.await.unwrap_or_default();
+    // Loop tasks: still tracked in the shared task_set.
+    let mut loop_set = std::mem::take(&mut *task_set.lock().await);
+    let total = turn_set.len() + loop_set.len();
+    if total > 0 {
+        info!(
+            turns = turn_set.len(),
+            loops = loop_set.len(),
+            "waiting for in-flight turns and loops to finish (up to 30 s)"
+        );
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while turn_set.join_next().await.is_some() {}
+            while loop_set.join_next().await.is_some() {}
+        })
+        .await;
     }
 
     info!("smdjad stopped");
