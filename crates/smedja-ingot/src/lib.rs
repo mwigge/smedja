@@ -928,6 +928,16 @@ impl Ingot {
         task::list(&self.conn, status)
     }
 
+    /// Returns the completed conversation turns for `session_id`, oldest first
+    /// (each task's `title` is the user message, `response` the assistant reply).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    pub fn session_history(&self, session_id: &str) -> Result<Vec<Task>, IngotError> {
+        task::history_for_session(&self.conn, session_id)
+    }
+
     /// Updates the `status` field for the task identified by `id`.
     ///
     /// # Errors

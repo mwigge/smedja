@@ -449,6 +449,18 @@ impl IngotHandle {
             .await
     }
 
+    /// Returns the completed conversation turns for `session_id`, oldest first
+    /// (`title` = user message, `response` = assistant reply).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`], or [`IngotError::TaskPanic`] on panic.
+    pub async fn session_history(&self, session_id: &str) -> Result<Vec<Task>, IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.session_history(&session_id))
+            .await
+    }
+
     /// Updates the `status` field for a task.
     ///
     /// # Errors
