@@ -1619,6 +1619,60 @@ impl PtySession {
     }
 }
 
+// ── VT conformance harness ────────────────────────────────────────────────────
+//
+// A headless "feed bytes → snapshot the grid" pipeline used by the golden
+// conformance suite and the `vtdump` example. Keeping it in the library (not
+// behind `cfg(test)`) lets the example reuse it to diff recorded app streams.
+
+/// Renders the active grid to a plain-text snapshot: one line per row, trailing
+/// blanks trimmed, with trailing empty rows removed. Cursor/colour state is not
+/// included — this captures the visible character layout for golden diffing.
+#[must_use]
+pub fn snapshot_grid(grid: &CellGrid) -> String {
+    let mut lines: Vec<String> = grid
+        .cells
+        .iter()
+        .map(|row| {
+            let s: String = row.iter().map(|c| c.ch).collect();
+            s.trim_end().to_owned()
+        })
+        .collect();
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+/// FNV-1a hash of a snapshot — a compact state fingerprint for golden assertions.
+#[must_use]
+pub fn snapshot_hash(snapshot: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in snapshot.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Feeds `bytes` to a fresh `cols×rows` grid through the real VT parser and
+/// returns its [`snapshot_grid`] text. The canonical entry point for conformance
+/// fixtures: deterministic, no PTY, no GPU.
+#[must_use]
+pub fn render_vt_snapshot(cols: u16, rows: u16, bytes: &[u8]) -> String {
+    let grid = Arc::new(Mutex::new(CellGrid::new(cols, rows)));
+    let mut handler = VtHandler {
+        grid: Arc::clone(&grid),
+        glyph_registry: Arc::new(Mutex::new(GlyphRegistry::new())),
+    };
+    let mut parser = vte::Parser::new();
+    for &b in bytes {
+        parser.advance(&mut handler, b);
+    }
+    let guard = grid.lock();
+    snapshot_grid(&guard)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2506,5 +2560,63 @@ mod tests {
             seq.windows(2).any(|w| w == b"\x1b\\"),
             "startup sequence should contain at least one string terminator"
         );
+    }
+
+    // ── VT conformance golden suite ──────────────────────────────────────────
+    // Each case feeds bytes to a fresh grid and asserts the snapshot. These lock
+    // in correct VT behaviour so later phases (wide chars, SGR, scroll regions)
+    // can't silently regress the basics.
+
+    #[test]
+    fn conformance_plain_text() {
+        assert_eq!(render_vt_snapshot(20, 3, b"hello world"), "hello world");
+    }
+
+    #[test]
+    fn conformance_crlf_newline() {
+        assert_eq!(render_vt_snapshot(20, 3, b"line1\r\nline2"), "line1\nline2");
+    }
+
+    #[test]
+    fn conformance_deferred_wrap_at_width() {
+        // 4-col grid: "abcd" fills the row (deferred wrap, no advance); "abcde"
+        // wraps the 'e' onto the next row.
+        assert_eq!(render_vt_snapshot(4, 3, b"abcd"), "abcd");
+        assert_eq!(render_vt_snapshot(4, 3, b"abcde"), "abcd\ne");
+    }
+
+    #[test]
+    fn conformance_cursor_position_and_overwrite() {
+        // CSI 2;3 H places the cursor at row 2 col 3 (1-based) → 'X' at [1][2].
+        assert_eq!(render_vt_snapshot(6, 3, b"\x1b[2;3HX"), "\n  X");
+    }
+
+    #[test]
+    fn conformance_carriage_return_overwrite() {
+        assert_eq!(render_vt_snapshot(6, 2, b"abc\rXY"), "XYc");
+    }
+
+    #[test]
+    fn conformance_erase_line_to_end() {
+        // Write "abcdef", move to col 3, erase-to-end (CSI K) → "ab".
+        assert_eq!(render_vt_snapshot(8, 2, b"abcdef\x1b[1;3H\x1b[K"), "ab");
+    }
+
+    #[test]
+    fn conformance_erase_display() {
+        assert_eq!(render_vt_snapshot(8, 3, b"foo\r\nbar\x1b[2J"), "");
+    }
+
+    #[test]
+    fn conformance_backspace_moves_cursor_left() {
+        assert_eq!(render_vt_snapshot(8, 2, b"abc\x08X"), "abX");
+    }
+
+    #[test]
+    fn conformance_snapshot_hash_is_stable() {
+        let a = render_vt_snapshot(10, 2, b"hello");
+        let b = render_vt_snapshot(10, 2, b"hello");
+        assert_eq!(snapshot_hash(&a), snapshot_hash(&b));
+        assert_ne!(snapshot_hash(&a), snapshot_hash(&render_vt_snapshot(10, 2, b"world")));
     }
 }
