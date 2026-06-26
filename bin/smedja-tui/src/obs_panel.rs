@@ -81,6 +81,34 @@ fn fmt_tok(n: u64) -> String {
     }
 }
 
+/// Eighth-block glyphs for the latency sparkline, low → high.
+const SPARK_BLOCKS: [char; 8] = ['\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+
+/// Renders the most recent `width` latency samples as an inline block
+/// sparkline, scaled to the window's own min/max. Returns an empty string for
+/// an empty series or zero width.
+fn sparkline(samples: &VecDeque<u64>, width: usize) -> String {
+    if width == 0 || samples.is_empty() {
+        return String::new();
+    }
+    let recent: Vec<u64> = samples.iter().rev().take(width).rev().copied().collect();
+    let max = recent.iter().copied().max().unwrap_or(0);
+    let min = recent.iter().copied().min().unwrap_or(0);
+    let span = max.saturating_sub(min).max(1);
+    recent
+        .iter()
+        .map(|&v| {
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let idx = (((v - min) as f64 / span as f64) * 7.0).round() as usize;
+            SPARK_BLOCKS[idx.min(7)]
+        })
+        .collect()
+}
+
 /// Shared budget thresholds: green below 60%, amber 60–85%, red at/above 85%.
 fn budget_color(pct: u64) -> ratatui::style::Color {
     let p = palette();
@@ -177,6 +205,15 @@ impl<'a> ObsPanel<'a> {
             }
         }
 
+        // ── Latency trend sparkline ──────────────────────────────────────────
+        let spark = sparkline(&snap.latency_samples, bar_w);
+        if !spark.is_empty() {
+            lines.push(Line::from(Span::styled(
+                spark,
+                Style::default().fg(p.local),
+            )));
+        }
+
         // ── Token throughput ─────────────────────────────────────────────────
         let total = snap.tokens_input + snap.tokens_output;
         lines.push(Line::from(vec![
@@ -219,20 +256,28 @@ impl<'a> ObsPanel<'a> {
             }
         }
 
-        // ── Cost + efficiency ────────────────────────────────────────────────
-        if snap.session_cost_usd > 0.0 || snap.efficiency_ratio > 0.0 {
+        // ── Session cost ─────────────────────────────────────────────────────
+        if snap.session_cost_usd > 0.0 {
+            lines.push(Line::from(vec![
+                Span::styled("\u{24}", Style::default().fg(p.text_dim)),
+                Span::raw(format!("{:.3}", snap.session_cost_usd)),
+            ]));
+        }
+
+        // ── Cache-efficiency bar (higher is better → success-toned) ──────────
+        if snap.efficiency_ratio > 0.0 {
             #[allow(
                 clippy::cast_precision_loss,
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss
             )]
-            let eff_pct = (snap.efficiency_ratio * 100.0).round() as u64;
-            lines.push(Line::from(vec![
-                Span::styled("\u{24}", Style::default().fg(p.text_dim)),
-                Span::raw(format!("{:.3}", snap.session_cost_usd)),
-                Span::styled("  eff ", Style::default().fg(p.text_dim)),
-                Span::styled(format!("{eff_pct}%"), Style::default().fg(p.success)),
-            ]));
+            let eff_pct = (snap.efficiency_ratio * 100.0).round().min(100.0) as u64;
+            let suffix = format!(" eff {eff_pct}%");
+            let reserved = suffix.chars().count();
+            let ew = bar_w.saturating_sub(reserved).max(1);
+            let mut spans = fill_bar(eff_pct, 100, ew, p.success).spans;
+            spans.push(Span::styled(suffix, Style::default().fg(p.text_dim)));
+            lines.push(Line::from(spans));
         }
 
         // ── Cache savings ────────────────────────────────────────────────────
@@ -311,6 +356,20 @@ mod tests {
         assert_eq!(budget_color(84), palette().warn);
         assert_eq!(budget_color(85), palette().error);
         assert_eq!(budget_color(100), palette().error);
+    }
+
+    #[test]
+    fn sparkline_maps_range_to_blocks_and_respects_width() {
+        let samples: VecDeque<u64> = vec![0, 50, 100].into();
+        let s = sparkline(&samples, 10);
+        let chars: Vec<char> = s.chars().collect();
+        assert_eq!(chars.len(), 3, "one glyph per sample, within width");
+        assert_eq!(chars[0], '\u{2581}', "min → lowest block");
+        assert_eq!(chars[2], '\u{2588}', "max → highest block");
+        // Only the most recent `width` samples are shown.
+        let many: VecDeque<u64> = (0..40).collect();
+        assert_eq!(sparkline(&many, 8).chars().count(), 8);
+        assert!(sparkline(&VecDeque::new(), 8).is_empty());
     }
 
     #[test]

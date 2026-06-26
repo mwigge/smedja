@@ -2998,6 +2998,12 @@ fn render_role_cockpit(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, 
         ]),
         Line::from(vec![
             Span::styled("role  ", Style::default().fg(p.text_dim)),
+            // Per-agent accent pip (deterministic colour); the name itself stays
+            // bright/readable rather than being recoloured.
+            Span::styled(
+                "\u{25C6} ",
+                Style::default().fg(crate::theme::agent_color(active_name)),
+            ),
             Span::styled(
                 active_name.to_owned(),
                 Style::default()
