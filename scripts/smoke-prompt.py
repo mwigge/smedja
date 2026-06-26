@@ -64,6 +64,48 @@ def check_ok(result, label):
     return response
 
 
+def check_set_runner(rpc):
+    """session.set_runner switches the active runner for a session (switchover)."""
+    sid = rpc.call("session.create", {"title": "smoke-set-runner"})["id"]
+    res = rpc.call("session.set_runner", {"session_id": sid, "runner": "copilot"})
+    if res.get("runner") != "copilot":
+        print(f"FAIL [set_runner]: expected runner 'copilot', got {res.get('runner')!r}")
+        return False
+    print(f"PASS [set_runner]: session {sid[:8]} runner -> {res['runner']!r}")
+    return True
+
+
+def check_takeover(rpc):
+    """session.takeover atomically forks a session onto a new runner."""
+    sid = rpc.call("session.create", {"title": "smoke-takeover"})["id"]
+    res = rpc.call("session.takeover", {"session_id": sid, "runner": "copilot"})
+    new_sid = res.get("new_session_id")
+    if not new_sid or new_sid == sid:
+        print(f"FAIL [takeover]: expected a new forked session id, got {new_sid!r}")
+        return False
+    if res.get("runner") != "copilot":
+        print(f"FAIL [takeover]: expected runner 'copilot', got {res.get('runner')!r}")
+        return False
+    print(f"PASS [takeover]: {sid[:8]} -> forked {new_sid[:8]} on {res['runner']!r}")
+    return True
+
+
+def check_rollback(rpc):
+    """Two turns create checkpoints at turn_n 0 and 1; rollback to 0 must succeed."""
+    sid = rpc.call("session.create", {"title": "smoke-rollback"})["id"]
+    for content in ["Reply with one word: one", "Reply with one word: two"]:
+        res = turn(rpc, sid, content)
+        if res.get("error"):
+            print(f"FAIL [rollback/setup]: turn errored: {res.get('error')}")
+            return False
+    res = rpc.call("session.rollback", {"session_id": sid, "turn_n": 0})
+    if res.get("turn_n") != 0 or "messages_json" not in res:
+        print(f"FAIL [rollback]: unexpected result {json.dumps(res)[:200]}")
+        return False
+    print(f"PASS [rollback]: session {sid[:8]} rolled back to turn_n=0")
+    return True
+
+
 def main():
     print(f"socket: {SOCK}")
     rpc = Rpc(SOCK)
@@ -86,7 +128,16 @@ def main():
     if "42" not in recall:
         print(f"FAIL [multi-turn]: prior context not recalled (got {recall!r}, expected '42')")
         return 1
-    print("PASS: single-turn and multi-turn prompting both work")
+
+    # 3) Session control: switchover, takeover, and rollback.
+    if not check_set_runner(rpc):
+        return 1
+    if not check_takeover(rpc):
+        return 1
+    if not check_rollback(rpc):
+        return 1
+
+    print("PASS: prompting (single+multi-turn), set_runner, takeover, and rollback all work")
     return 0
 
 
