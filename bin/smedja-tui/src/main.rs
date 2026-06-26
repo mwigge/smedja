@@ -3412,7 +3412,13 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Bracket the frame in a synchronized update (`?2026h`/`?2026l`) so the
+        // host terminal only presents complete frames. Without this, rapid
+        // streaming redraws are parsed and rendered half-applied, tearing the
+        // message area into overlapping garbage.
+        let _ = execute!(stdout(), crossterm::terminal::BeginSynchronizedUpdate);
         terminal.draw(|f| render(f, &mut state))?;
+        let _ = execute!(stdout(), crossterm::terminal::EndSynchronizedUpdate);
 
         // Drain NDJSON stream events from the background reader task.
         // When streaming is active (stream_rx is Some), render deltas in real
