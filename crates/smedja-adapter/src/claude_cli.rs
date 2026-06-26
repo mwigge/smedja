@@ -3,7 +3,7 @@
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    AdapterError, AnthropicProvider, CallOptions, Delta, DeltaStream, Message, Provider,
+    AdapterError, AnthropicProvider, CallOptions, Delta, DeltaStream, Message, Provider, Role,
     SubprocessProvider,
 };
 
@@ -38,28 +38,31 @@ impl Provider for ClaudeCliProvider {
     }
 }
 
-fn stream_claude_cli(messages: &[Message], opts: &CallOptions) -> DeltaStream {
-    let prompt = messages
-        .last()
-        .map_or_else(String::new, |message| message.content.clone());
-    let resume_id = opts.provider_session_id.clone();
+fn stream_claude_cli(messages: &[Message], _opts: &CallOptions) -> DeltaStream {
+    // Render the FULL conversation into the prompt and deliver it on stdin.
+    // We do NOT use `--resume`: it depends on the CLI's own conversation store,
+    // which is unreliable under the daemon's working directory / sandbox and
+    // fails with "No conversation found" (exit 1) on the second turn. milliways
+    // takes the same approach — assemble the whole prompt upstream, no resume.
+    let prompt = render_conversation(messages);
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::spawn(async move {
+        // Mirror the proven milliways invocation. Notably:
+        //  * NO `--bare`: that flag selects a credential path that ignores the
+        //    logged-in Claude session and fails with "Not logged in".
+        //  * NO `--dangerously-skip-permissions`: not needed for the prompt path
+        //    and a source of non-zero exits in non-interactive use.
+        //  * The prompt is delivered on STDIN, not as a positional argv element —
+        //    a large prompt (system preamble + context) as a single argv entry
+        //    overflows MAX_ARG_STRLEN (128 KiB) and execve fails with E2BIG.
         let mut command = tokio::process::Command::new("claude");
         command
             .arg("--print")
-            .arg("--verbose")
             .arg("--output-format")
             .arg("stream-json")
-            .arg("--include-partial-messages")
-            .arg("--bare")
-            .arg("--dangerously-skip-permissions");
-        if let Some(id) = resume_id.filter(|id| !id.is_empty()) {
-            command.arg("--resume").arg(id);
-        }
-        command
-            .arg(prompt)
+            .arg("--verbose")
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
@@ -70,6 +73,14 @@ fn stream_claude_cli(messages: &[Message], opts: &CallOptions) -> DeltaStream {
                 return;
             }
         };
+
+        // Write the prompt to stdin and close it so claude (in --print mode with
+        // no positional prompt) reads the request to completion.
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt as _;
+            let _ = stdin.write_all(prompt.as_bytes()).await;
+            let _ = stdin.shutdown().await;
+        }
 
         let stderr = child.stderr.take();
         if let Some(stdout) = child.stdout.take() {
@@ -111,6 +122,39 @@ fn stream_claude_cli(messages: &[Message], opts: &CallOptions) -> DeltaStream {
     });
 
     Box::pin(ReceiverStream::new(rx))
+}
+
+/// Renders the conversation into a single prompt for `claude --print`.
+///
+/// A lone user turn is sent verbatim (the common single-turn case). Multi-turn
+/// histories become a labelled `Human:` / `Assistant:` transcript so the CLI
+/// has the full context in one shot — no dependency on its resume store.
+/// System messages are delivered out of band and excluded here.
+fn render_conversation(messages: &[Message]) -> String {
+    let dialogue: Vec<&Message> = messages
+        .iter()
+        .filter(|m| !matches!(m.role, Role::System))
+        .collect();
+    match dialogue.as_slice() {
+        [] => messages
+            .last()
+            .map_or_else(String::new, |m| m.content.clone()),
+        [single] => single.content.clone(),
+        many => {
+            let mut out = String::new();
+            for m in many {
+                let label = match m.role {
+                    Role::Assistant => "Assistant",
+                    _ => "Human",
+                };
+                out.push_str(label);
+                out.push_str(": ");
+                out.push_str(&m.content);
+                out.push_str("\n\n");
+            }
+            out
+        }
+    }
 }
 
 async fn read_stderr(stderr: Option<tokio::process::ChildStderr>) -> String {
@@ -326,9 +370,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn render_conversation_single_user_turn_is_verbatim() {
+        let msgs = vec![Message {
+            role: Role::User,
+            content: "hello there".into(),
+        }];
+        assert_eq!(render_conversation(&msgs), "hello there");
+    }
+
+    #[test]
+    fn render_conversation_multi_turn_is_labelled_transcript() {
+        let msgs = vec![
+            Message {
+                role: Role::User,
+                content: "my number is 7".into(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "noted".into(),
+            },
+            Message {
+                role: Role::User,
+                content: "what number?".into(),
+            },
+        ];
+        let rendered = render_conversation(&msgs);
+        assert_eq!(
+            rendered,
+            "Human: my number is 7\n\nAssistant: noted\n\nHuman: what number?\n\n"
+        );
+    }
+
+    #[test]
+    fn render_conversation_excludes_system_messages() {
+        let msgs = vec![
+            Message {
+                role: Role::System,
+                content: "be terse".into(),
+            },
+            Message {
+                role: Role::User,
+                content: "hi".into(),
+            },
+        ];
+        // System filtered → single dialogue turn → verbatim.
+        assert_eq!(render_conversation(&msgs), "hi");
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the stream to serialize $PATH mutation across concurrent tests
-    async fn cli_provider_streams_mock_claude_and_passes_resume() {
+    async fn cli_provider_streams_mock_claude_via_stdin_without_resume() {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp_dir = std::env::temp_dir().join(format!(
             "smedja-claude-mock-{}-{}",
@@ -340,12 +432,15 @@ mod tests {
         ));
         std::fs::create_dir_all(&temp_dir).unwrap();
         let args_file = temp_dir.join("args.txt");
+        let stdin_file = temp_dir.join("stdin.txt");
         let script_path = temp_dir.join("claude");
+        // Record argv and stdin, then emit a minimal stream-json transcript.
         std::fs::write(
             &script_path,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"mock-session\"}}'\nprintf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"hello\"}}]}}}}'\n",
-                args_file.display()
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\nprintf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"mock-session\"}}'\nprintf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"hello\"}}]}}}}'\n",
+                args_file.display(),
+                stdin_file.display()
             ),
         )
         .unwrap();
@@ -389,8 +484,28 @@ mod tests {
         assert!(deltas.contains(&Delta::SessionId("mock-session".into())));
         assert!(deltas.contains(&Delta::Text("hello".into())));
         let args = std::fs::read_to_string(&args_file).unwrap();
-        assert!(args.contains("--resume"));
-        assert!(args.contains("resume-123"));
+        // `--bare` selects a credential path that ignores the logged-in session
+        // ("Not logged in"); it must never be passed.
+        assert!(
+            !args.contains("--bare"),
+            "--bare breaks auth and must not be used; args were:\n{args}"
+        );
+        // `--resume` depends on the CLI's own conversation store and fails under
+        // the daemon (exit 1, "No conversation found"); the full conversation is
+        // rendered into the prompt instead, so resume must never be passed even
+        // when a provider_session_id is set.
+        assert!(
+            !args.contains("--resume"),
+            "--resume must not be used; args were:\n{args}"
+        );
+        // The prompt must be delivered on stdin, not as a positional argv entry
+        // (argv overflows MAX_ARG_STRLEN for large prompts → E2BIG).
+        let stdin = std::fs::read_to_string(&stdin_file).unwrap();
+        assert_eq!(stdin, "hi", "prompt must arrive on stdin");
+        assert!(
+            !args.contains("hi"),
+            "prompt must not be passed as an argv element; args were:\n{args}"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

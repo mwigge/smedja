@@ -581,6 +581,29 @@ impl TurnOrchestrator {
             "cold context injection"
         );
 
+        // Replay prior completed turns for this session so the provider has the
+        // full conversation context. smedja used to delegate memory to the CLI's
+        // `--resume`, but that is environment-fragile and was dropped; loading
+        // the history here (milliways-style) makes multi-turn work everywhere.
+        match ingot.session_history(&session_id).await {
+            Ok(history) => {
+                for past in history {
+                    if past.id.to_string() == turn_id {
+                        continue; // never replay the in-flight turn
+                    }
+                    mem.push(AdapterMessage::user(past.title));
+                    if let Some(resp) = past.response {
+                        if !resp.is_empty() {
+                            mem.push(AdapterMessage::assistant(resp));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "could not load session history; continuing without it");
+            }
+        }
+
         mem.push(AdapterMessage::user(first_user_content));
         mem.seal_prefix();
 
@@ -648,7 +671,17 @@ impl TurnOrchestrator {
         'ring: for entry in &ring {
             let entry_runner_name = entry.runner_name.to_owned();
             let runner_enum = entry.runner;
-            let session_store_key = crate::common::runner_session_key(runner_enum);
+            // Key the provider-native resume id by (session, runner), NOT by
+            // runner alone. A bare runner key ("claude-cli") is global: the
+            // first turn's native conversation id leaks into every other
+            // session, so later turns pass `--resume <stale id>` and the CLI
+            // fails with "No conversation found" (exit 1). Scoping by session id
+            // means a fresh session starts with no resume and each session keeps
+            // its own conversation.
+            let session_store_key = format!(
+                "{session_id}:{}",
+                crate::common::runner_session_key(runner_enum)
+            );
 
             // Re-derive the model for this entry: explicit route/env/session
             // override take precedence over the entry's default model.
@@ -673,7 +706,7 @@ impl TurnOrchestrator {
                 provider_sessions
                     .lock()
                     .await
-                    .get(session_store_key)
+                    .get(&session_store_key)
                     .cloned()
             } else {
                 None

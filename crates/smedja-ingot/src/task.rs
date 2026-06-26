@@ -75,6 +75,30 @@ pub(crate) fn list(
     Ok(collected?)
 }
 
+/// Returns the completed turns for `session_id`, oldest first — the prior
+/// conversation history (each task's `title` is the user content and `response`
+/// the assistant reply). Only `status = 'complete'` rows with a non-null
+/// response are returned, so in-flight and failed turns are excluded.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the query fails.
+pub(crate) fn history_for_session(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Vec<Task>, IngotError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, description, status, created_at, session_id, response \
+         FROM tasks \
+         WHERE session_id = ?1 AND status = 'complete' AND response IS NOT NULL \
+         ORDER BY created_at ASC",
+    )?;
+    let collected: Result<Vec<Task>, _> = stmt
+        .query_map(rusqlite::params![session_id], row_to_task)?
+        .collect();
+    Ok(collected?)
+}
+
 /// Retrieves a single [`Task`] by `id`, returning `None` when not found.
 ///
 /// # Errors
@@ -214,6 +238,46 @@ mod tests {
 
         let results = ingot.list_tasks(Some("complete")).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn session_history_returns_completed_turns_in_order() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let sid = "11111111-1111-1111-1111-111111111111";
+        let other = "22222222-2222-2222-2222-222222222222";
+
+        let mk = |title: &str, created: f64, session: &str| Task {
+            id: Uuid::new_v4(),
+            title: title.to_string(),
+            description: String::new(),
+            status: "planned".to_string(),
+            created_at: Timestamp::from_secs_f64(created),
+            session_id: Some(session.to_string()),
+            response: None,
+        };
+
+        // Two completed turns in `sid` (out of insertion order to test sorting).
+        let t2 = mk("second", 2000.0, sid);
+        let t1 = mk("first", 1000.0, sid);
+        ingot.create_task(&t2).unwrap();
+        ingot.create_task(&t1).unwrap();
+        ingot.set_task_response(&t1.id.to_string(), "ans-first").unwrap();
+        ingot.set_task_response(&t2.id.to_string(), "ans-second").unwrap();
+
+        // A completed turn in a different session — must be excluded.
+        let other_t = mk("other", 1500.0, other);
+        ingot.create_task(&other_t).unwrap();
+        ingot.set_task_response(&other_t.id.to_string(), "ans-other").unwrap();
+
+        // An in-flight (planned, no response) turn in `sid` — must be excluded.
+        ingot.create_task(&mk("pending", 3000.0, sid)).unwrap();
+
+        let hist = ingot.session_history(sid).unwrap();
+        assert_eq!(hist.len(), 2, "only completed turns for the session");
+        assert_eq!(hist[0].title, "first", "oldest first");
+        assert_eq!(hist[0].response.as_deref(), Some("ans-first"));
+        assert_eq!(hist[1].title, "second");
+        assert_eq!(hist[1].response.as_deref(), Some("ans-second"));
     }
 
     #[test]
