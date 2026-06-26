@@ -1848,7 +1848,7 @@ async fn main() -> Result<()> {
                             .into_iter()
                             .flatten()
                             .flatten()
-                            .filter(|e| e.path().extension().map_or(false, |x| x == "toml"))
+                            .filter(|e| e.path().extension().is_some_and(|x| x == "toml"))
                             .collect();
                         entries.sort_by_key(|e| e.file_name());
                         for entry in entries {
@@ -1861,13 +1861,13 @@ async fn main() -> Result<()> {
                             let title = text
                                 .lines()
                                 .find(|l| l.starts_with("title"))
-                                .and_then(|l| l.splitn(2, '=').nth(1))
+                                .and_then(|l| l.split_once('=').map(|x| x.1))
                                 .map(|s| s.trim().trim_matches('"').to_owned())
                                 .unwrap_or_default();
                             let status = text
                                 .lines()
                                 .find(|l| l.starts_with("status"))
-                                .and_then(|l| l.splitn(2, '=').nth(1))
+                                .and_then(|l| l.split_once('=').map(|x| x.1))
                                 .map(|s| s.trim().trim_matches('"').to_owned())
                                 .unwrap_or_default();
                             println!("{id:<12}  {status:<14}  {title}");
@@ -1915,7 +1915,7 @@ async fn main() -> Result<()> {
                         .into_iter()
                         .flatten()
                         .flatten()
-                        .filter(|e| e.path().extension().map_or(false, |x| x == "toml"))
+                        .filter(|e| e.path().extension().is_some_and(|x| x == "toml"))
                         .count() as u32
                         + 1;
                     let id = format!("WI-{next_n:03}");

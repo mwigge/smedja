@@ -73,6 +73,9 @@ fn segment_runner(ctx: &ModuleCtx<'_>) -> String {
 /// Renders the status bar as a single string from ordered segments.
 ///
 /// Delegates to [`render_status_bar_with_timeout`] with a default 30 ms timeout.
+/// Retained as the plain-text status API (config-driven format, tests); the live
+/// TUI now renders a styled segmented line via `status_bar_line`.
+#[allow(dead_code)]
 pub fn render_status_bar(ctx: &ModuleCtx<'_>) -> String {
     render_status_bar_configured(ctx, None, 30)
 }

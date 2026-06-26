@@ -68,6 +68,10 @@ pub enum TurnEvent {
         tool_name: String,
         /// A short, human-readable description of the tool's input.
         input_summary: String,
+        /// The full tool input (capped), for on-demand detail views. Optional so
+        /// older producers and non-provider tool paths can omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        full_input: Option<String>,
         /// Turn identifier; correlates this event with the enclosing turn.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
@@ -314,6 +318,7 @@ mod tests {
         let ev = TurnEvent::ToolCalled {
             tool_name: "bash".into(),
             input_summary: "ls".into(),
+            full_input: None,
             turn_id: None,
             correlation: CorrelationCtx {
                 trace_id: Some("t".into()),

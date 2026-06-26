@@ -887,6 +887,7 @@ impl TurnOrchestrator {
                     dispatcher.publish(TurnEvent::ToolCalled {
                         tool_name: tool_name.clone(),
                         input_summary: tool_input.chars().take(120).collect(),
+                        full_input: Some(tool_input.chars().take(4096).collect()),
                         turn_id: Some(turn_id.clone()),
                         correlation: CorrelationCtx {
                             conversation_id: Some(session_id.clone()),

@@ -191,6 +191,7 @@ mod tests {
             TurnEvent::ToolCalled {
                 tool_name: "bash".to_owned(),
                 input_summary: "ls -la /tmp".to_owned(),
+                full_input: None,
                 turn_id: Some("turn-4".to_owned()),
                 correlation: CorrelationCtx::default(),
                 tool_call_id: None,

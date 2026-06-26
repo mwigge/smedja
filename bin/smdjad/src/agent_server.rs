@@ -267,6 +267,7 @@ mod tests {
         let event = TurnEvent::ToolCalled {
             tool_name: "Bash".into(),
             input_summary: "ls -la".into(),
+            full_input: None,
             turn_id: Some("t1".into()),
             correlation: CorrelationCtx::default(),
             tool_call_id: None,

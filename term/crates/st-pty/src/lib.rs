@@ -1565,6 +1565,9 @@ pub struct PtySession {
     pub grid: Arc<Mutex<CellGrid>>,
     /// Set to `true` whenever the grid changes.  Renderers poll this flag.
     pub dirty: Arc<AtomicBool>,
+    /// Set to `true` once the child process exits (reader hits EOF). The host
+    /// app polls this to close the window instead of showing a dead/blank grid.
+    pub exited: Arc<AtomicBool>,
     /// Copy-mode state.
     pub copy_mode: CopyMode,
     /// Glyph registry: maps glyph IDs to PUA codepoints.
@@ -1635,6 +1638,7 @@ impl PtySession {
             writer,
             grid,
             dirty,
+            exited: Arc::new(AtomicBool::new(false)),
             copy_mode: CopyMode::new(),
             glyph_registry,
         })
@@ -1678,6 +1682,7 @@ impl PtySession {
     pub fn start_reader(self: Arc<Self>) {
         let grid = Arc::clone(&self.grid);
         let dirty = Arc::clone(&self.dirty);
+        let exited = Arc::clone(&self.exited);
         let glyph_registry = Arc::clone(&self.glyph_registry);
         // ponytail: master.try_clone() is synchronous I/O; reader lives on a
         // dedicated thread so it never blocks the async runtime.
@@ -1734,6 +1739,9 @@ impl PtySession {
                     }
                 }
             }
+            // Child exited — signal the host app (and wake it for a final poll).
+            exited.store(true, Ordering::Release);
+            dirty.store(true, Ordering::Release);
             debug!("PTY reader thread exited");
         });
     }
@@ -1751,6 +1759,7 @@ impl PtySession {
     pub fn start_reader_detached(&mut self) {
         let grid = Arc::clone(&self.grid);
         let dirty = Arc::clone(&self.dirty);
+        let exited = Arc::clone(&self.exited);
         let glyph_registry = Arc::clone(&self.glyph_registry);
         let mut reader = match self.master.try_clone_reader() {
             Ok(r) => r,
@@ -1803,6 +1812,9 @@ impl PtySession {
                     }
                 }
             }
+            // Child exited — signal the host app (and wake it for a final poll).
+            exited.store(true, Ordering::Release);
+            dirty.store(true, Ordering::Release);
             debug!("PTY reader thread exited");
         });
     }
@@ -1859,6 +1871,33 @@ pub fn snapshot_grid(grid: &CellGrid) -> String {
         lines.pop();
     }
     lines.join("\n")
+}
+
+/// Replays `bytes` into a fresh grid and counts cells whose stored `row`/`col`
+/// fields diverge from their actual grid index. The GPU renderer positions cells
+/// by these stored fields, so any nonzero count means glyphs are drawn at the
+/// wrong place — diagnostic for the top-row overlap.
+#[must_use]
+pub fn render_vt_stale_cell_count(cols: u16, rows: u16, bytes: &[u8]) -> usize {
+    let grid = Arc::new(Mutex::new(CellGrid::new(cols, rows)));
+    let mut handler = VtHandler {
+        grid: Arc::clone(&grid),
+        glyph_registry: Arc::new(Mutex::new(GlyphRegistry::new())),
+    };
+    let mut parser = vte::Parser::new();
+    for &b in bytes {
+        parser.advance(&mut handler, b);
+    }
+    let guard = grid.lock();
+    let mut stale = 0usize;
+    for (r, row) in guard.cells.iter().enumerate() {
+        for (c, cell) in row.iter().enumerate() {
+            if usize::from(cell.row) != r || usize::from(cell.col) != c {
+                stale += 1;
+            }
+        }
+    }
+    stale
 }
 
 /// FNV-1a hash of a snapshot — a compact state fingerprint for golden assertions.
