@@ -92,6 +92,21 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                             buf.push_back(line);
                         }
                     }
+                    TurnEvent::ThinkingDelta {
+                        ref content,
+                        ref turn_id,
+                        ..
+                    } => {
+                        let Some(tid) = turn_id else { continue };
+                        if let Some(buf) = store.get_mut(tid) {
+                            let line =
+                                json!({"type": "thinking", "text": content}).to_string();
+                            if buf.len() >= MAX_BUFFER_PER_TURN {
+                                buf.pop_front();
+                            }
+                            buf.push_back(line);
+                        }
+                    }
                     TurnEvent::ToolCalled {
                         ref tool_name,
                         ref input_summary,
@@ -308,6 +323,12 @@ fn turn_event_to_ndjson(
             let line = json!({"type": "delta", "text": content}).to_string();
             (turn_id.clone(), line, false)
         }
+        TurnEvent::ThinkingDelta {
+            content, turn_id, ..
+        } => {
+            let line = json!({"type": "thinking", "text": content}).to_string();
+            (turn_id.clone(), line, false)
+        }
         TurnEvent::ToolCalled {
             tool_name,
             input_summary,
@@ -520,5 +541,25 @@ mod tests {
             !store.lock().await.contains_key("t-ttl"),
             "buffer must be evicted after TTL"
         );
+    }
+
+    #[test]
+    fn turn_event_to_ndjson_thinking_delta_returns_thinking_type() {
+        let event = TurnEvent::ThinkingDelta {
+            content: "let me reason about this".into(),
+            turn_id: Some("t-think".into()),
+            correlation: CorrelationCtx::default(),
+        };
+        let (tid, line, terminal) = turn_event_to_ndjson(&event, "t-think");
+        assert_eq!(tid.as_deref(), Some("t-think"));
+        assert!(
+            line.contains(r#""type":"thinking""#),
+            "thinking delta must have type=thinking; got: {line}"
+        );
+        assert!(
+            line.contains("let me reason"),
+            "thinking content must appear in NDJSON; got: {line}"
+        );
+        assert!(!terminal, "thinking delta must not be a terminal event");
     }
 }
