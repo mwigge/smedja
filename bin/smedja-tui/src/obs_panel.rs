@@ -81,6 +81,42 @@ fn fmt_tok(n: u64) -> String {
     }
 }
 
+/// Shared budget thresholds: green below 60%, amber 60–85%, red at/above 85%.
+fn budget_color(pct: u64) -> ratatui::style::Color {
+    let p = palette();
+    if pct >= 85 {
+        p.error
+    } else if pct >= 60 {
+        p.warn
+    } else {
+        p.success
+    }
+}
+
+/// Builds a width-aware labeled gauge line: `prefix [████░░░] suffix`. The bar
+/// is `value/max` coloured by [`budget_color`] and shrinks to fit `width` after
+/// the prefix/suffix so the numeric labels are never truncated.
+fn labeled_gauge(prefix: &str, suffix: &str, value: u64, max: u64, width: usize) -> Line<'static> {
+    let p = palette();
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let pct = if max == 0 {
+        0
+    } else {
+        ((value as f64 / max as f64) * 100.0).min(100.0) as u64
+    };
+    let reserved = prefix.chars().count() + suffix.chars().count();
+    let bar_w = width.saturating_sub(reserved).max(1);
+    let bar = fill_bar(value, max, bar_w, budget_color(pct));
+    let mut spans = vec![Span::styled(prefix.to_owned(), Style::default().fg(p.text_dim))];
+    spans.extend(bar.spans);
+    spans.push(Span::styled(suffix.to_owned(), Style::default().fg(p.text_dim)));
+    Line::from(spans)
+}
+
 fn fill_bar(value: u64, max: u64, width: usize, color: ratatui::style::Color) -> Line<'static> {
     if width == 0 {
         return Line::default();
@@ -155,7 +191,7 @@ impl<'a> ObsPanel<'a> {
             Span::raw(fmt_tok(snap.tokens_output)),
         ]));
 
-        // ── Context fill bar ─────────────────────────────────────────────────
+        // ── Context (token-budget) gauge: green/amber/red by fill ────────────
         if snap.context_window > 0 {
             #[allow(
                 clippy::cast_precision_loss,
@@ -163,39 +199,23 @@ impl<'a> ObsPanel<'a> {
                 clippy::cast_sign_loss
             )]
             let pct = ((snap.context_used as f64 / snap.context_window as f64) * 100.0) as u64;
-            let color = if pct > 80 {
-                p.error
-            } else if pct > 60 {
-                p.warn
-            } else {
-                p.success
-            };
-            let mut bar = fill_bar(snap.context_used, snap.context_window, bar_w, color);
-            bar.spans.push(Span::styled(
-                format!(" {pct:>3}%"),
-                Style::default().fg(p.text_dim),
+            let suffix = format!(" {} {pct}%", fmt_tok(snap.context_used));
+            lines.push(labeled_gauge(
+                "ctx ",
+                &suffix,
+                snap.context_used,
+                snap.context_window,
+                bar_w,
             ));
-            lines.push(bar);
         }
 
-        // ── Daily quota bar ──────────────────────────────────────────────────
+        // ── Daily quota gauge ────────────────────────────────────────────────
         if let (Some(used), Some(limit)) = (snap.daily_tokens_used, snap.daily_tokens_limit) {
             if limit > 0 {
                 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
                 let pct = ((used as f64 / limit as f64) * 100.0).min(100.0) as u64;
-                let color = if pct > 80 {
-                    p.error
-                } else if pct > 60 {
-                    p.warn
-                } else {
-                    p.text
-                };
-                let mut bar = fill_bar(used, limit, bar_w, color);
-                bar.spans.push(Span::styled(
-                    format!(" dy{pct:>2}%"),
-                    Style::default().fg(p.text_dim),
-                ));
-                lines.push(bar);
+                let suffix = format!(" {pct}%");
+                lines.push(labeled_gauge("day ", &suffix, used, limit, bar_w));
             }
         }
 
@@ -280,6 +300,28 @@ mod tests {
         assert_eq!(fmt_ms(500), "500ms");
         assert_eq!(fmt_ms(1500), "1.5s");
         assert_eq!(fmt_ms(90_000), "1.5m");
+    }
+
+    #[test]
+    fn budget_color_thresholds_green_amber_red() {
+        // Green below 60, amber 60–84, red at/above 85.
+        assert_eq!(budget_color(0), palette().success);
+        assert_eq!(budget_color(59), palette().success);
+        assert_eq!(budget_color(60), palette().warn);
+        assert_eq!(budget_color(84), palette().warn);
+        assert_eq!(budget_color(85), palette().error);
+        assert_eq!(budget_color(100), palette().error);
+    }
+
+    #[test]
+    fn labeled_gauge_keeps_labels_and_fits_width() {
+        // 50% fill, width 20, prefix "ctx " (4) + suffix " 50%" (4) → bar 12.
+        let line = labeled_gauge("ctx ", " 50%", 50, 100, 20);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with("ctx "), "prefix preserved: {text:?}");
+        assert!(text.ends_with(" 50%"), "suffix preserved: {text:?}");
+        // Total rendered width never exceeds the budget.
+        assert!(text.chars().count() <= 20, "width respected: {text:?}");
     }
 
     #[test]

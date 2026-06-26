@@ -289,6 +289,37 @@ pub fn agent_theme() -> HashMap<&'static str, Color> {
     m
 }
 
+/// Normalises a runner/client name to its lowercase key, dropping a `-cli`
+/// suffix (`claude-cli` → `claude`).
+fn runner_key(runner: &str) -> String {
+    let lower = runner.trim().to_ascii_lowercase();
+    lower
+        .strip_suffix("-cli")
+        .map_or(lower.clone(), str::to_owned)
+}
+
+/// Brand accent colour for a runner/client. Distinct, high-contrast hues on the
+/// dark forge background; unknown runners fall back to the configured accent.
+#[must_use]
+pub fn runner_color(runner: &str) -> Color {
+    match runner_key(runner).as_str() {
+        "claude" | "anthropic" => Color::Rgb(0xC9, 0x7A, 0x40), // copper
+        "codex" | "openai" => Color::Rgb(0x10, 0xA3, 0x7F),     // openai green
+        "copilot" | "github" => Color::Rgb(0x3B, 0x8E, 0xEA),   // azure
+        "minimax" => Color::Rgb(0xA0, 0x6C, 0xD5),              // violet
+        "gemini" | "google" => Color::Rgb(0x53, 0x8B, 0xF0),    // blue
+        "berget" => Color::Rgb(0xE0, 0x8C, 0x52),               // ember
+        "local" => palette().local,                             // teal
+        _ => palette().accent,
+    }
+}
+
+/// Short uppercase display label for a runner (`claude-cli` → `CLAUDE`).
+#[must_use]
+pub fn runner_label(runner: &str) -> String {
+    runner_key(runner).to_ascii_uppercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +340,27 @@ mod tests {
         assert!(matches!(FORGE_BG, Color::Rgb(_, _, _)));
         assert!(matches!(FORGE_BORDER, Color::Rgb(_, _, _)));
         assert!(matches!(CODE_KEYWORD, Color::Rgb(_, _, _)));
+    }
+
+    #[test]
+    fn runner_label_strips_cli_suffix_and_uppercases() {
+        assert_eq!(runner_label("claude-cli"), "CLAUDE");
+        assert_eq!(runner_label("codex-cli"), "CODEX");
+        assert_eq!(runner_label("copilot"), "COPILOT");
+        assert_eq!(runner_label("  MiniMax  "), "MINIMAX");
+    }
+
+    #[test]
+    fn runner_color_is_distinct_per_brand() {
+        let claude = runner_color("claude-cli");
+        let codex = runner_color("codex");
+        let copilot = runner_color("copilot");
+        assert!(matches!(claude, Color::Rgb(_, _, _)));
+        assert_ne!(claude, codex);
+        assert_ne!(codex, copilot);
+        assert_ne!(claude, copilot);
+        // -cli suffix is irrelevant to the colour.
+        assert_eq!(runner_color("claude"), runner_color("claude-cli"));
     }
 
     #[test]
