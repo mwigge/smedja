@@ -600,24 +600,38 @@ impl ApplicationHandler<UserEvent> for App {
                     if dirty && !sync_active {
                         pty.dirty.store(false, Ordering::Release);
                         let grid = pty.grid.lock();
-                        // Render the viewport at the current scroll-back offset
-                        // (0 = live screen). Row/col are stamped from the cell's
-                        // position in the visible window, not the cell's stored
-                        // indices, so scrolled-in scrollback rows land correctly.
-                        let cells: Vec<st_render::Cell> = grid
-                            .visible_rows(grid.scroll_offset)
-                            .iter()
-                            .enumerate()
-                            .flat_map(|(r, row)| {
-                                row.iter().enumerate().map(move |(col, c)| st_render::Cell {
-                                    ch: c.ch,
-                                    fg: c.fg,
-                                    bg: c.bg,
-                                    col: u16::try_from(col).unwrap_or(u16::MAX),
-                                    row: u16::try_from(r).unwrap_or(u16::MAX),
+                        // Live screen (offset 0): use the cells' own stored
+                        // row/col exactly as before — no behaviour change to the
+                        // common path. Only when scrolled back do we stamp
+                        // positions, since scrollback rows carry stale indices.
+                        let cells: Vec<st_render::Cell> = if grid.scroll_offset <= 0 {
+                            grid.cells
+                                .iter()
+                                .flat_map(|row| {
+                                    row.iter().map(|c| st_render::Cell {
+                                        ch: c.ch,
+                                        fg: c.fg,
+                                        bg: c.bg,
+                                        col: c.col,
+                                        row: c.row,
+                                    })
                                 })
-                            })
-                            .collect();
+                                .collect()
+                        } else {
+                            grid.visible_rows(grid.scroll_offset)
+                                .iter()
+                                .enumerate()
+                                .flat_map(|(r, row)| {
+                                    row.iter().enumerate().map(move |(col, c)| st_render::Cell {
+                                        ch: c.ch,
+                                        fg: c.fg,
+                                        bg: c.bg,
+                                        col: u16::try_from(col).unwrap_or(u16::MAX),
+                                        row: u16::try_from(r).unwrap_or(u16::MAX),
+                                    })
+                                })
+                                .collect()
+                        };
                         let non_blank = cells.iter().filter(|c| c.ch != ' ').count();
                         drop(grid);
                         debug!(
@@ -996,6 +1010,10 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(pty) = &mut self.pty {
                     let kbd_flags = pty.grid.lock().kbd_flags();
                     let bytes = encode_key(&logical_key, shift, alt, ctrl, sup, kbd_flags);
+                    debug!(
+                        "encode_key: key={:?} shift={} alt={} ctrl={} sup={} kbd_flags={} -> {:?}",
+                        logical_key, shift, alt, ctrl, sup, kbd_flags, bytes
+                    );
                     if let Some(data) = bytes {
                         // Typing snaps the viewport back to the live screen so
                         // input is always visible.

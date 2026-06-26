@@ -3085,16 +3085,51 @@ impl Drop for TerminalGuard {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Initialises tracing, honouring `SMEDJA_LOG_FORMAT` (`text` default | `json`;
-/// unrecognised → text + warning).
+/// Resolves the TUI log file path: `$XDG_STATE_HOME/smedja/smedja-tui.log`
+/// (falling back to `~/.local/state/smedja/`). Creates the directory.
+fn tui_log_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+    let dir = base.join("smedja");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("smedja-tui.log"))
+}
+
+/// Initialises tracing to a **file**, honouring `SMEDJA_LOG_FORMAT` (`text`
+/// default | `json`).
+///
+/// Crucially this never writes to stdout/stderr: this process is a full-screen
+/// ratatui app that owns the terminal, and log lines on that stream would be
+/// painted straight into the UI (interleaved garbage). If the log file cannot
+/// be opened we install no subscriber at all rather than corrupt the display.
 fn init_tracing() {
+    let Some(path) = tui_log_path() else {
+        return;
+    };
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    // The fmt layer clones the file handle per write via this closure; on the
+    // (essentially OOM-only) clone failure we discard the line rather than panic.
+    let make_writer = move || -> Box<dyn std::io::Write> {
+        file.try_clone()
+            .map_or_else(|_| Box::new(std::io::sink()) as Box<dyn std::io::Write>, |f| Box::new(f))
+    };
     match std::env::var("SMEDJA_LOG_FORMAT").as_deref() {
-        Ok("json") => tracing_subscriber::fmt().json().init(),
-        Ok("text" | "") | Err(_) => tracing_subscriber::fmt().init(),
-        Ok(other) => {
-            tracing_subscriber::fmt().init();
-            tracing::warn!(format = other, "unrecognised SMEDJA_LOG_FORMAT; using text");
-        }
+        Ok("json") => tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .with_writer(make_writer)
+            .init(),
+        _ => tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(make_writer)
+            .init(),
     }
 }
 
