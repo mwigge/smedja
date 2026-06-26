@@ -1772,7 +1772,16 @@ fn load_window_icon() -> Option<winit::window::Icon> {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    // Honour RUST_LOG, but default the GPU stack (wgpu/naga) to `warn` so a
+    // `RUST_LOG=debug` capture isn't drowned by thousands of per-frame wgpu
+    // lines — smedja's own debug events (input, redraw, mouse) stay readable.
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = filter
+        .add_directive("wgpu_core=warn".parse().expect("static directive"))
+        .add_directive("wgpu_hal=warn".parse().expect("static directive"))
+        .add_directive("naga=warn".parse().expect("static directive"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let args = Args::parse();
 
