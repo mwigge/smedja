@@ -13,10 +13,9 @@ struct RoleEntry {
     runner: Option<String>,
     tier: Option<String>,
     model: Option<String>,
-    /// Tool whitelist for this role — parsed but not yet enforced; reserved for the
-    /// `BashArity` permission gate (task-list item 6).
+    /// Tool whitelist for this role; propagated into the routing `Route`.
+    /// Empty means all tools are allowed.
     #[serde(default)]
-    #[allow(dead_code)] // reserved for BashArity gate — not yet wired up
     tools: Vec<String>,
 }
 
@@ -29,7 +28,7 @@ struct AgentsFile {
 /// Loads `.smedja/agents.toml` from `workspace_dir` and returns routing rules.
 ///
 /// Returns an empty vec if the file does not exist. The `tools` field is parsed
-/// but not yet wired into `RoutingRule` (reserved for `BashArity` gate work).
+/// and propagated into the `Route` so callers can inspect the per-role whitelist.
 ///
 /// # Errors
 ///
@@ -63,6 +62,7 @@ pub fn load_rules(workspace_dir: &Path) -> Result<Vec<RoutingRule>, String> {
             runner,
             tier,
             model: entry.model.clone(),
+            tools: entry.tools.clone(),
         };
         rules.push(RoutingRule::new(Some(role), None, route));
     }

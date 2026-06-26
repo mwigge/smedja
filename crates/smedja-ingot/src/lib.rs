@@ -286,6 +286,8 @@ impl Ingot {
         self.conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
+            PRAGMA synchronous  = NORMAL;
+            PRAGMA busy_timeout = 5000;
             -- NOTE: foreign_keys is intentionally left at its default (OFF).
             -- This schema declares no REFERENCES clauses; referential integrity
             -- between sessions/tasks/checkpoints/cost_ledger is enforced in
@@ -448,10 +450,31 @@ impl Ingot {
                 continue;
             }
             // Each ALTER TABLE may fail on a fresh database where the column was
-            // already present in the base CREATE TABLE DDL above.  We suppress the
-            // error so migrate() stays idempotent across both fresh and pre-existing
-            // databases.
-            let _ = self.conn.execute_batch(sql);
+            // already present in the base CREATE TABLE DDL above.  Run the DDL
+            // inside a savepoint so idempotent errors (duplicate column, table
+            // already exists) are silently ignored, but real failures are
+            // propagated rather than silently recording the migration as applied.
+            let sp_name = format!("migration_{version}");
+            self.conn
+                .execute_batch(&format!("SAVEPOINT \"{sp_name}\""))?;
+            let ddl_result = self.conn.execute_batch(sql);
+            match ddl_result {
+                Ok(()) => {
+                    self.conn
+                        .execute_batch(&format!("RELEASE \"{sp_name}\""))?;
+                }
+                Err(ref e) if is_idempotent_ddl_error(e) => {
+                    self.conn
+                        .execute_batch(&format!("RELEASE \"{sp_name}\""))?;
+                }
+                Err(e) => {
+                    self.conn
+                        .execute_batch(&format!("ROLLBACK TO \"{sp_name}\""))?;
+                    self.conn
+                        .execute_batch(&format!("RELEASE \"{sp_name}\""))?;
+                    return Err(IngotError::Db(e));
+                }
+            }
             self.conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                 rusqlite::params![version, now],
@@ -650,23 +673,25 @@ impl Ingot {
         let cutoff = smedja_types::Timestamp::now().as_micros()
             - i64::try_from(older_than_days).unwrap_or(i64::MAX) * micros_per_day;
 
-        let deleted = self.conn.execute(
-            "DELETE FROM sessions WHERE status IN ('complete','failed','orphaned') AND updated_at < ?1",
-            rusqlite::params![cutoff],
-        )?;
-
-        // Remove dependent rows whose session is gone.
-        for table in &["checkpoints", "cost_ledger", "audit_events"] {
-            self.conn.execute(
-                &format!("DELETE FROM {table} WHERE session_id NOT IN (SELECT id FROM sessions)"),
+        let deleted = {
+            let tx = self.conn.unchecked_transaction()?;
+            let n = tx.execute(
+                "DELETE FROM sessions WHERE status IN ('complete','failed','orphaned') AND updated_at < ?1",
+                rusqlite::params![cutoff],
+            )?;
+            for table in &["checkpoints", "cost_ledger", "audit_events"] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE session_id NOT IN (SELECT id FROM sessions)"),
+                    [],
+                )?;
+            }
+            tx.execute(
+                "DELETE FROM tasks WHERE session_id IS NOT NULL AND session_id NOT IN (SELECT id FROM sessions)",
                 [],
             )?;
-        }
-        // tasks.session_id is nullable; only prune rows with a non-null orphaned ref.
-        self.conn.execute(
-            "DELETE FROM tasks WHERE session_id IS NOT NULL AND session_id NOT IN (SELECT id FROM sessions)",
-            [],
-        )?;
+            tx.commit()?;
+            n
+        };
 
         Ok(deleted)
     }
@@ -1570,6 +1595,16 @@ pub(crate) fn read_micros(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Resu
     }
 }
 
+/// Returns `true` for DDL errors that are safe to ignore for idempotency
+/// (duplicate column, table already exists). Real failures (wrong syntax,
+/// constraint violations, etc.) return `false` and must be propagated.
+fn is_idempotent_ddl_error(e: &rusqlite::Error) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("duplicate column name")
+        || msg.contains("already exists")
+        || msg.contains("table") && msg.contains("already")
+}
+
 /// Returns the current time as a Unix epoch `f64`.
 fn now_epoch() -> f64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1830,6 +1865,16 @@ mod tests {
                  id TEXT PRIMARY KEY, session_id TEXT NOT NULL, turn_n INTEGER NOT NULL,
                  messages_json TEXT NOT NULL, created_at REAL NOT NULL,
                  UNIQUE(session_id, turn_n)
+             );
+             CREATE TABLE audit_events (
+                 id TEXT PRIMARY KEY, ts REAL NOT NULL, session_id TEXT NOT NULL,
+                 turn_id TEXT, action_type TEXT NOT NULL, actor TEXT NOT NULL,
+                 tool_name TEXT, input_tok INTEGER NOT NULL DEFAULT 0,
+                 output_tok INTEGER NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0,
+                 traceparent TEXT, tier TEXT,
+                 role_id TEXT, conversation_id TEXT, trace_id TEXT, span_id TEXT,
+                 parent_span_id TEXT, agent_name TEXT, operation_name TEXT,
+                 status TEXT, error_kind TEXT, error_count INTEGER, tool_call_id TEXT
              );",
         )
         .unwrap();

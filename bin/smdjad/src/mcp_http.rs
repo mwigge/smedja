@@ -31,7 +31,11 @@ impl McpHttpClient {
         Ok(Self {
             url: url.to_owned(),
             token: token.to_owned(),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_default(),
         })
     }
 

@@ -137,6 +137,10 @@ impl RoleRunner for LoopRoleRunner {
             Arc::clone(&self.provider_sessions),
             Arc::clone(&self.cache_aligners),
         );
+        // Safety: `orchestrator.run()` uses structured concurrency — `drain_stream`
+        // internally awaits without spawning background tasks, so dropping the
+        // future when the outer `timeout` fires cancels all inner awaits cleanly.
+        // No explicit `abort()` is required.
         let run = orchestrator.run(session_id.to_string(), task_id.to_string());
         if tokio::time::timeout(std::time::Duration::from_secs(self.agent_timeout_s), run)
             .await

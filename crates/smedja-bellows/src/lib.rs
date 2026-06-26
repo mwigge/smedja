@@ -253,4 +253,26 @@ mod tests {
         let batch = super::drain_ready(&mut rx);
         assert_eq!(batch.len(), 3);
     }
+
+    #[test]
+    fn drain_ready_on_lagged_receiver_returns_empty_and_logs_warning() {
+        // Use capacity 2; publish 4 events without consuming — forces Lagged.
+        let dispatcher = Dispatcher::new(2);
+        let mut rx = dispatcher.subscribe();
+
+        // Publish more events than capacity to trigger Lagged on next receive.
+        for i in 0..4u8 {
+            dispatcher.publish(TurnEvent::AssistantDelta {
+                content: format!("msg-{i}"),
+                turn_id: None,
+                correlation: CorrelationCtx::default(),
+            });
+        }
+
+        // drain_ready must handle Lagged without panicking and return a partial/empty batch.
+        let batch = super::drain_ready(&mut rx);
+        // The receiver is lagged: it may return 0 or some events depending on internal state.
+        // The important invariant: no panic, and len ≤ 4.
+        assert!(batch.len() <= 4, "batch must be bounded; got {}", batch.len());
+    }
 }

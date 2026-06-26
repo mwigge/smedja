@@ -7,9 +7,20 @@ mod lsp_panel;
 pub mod main_panel;
 mod metrics_view;
 mod obs_panel;
+pub(crate) mod slash;
 mod staging;
 mod statusbar;
 pub mod theme;
+
+// Re-export slash module items so that `use super::*` in the test module
+// continues to find them without change.  The `#[allow(unused_imports)]` is
+// needed because the compiler does not see the indirect usage via `use super::*`
+// in the test module.
+#[allow(unused_imports)]
+pub(crate) use slash::{
+    apply_agent, apply_tier, dispatch_slash, format_agents_table, format_approvals_list,
+    format_local_model_list, format_metrics, format_model_list,
+};
 
 use std::collections::VecDeque;
 use std::io::stdout;
@@ -86,7 +97,7 @@ struct Message {
 
 /// Structured output type requested by a generator slash command.
 #[derive(Debug, Clone, PartialEq)]
-enum OutputType {
+pub(crate) enum OutputType {
     /// `/drawio` — draw.io mxGraph XML
     DrawIo { slug: String },
     /// `/pptx` — python-pptx presentation script
@@ -126,7 +137,7 @@ enum ResumePlan {
 }
 
 /// Derives the resume plan from an optional turn target.
-fn resume_plan(turn: Option<u32>) -> ResumePlan {
+pub(crate) fn resume_plan(turn: Option<u32>) -> ResumePlan {
     match turn {
         Some(turn_n) => ResumePlan::Rollback { turn_n },
         None => ResumePlan::ReplayOnly,
@@ -139,6 +150,7 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/approve",
     "/briefing",
     "/clear",
+    "/cowork",
     "/drawio",
     "/gov",
     "/health",
@@ -153,6 +165,7 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/quota",
     "/resume",
     "/review",
+    "/session",
     "/spec",
     "/switch",
     "/takeover",
@@ -162,12 +175,13 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/version",
 ];
 
-const HELP_TEXT: &str = "\
+pub(crate) const HELP_TEXT: &str = "\
 slash commands:
   /agent [id]        — run named agent (omit id to list available agents)
   /approve [id]      — approve a cowork item (omit id to list pending approvals)
   /briefing          — show session briefing
   /clear             — clear message display (keeps session data)
+  /cowork on|off|status — toggle or query cowork approval mode
   /drawio <slug>     — generate draw.io diagram
   /gov [list|show <id>|create work-item|rfc|adr <title>|transition <id> <status>] — govctl artifacts
   /health            — check daemon connectivity
@@ -222,6 +236,7 @@ keybindings (scroll/normal mode):
   y                  — yank selection to clipboard
   t                  — copy traceparent
   T                  — expand / collapse thinking block (when model emits thinking tokens)
+  /                  — search panel text (type to filter, Esc to clear)
   Esc                — exit selection / return to input
 
 note: scroll wheel scrolls the main panel; use v/y in scroll mode to copy text.
@@ -250,7 +265,7 @@ struct PanelVisibility {
 
 #[allow(clippy::struct_excessive_bools)] // AppState is a TUI dispatch table; enum-splitting would add indirection without clarity
 #[derive(Debug)]
-struct AppState {
+pub(crate) struct AppState {
     session_id: String,
     mode: Option<String>,
     tier: Option<String>,
@@ -322,8 +337,7 @@ struct AppState {
     session_rail_cursor: usize,
     /// Timestamp of the last session rail refresh.
     last_session_rail_poll: Option<std::time::Instant>,
-    /// True while a turn is awaiting a response from the daemon.
-    #[allow(dead_code)] // wired at init; read path lands once streaming poll is complete
+    /// True while a turn is awaiting a streaming response.
     turn_in_flight: bool,
     /// Number of consecutive unexpected (non-done) poll responses received.
     ///
@@ -552,7 +566,7 @@ async fn resolve_session(client: &mut Client, start: SessionStart) -> Result<Res
 /// is non-destructive: it never calls `session.rollback`. In both cases the
 /// rewound history is fetched via `session.history` and seeded into the view by
 /// [`replay_history`].
-async fn resume_into_view(state: &mut AppState, client: &mut Client, plan: ResumePlan) {
+pub(crate) async fn resume_into_view(state: &mut AppState, client: &mut Client, plan: ResumePlan) {
     let session_id = state.session_id.clone();
     if let ResumePlan::Rollback { turn_n } = plan {
         if let Err(e) = client
@@ -579,7 +593,7 @@ async fn resume_into_view(state: &mut AppState, client: &mut Client, plan: Resum
 // Submit a user turn to the daemon
 // ---------------------------------------------------------------------------
 
-async fn submit(input: &str, state: &mut AppState, client: &mut Client) -> Result<()> {
+pub(crate) async fn submit(input: &str, state: &mut AppState, client: &mut Client) -> Result<()> {
     let text = input.trim().to_owned();
     if text.is_empty() {
         return Ok(());
@@ -649,7 +663,28 @@ fn filtered_completions(input: &str) -> Vec<String> {
         .collect()
 }
 
-fn push_system_message(state: &mut AppState, text: impl Into<String>) {
+/// Classifies an LLM turn error message into a short label and optional hint.
+///
+/// Returns `(label, hint)` where `hint` is empty when there is nothing useful
+/// to suggest.  The label is used to prefix the displayed error line.
+fn classify_turn_error(msg: &str) -> (&'static str, &'static str) {
+    let lower = msg.to_lowercase();
+    if lower.contains("rate limit") || lower.contains("rate_limit") {
+        ("RATE LIMITED", "Wait a moment and press Ctrl-Enter to retry")
+    } else if lower.contains("api key") || lower.contains("auth") || lower.contains("401") || lower.contains("403") {
+        ("AUTH ERROR", "Check ANTHROPIC_API_KEY or provider credentials")
+    } else if lower.contains("quota") || lower.contains("429") {
+        ("QUOTA EXCEEDED", "Daily quota reached; check smj cost")
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        ("TIMEOUT", "Turn exceeded the time limit; try a shorter prompt")
+    } else if lower.contains("network") || lower.contains("connection") || lower.contains("connect") {
+        ("NETWORK ERROR", "Check network connectivity and provider endpoint")
+    } else {
+        ("ERROR", "")
+    }
+}
+
+pub(crate) fn push_system_message(state: &mut AppState, text: impl Into<String>) {
     let msg = Message {
         role: Role::System,
         text: text.into(),
@@ -725,7 +760,7 @@ fn replay_history(state: &mut AppState, history: &serde_json::Value) {
 /// short id is the first 8 characters. Missing titles/modes degrade to empty
 /// or `?` placeholders rather than being dropped.
 #[must_use]
-fn format_resume_rows(list: &serde_json::Value) -> Vec<String> {
+pub(crate) fn format_resume_rows(list: &serde_json::Value) -> Vec<String> {
     let Some(items) = list.as_array() else {
         return Vec::new();
     };
@@ -745,10 +780,23 @@ fn format_resume_rows(list: &serde_json::Value) -> Vec<String> {
                 .get("mode")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("?");
-            let updated = s
-                .get("updated_at")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
+            let updated = if let Some(s_val) = s.get("updated_at").and_then(serde_json::Value::as_str) {
+                s_val.to_owned()
+            } else if let Some(n) = s.get("updated_at").and_then(serde_json::Value::as_f64) {
+                // epoch microseconds → relative display
+                let secs = (n / 1_000_000.0) as i64;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let ago = now - secs;
+                if ago < 60 { format!("{ago}s ago") }
+                else if ago < 3600 { format!("{}m ago", ago / 60) }
+                else if ago < 86400 { format!("{}h ago", ago / 3600) }
+                else { format!("{}d ago", ago / 86400) }
+            } else {
+                "-".to_owned()
+            };
             format!("{short}  {title}  {mode}  {updated}")
         })
         .collect()
@@ -760,7 +808,7 @@ fn format_resume_rows(list: &serde_json::Value) -> Vec<String> {
 /// non-numeric turn token is ignored (no turn target). Empty input yields
 /// `None`.
 #[must_use]
-fn parse_resume_args(args: &str) -> Option<(String, Option<u32>)> {
+pub(crate) fn parse_resume_args(args: &str) -> Option<(String, Option<u32>)> {
     let trimmed = args.trim();
     if trimmed.is_empty() {
         return None;
@@ -773,7 +821,7 @@ fn parse_resume_args(args: &str) -> Option<(String, Option<u32>)> {
 
 /// Returns `true` (and emits a status line) when a resume must be refused
 /// because a turn is awaiting a response.
-fn resume_blocked_by_pending_turn(state: &mut AppState) -> bool {
+pub(crate) fn resume_blocked_by_pending_turn(state: &mut AppState) -> bool {
     if state.pending_task_id.is_some() {
         push_system_message(state, "cannot resume while a turn is in flight");
         true
@@ -783,7 +831,7 @@ fn resume_blocked_by_pending_turn(state: &mut AppState) -> bool {
 }
 
 /// Slugify `topic` for use in output filenames.
-fn slugify(topic: &str) -> String {
+pub(crate) fn slugify(topic: &str) -> String {
     topic
         .to_lowercase()
         .chars()
@@ -800,7 +848,7 @@ fn slugify(topic: &str) -> String {
 /// No args → working-tree diff (`{}`); `<path>` → `{ "path": <path> }`;
 /// `--branch <base>` → `{ "branch": <base> }`; `--pr <ref>` → `{ "pr": <ref> }`.
 /// Unknown leading tokens are treated as a path argument.
-fn parse_review_scope(args: &str) -> serde_json::Value {
+pub(crate) fn parse_review_scope(args: &str) -> serde_json::Value {
     let args = args.trim();
     if args.is_empty() {
         return json!({});
@@ -820,7 +868,7 @@ fn parse_review_scope(args: &str) -> serde_json::Value {
 ///
 /// `counts` is the `audit.run` response's `counts` object; `report_path` is the
 /// written path when present, otherwise the report was returned inline.
-fn render_findings_summary(counts: &serde_json::Value, report_path: Option<&str>) -> String {
+pub(crate) fn render_findings_summary(counts: &serde_json::Value, report_path: Option<&str>) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::from("audit complete — findings:");
@@ -1098,14 +1146,14 @@ fn open_in_editor(initial_text: &str) -> Option<String> {
 
 /// Runs `openspec bin args` as a subprocess and returns stdout on success, stderr on error.
 /// Current binary version, baked in at compile time.
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Fetches the latest release tag from the GitHub API.
 ///
 /// Returns `Some("v0.15.1")` on success, `None` on any network or parse
 /// failure.  Uses `curl` as an external subprocess so we don't need a full
 /// HTTP client dependency.
-async fn fetch_latest_version() -> Option<String> {
+pub(crate) async fn fetch_latest_version() -> Option<String> {
     let out = tokio::process::Command::new("curl")
         .args([
             "-sf",
@@ -1129,7 +1177,7 @@ async fn fetch_latest_version() -> Option<String> {
 
 /// Returns `true` when `latest` (e.g. `"v0.16.0"`) is strictly greater than
 /// `current` (e.g. `"0.15.0"`).  Leading `v` is stripped before comparison.
-fn is_newer(latest: &str, current: &str) -> bool {
+pub(crate) fn is_newer(latest: &str, current: &str) -> bool {
     let parse = |v: &str| -> Option<(u64, u64, u64)> {
         let v = v.trim_start_matches('v');
         let p: Vec<u64> = v.split('.').filter_map(|s| s.parse().ok()).collect();
@@ -1150,7 +1198,7 @@ fn is_newer(latest: &str, current: &str) -> bool {
 ///
 /// Returns a human-readable outcome string (success or error details) so the
 /// caller can push it straight into the panel.
-async fn run_upgrade(latest_tag: &str) -> String {
+pub(crate) async fn run_upgrade(latest_tag: &str) -> String {
     let arch = if cfg!(target_arch = "x86_64") {
         "x86_64"
     } else {
@@ -1251,7 +1299,7 @@ async fn run_upgrade(latest_tag: &str) -> String {
     msg
 }
 
-async fn run_openspec(bin: &std::path::Path, args: &[&str]) -> Result<String, String> {
+pub(crate) async fn run_openspec(bin: &std::path::Path, args: &[&str]) -> Result<String, String> {
     let output = tokio::process::Command::new(bin)
         .args(args)
         .output()
@@ -1266,7 +1314,7 @@ async fn run_openspec(bin: &std::path::Path, args: &[&str]) -> Result<String, St
 
 /// Renders `openspec list --json` output into a human-readable string.
 #[must_use]
-fn format_openspec_list(json: &str) -> String {
+pub(crate) fn format_openspec_list(json: &str) -> String {
     let v: serde_json::Value = match serde_json::from_str(json) {
         Ok(v) => v,
         Err(e) => return format!("openspec list parse error: {e}"),
@@ -1286,7 +1334,7 @@ fn format_openspec_list(json: &str) -> String {
 
 /// Renders `openspec status --json` output as `key: value` lines.
 #[must_use]
-fn format_openspec_status(json: &str) -> String {
+pub(crate) fn format_openspec_status(json: &str) -> String {
     let v: serde_json::Value = match serde_json::from_str(json) {
         Ok(v) => v,
         Err(e) => return format!("openspec status parse error: {e}"),
@@ -1352,1015 +1400,11 @@ fn clear_slash_popup(state: &mut AppState) {
     state.session_picker_ids.clear();
 }
 
-fn apply_tier(args: &str, state: &mut AppState) -> String {
-    match args {
-        "fast" | "deep" | "local" => {
-            state.tier = Some(args.to_owned());
-            format!("tier set to {args}")
-        }
-        "" => "usage: /tier fast|deep|local".to_owned(),
-        other => format!("unknown tier: {other}"),
-    }
-}
-
-fn apply_agent(args: &str, state: &mut AppState) -> String {
-    match args {
-        "impl" | "review" | "test" | "sre" | "explain" => {
-            state.mode = Some(args.to_owned());
-            if args == "sre" {
-                state.tier = Some("deep".to_owned());
-            }
-            format!("agent mode set to {args}")
-        }
-        "" => "usage: /agent impl|review|test|sre|explain".to_owned(),
-        other => format!("unknown agent mode: {other}"),
-    }
-}
-
-#[allow(clippy::too_many_lines)] // flat slash-command dispatch table; splitting is out of scope here
-async fn dispatch_slash(input: &str, state: &mut AppState, client: &mut Client) -> Result<bool> {
-    let trimmed = input.trim();
-    let Some(command_line) = trimmed.strip_prefix('/') else {
-        return Ok(false);
-    };
-    let mut parts = command_line.splitn(2, ' ');
-    let cmd = parts.next().unwrap_or_default();
-    let args = parts.next().unwrap_or_default().trim();
-
-    match cmd {
-        "tier" => {
-            let text = apply_tier(args, state);
-            push_system_message(state, text);
-            Ok(true)
-        }
-        "agent" => {
-            if args.is_empty() {
-                let result = client.call("runner.list", json!({})).await;
-                let text = match result {
-                    Ok(v) => format_agents_table(&v),
-                    Err(e) => format!("runner.list error: {e}"),
-                };
-                push_system_message(state, text);
-            } else {
-                let text = apply_agent(args, state);
-                if matches!(args, "impl" | "review" | "test" | "sre" | "explain") {
-                    let session_id = state.session_id.clone();
-                    let _ = client
-                        .call(
-                            "session.set_mode",
-                            json!({
-                                "session_id": session_id,
-                                "mode": args,
-                            }),
-                        )
-                        .await;
-                }
-                push_system_message(state, text);
-            }
-            Ok(true)
-        }
-        "health" => {
-            let start = std::time::Instant::now();
-            let session_id = state.session_id.clone();
-            let health_result = client
-                .call("session.get", json!({ "id": session_id }))
-                .await;
-            let latency_ms = start.elapsed().as_millis();
-            let text = match health_result {
-                Ok(_) => {
-                    format!("health: socket=ok session={session_id} latency={latency_ms}ms")
-                }
-                Err(e) => format!("health: error — {e}"),
-            };
-            push_system_message(state, text);
-            Ok(true)
-        }
-        "gov" => {
-            let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let artifacts = scan_gov_artifacts(&workspace);
-            match args {
-                "" | "list" => {
-                    push_system_message(state, format_gov_list(&artifacts));
-                }
-                id_or_show if id_or_show.starts_with("show ") => {
-                    let id = id_or_show.trim_start_matches("show ").trim();
-                    if let Some(a) = artifacts.iter().find(|a| a.id.eq_ignore_ascii_case(id)) {
-                        push_system_message(
-                            state,
-                            format!(
-                                "id: {}\nkind: {}\nstatus: {}\ntitle: {}",
-                                a.id, a.kind, a.status, a.title
-                            ),
-                        );
-                    } else {
-                        push_system_message(state, format!("gov show: artifact '{id}' not found"));
-                    }
-                }
-                create_args if create_args.starts_with("create ") => {
-                    let rest = create_args.trim_start_matches("create ").trim();
-                    let msg = gov_create(&workspace, rest);
-                    push_system_message(state, msg);
-                }
-                transition_args if transition_args.starts_with("transition ") => {
-                    let rest = transition_args.trim_start_matches("transition ").trim();
-                    let msg = gov_transition(&workspace, rest);
-                    push_system_message(state, msg);
-                }
-                _ => {
-                    push_system_message(
-                        state,
-                        "gov: unknown subcommand — try: /gov list | /gov show <id> | /gov create work-item <title> | /gov transition <id> <status>",
-                    );
-                }
-            }
-            Ok(true)
-        }
-        "help" => {
-            push_system_message(state, HELP_TEXT);
-            Ok(true)
-        }
-        "loop" => {
-            match args {
-                "status" | "" => {
-                    match client
-                        .call("loop.list_by_status", json!({"statuses": ["planning","slicing","verifying","reviewing","fixed"]}))
-                        .await
-                    {
-                        Ok(Value::Object(ref resp)) => {
-                            let loops = resp.get("loops")
-                                .and_then(serde_json::Value::as_array)
-                                .cloned()
-                                .unwrap_or_default();
-                            if loops.is_empty() {
-                                push_system_message(state, "loop: no active loops");
-                            } else {
-                                let mut lines = vec!["active loops:".to_owned()];
-                                for l in &loops {
-                                    let id = l["id"].as_str().unwrap_or("?");
-                                    let status = l["status"].as_str().unwrap_or("?");
-                                    let goal = l["goal"].as_str().unwrap_or("");
-                                    lines.push(format!("  {id} [{status}] {goal}"));
-                                }
-                                push_system_message(state, lines.join("\n"));
-                            }
-                        }
-                        Err(e) => push_system_message(state, format!("loop.status error: {e}")),
-                        _ => push_system_message(state, "loop: unexpected response format"),
-                    }
-                }
-                "list" => {
-                    match client
-                        .call("loop.list", json!({"session_id": state.session_id}))
-                        .await
-                    {
-                        Ok(Value::Object(ref resp)) => {
-                            let loops = resp
-                                .get("loops")
-                                .and_then(serde_json::Value::as_array)
-                                .cloned()
-                                .unwrap_or_default();
-                            if loops.is_empty() {
-                                push_system_message(state, "loop: no loops for this session");
-                            } else {
-                                let mut lines = vec!["loops:".to_owned()];
-                                for l in &loops {
-                                    let id = l["id"].as_str().unwrap_or("?");
-                                    let status = l["status"].as_str().unwrap_or("?");
-                                    let goal = l["goal"].as_str().unwrap_or("");
-                                    lines.push(format!("  {id} [{status}] {goal}"));
-                                }
-                                push_system_message(state, lines.join("\n"));
-                            }
-                        }
-                        Err(e) => push_system_message(state, format!("loop.list error: {e}")),
-                        _ => push_system_message(state, "loop: unexpected response format"),
-                    }
-                }
-                goal if goal.starts_with("create ") => {
-                    let goal_text = goal.trim_start_matches("create ").trim();
-                    if goal_text.is_empty() {
-                        push_system_message(
-                            state,
-                            "loop create: provide a goal — /loop create <goal text>",
-                        );
-                    } else {
-                        match client
-                            .call(
-                                "loop.create",
-                                json!({
-                                    "session_id": state.session_id,
-                                    "goal": goal_text,
-                                }),
-                            )
-                            .await
-                        {
-                            Ok(ref resp) => {
-                                let id = resp["id"].as_str().unwrap_or("?");
-                                push_system_message(state, format!("loop created: {id}"));
-                            }
-                            Err(e) => push_system_message(state, format!("loop.create error: {e}")),
-                        }
-                    }
-                }
-                "cancel" => {
-                    // Cancel the most recent active loop for this session.
-                    match client
-                        .call("loop.list_by_status", json!({"statuses": ["planning","slicing","verifying","reviewing","fixed"]}))
-                        .await
-                    {
-                        Ok(Value::Object(ref resp)) => {
-                            let loops = resp.get("loops")
-                                .and_then(serde_json::Value::as_array)
-                                .cloned()
-                                .unwrap_or_default();
-                            if let Some(first) = loops.first() {
-                                let id = first["id"].as_str().unwrap_or("").to_owned();
-                                match client.call("loop.cancel", json!({"id": id})).await {
-                                    Ok(_) => push_system_message(state, format!("loop cancelled: {id}")),
-                                    Err(e) => push_system_message(state, format!("loop.cancel error: {e}")),
-                                }
-                            } else {
-                                push_system_message(state, "loop cancel: no active loop to cancel");
-                            }
-                        }
-                        Err(e) => push_system_message(state, format!("loop.list error: {e}")),
-                        _ => push_system_message(state, "loop: unexpected response"),
-                    }
-                }
-                _ => {
-                    push_system_message(state, "loop: unknown subcommand — try: /loop status | list | create <goal> | cancel");
-                }
-            }
-            Ok(true)
-        }
-        "quit" | "exit" => {
-            state.quit = true;
-            Ok(true)
-        }
-        "clear" => {
-            state.display_start_idx = state.messages.len();
-            state.main_panel.clear_display();
-            Ok(true)
-        }
-        "spec" => {
-            let Some(ref bin) = state.openspec_bin else {
-                push_system_message(
-                    state,
-                    "openspec not found — install it and restart smedja-tui",
-                );
-                return Ok(true);
-            };
-            let bin = bin.clone();
-            let (sub, rest) = args.split_once(' ').unwrap_or((args, ""));
-            let text = match sub {
-                "" | "list" => match run_openspec(&bin, &["list", "--json"]).await {
-                    Ok(json) => format_openspec_list(&json),
-                    Err(e) => e,
-                },
-                "status" => {
-                    let extra: Vec<&str> = if rest.is_empty() {
-                        vec!["status", "--json"]
-                    } else {
-                        vec!["status", "--change", rest, "--json"]
-                    };
-                    match run_openspec(&bin, &extra).await {
-                        Ok(json) => format_openspec_status(&json),
-                        Err(e) => e,
-                    }
-                }
-                "archive" if !rest.is_empty() => {
-                    match run_openspec(&bin, &["archive", rest, "--yes"]).await {
-                        Ok(_) => format!("archived: {rest}"),
-                        Err(e) => e,
-                    }
-                }
-                _ => "usage: /spec [list|status [name]|archive <name>]".to_owned(),
-            };
-            push_system_message(state, text);
-            Ok(true)
-        }
-        "model" => {
-            let session_id = state.session_id.clone();
-            let is_local = state.runner == "local";
-            if args.is_empty() || args == "reset" {
-                // For the local runner, list the GPU-annotated inventory via
-                // local.models; for hosted runners keep the runner.list view.
-                let text = if is_local {
-                    match client.call("local.models", json!({})).await {
-                        Ok(v) => format_local_model_list(&v),
-                        Err(e) => format!("local.models error: {e}"),
-                    }
-                } else {
-                    match client.call("runner.list", json!({})).await {
-                        Ok(v) => format_model_list(&v),
-                        Err(e) => format!("runner.list error: {e}"),
-                    }
-                };
-                push_system_message(state, text);
-            } else if is_local {
-                // Local runner: a model name hot-swaps the active local model via
-                // local.swap (not the relabel-only session.set_model).
-                let model = args.to_owned();
-                let result = client.call("local.swap", json!({ "model": model })).await;
-                match result {
-                    Ok(v) => {
-                        let latency = v["swap_latency_ms"].as_u64().unwrap_or(0);
-                        state.model = Some(model.clone());
-                        push_system_message(
-                            state,
-                            format!("local model swapped to {model} ({latency} ms)"),
-                        );
-                    }
-                    Err(e) => push_system_message(state, format!("local.swap error: {e}")),
-                }
-            } else {
-                let model = args.to_owned();
-                let result = client
-                    .call(
-                        "session.set_model",
-                        json!({ "session_id": session_id, "model": model }),
-                    )
-                    .await;
-                match result {
-                    Ok(_) => {
-                        state.model = Some(model.clone());
-                        push_system_message(state, format!("model set to {model}"));
-                    }
-                    Err(e) => push_system_message(state, format!("session.set_model error: {e}")),
-                }
-            }
-            Ok(true)
-        }
-        "metrics" => {
-            let session_id = state.session_id.clone();
-            let usage_result = client
-                .call("session.token_usage", json!({ "session_id": session_id }))
-                .await;
-            let cost_result = client
-                .call("session.cost", json!({ "session_id": &state.session_id }))
-                .await;
-            let text = format_metrics(&usage_result, &cost_result, &state.session_id);
-            push_system_message(state, text);
-            Ok(true)
-        }
-        "approve" => {
-            if args.is_empty() {
-                let session_id = state.session_id.clone();
-                let result = client
-                    .call("cowork.pending", json!({ "session_id": session_id }))
-                    .await;
-                let text = match result {
-                    Ok(v) => format_approvals_list(&v),
-                    Err(e) => format!("cowork.pending error: {e}"),
-                };
-                push_system_message(state, text);
-                return Ok(true);
-            }
-            let id = args.to_owned();
-            let session_id = state.session_id.clone();
-            let result = client
-                .call(
-                    "cowork.approve",
-                    json!({ "session_id": session_id, "id": id }),
-                )
-                .await;
-            match result {
-                Ok(v) => {
-                    let resolved = v
-                        .get("resolved")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
-                    let text = if resolved {
-                        format!("approved: {id}")
-                    } else {
-                        format!("item not found: {id}")
-                    };
-                    push_system_message(state, text);
-                }
-                Err(e) => push_system_message(state, format!("cowork.approve error: {e}")),
-            }
-            Ok(true)
-        }
-        "review" => {
-            let mut params = parse_review_scope(args);
-
-            // Empty working-tree diff (everything committed) no longer hard-refuses:
-            // fall back to a repository path scope instead.
-            let is_diff_scope = params.get("path").is_none()
-                && params.get("branch").is_none()
-                && params.get("pr").is_none();
-            if is_diff_scope {
-                let empty_diff = std::process::Command::new("git")
-                    .args(["diff", "HEAD"])
-                    .output()
-                    .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim().is_empty());
-                if empty_diff {
-                    params = json!({ "path": "." });
-                    push_system_message(
-                        state,
-                        "working tree clean; auditing the repository path scope",
-                    );
-                }
-            }
-
-            // The audit runs under the read-only Review role; set review mode.
-            let session_id = state.session_id.clone();
-            let _ = client
-                .call(
-                    "session.set_mode",
-                    json!({ "session_id": session_id, "mode": "review" }),
-                )
-                .await;
-
-            match client.call("audit.run", params).await {
-                Ok(resp) => {
-                    let counts = resp.get("counts").cloned().unwrap_or_else(|| json!({}));
-                    let report_path = resp.get("report_path").and_then(serde_json::Value::as_str);
-                    push_system_message(state, render_findings_summary(&counts, report_path));
-                }
-                Err(e) => push_system_message(state, format!("audit.run error: {e}")),
-            }
-            Ok(true)
-        }
-        "drawio" => {
-            if args.is_empty() {
-                push_system_message(state, "usage: /drawio <topic>");
-                return Ok(true);
-            }
-            let slug = slugify(args);
-            state.pending_output_type = Some(OutputType::DrawIo { slug });
-            let message = format!(
-                "Generate a draw.io diagram (mxGraph XML format) for: {args}\n\n\
-                 Output ONLY the complete XML, enclosed in a ```xml code block. \
-                 Use valid mxGraph XML that draw.io can open directly."
-            );
-            submit(&message, state, client).await?;
-            Ok(true)
-        }
-        "pptx" => {
-            if args.is_empty() {
-                push_system_message(state, "usage: /pptx <topic>");
-                return Ok(true);
-            }
-            let slug = slugify(args);
-            state.pending_output_type = Some(OutputType::Pptx { slug });
-            let message = format!(
-                "Generate a python-pptx script to create a presentation about: {args}\n\n\
-                 Output ONLY the complete Python script, enclosed in a ```python code block. \
-                 The script must save the file as '{args_slug}.pptx' in the current directory.",
-                args_slug = slugify(args)
-            );
-            submit(&message, state, client).await?;
-            Ok(true)
-        }
-        "briefing" => {
-            let session_id = state.session_id.clone();
-            let result = client
-                .call("session.compact", json!({ "session_id": session_id }))
-                .await;
-            match result {
-                Ok(v) => {
-                    let summary = v
-                        .get("summary")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("(no summary)")
-                        .to_owned();
-                    push_system_message(state, format!("briefing:\n{summary}"));
-                }
-                Err(e) => push_system_message(state, format!("session.compact error: {e}")),
-            }
-            Ok(true)
-        }
-        "lsp" => {
-            let snap = &state.lsp_snapshot;
-            if snap.servers.is_empty() {
-                push_system_message(state, "lsp: no language servers running (install rust-analyzer, gopls, pyright, or typescript-language-server)");
-            } else {
-                let mut lines = vec!["lsp servers:".to_owned()];
-                for srv in &snap.servers {
-                    let state_str = match &srv.state {
-                        smedja_lsp::ServerState::Starting => "starting".to_owned(),
-                        smedja_lsp::ServerState::Ready => "ready".to_owned(),
-                        smedja_lsp::ServerState::Degraded(r) => format!("degraded ({r})"),
-                    };
-                    lines.push(format!("  {} — {}", srv.name, state_str));
-                }
-                let errs = snap.error_count();
-                let warns = snap.warning_count();
-                lines.push(format!("diagnostics: {errs} error(s), {warns} warning(s)"));
-                for diag in snap.diagnostics.iter().take(10) {
-                    let label = diag.severity.label();
-                    let file = diag.file.display();
-                    let code = diag.code.as_deref().unwrap_or("");
-                    lines.push(format!(
-                        "  {label} {file}:{} {code} — {}",
-                        diag.line,
-                        &diag.message[..diag.message.len().min(60)]
-                    ));
-                }
-                push_system_message(state, lines.join("\n"));
-            }
-            Ok(true)
-        }
-        "test" => {
-            let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let detected = detect_project_types(&workspace);
-            let has_cargo = detected.contains(&"Cargo.toml");
-            let has_npm = detected.contains(&"package.json");
-            let has_go = detected.contains(&"go.mod");
-            let has_py = detected.contains(&"pyproject.toml");
-            if detected.len() > 1 {
-                push_system_message(
-                    state,
-                    format!(
-                        "note: multiple manifests ({}) — using {} (pass /test cargo|npm|go|py to override)",
-                        detected.join(", "),
-                        detected[0]
-                    ),
-                );
-            }
-            let (cmd, cmd_args): (&str, &[&str]) = match args {
-                "cargo" => ("cargo", &["test", "--", "--test-output=immediate"]),
-                "npm" => ("npm", &["test"]),
-                "go" => ("go", &["test", "./..."]),
-                "py" | "pytest" => ("python", &["-m", "pytest"]),
-                _ => {
-                    if has_cargo {
-                        ("cargo", &["test", "--", "--test-output=immediate"])
-                    } else if has_npm {
-                        ("npm", &["test"])
-                    } else if has_go {
-                        ("go", &["test", "./..."])
-                    } else if has_py {
-                        ("python", &["-m", "pytest"])
-                    } else {
-                        ("cargo", &["test", "--", "--test-output=immediate"])
-                    }
-                }
-            };
-            push_system_message(
-                state,
-                format!("running {cmd} {}\u{2026}", cmd_args.join(" ")),
-            );
-            let text = match tokio::process::Command::new(cmd)
-                .args(cmd_args)
-                .current_dir(&workspace)
-                .output()
-                .await
-            {
-                Err(e) => format!("{cmd} failed to start: {e}"),
-                Ok(out) => {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let combined = format!("{stdout}{stderr}");
-                    let passed = combined.matches("test result: ok").count()
-                        + combined.matches("PASSED").count()
-                        + combined.matches(" passed").count();
-                    let failed =
-                        combined.matches("FAILED").count() + combined.matches(" failed").count();
-                    let mut summary = format!("test: {passed} passed, {failed} failed");
-                    // Show last 20 lines of output for context.
-                    let tail: Vec<&str> = combined.lines().rev().take(20).collect();
-                    let tail_text: Vec<&str> = tail.into_iter().rev().collect();
-                    if !tail_text.is_empty() {
-                        summary.push('\n');
-                        summary.push_str(&tail_text.join("\n"));
-                    }
-                    summary
-                }
-            };
-            push_system_message(state, text);
-            Ok(true)
-        }
-        "quota" => {
-            let used = state.obs_snapshot.daily_tokens_used;
-            let limit = state.obs_snapshot.daily_tokens_limit;
-            let text = match (used, limit) {
-                (Some(u), Some(l)) if l > 0 => {
-                    let pct = (u as f64 / l as f64 * 100.0).min(100.0);
-                    format!("quota: {}/{} tokens used ({:.1}%)",
-                        format_token_count(u), format_token_count(l), pct)
-                }
-                (Some(u), _) => format!(
-                    "quota: {} tokens used (no daily limit configured — set SMEDJA_DAILY_TOKEN_LIMIT)",
-                    format_token_count(u)
-                ),
-                (None, _) => "quota: no usage data yet — opens after first turn completes".into(),
-            };
-            push_system_message(state, text);
-            Ok(true)
-        }
-        "login" => {
-            let guidance = if args.is_empty() {
-                // Scan for installed CLIs so the user sees what's found vs missing.
-                let claude_found = std::process::Command::new("which")
-                    .arg("claude")
-                    .output()
-                    .is_ok_and(|o| o.status.success());
-                let codex_found = std::process::Command::new("which")
-                    .arg("codex")
-                    .output()
-                    .is_ok_and(|o| o.status.success());
-                let llmctl_found = std::process::Command::new("which")
-                    .arg("llmctl")
-                    .output()
-                    .is_ok_and(|o| o.status.success());
-
-                let mut lines = vec![
-                    "available runners:".to_owned(),
-                    format!(
-                        "  claude   [{}]  — Claude.ai subscription (OAuth, no API key needed)",
-                        if claude_found {
-                            "installed"
-                        } else {
-                            "not found"
-                        }
-                    ),
-                    format!(
-                        "  codex    [{}]  — OpenAI Codex CLI",
-                        if codex_found {
-                            "installed"
-                        } else {
-                            "not found"
-                        }
-                    ),
-                    format!(
-                        "  local    [{}]  — local model via rs-llmctl",
-                        if llmctl_found {
-                            "installed"
-                        } else {
-                            "not found"
-                        }
-                    ),
-                    "  copilot              — GitHub Copilot".to_owned(),
-                    "  minimax              — Minimax (set MINIMAX_API_KEY)".to_owned(),
-                    "  berget               — Berget AI (set BERGET_API_KEY)".to_owned(),
-                ];
-                if !claude_found {
-                    lines.push(String::new());
-                    lines.push("to install claude CLI: https://claude.ai/download".to_owned());
-                    lines.push("then run: claude login".to_owned());
-                }
-                lines.join("\n")
-            } else {
-                match args {
-                    "claude" => {
-                        let found = std::process::Command::new("which")
-                            .arg("claude")
-                            .output()
-                            .is_ok_and(|o| o.status.success());
-                        if found {
-                            "claude CLI is installed — uses your Claude.ai subscription (OAuth).\n\
-                             if not authenticated yet, run: claude login"
-                                .to_owned()
-                        } else {
-                            "claude CLI not found.\n\
-                             install: https://claude.ai/download\n\
-                             then run: claude login\n\
-                             no API key required — uses your Claude.ai subscription."
-                                .to_owned()
-                        }
-                    }
-                    "codex" => {
-                        let found = std::process::Command::new("which")
-                            .arg("codex")
-                            .output()
-                            .is_ok_and(|o| o.status.success());
-                        if found {
-                            "codex CLI is installed.\n\
-                             set OPENAI_API_KEY in your shell profile to authenticate."
-                                .to_owned()
-                        } else {
-                            "codex CLI not found.\n\
-                             install: npm install -g @openai/codex\n\
-                             then set OPENAI_API_KEY in your shell profile."
-                                .to_owned()
-                        }
-                    }
-                    "local" => "local runner uses rs-llmctl and a llama-swap proxy.\n\
-                                install rs-llmctl, then restart smdjad."
-                        .to_owned(),
-                    "copilot" => "copilot runner uses GitHub Copilot.\n\
-                                  authenticate via the copilot CLI or VS Code extension."
-                        .to_owned(),
-                    "minimax" => "set MINIMAX_API_KEY=<your-key> in your shell profile.".to_owned(),
-                    "berget" => "set BERGET_API_KEY=<your-key> in your shell profile.".to_owned(),
-                    other => format!("unknown runner: {other}\nvalid: claude, codex, local, copilot, minimax, berget"),
-                }
-            };
-            push_system_message(state, guidance);
-            Ok(true)
-        }
-        "switch" => {
-            if args.is_empty() {
-                let result = client.call("runner.list", json!({})).await;
-                match result {
-                    Ok(v) => {
-                        let runners: Vec<String> = v
-                            .get("runners")
-                            .and_then(|r| r.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|r| {
-                                        r.get("runner").and_then(|n| n.as_str()).map(str::to_owned)
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        if runners.is_empty() {
-                            push_system_message(state, "no runners available from runner.list");
-                        } else {
-                            state.slash_completions = runners;
-                            state.slash_cursor = 0;
-                            state.slash_popup_visible = true;
-                            state.runner_picker_mode = true;
-                            state.input.clear();
-                            state.input_cursor = 0;
-                        }
-                    }
-                    Err(e) => {
-                        push_system_message(
-                            state,
-                            format!(
-                                "usage: /switch [runner]  — omit for interactive picker\n\
-                                 runners: claude, codex, local, copilot, minimax, berget\n\
-                                 (runner.list error: {e})"
-                            ),
-                        );
-                    }
-                }
-                return Ok(true);
-            }
-            let session_id = state.session_id.clone();
-            let result = client
-                .call(
-                    "session.set_runner",
-                    json!({ "session_id": session_id, "runner": args }),
-                )
-                .await;
-            match result {
-                Ok(v) => {
-                    let canonical = v
-                        .get("runner")
-                        .and_then(|r| r.as_str())
-                        .unwrap_or(args)
-                        .to_owned();
-                    state.runner.clone_from(&canonical);
-                    push_system_message(state, format!("runner switched to {canonical}"));
-                }
-                Err(e) => push_system_message(state, format!("session.set_runner error: {e}")),
-            }
-            Ok(true)
-        }
-        "takeover" => {
-            if args.is_empty() {
-                push_system_message(
-                    state,
-                    "usage: /takeover <runner>  — fork this session onto a new runner",
-                );
-                return Ok(true);
-            }
-            let session_id = state.session_id.clone();
-            let result = client
-                .call(
-                    "session.takeover",
-                    json!({ "session_id": session_id, "runner": args }),
-                )
-                .await;
-            match result {
-                Ok(v) => {
-                    let new_session_id = v
-                        .get("new_session_id")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    let runner = v
-                        .get("runner")
-                        .and_then(|r| r.as_str())
-                        .unwrap_or(args)
-                        .to_owned();
-                    state.session_id.clone_from(&new_session_id);
-                    state.runner.clone_from(&runner);
-                    push_system_message(
-                        state,
-                        format!(
-                            "handed off to {runner} — new session: {}",
-                            &new_session_id[..8.min(new_session_id.len())]
-                        ),
-                    );
-                }
-                Err(e) => push_system_message(state, format!("session.takeover error: {e}")),
-            }
-            Ok(true)
-        }
-        "resume" => {
-            if resume_blocked_by_pending_turn(state) {
-                return Ok(true);
-            }
-            match parse_resume_args(args) {
-                None => {
-                    // No id: open the interactive picker from session.list.
-                    match client.call("session.list", json!({})).await {
-                        Ok(list) => {
-                            let rows = format_resume_rows(&list);
-                            let ids: Vec<String> = list
-                                .as_array()
-                                .map(|items| {
-                                    items
-                                        .iter()
-                                        .map(|s| {
-                                            s.get("id")
-                                                .and_then(serde_json::Value::as_str)
-                                                .unwrap_or("")
-                                                .to_owned()
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            if rows.is_empty() {
-                                push_system_message(state, "no sessions available to resume");
-                            } else {
-                                state.slash_completions = rows;
-                                state.session_picker_ids = ids;
-                                state.slash_cursor = 0;
-                                state.slash_popup_visible = true;
-                                state.session_picker_mode = true;
-                                state.input.clear();
-                                state.input_cursor = 0;
-                            }
-                        }
-                        Err(e) => push_system_message(state, format!("session.list error: {e}")),
-                    }
-                }
-                Some((id, turn)) => {
-                    // Direct resume: swap session, clear the live display, replay.
-                    state.session_id = id;
-                    state.display_start_idx = state.messages.len();
-                    state.main_panel.clear_display();
-                    resume_into_view(state, client, resume_plan(turn)).await;
-                }
-            }
-            Ok(true)
-        }
-        "version" => {
-            push_system_message(state, format!("smedja v{VERSION}"));
-            match fetch_latest_version().await {
-                Some(ref tag) if is_newer(tag, VERSION) => {
-                    push_system_message(
-                        state,
-                        format!("new version {tag} available — run /upgrade to install"),
-                    );
-                }
-                Some(_) => {
-                    push_system_message(state, "you are up to date");
-                }
-                None => {
-                    push_system_message(state, "could not reach GitHub to check for updates");
-                }
-            }
-            Ok(true)
-        }
-        "upgrade" => {
-            push_system_message(
-                state,
-                format!("checking for updates (current: v{VERSION})…"),
-            );
-            let latest = match fetch_latest_version().await {
-                Some(t) => t,
-                None => {
-                    push_system_message(state, "upgrade failed: could not reach GitHub releases");
-                    return Ok(true);
-                }
-            };
-            if !is_newer(&latest, VERSION) {
-                push_system_message(state, format!("already at {latest}, nothing to upgrade"));
-                return Ok(true);
-            }
-            push_system_message(state, format!("downloading {latest}…"));
-            let result = run_upgrade(&latest).await;
-            push_system_message(state, result);
-            Ok(true)
-        }
-        _ => Ok(false),
-    }
-}
-
-fn format_model_list(v: &serde_json::Value) -> String {
-    let runners = v.get("runners").and_then(|r| r.as_array());
-    let Some(runners) = runners else {
-        return "no runners available".to_owned();
-    };
-    let mut lines = vec!["available models:".to_owned()];
-    for r in runners {
-        let runner = r.get("runner").and_then(|v| v.as_str()).unwrap_or("?");
-        let tier = r.get("tier").and_then(|v| v.as_str()).unwrap_or("?");
-        let model = r.get("model").and_then(|v| v.as_str()).unwrap_or("?");
-        lines.push(format!("  {runner} ({tier}): {model}"));
-    }
-    lines.join("\n")
-}
-
-/// Renders the `local.models` response: the GPU-annotated local-model inventory.
-///
-/// Each line shows the model id, its advisory GPU fit, and an active marker.
-fn format_local_model_list(v: &serde_json::Value) -> String {
-    let Some(models) = v.get("models").and_then(|m| m.as_array()) else {
-        return "no local models".to_owned();
-    };
-    if models.is_empty() {
-        return "no local models".to_owned();
-    }
-    let mut lines = vec!["local models:".to_owned()];
-    for m in models {
-        let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-        let fit = m.get("fit").and_then(|v| v.as_str()).unwrap_or("unknown");
-        let marker = if m.get("active").and_then(serde_json::Value::as_bool) == Some(true) {
-            " *"
-        } else {
-            ""
-        };
-        lines.push(format!("  {id} [{fit}]{marker}"));
-    }
-    lines.join("\n")
-}
-
-fn format_agents_table(v: &serde_json::Value) -> String {
-    let runners = v.get("runners").and_then(|r| r.as_array());
-    let Some(runners) = runners else {
-        return "no runners configured".to_owned();
-    };
-    if runners.is_empty() {
-        return "no runners available".to_owned();
-    }
-    let mut lines = vec![
-        format!(" {:<14} {:<8} {}", "runner", "tier", "model"),
-        format!(" {}", "─".repeat(60)),
-    ];
-    for r in runners {
-        let runner = r.get("runner").and_then(|v| v.as_str()).unwrap_or("?");
-        let tier = r.get("tier").and_then(|v| v.as_str()).unwrap_or("?");
-        let model = r.get("model").and_then(|v| v.as_str()).unwrap_or("?");
-        lines.push(format!(" {runner:<14} {tier:<8} {model}"));
-    }
-    lines.join("\n")
-}
-
-fn format_metrics(
-    usage: &Result<serde_json::Value, smedja_rpc::RpcError>,
-    cost: &Result<serde_json::Value, smedja_rpc::RpcError>,
-    session_id: &str,
-) -> String {
-    let (turn_count, total_input, total_output) = match usage {
-        Ok(v) => {
-            let turns = v.get("turns").and_then(|t| t.as_array());
-            turns.map_or((0usize, 0i64, 0i64), |arr| {
-                let last = arr.last();
-                let total_in = last
-                    .and_then(|r| r.get("cumulative_input"))
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0);
-                let total_out = last
-                    .and_then(|r| r.get("cumulative_output"))
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0);
-                (arr.len(), total_in, total_out)
-            })
-        }
-        Err(_) => (0, 0, 0),
-    };
-    let cost_usd = match cost {
-        Ok(v) => v
-            .get("total_usd")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0),
-        Err(_) => 0.0,
-    };
-    let total_tok = total_input.saturating_add(total_output);
-    format!(
-        "session: {session_id}\n\
-         turns: {turn_count}   tokens: {total_tok}\n\
-         cost: ${cost_usd:.4}   input: {total_input}   output: {total_output}"
-    )
-}
-
-fn format_approvals_list(v: &serde_json::Value) -> String {
-    let items = v.as_array();
-    let Some(items) = items else {
-        return "cowork: unexpected response format".to_owned();
-    };
-    if items.is_empty() {
-        return "cowork: no pending approvals".to_owned();
-    }
-    let mut lines = vec!["pending approvals:".to_owned()];
-    for item in items {
-        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-        let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("?");
-        let args = item.get("args").and_then(|v| v.as_str()).unwrap_or("");
-        lines.push(format!("  [{id}] {tool}: {args}"));
-    }
-    lines.push("use /approve <id> to approve".to_owned());
-    lines.join("\n")
-}
+// dispatch_slash, apply_tier, apply_agent, and their exclusive format helpers
+// (format_model_list, format_local_model_list, format_agents_table,
+// format_metrics, format_approvals_list) have been extracted to src/slash.rs.
+// They are re-exported at the top of this file via `pub(crate) use slash::...`
+// so callers and the test module (which uses `use super::*`) see them unchanged.
 
 // ---------------------------------------------------------------------------
 // Cowork resolver
@@ -2433,6 +1477,9 @@ async fn handle_key(
     // ------------------------------------------------------------------
     // Cowork gate widget intercepts keys when there are pending approvals.
     // ------------------------------------------------------------------
+    // `y`/`Y` → cowork.approve, `n`/`N` → cowork.deny, `m`/`M` → modify
+    // mode. All other keys are consumed while approvals are pending so that
+    // accidental keystrokes do not reach the input bar.
     if !state.pending_cowork.is_empty() {
         if state.cowork_modify_mode {
             match key.code {
@@ -4074,12 +3121,18 @@ async fn main() -> Result<()> {
     // Ignore load errors — history file may not exist on first run.
     let _ = editor.load_history(&history_path);
 
-    let mut client = Client::connect(&sock).await.with_context(|| {
-        format!(
-            "smdjad is not running — start it with: smj daemon start\n(tried socket: {})",
-            sock.display()
-        )
-    })?;
+    let mut client = Client::connect(&sock).await.unwrap_or_else(|_| {
+        eprintln!("smedja: cannot connect to smdjad at {}", sock.display());
+        eprintln!();
+        eprintln!("If smdjad is not running, start it:");
+        eprintln!("  systemctl --user start smdjad");
+        eprintln!("  # or run directly: smdjad &");
+        eprintln!();
+        eprintln!("If you haven't set up a provider yet:");
+        eprintln!("  export ANTHROPIC_API_KEY=<your-key>");
+        eprintln!("  smdjad &");
+        std::process::exit(1);
+    });
 
     // Branch on the --session flag: resume an existing session (validated via
     // session.get) or create a fresh one. Resume validation runs before any
@@ -4211,10 +3264,10 @@ async fn main() -> Result<()> {
         resume_into_view(&mut state, &mut client, resume_plan(cli.turn)).await;
     }
 
+    let _guard = TerminalGuard; // instantiate immediately so Drop restores terminal on any panic
     enable_raw_mode().context("enable raw mode")?;
     execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)
         .context("enter alternate screen")?;
-    let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend).context("create terminal")?;
@@ -4397,7 +3450,18 @@ async fn main() -> Result<()> {
                     }
                     Some("error") => {
                         let msg_text = event["message"].as_str().unwrap_or("unknown error");
-                        state.main_panel.push_line(format!("error: {msg_text}"));
+                        let (label, hint) = classify_turn_error(msg_text);
+                        let display = if hint.is_empty() {
+                            format!("[{label}] {msg_text}")
+                        } else {
+                            format!("[{label}] {msg_text}\n  \u{2192} {hint}")
+                        };
+                        // push_system_message cannot be called here because `state.stream_rx`
+                        // is mutably borrowed via `ref mut rx` for the entire enclosing block.
+                        // Emit to the main panel directly instead.
+                        for line in display.lines() {
+                            state.main_panel.push_line(line.to_owned());
+                        }
                         if let Some(mut block) = state.current_block.take() {
                             block.fail();
                             state.block_store.push(block);
@@ -4445,7 +3509,14 @@ async fn main() -> Result<()> {
                 {
                     Ok(v) if v["done"].as_bool() == Some(true) => {
                         if let Some(error) = v["error"].as_str() {
-                            state.main_panel.push_line(format!("error: {error}"));
+                            let (label, hint) = classify_turn_error(error);
+                            let display = if hint.is_empty() {
+                                format!("[{label}] {error}")
+                            } else {
+                                format!("[{label}] {error}\n  \u{2192} {hint}")
+                            };
+                            state.main_panel.push_line(display.clone());
+                            push_system_message(&mut state, display);
                             if let Some(mut block) = state.current_block.take() {
                                 block.fail();
                                 state.block_store.push(block);
@@ -4538,11 +3609,30 @@ async fn main() -> Result<()> {
                         } else {
                             format!("turn error: {e}")
                         };
-                        state.main_panel.push_line(text.clone());
-                        state.messages.push(Message {
-                            role: Role::System,
-                            text,
-                        });
+                        // On transport-level disconnects attempt a reconnect before
+                        // giving up, so a daemon restart does not require a TUI restart.
+                        if e.code == smedja_rpc::codes::SERVER_DISCONNECTED {
+                            state.main_panel.push_line(
+                                "daemon disconnected — attempting reconnect…".to_owned(),
+                            );
+                            match try_reconnect(&sock).await {
+                                Some(new_client) => {
+                                    client = new_client;
+                                    state.main_panel.push_line("reconnected to daemon".to_owned());
+                                }
+                                None => {
+                                    state.main_panel.push_line(
+                                        "reconnect failed — restart smedja-tui when the daemon is back".to_owned(),
+                                    );
+                                }
+                            }
+                        } else {
+                            state.main_panel.push_line(text.clone());
+                            state.messages.push(Message {
+                                role: Role::System,
+                                text,
+                            });
+                        }
                         state.pending_task_id = None;
                         state.last_poll = None;
                         state.turn_in_flight = false;
@@ -4735,6 +3825,28 @@ async fn main() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Reconnect helper
+// ---------------------------------------------------------------------------
+
+/// Attempts to re-establish a connection to the smdjad socket after a
+/// transport-level failure (e.g. daemon restart).
+///
+/// Tries up to 3 times with exponential backoff (500 ms → 1 s → 2 s).
+/// Returns `Some(client)` on success, `None` if all attempts fail.
+async fn try_reconnect(sock: &std::path::Path) -> Option<Client> {
+    for attempt in 0..3u32 {
+        tokio::time::sleep(std::time::Duration::from_millis(
+            500 * u64::from(2u32.pow(attempt)),
+        ))
+        .await;
+        if let Ok(client) = Client::connect(sock).await {
+            return Some(client);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // metrics-live-fetch: pure helpers (off the render hot path, unit-testable)
 // ---------------------------------------------------------------------------
 
@@ -4752,7 +3864,7 @@ const METRICS_SINCE_WINDOW_MICROS: i64 = 24 * 3_600 * 1_000_000;
 ///
 /// State field: `"starting"` | `"ready"` | `"degraded: <reason>"` (daemon format).
 /// Severity field: `"error"` | `"warning"` | `"info"` | `"hint"` (daemon format).
-fn format_token_count(n: u64) -> String {
+pub(crate) fn format_token_count(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {
@@ -4884,7 +3996,7 @@ fn toggle_metrics_view(state: &mut AppState) {
 
 /// Returns the manifest file names present in `workspace`, in detection order:
 /// Cargo.toml, package.json, go.mod, pyproject.toml.
-fn detect_project_types(workspace: &std::path::Path) -> Vec<&'static str> {
+pub(crate) fn detect_project_types(workspace: &std::path::Path) -> Vec<&'static str> {
     [
         workspace
             .join("Cargo.toml")
@@ -4911,21 +4023,21 @@ fn detect_project_types(workspace: &std::path::Path) -> Vec<&'static str> {
 
 /// A single govctl artifact read from a `gov/` TOML file.
 #[derive(Debug, Clone)]
-struct GovArtifact {
+pub(crate) struct GovArtifact {
     /// E.g. "WI-001", "RFC-001", "ADR-001"
-    id: String,
+    pub(crate) id: String,
     /// Artifact kind: "work-item", "rfc", or "adr"
-    kind: String,
-    title: String,
+    pub(crate) kind: String,
+    pub(crate) title: String,
     /// "planned" | "in_progress" | "done" | "cancelled" | "draft" | "accepted" | "superseded"
-    status: String,
+    pub(crate) status: String,
 }
 
 /// Scans `<workspace>/gov/` for TOML files and parses them as govctl artifacts.
 ///
 /// Expected TOML fields: `id`, `title`, `status` (required), `type`/`kind` (optional).
 /// Files that fail to parse are silently skipped.
-fn scan_gov_artifacts(workspace: &std::path::Path) -> Vec<GovArtifact> {
+pub(crate) fn scan_gov_artifacts(workspace: &std::path::Path) -> Vec<GovArtifact> {
     let gov_dir = workspace.join("gov");
     if !gov_dir.is_dir() {
         return Vec::new();
@@ -4991,7 +4103,7 @@ fn scan_gov_artifacts(workspace: &std::path::Path) -> Vec<GovArtifact> {
 /// `rest` is the tail of `/gov create <rest>`, e.g. `work-item My title here`.
 /// Auto-increments the numeric suffix (WI-NNN, RFC-NNN, ADR-NNN) by scanning
 /// existing files.  Returns a human-readable outcome string.
-fn gov_create(workspace: &std::path::Path, rest: &str) -> String {
+pub(crate) fn gov_create(workspace: &std::path::Path, rest: &str) -> String {
     let (kind, prefix, subdir, default_status) = if let Some(title) = rest
         .strip_prefix("work-item ")
         .or_else(|| rest.strip_prefix("work-items "))
@@ -5032,7 +4144,7 @@ fn gov_create(workspace: &std::path::Path, rest: &str) -> String {
 ///
 /// `rest` is `<id> <new-status>`.  Reads the existing TOML file, replaces the
 /// `status` line, and writes it back.  Returns a human-readable outcome string.
-fn gov_transition(workspace: &std::path::Path, rest: &str) -> String {
+pub(crate) fn gov_transition(workspace: &std::path::Path, rest: &str) -> String {
     let valid_wi = ["planned", "in_progress", "done", "cancelled"];
     let valid_rfc_adr = ["draft", "accepted", "rejected", "superseded"];
 
@@ -5108,7 +4220,7 @@ fn gov_transition(workspace: &std::path::Path, rest: &str) -> String {
 }
 
 /// Formats a list of govctl artifacts for display in the main panel.
-fn format_gov_list(artifacts: &[GovArtifact]) -> String {
+pub(crate) fn format_gov_list(artifacts: &[GovArtifact]) -> String {
     if artifacts.is_empty() {
         return "gov: no artifacts found in ./gov/ — create gov/work-items/WI-001.toml to start"
             .to_owned();

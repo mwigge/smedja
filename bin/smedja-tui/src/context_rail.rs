@@ -84,8 +84,6 @@ impl ContextSlot {
 /// The context rail widget.
 pub struct ContextRail {
     pub slots: Vec<ContextSlot>,
-    #[allow(dead_code)] // toggled by Ctrl-R keybinding; visibility checked by caller
-    pub visible: bool,
 }
 
 impl ContextRail {
@@ -93,15 +91,7 @@ impl ContextRail {
 
     #[must_use]
     pub fn new(slots: Vec<ContextSlot>) -> Self {
-        Self {
-            slots,
-            visible: true,
-        }
-    }
-
-    #[allow(dead_code)] // called via Ctrl-R keybinding via AppState.context_rail_visible toggle
-    pub fn toggle(&mut self) {
-        self.visible = !self.visible;
+        Self { slots }
     }
 }
 

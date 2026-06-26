@@ -35,7 +35,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.17.0"
+version = "0.17.1"
 edition    = "2021"
 license    = "Apache-2.0"
 repository = "https://github.com/mwigge/smedja"
@@ -103,8 +103,6 @@ thiserror    = "2"
 tokio        = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 
-# testing
-tokio-test   = "0.4"
 toml         = "0.8"
 tower        = "0.5"
 tower-http   = { version = "0.6", features = ["trace", "cors"] }

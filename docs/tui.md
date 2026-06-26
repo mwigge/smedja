@@ -143,7 +143,7 @@ IDs auto-increment within their kind (WI-001, WI-002…; RFC-001…; ADR-001…)
 
 ## Inline Context Fragments
 
-Fragments are expanded into your message text before the turn reaches the daemon. They let you inject file contents, git state, or shell output without copying and pasting.
+Fragments are expanded daemon-side when the turn is received. They let you inject file contents, git state, or shell output without copying and pasting.
 
 | Fragment | What it injects |
 |----------|----------------|
@@ -151,6 +151,9 @@ Fragments are expanded into your message text before the turn reaches the daemon
 | `@git` | Output of `git status --short` and `git diff HEAD` (current working tree changes). |
 | `@branch` | The current branch name and its upstream ref. |
 | `@shell <cmd>` | The stdout of a shell command. When cowork mode is on, the command pauses for approval before running. |
+
+> **Note:** `@shell` fragments are expanded daemon-side before the turn is submitted to the model.
+> Cowork approval gates `@shell` execution at submission time, not during turn tool-call execution.
 
 ---
 

@@ -2,6 +2,7 @@
 //! `session.create/list/get/delete/fork/set_model/set_runner/set_mode/`
 //! `context/token_usage/takeover` and `runner.list`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -86,73 +87,7 @@ pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, 
         .map_err(|e| ingot_err(&e))?;
 
     // Auto-index: check workspace.toml in cwd; if stale, index in background.
-    {
-        let cwd = crate::common::workspace_root();
-        let toml_path = cwd.join(".smedja").join("workspace.toml");
-        let needs_index = if toml_path.exists() {
-            let content = std::fs::read_to_string(&toml_path).unwrap_or_default();
-            if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
-                parsed
-                    .get("graph")
-                    .and_then(|g| g.get("last_indexed_at"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                    .is_none_or(|ts| {
-                        let age = chrono::Utc::now()
-                            .signed_duration_since(ts.with_timezone(&chrono::Utc));
-                        age.num_hours() >= 24
-                    })
-            } else {
-                true
-            }
-        } else {
-            // Only auto-index if workspace.toml already exists (workspace was initialised).
-            false
-        };
-
-        if needs_index {
-            let bg_cwd = cwd.clone();
-            let bg_toml = toml_path.clone();
-            tokio::task::spawn(async move {
-                use opentelemetry::trace::Span as _;
-                let tracer = opentelemetry::global::tracer("smedja");
-                let mut span =
-                    opentelemetry::trace::Tracer::start(&tracer, "smedja.workspace.index");
-                let start = std::time::Instant::now();
-                let db_path = bg_cwd.join(".smedja").join("graph.db");
-                let bg_cwd_clone = bg_cwd.clone();
-                let symbol_count = tokio::task::spawn_blocking(move || {
-                    smedja_graph::GraphStore::open(&db_path)
-                        .and_then(|mut s| {
-                            s.index_workspace_incremental(&bg_cwd_clone, "workspace", None)
-                        })
-                        .unwrap_or(0)
-                })
-                .await
-                .unwrap_or(0);
-                let duration_ms = start.elapsed().as_millis();
-                span.set_attribute(opentelemetry::KeyValue::new(
-                    "workspace_path",
-                    bg_cwd.to_string_lossy().into_owned(),
-                ));
-                span.set_attribute(opentelemetry::KeyValue::new(
-                    "symbol_count",
-                    i64::try_from(symbol_count).unwrap_or(i64::MAX),
-                ));
-                span.set_attribute(opentelemetry::KeyValue::new(
-                    "duration_ms",
-                    i64::try_from(duration_ms).unwrap_or(i64::MAX),
-                ));
-                span.end();
-                let ts = chrono::Utc::now().to_rfc3339();
-                let new_content =
-                    format!("[graph]\nauto_index = true\nlast_indexed_at = \"{ts}\"\n");
-                if let Err(e) = std::fs::write(&bg_toml, new_content) {
-                    tracing::warn!(error = %e, "failed to update workspace.toml after auto-index");
-                }
-            });
-        }
-    }
+    maybe_reindex_workspace(crate::common::workspace_root());
 
     // When cowork_mode is requested, register the per-session gate.
     // The gate map is owned by build_router; session.create handles the DB flag
@@ -175,13 +110,91 @@ pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, 
     }))
 }
 
+/// Triggers a background workspace graph re-index when the workspace has been
+/// initialised (`.smedja/workspace.toml` exists) and the graph is stale (older
+/// than 24 h, or never indexed).
+///
+/// Errors are logged and swallowed — re-indexing is advisory and must not fail
+/// the `session.create` RPC call that triggers it.
+fn maybe_reindex_workspace(cwd: PathBuf) {
+    let toml_path = cwd.join(".smedja").join("workspace.toml");
+    let needs_index = if toml_path.exists() {
+        let content = std::fs::read_to_string(&toml_path).unwrap_or_default();
+        if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
+            parsed
+                .get("graph")
+                .and_then(|g| g.get("last_indexed_at"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .is_none_or(|ts| {
+                    let age = chrono::Utc::now()
+                        .signed_duration_since(ts.with_timezone(&chrono::Utc));
+                    age.num_hours() >= 24
+                })
+        } else {
+            true
+        }
+    } else {
+        // Only auto-index if workspace.toml already exists (workspace was initialised).
+        false
+    };
+
+    if needs_index {
+        let bg_cwd = cwd.clone();
+        let bg_toml = toml_path.clone();
+        tokio::task::spawn(async move {
+            use opentelemetry::trace::Span as _;
+            let tracer = opentelemetry::global::tracer("smedja");
+            let mut span =
+                opentelemetry::trace::Tracer::start(&tracer, "smedja.workspace.index");
+            let start = std::time::Instant::now();
+            let db_path = bg_cwd.join(".smedja").join("graph.db");
+            let bg_cwd_clone = bg_cwd.clone();
+            let symbol_count = tokio::task::spawn_blocking(move || {
+                smedja_graph::GraphStore::open(&db_path)
+                    .and_then(|mut s| {
+                        s.index_workspace_incremental(&bg_cwd_clone, "workspace", None)
+                    })
+                    .unwrap_or(0)
+            })
+            .await
+            .unwrap_or(0);
+            let duration_ms = start.elapsed().as_millis();
+            span.set_attribute(opentelemetry::KeyValue::new(
+                "workspace_path",
+                bg_cwd.to_string_lossy().into_owned(),
+            ));
+            span.set_attribute(opentelemetry::KeyValue::new(
+                "symbol_count",
+                i64::try_from(symbol_count).unwrap_or(i64::MAX),
+            ));
+            span.set_attribute(opentelemetry::KeyValue::new(
+                "duration_ms",
+                i64::try_from(duration_ms).unwrap_or(i64::MAX),
+            ));
+            span.end();
+            let ts = chrono::Utc::now().to_rfc3339();
+            let new_content =
+                format!("[graph]\nauto_index = true\nlast_indexed_at = \"{ts}\"\n");
+            if let Err(e) = std::fs::write(&bg_toml, new_content) {
+                tracing::warn!(error = %e, "failed to update workspace.toml after auto-index");
+            }
+        });
+    }
+}
+
 /// Handles `session.list`.
 ///
 /// # Errors
 ///
 /// Returns an error when the ingot query fails.
 pub(crate) async fn list(state: HandlerState, _params: Value) -> Result<Value, RpcError> {
-    let ig = state.ingot;
+    list_with(&state.ingot).await
+}
+
+/// Core of `session.list`, parameterised on the ingot handle so it is testable
+/// without constructing a full [`HandlerState`].
+async fn list_with(ig: &smedja_ingot::IngotHandle) -> Result<Value, RpcError> {
     let sessions = ig.list_sessions().await.map_err(|e| ingot_err(&e))?;
     let out: Vec<Value> = sessions
         .into_iter()
@@ -251,13 +264,20 @@ pub(crate) async fn delete(state: HandlerState, params: Value) -> Result<Value, 
 /// Returns an error when `session_id` is missing, the session does not exist, or
 /// an ingot write fails.
 pub(crate) async fn fork(state: HandlerState, params: Value) -> Result<Value, RpcError> {
-    let ig = state.ingot;
     let session_id = params
         .get("session_id")
         .and_then(Value::as_str)
         .ok_or_else(|| missing_param("session_id"))?
         .to_owned();
+    fork_with(&state.ingot, session_id).await
+}
 
+/// Core of `session.fork`, parameterised on the ingot handle so it is testable
+/// without constructing a full [`HandlerState`].
+async fn fork_with(
+    ig: &smedja_ingot::IngotHandle,
+    session_id: String,
+) -> Result<Value, RpcError> {
     // Each DB call acquires and immediately releases the lock so other
     // concurrent RPC handlers (including turn.subscribe's polling loop)
     // are not serialised behind the entire fork sequence.
@@ -682,4 +702,124 @@ pub(crate) async fn history(state: HandlerState, params: Value) -> Result<Value,
         "turns": turns,
         "audit": audit_json,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smedja_ingot::{Ingot, IngotHandle};
+
+    fn handle() -> IngotHandle {
+        IngotHandle::new(Ingot::open_in_memory().unwrap())
+    }
+
+    fn sample_session(id: Uuid, title: &str) -> Session {
+        let now = Timestamp::now();
+        Session {
+            id,
+            created_at: now,
+            updated_at: now,
+            status: "active".to_owned(),
+            task_id: None,
+            mode: None,
+            title: title.to_owned(),
+            cowork_mode: false,
+            workspace_root: None,
+            model_override: None,
+            runner_override: None,
+        }
+    }
+
+    // ── session.list ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_returns_empty_when_no_sessions() {
+        let ig = handle();
+        let resp = list_with(&ig).await.unwrap();
+        assert_eq!(resp, Value::Array(vec![]));
+    }
+
+    #[tokio::test]
+    async fn list_returns_all_created_sessions() {
+        let ig = handle();
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        ig.create_session(sample_session(id_a, "alpha")).await.unwrap();
+        ig.create_session(sample_session(id_b, "beta")).await.unwrap();
+
+        let resp = list_with(&ig).await.unwrap();
+        let arr = resp.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "expected two sessions");
+        let titles: Vec<&str> = arr
+            .iter()
+            .map(|v| v["title"].as_str().unwrap())
+            .collect();
+        assert!(titles.contains(&"alpha"), "missing 'alpha'");
+        assert!(titles.contains(&"beta"), "missing 'beta'");
+    }
+
+    // ── session.fork ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fork_creates_new_session_with_same_title() {
+        let ig = handle();
+        let parent_id = Uuid::new_v4();
+        ig.create_session(sample_session(parent_id, "my-session"))
+            .await
+            .unwrap();
+
+        let resp = fork_with(&ig, parent_id.to_string()).await.unwrap();
+
+        // The response reports the new session id and the parent.
+        assert_eq!(resp["forked_from"], parent_id.to_string());
+        let new_id = resp["session_id"].as_str().unwrap();
+        assert_ne!(new_id, parent_id.to_string(), "forked id must differ");
+
+        // The new session must exist in the store with the same title.
+        let new_sess = ig.get_session(new_id).await.unwrap().unwrap();
+        assert_eq!(new_sess.title, "my-session");
+        assert_eq!(new_sess.status, "active");
+    }
+
+    #[tokio::test]
+    async fn fork_has_checkpoint_false_when_no_checkpoint() {
+        let ig = handle();
+        let parent_id = Uuid::new_v4();
+        ig.create_session(sample_session(parent_id, "s")).await.unwrap();
+
+        let resp = fork_with(&ig, parent_id.to_string()).await.unwrap();
+        assert_eq!(resp["has_checkpoint"], false);
+    }
+
+    #[tokio::test]
+    async fn fork_copies_checkpoint_into_forked_session() {
+        let ig = handle();
+        let parent_id = Uuid::new_v4();
+        ig.create_session(sample_session(parent_id, "s")).await.unwrap();
+        ig.save_checkpoint(Checkpoint {
+            id: Uuid::new_v4(),
+            session_id: parent_id.to_string(),
+            turn_n: 3,
+            messages_json: r#"["hello"]"#.to_owned(),
+            created_at: Timestamp::now(),
+            compaction_id: None,
+        })
+        .await
+        .unwrap();
+
+        let resp = fork_with(&ig, parent_id.to_string()).await.unwrap();
+        assert_eq!(resp["has_checkpoint"], true, "checkpoint should be copied");
+
+        let new_id = resp["session_id"].as_str().unwrap();
+        let cp = ig.latest_checkpoint(new_id).await.unwrap();
+        assert!(cp.is_some(), "forked session must have a checkpoint");
+        assert_eq!(cp.unwrap().turn_n, 3);
+    }
+
+    #[tokio::test]
+    async fn fork_returns_error_for_unknown_session() {
+        let ig = handle();
+        let err = fork_with(&ig, "no-such-id".to_owned()).await.unwrap_err();
+        assert_eq!(err.code, smedja_rpc::codes::INTERNAL_ERROR);
+    }
 }

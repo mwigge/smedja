@@ -30,6 +30,8 @@ pub struct Route {
     pub tier: Tier,
     /// Optional model override (e.g. `"claude-sonnet-4-6"`). `None` uses the runner default.
     pub model: Option<String>,
+    /// Tool whitelist from `agents.toml`; empty means all tools are allowed.
+    pub tools: Vec<String>,
 }
 
 /// A fully resolved routing decision: the chosen destination plus the inputs

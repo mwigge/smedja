@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use smedja_adapter::types::Message as AdapterMessage;
 use smedja_adapter::CallOptions;
-use smedja_assayer::{AgentRole, Complexity, Runner, Tier};
+use smedja_assayer::{Runner, Tier};
 use smedja_bellows::event::CorrelationCtx;
 use smedja_bellows::Dispatcher;
 use smedja_ingot::{AuditEvent, IngotHandle, Session};
@@ -878,13 +878,6 @@ fn resolve_workspace(params: &Value) -> std::path::PathBuf {
             || std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             std::path::PathBuf::from,
         )
-}
-
-/// Routes a role through the assayer for the auditor; kept for symmetry with the
-/// orchestrator's routing so the Review role's deep tier is explicit.
-#[allow(dead_code)] // documents the Review→deep routing the loop relies on
-fn review_route(assayer: &smedja_assayer::Assayer) -> smedja_assayer::Route {
-    assayer.route(AgentRole::Review, Complexity::Complex)
 }
 
 #[cfg(test)]

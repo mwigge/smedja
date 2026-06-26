@@ -168,13 +168,11 @@ impl TurnBlock {
 ///
 /// Capacity is fixed at 200; oldest entries are evicted when the limit is
 /// reached.
-#[allow(dead_code)] // session block history; wired to TUI history panel in upcoming story
 #[derive(Debug, Default)]
 pub struct BlockStore {
     blocks: std::collections::VecDeque<TurnBlock>,
 }
 
-#[allow(dead_code)] // session block history; wired to TUI history panel in upcoming story
 impl BlockStore {
     /// Creates an empty [`BlockStore`] pre-allocated for 200 entries.
     #[must_use]

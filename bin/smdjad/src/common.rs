@@ -122,6 +122,19 @@ pub(crate) fn effective_max_tool_turns() -> usize {
         .map_or(MAX_TOOL_TURNS, |n| n.min(50))
 }
 
+/// Hard wall-clock cap (in seconds) for a single agent turn, covering all
+/// provider rotations and tool-loop iterations combined.
+///
+/// Override with `SMEDJA_TURN_TIMEOUT_S` (e.g. `SMEDJA_TURN_TIMEOUT_S=600`).
+/// Defaults to 900 s (15 min).
+#[must_use]
+pub(crate) fn effective_agent_timeout_s() -> u64 {
+    std::env::var("SMEDJA_TURN_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(900) // 15-minute hard cap per turn
+}
+
 /// Error returned by [`drain_stream`], distinguishing rate-limit responses and
 /// rotatable provider failures from other failures so callers can apply an
 /// appropriate recovery strategy.

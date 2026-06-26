@@ -225,6 +225,7 @@ impl TurnOrchestrator {
                 runner: decision.runner(),
                 tier: decision.tier(),
                 model: decision.model().map(str::to_owned),
+                tools: vec![],
             }
         };
 
@@ -633,6 +634,13 @@ impl TurnOrchestrator {
         let mut last_kind: &'static str = "request";
         let mut rotations: u32 = 0;
 
+        // Wall-clock deadline shared across all provider rotations and tool-loop
+        // iterations for this turn.  Using a single `Instant` deadline (rather
+        // than a fresh per-iteration duration) prevents the effective ceiling from
+        // multiplying up to `MAX_TOOL_TURNS * 5 min`.
+        let turn_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(crate::common::effective_agent_timeout_s());
+
         // Drive the turn over the eligible ring. On a retryable failure the loop
         // advances to the next entry (bounded by MAX_PROVIDER_ROTATIONS),
         // re-deriving CallOptions for the new provider while preserving the same
@@ -746,8 +754,8 @@ impl TurnOrchestrator {
                     opts.system = Some(inject_conciseness(&base_system, used, context_window));
                     loop {
                         let stream = provider.stream_chat(&prompt, &opts);
-                        let drain_result = tokio::time::timeout(
-                            std::time::Duration::from_mins(5),
+                        let drain_result = tokio::time::timeout_at(
+                            turn_deadline,
                             crate::common::drain_stream(
                                 stream,
                                 dispatcher,
@@ -796,8 +804,11 @@ impl TurnOrchestrator {
                                 return;
                             }
                             Err(_elapsed) => {
-                                let reason = "stream timed out after 300s".to_owned();
-                                warn!(turn_id = %turn_id, "provider stream timed out");
+                                let reason = format!(
+                                    "turn deadline exceeded after {}s",
+                                    crate::common::effective_agent_timeout_s()
+                                );
+                                warn!(turn_id = %turn_id, "turn wall-clock deadline exceeded");
                                 let _ = ingot.update_task_status(&turn_id, "failed").await;
                                 dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
                                 tel::set_span_error(&mut turn_span, "request", &reason, false);

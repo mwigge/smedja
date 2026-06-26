@@ -72,7 +72,15 @@ pub(crate) async fn list(state: HandlerState, params: Value) -> Result<Value, Rp
 ///
 /// Returns an error when `title` is missing or the ingot write fails.
 pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, RpcError> {
-    let ig = state.ingot;
+    create_with(&state.ingot, &params).await
+}
+
+/// Core of `task.create`, parameterised on the ingot handle so it is testable
+/// without constructing a full [`HandlerState`].
+async fn create_with(
+    ig: &smedja_ingot::IngotHandle,
+    params: &Value,
+) -> Result<Value, RpcError> {
     let title = params
         .get("title")
         .and_then(Value::as_str)
@@ -302,4 +310,57 @@ pub(crate) async fn cancel(state: HandlerState, params: Value) -> Result<Value, 
         .to_owned();
     let found = pool.lock().await.cancel(&task_id);
     Ok(json!({ "task_id": task_id, "cancelled": found }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smedja_ingot::{Ingot, IngotHandle};
+
+    fn handle() -> IngotHandle {
+        IngotHandle::new(Ingot::open_in_memory().unwrap())
+    }
+
+    // ── task.create ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn create_returns_id_and_planned_status() {
+        let ig = handle();
+        let params = json!({ "title": "Fix the bug" });
+        let resp = create_with(&ig, &params).await.unwrap();
+        assert_eq!(resp["status"], "planned");
+        assert!(resp["id"].as_str().is_some(), "id must be present");
+    }
+
+    #[tokio::test]
+    async fn create_task_is_persisted_and_retrievable() {
+        let ig = handle();
+        let params = json!({ "title": "Ship it", "description": "desc" });
+        let resp = create_with(&ig, &params).await.unwrap();
+        let id = resp["id"].as_str().unwrap();
+
+        let task = ig.get_task(id).await.unwrap().unwrap();
+        assert_eq!(task.title, "Ship it");
+        assert_eq!(task.description, "desc");
+        assert_eq!(task.status, "planned");
+    }
+
+    #[tokio::test]
+    async fn create_missing_title_returns_invalid_params() {
+        let ig = handle();
+        let params = json!({ "description": "no title" });
+        let err = create_with(&ig, &params).await.unwrap_err();
+        assert_eq!(err.code, smedja_rpc::codes::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn create_with_optional_session_id_stored() {
+        let ig = handle();
+        let params = json!({ "title": "t", "session_id": "sess-abc" });
+        let resp = create_with(&ig, &params).await.unwrap();
+        let id = resp["id"].as_str().unwrap();
+
+        let task = ig.get_task(id).await.unwrap().unwrap();
+        assert_eq!(task.session_id.as_deref(), Some("sess-abc"));
+    }
 }
