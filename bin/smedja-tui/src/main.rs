@@ -54,7 +54,7 @@ use smedja_rpc::client::Client;
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "smedja-tui", about = "smedja agent dashboard (TUI)")]
+#[command(name = "smedja-tui", version, about = "smedja agent dashboard (TUI)")]
 struct Cli {
     /// smdjad socket path (default: `$XDG_RUNTIME_DIR/smdjad.sock`)
     #[arg(long, env = "SMEDJA_SOCK")]

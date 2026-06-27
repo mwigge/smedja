@@ -44,7 +44,8 @@ vte          = { workspace = true }
 name              = "smedja"
 identifier        = "nu.wigge.smedja"
 icon              = ["../../../assets/brand/smedja.icns"]
-version = "0.14.1"
+# No `version` here on purpose: cargo-bundle falls back to the package version
+# (version.workspace = true), so the bundle always tracks the workspace.
 copyright         = "© 2025 Morgan Wigge"
 category          = "developer-tools"
 short_description = "GPU-accelerated terminal emulator and AI orchestration forge"

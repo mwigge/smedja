@@ -718,6 +718,16 @@ fn init_tracing() {
 #[allow(clippy::too_many_lines)] // startup sequence: bind, migrate, orphan sweep, spawn workers
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // smdjad has no clap parser; honour `--version`/`-V` so it can report its
+    // own build like the other binaries (CARGO_PKG_VERSION = workspace version).
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|a| a == "--version" || a == "-V")
+    {
+        println!("smdjad {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     init_tracing();
 
     // Install the W3C trace-context propagator process-wide so outbound HTTP
