@@ -1,5 +1,42 @@
 use crate::types::{AgentRole, Complexity, Route, RoutingDecision, Runner, Tier};
 
+/// Cost-aware tier ladder: the tier to use at implementation `step` (0-based),
+/// descending from the strongest model early to cheaper models as work
+/// progresses — the "opus → sonnet → haiku throughout implementation" policy.
+///
+/// step 0 → Deep (plan/first cut with the strong model), steps 1–2 → Fast,
+/// step 3+ → Local. Capping a route at this tier lets an orchestrated loop start
+/// deep and get cheaper without losing the ability to escalate per role.
+#[must_use]
+pub fn descending_tier(step: usize) -> Tier {
+    match step {
+        0 => Tier::Deep,
+        1 | 2 => Tier::Fast,
+        _ => Tier::Local,
+    }
+}
+
+/// Caps `tier` so it is never *more* capable than `ceiling` — used to apply the
+/// [`descending_tier`] ladder on top of a role's routed tier (a role can pin a
+/// cheaper tier but the ladder won't force a role above its ceiling).
+#[must_use]
+pub fn cap_tier(tier: Tier, ceiling: Tier) -> Tier {
+    if tier_rank(tier) > tier_rank(ceiling) {
+        ceiling
+    } else {
+        tier
+    }
+}
+
+/// Capability rank for tier ordering (Local < Fast < Deep).
+fn tier_rank(tier: Tier) -> u8 {
+    match tier {
+        Tier::Local => 0,
+        Tier::Fast => 1,
+        Tier::Deep => 2,
+    }
+}
+
 /// A single routing rule: optional role and optional complexity matchers, plus the
 /// `Route` to emit when both match. `None` in either position acts as a wildcard.
 #[derive(Debug, Clone)]
@@ -219,6 +256,19 @@ mod tests {
     }
 
     // ------------------------------------------------------------------ tests
+
+    #[test]
+    fn descending_tier_ladder_steps_down_and_caps() {
+        assert_eq!(super::descending_tier(0), Tier::Deep);
+        assert_eq!(super::descending_tier(1), Tier::Fast);
+        assert_eq!(super::descending_tier(2), Tier::Fast);
+        assert_eq!(super::descending_tier(3), Tier::Local);
+        assert_eq!(super::descending_tier(99), Tier::Local);
+        // cap never raises above the ceiling, never lowers a cheaper tier.
+        assert_eq!(super::cap_tier(Tier::Deep, Tier::Fast), Tier::Fast);
+        assert_eq!(super::cap_tier(Tier::Local, Tier::Deep), Tier::Local);
+        assert_eq!(super::cap_tier(Tier::Fast, Tier::Fast), Tier::Fast);
+    }
 
     #[test]
     fn read_only_roles_are_classified() {
