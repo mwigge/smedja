@@ -95,6 +95,44 @@ pub(crate) async fn set_mode(state: HandlerState, params: Value) -> Result<Value
     Ok(json!({ "session_id": session_id, "mode": new_mode.as_str() }))
 }
 
+/// Handles `cowork.gate_tool`: the PreToolUse hook entry point for external CLIs
+/// (claude via `smj tool-gate`). Evaluates the session's permission policy and
+/// blocks on the user when it says "ask". Returns `{decision, reason}` where
+/// `decision` is `"allow"` or `"deny"`.
+///
+/// # Errors
+///
+/// Never returns an RPC error — a missing tool/session resolves to a decision so
+/// the hook always gets an answer (fail-safe is handled by the policy/gate).
+pub(crate) async fn gate_tool(state: HandlerState, params: Value) -> Result<Value, RpcError> {
+    let session_id = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let tool_name = params
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let tool_input = params.get("tool_input").cloned().unwrap_or(Value::Null);
+
+    let gate = {
+        let mut g = state.gates.lock().await;
+        Arc::clone(
+            g.entry(session_id.clone())
+                .or_insert_with(|| Arc::new(CoworkGate::default())),
+        )
+    };
+    let (decision, reason) = match gate.gate_tool(0, &tool_name, tool_input, "").await {
+        crate::cowork::Decision::Approve => ("allow", String::new()),
+        crate::cowork::Decision::Deny(r) => ("deny", r),
+        // External CLIs can't apply a "modify"; treat as approve.
+        crate::cowork::Decision::Modify(_) => ("allow", "approved".to_owned()),
+    };
+    Ok(json!({ "decision": decision, "reason": reason }))
+}
+
 /// Looks up the cowork gate for `session_id`, erroring when none is registered.
 async fn gate_for(state: &HandlerState, session_id: &str) -> Result<Arc<CoworkGate>, RpcError> {
     state

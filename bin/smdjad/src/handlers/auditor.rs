@@ -712,6 +712,7 @@ impl ReviewTurn for ProviderReviewTurn {
                 system: system.clone(),
                 tools: None,
                 provider_session_id: None,
+                smedja_session_id: None,
                 stable_prefix_len: None,
                 cache_strategy: smedja_adapter::CacheStrategy::None,
             };

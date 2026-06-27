@@ -38,13 +38,68 @@ impl Provider for ClaudeCliProvider {
     }
 }
 
-fn stream_claude_cli(messages: &[Message], _opts: &CallOptions) -> DeltaStream {
+/// POSIX single-quotes a string for safe embedding in a shell command (claude
+/// runs the hook command through a shell).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Installs smedja's PreToolUse approval hook on a `claude` command so each of
+/// claude's own tool calls is gated through the daemon's permission policy
+/// (`smj tool-gate` → `cowork.gate_tool`, which blocks on the user when the
+/// policy says "ask"). The smedja session id is passed via `SMEDJA_SESSION_ID`
+/// so the hook knows which session's gate to consult.
+///
+/// No-op when `SMEDJA_TOOL_GATE=off`, `smj` is not on `$PATH`, or there is no
+/// session to attribute approvals to — the hook then "fails open" (claude runs
+/// unimpeded) rather than bricking the agent.
+fn install_tool_gate(command: &mut tokio::process::Command, session_id: Option<&str>) {
+    let disabled = std::env::var("SMEDJA_TOOL_GATE").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "none" | "disable" | "disabled"
+        )
+    });
+    if disabled {
+        return;
+    }
+    let Some(session_id) = session_id.filter(|s| !s.is_empty()) else {
+        return;
+    };
+    // Bake the absolute smj path into the hook so it resolves regardless of
+    // claude's own PATH. If smj can't be found, skip the hook (fail open).
+    let Ok(smj) = which::which("smj") else {
+        return;
+    };
+    let hook_command = format!("{} tool-gate", shell_quote(&smj.to_string_lossy()));
+    let settings = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": hook_command,
+                    "timeout": 1800,
+                }],
+            }],
+        }
+    });
+    let path = std::env::temp_dir().join("smedja-claude-settings.json");
+    if std::fs::write(&path, settings.to_string()).is_err() {
+        return;
+    }
+    command.arg("--settings").arg(&path);
+    command.env("SMEDJA_SESSION_ID", session_id);
+}
+
+fn stream_claude_cli(messages: &[Message], opts: &CallOptions) -> DeltaStream {
     // Render the FULL conversation into the prompt and deliver it on stdin.
     // We do NOT use `--resume`: it depends on the CLI's own conversation store,
     // which is unreliable under the daemon's working directory / sandbox and
     // fails with "No conversation found" (exit 1) on the second turn. milliways
     // takes the same approach — assemble the whole prompt upstream, no resume.
     let prompt = render_conversation(messages);
+    let session_id = opts.smedja_session_id.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::spawn(async move {
@@ -68,6 +123,10 @@ fn stream_claude_cli(messages: &[Message], _opts: &CallOptions) -> DeltaStream {
             // So an interrupted turn (turn.cancel aborts the run task) kills the
             // child instead of leaking a runaway `claude` process.
             .kill_on_drop(true);
+
+        // Install the PreToolUse approval hook so claude's own tool calls are
+        // gated through smedja's permission policy (ask → approve/deny).
+        install_tool_gate(&mut command, session_id.as_deref());
 
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -468,6 +527,7 @@ mod tests {
             system: None,
             tools: None,
             provider_session_id: Some("resume-123".into()),
+            smedja_session_id: None,
             stable_prefix_len: None,
             cache_strategy: crate::types::CacheStrategy::None,
         };
