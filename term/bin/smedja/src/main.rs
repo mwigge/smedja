@@ -338,6 +338,53 @@ impl App {
     fn superkey(&self) -> bool {
         self.modifiers.state().super_key()
     }
+
+    /// Pastes the clipboard into the active PTY, wrapping it in bracketed-paste
+    /// markers when the application has that mode enabled. No-op when there is
+    /// no PTY, no clipboard, or the clipboard holds no text.
+    fn paste_from_clipboard(&mut self) {
+        let Some(pty) = &mut self.pty else { return };
+        let bracketed = pty.grid.lock().bracketed_paste;
+        let Ok(mut cb) = arboard::Clipboard::new() else {
+            return;
+        };
+        let Ok(text) = cb.get_text() else { return };
+        let payload = text.into_bytes();
+        let data = if bracketed {
+            let mut w = b"\x1b[200~".to_vec();
+            w.extend_from_slice(&payload);
+            w.extend_from_slice(b"\x1b[201~");
+            w
+        } else {
+            payload
+        };
+        if let Err(e) = pty.write_input(&data) {
+            debug!("PTY paste write error: {}", e);
+        }
+    }
+
+    /// Maps a window pixel position to the grid cell under it, returning
+    /// `(col, row, mouse_mode, mouse_sgr)`. Locks the PTY grid; `None` when
+    /// there is no PTY. Single source of the pointer→cell arithmetic shared by
+    /// the `CursorMoved`, `MouseInput`, and `MouseWheel` handlers.
+    fn pointer_cell(&self, win_x: f64, win_y: f64) -> Option<(u16, u16, st_pty::MouseMode, bool)> {
+        let pty = self.pty.as_ref()?;
+        let grid = pty.grid.lock();
+        let sf = self.renderer.as_ref().map_or(1.0_f64, |r| r.scale_factor);
+        #[allow(clippy::cast_possible_truncation)]
+        let eff_font = self.config.font.size * sf as f32;
+        let top_bar_h = self.renderer.as_ref().map_or(0, |r| r.top_bar_height_px());
+        let phys_x = (win_x * sf) as u32;
+        let phys_y = (win_y * sf) as u32;
+        let grid_y = phys_y.saturating_sub(top_bar_h);
+        let cw = st_glyph::char_advance_width(eff_font).max(1.0);
+        let ch = st_glyph::line_height(eff_font).max(1.0);
+        #[allow(clippy::cast_possible_truncation)]
+        let col = ((phys_x as f32 / cw) as u16).min(grid.cols.saturating_sub(1));
+        #[allow(clippy::cast_possible_truncation)]
+        let row = ((grid_y as f32 / ch) as u16).min(grid.rows.saturating_sub(1));
+        Some((col, row, grid.mouse_mode, grid.mouse_sgr))
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -912,25 +959,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.ctrl() && !self.shift() {
                     if let Key::Character(s) = &logical_key {
                         if s.to_lowercase() == "v" {
-                            if let Some(pty) = &mut self.pty {
-                                let bracketed = pty.grid.lock().bracketed_paste;
-                                if let Ok(mut cb) = arboard::Clipboard::new() {
-                                    if let Ok(text) = cb.get_text() {
-                                        let payload = text.into_bytes();
-                                        let data = if bracketed {
-                                            let mut w = b"\x1b[200~".to_vec();
-                                            w.extend_from_slice(&payload);
-                                            w.extend_from_slice(b"\x1b[201~");
-                                            w
-                                        } else {
-                                            payload
-                                        };
-                                        if let Err(e) = pty.write_input(&data) {
-                                            debug!("PTY paste write error: {}", e);
-                                        }
-                                    }
-                                }
-                            }
+                            self.paste_from_clipboard();
                             return;
                         }
                     }
@@ -981,25 +1010,7 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             // Ctrl+Shift+V → paste from clipboard (with bracketed paste support)
                             "v" => {
-                                if let Some(pty) = &mut self.pty {
-                                    let bracketed = pty.grid.lock().bracketed_paste;
-                                    if let Ok(mut cb) = arboard::Clipboard::new() {
-                                        if let Ok(text) = cb.get_text() {
-                                            let payload = text.into_bytes();
-                                            let data = if bracketed {
-                                                let mut w = b"\x1b[200~".to_vec();
-                                                w.extend_from_slice(&payload);
-                                                w.extend_from_slice(b"\x1b[201~");
-                                                w
-                                            } else {
-                                                payload
-                                            };
-                                            if let Err(e) = pty.write_input(&data) {
-                                                debug!("PTY paste write error: {}", e);
-                                            }
-                                        }
-                                    }
-                                }
+                                self.paste_from_clipboard();
                                 return;
                             }
                             // Ctrl+Shift+B → vertical split (was Ctrl+Shift+V before paste)
@@ -1059,23 +1070,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.cursor_pos = (position.x, position.y);
                 // Send mouse motion events when a button is held (ButtonEvent mode)
                 // or unconditionally (AnyEvent mode).
-                if let Some(pty) = &mut self.pty {
-                    let (mode, sgr, col, row) = {
-                        let grid = pty.grid.lock();
-                        let sf = self.renderer.as_ref().map_or(1.0_f64, |r| r.scale_factor);
-                        #[allow(clippy::cast_possible_truncation)]
-                        let eff_font = self.config.font.size * sf as f32;
-                        let top_bar_h = self.renderer.as_ref().map_or(0, |r| r.top_bar_height_px());
-                        let phys_x = (position.x * sf) as u32;
-                        let phys_y = (position.y * sf) as u32;
-                        let grid_y = phys_y.saturating_sub(top_bar_h);
-                        let cw = st_glyph::char_advance_width(eff_font).max(1.0);
-                        let ch = st_glyph::line_height(eff_font).max(1.0);
-                        #[allow(clippy::cast_possible_truncation)]
-                        let col = ((phys_x as f32 / cw) as u16).min(grid.cols.saturating_sub(1));
-                        #[allow(clippy::cast_possible_truncation)]
-                        let row = ((grid_y as f32 / ch) as u16).min(grid.rows.saturating_sub(1));
-                        (grid.mouse_mode, grid.mouse_sgr, col, row)
+                if self.pty.is_some() {
+                    let Some((col, row, mode, sgr)) =
+                        self.pointer_cell(position.x, position.y)
+                    else {
+                        return;
                     };
 
                     let should_send = match mode {
@@ -1102,8 +1101,10 @@ impl ApplicationHandler<UserEvent> for App {
                         } else {
                             encode_mouse_x10(col, row, motion_btn)
                         };
-                        if let Err(e) = pty.write_input(&bytes) {
-                            debug!("PTY mouse motion write error: {}", e);
+                        if let Some(pty) = &mut self.pty {
+                            if let Err(e) = pty.write_input(&bytes) {
+                                debug!("PTY mouse motion write error: {}", e);
+                            }
                         }
                     }
                 }
@@ -1114,51 +1115,38 @@ impl ApplicationHandler<UserEvent> for App {
                     "MouseInput {:?} {:?} occluded={}",
                     state, button, self.occluded
                 );
+                let btn_code: u8 = match button {
+                    MouseButton::Left => 0,
+                    MouseButton::Middle => 1,
+                    MouseButton::Right => 2,
+                    _ => return, // unknown button (Back/Forward)
+                };
+                let pressed = state == ElementState::Pressed;
+                if pressed {
+                    self.mouse_buttons |= 1 << btn_code;
+                } else {
+                    self.mouse_buttons &= !(1 << btn_code);
+                }
+
+                let Some((col, row, mode, sgr)) =
+                    self.pointer_cell(self.cursor_pos.0, self.cursor_pos.1)
+                else {
+                    return;
+                };
+                debug!(
+                    "MouseInput mode={:?} sgr={} col={} row={}",
+                    mode, sgr, col, row
+                );
+                if mode == st_pty::MouseMode::None {
+                    debug!("MouseInput: mode=None, not forwarding to PTY");
+                    return;
+                }
+                let bytes = if sgr {
+                    encode_mouse_sgr(col, row, btn_code, pressed)
+                } else {
+                    encode_mouse_x10(col, row, if pressed { btn_code } else { 3 })
+                };
                 if let Some(pty) = &mut self.pty {
-                    let btn_code: u8 = match button {
-                        MouseButton::Left => 0,
-                        MouseButton::Middle => 1,
-                        MouseButton::Right => 2,
-                        _ => return, // unknown button (Back/Forward)
-                    };
-                    let pressed = state == ElementState::Pressed;
-                    if pressed {
-                        self.mouse_buttons |= 1 << btn_code;
-                    } else {
-                        self.mouse_buttons &= !(1 << btn_code);
-                    }
-
-                    let (col, row, mode, sgr) = {
-                        let grid = pty.grid.lock();
-                        let sf = self.renderer.as_ref().map_or(1.0_f64, |r| r.scale_factor);
-                        #[allow(clippy::cast_possible_truncation)]
-                        let eff_font = self.config.font.size * sf as f32;
-                        let top_bar_h = self.renderer.as_ref().map_or(0, |r| r.top_bar_height_px());
-                        let phys_x = (self.cursor_pos.0 * sf) as u32;
-                        let phys_y = (self.cursor_pos.1 * sf) as u32;
-                        let grid_y = phys_y.saturating_sub(top_bar_h);
-                        let cw = st_glyph::char_advance_width(eff_font).max(1.0);
-                        let ch = st_glyph::line_height(eff_font).max(1.0);
-                        #[allow(clippy::cast_possible_truncation)]
-                        let col = ((phys_x as f32 / cw) as u16).min(grid.cols.saturating_sub(1));
-                        #[allow(clippy::cast_possible_truncation)]
-                        let row = ((grid_y as f32 / ch) as u16).min(grid.rows.saturating_sub(1));
-                        (col, row, grid.mouse_mode, grid.mouse_sgr)
-                    };
-
-                    debug!(
-                        "MouseInput mode={:?} sgr={} col={} row={}",
-                        mode, sgr, col, row
-                    );
-                    if mode == st_pty::MouseMode::None {
-                        debug!("MouseInput: mode=None, not forwarding to PTY");
-                        return;
-                    }
-                    let bytes = if sgr {
-                        encode_mouse_sgr(col, row, btn_code, pressed)
-                    } else {
-                        encode_mouse_x10(col, row, if pressed { btn_code } else { 3 })
-                    };
                     if let Err(e) = pty.write_input(&bytes) {
                         debug!("PTY mouse write error: {}", e);
                     }
@@ -1180,31 +1168,18 @@ impl ApplicationHandler<UserEvent> for App {
                 if lines == 0 {
                     return;
                 }
-                if let Some(pty) = &mut self.pty {
-                    // When an application is in a mouse-reporting mode, forward
-                    // the wheel as SGR/X10 button 64 (up) / 65 (down) so it can
-                    // scroll its own viewport. Otherwise scroll the terminal's
-                    // local scrollback buffer.
-                    let (mode, sgr, col, row) = {
-                        let grid = pty.grid.lock();
-                        let sf = self.renderer.as_ref().map_or(1.0_f64, |r| r.scale_factor);
-                        #[allow(clippy::cast_possible_truncation)]
-                        let eff_font = self.config.font.size * sf as f32;
-                        let top_bar_h = self.renderer.as_ref().map_or(0, |r| r.top_bar_height_px());
-                        let phys_x = (self.cursor_pos.0 * sf) as u32;
-                        let phys_y = (self.cursor_pos.1 * sf) as u32;
-                        let grid_y = phys_y.saturating_sub(top_bar_h);
-                        let cw = st_glyph::char_advance_width(eff_font).max(1.0);
-                        let ch = st_glyph::line_height(eff_font).max(1.0);
-                        #[allow(clippy::cast_possible_truncation)]
-                        let col = ((phys_x as f32 / cw) as u16).min(grid.cols.saturating_sub(1));
-                        #[allow(clippy::cast_possible_truncation)]
-                        let row = ((grid_y as f32 / ch) as u16).min(grid.rows.saturating_sub(1));
-                        (grid.mouse_mode, grid.mouse_sgr, col, row)
-                    };
-
-                    if mode == st_pty::MouseMode::None {
-                        // Local scrollback. Positive lines scroll up into history.
+                // When an application is in a mouse-reporting mode, forward the
+                // wheel as SGR/X10 button 64 (up) / 65 (down) so it can scroll
+                // its own viewport. Otherwise scroll the terminal's local
+                // scrollback buffer.
+                let Some((col, row, mode, sgr)) =
+                    self.pointer_cell(self.cursor_pos.0, self.cursor_pos.1)
+                else {
+                    return;
+                };
+                if mode == st_pty::MouseMode::None {
+                    // Local scrollback. Positive lines scroll up into history.
+                    if let Some(pty) = &mut self.pty {
                         let changed = pty.grid.lock().scroll_by(lines);
                         if changed {
                             pty.dirty.store(true, Ordering::Release);
@@ -1212,17 +1187,19 @@ impl ApplicationHandler<UserEvent> for App {
                                 w.request_redraw();
                             }
                         }
-                    } else {
-                        let btn: u8 = if lines > 0 { 64 } else { 65 };
-                        let mut data = Vec::new();
-                        for _ in 0..lines.abs() {
-                            let bytes = if sgr {
-                                encode_mouse_sgr(col, row, btn, true)
-                            } else {
-                                encode_mouse_x10(col, row, btn)
-                            };
-                            data.extend_from_slice(&bytes);
-                        }
+                    }
+                } else {
+                    let btn: u8 = if lines > 0 { 64 } else { 65 };
+                    let mut data = Vec::new();
+                    for _ in 0..lines.abs() {
+                        let bytes = if sgr {
+                            encode_mouse_sgr(col, row, btn, true)
+                        } else {
+                            encode_mouse_x10(col, row, btn)
+                        };
+                        data.extend_from_slice(&bytes);
+                    }
+                    if let Some(pty) = &mut self.pty {
                         if let Err(e) = pty.write_input(&data) {
                             debug!("PTY wheel write error: {}", e);
                         }
