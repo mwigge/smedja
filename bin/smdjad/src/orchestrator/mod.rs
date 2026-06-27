@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use smedja_telemetry as tel;
 
-use crate::cowork::{ApprovalPrompt, CoworkGate, Decision};
+use crate::cowork::{CoworkGate, Decision};
 use crate::executor::execute_tool;
 use crate::price_table::PriceTable;
 use crate::provider_pool::ProviderPool;
@@ -904,30 +904,32 @@ impl TurnOrchestrator {
                         tool_call_id: Some(tool_call_id.clone()),
                     });
 
-                    // 5c. Cowork gate intercept.
-                    let cowork_denied = if session.as_ref().is_some_and(|s| s.cowork_mode) {
-                        if let Some(gate) = gates.lock().await.get(&session_id).cloned() {
-                            let ap = ApprovalPrompt {
-                                step_n: 0,
-                                tool: tool_name.clone(),
-                                args_scrubbed: serde_json::from_str(&tool_input)
-                                    .unwrap_or(serde_json::Value::Null),
-                                reasoning: String::new(),
-                                plan_summary: String::new(),
-                            };
-                            match gate.intercept(ap, 300).await {
-                                Decision::Approve => None,
-                                Decision::Deny(reason) => Some(format!("denied: {reason}")),
-                                Decision::Modify(new_input) => {
-                                    tool_input = new_input;
-                                    None
-                                }
+                    // 5c. Permission gate. The session's permission policy
+                    // (default Ask) decides allow/deny outright or — for a
+                    // mutation under Ask — suspends until the user responds via
+                    // cowork.approve/deny (surfaced by the TUI's cowork.pending
+                    // poll). Ask-on-mutation is the default; Auto/Plan/
+                    // AcceptEdits are toggled from the TUI (cowork.set_mode).
+                    // The gate is created on demand so gating works without an
+                    // explicit `/cowork on`.
+                    let cowork_denied = {
+                        let gate = {
+                            let mut g = gates.lock().await;
+                            Arc::clone(
+                                g.entry(session_id.clone())
+                                    .or_insert_with(|| Arc::new(CoworkGate::default())),
+                            )
+                        };
+                        let args_scrubbed = serde_json::from_str(&tool_input)
+                            .unwrap_or(serde_json::Value::Null);
+                        match gate.gate_tool(0, &tool_name, args_scrubbed, "").await {
+                            Decision::Approve => None,
+                            Decision::Deny(reason) => Some(format!("denied: {reason}")),
+                            Decision::Modify(new_input) => {
+                                tool_input = new_input;
+                                None
                             }
-                        } else {
-                            None
                         }
-                    } else {
-                        None
                     };
 
                     // 5d. Execute the tool (or return the denial).

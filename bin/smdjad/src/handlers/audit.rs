@@ -65,6 +65,36 @@ pub(crate) async fn set(state: HandlerState, params: Value) -> Result<Value, Rpc
     Ok(json!({ "session_id": session_id, "cowork_mode": enabled }))
 }
 
+/// Handles `cowork.set_mode`: sets the session's permission mode, creating the
+/// gate on demand. `mode` is `ask|accept_edits|plan|auto`; omit `mode` to cycle
+/// to the next mode (Shift+Tab from the TUI).
+///
+/// # Errors
+///
+/// Returns an error when `session_id` is missing.
+pub(crate) async fn set_mode(state: HandlerState, params: Value) -> Result<Value, RpcError> {
+    let session_id = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| missing_param("session_id"))?
+        .to_owned();
+    let gate = {
+        let mut g = state.gates.lock().await;
+        Arc::clone(
+            g.entry(session_id.clone())
+                .or_insert_with(|| Arc::new(CoworkGate::default())),
+        )
+    };
+    let new_mode = match params.get("mode").and_then(Value::as_str) {
+        Some(m) => {
+            gate.set_mode(crate::cowork::PermissionMode::parse_lenient(m))
+                .await
+        }
+        None => gate.cycle_mode().await,
+    };
+    Ok(json!({ "session_id": session_id, "mode": new_mode.as_str() }))
+}
+
 /// Looks up the cowork gate for `session_id`, erroring when none is registered.
 async fn gate_for(state: &HandlerState, session_id: &str) -> Result<Arc<CoworkGate>, RpcError> {
     state

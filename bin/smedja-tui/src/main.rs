@@ -288,6 +288,9 @@ pub(crate) struct AppState {
     /// True after one Ctrl-C with an empty input — a second consecutive Ctrl-C
     /// confirms quit. Reset by any other key so quitting is always deliberate.
     quit_armed: bool,
+    /// Current permission mode (`ask`/`accept_edits`/`plan`/`auto`), cycled with
+    /// Shift+Tab via `cowork.set_mode` and shown in the status bar.
+    permission_mode: String,
     /// Symbol count from the last `/index` this session (`None` = not indexed
     /// here yet). Surfaced as a code-graph status under the LSP panel.
     graph_symbols: Option<usize>,
@@ -1914,6 +1917,22 @@ async fn handle_key(
     }
 
     // ------------------------------------------------------------------
+    // Shift+Tab cycles the permission mode (ask → accept_edits → plan → auto).
+    // ------------------------------------------------------------------
+    if key.code == KeyCode::BackTab && state.secret_var.is_none() {
+        if let Ok(v) = client
+            .call("cowork.set_mode", json!({ "session_id": state.session_id }))
+            .await
+        {
+            if let Some(m) = v.get("mode").and_then(Value::as_str) {
+                state.permission_mode = m.to_owned();
+                push_system_message(state, format!("permission mode \u{2192} {m}"));
+            }
+        }
+        return Ok(());
+    }
+
+    // ------------------------------------------------------------------
     // Slash-completion popup intercepts most keys when visible.
     // ------------------------------------------------------------------
     if state.slash_popup_visible {
@@ -3520,6 +3539,7 @@ async fn main() -> Result<()> {
         input: String::new(),
         quit: false,
         quit_armed: false,
+        permission_mode: "ask".to_owned(),
         graph_symbols: None,
         tool_details: Vec::new(),
         pending_tool: None,
@@ -5733,6 +5753,7 @@ mod tests {
             input: String::new(),
             quit: false,
             quit_armed: false,
+        permission_mode: "ask".to_owned(),
             graph_symbols: None,
             tool_details: Vec::new(),
             pending_tool: None,
