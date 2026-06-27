@@ -27,6 +27,25 @@ pub enum AgentRole {
     Orchestrator,
 }
 
+impl AgentRole {
+    /// Lowercase identifier for the role (used for routing rationale, role-skill
+    /// file lookup, etc.).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentRole::Impl => "impl",
+            AgentRole::Plan => "plan",
+            AgentRole::Research => "research",
+            AgentRole::Debug => "debug",
+            AgentRole::Ask => "ask",
+            AgentRole::Test => "test",
+            AgentRole::Review => "review",
+            AgentRole::Sre => "sre",
+            AgentRole::Orchestrator => "orchestrator",
+        }
+    }
+}
+
 pub use smedja_types::{Complexity, Runner, Tier};
 
 /// The resolved routing destination for a role × complexity combination.

@@ -162,17 +162,7 @@ impl Assayer {
 
 /// Returns the lowercase label for an agent role, used in rationale strings.
 fn role_label(role: AgentRole) -> &'static str {
-    match role {
-        AgentRole::Impl => "impl",
-        AgentRole::Plan => "plan",
-        AgentRole::Research => "research",
-        AgentRole::Debug => "debug",
-        AgentRole::Ask => "ask",
-        AgentRole::Test => "test",
-        AgentRole::Review => "review",
-        AgentRole::Sre => "sre",
-        AgentRole::Orchestrator => "orchestrator",
-    }
+    role.label()
 }
 
 /// Returns the lowercase label for a complexity, used in rationale strings.
