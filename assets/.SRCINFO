@@ -1,6 +1,6 @@
 pkgbase = smedja
 	pkgdesc = GPU-accelerated terminal emulator and AI orchestration forge
-	pkgver = 0.19.5
+	pkgver = 0.20.0
 	pkgrel = 1
 	url = https://github.com/mwigge/smedja
 	arch = x86_64
@@ -11,9 +11,9 @@ pkgbase = smedja
 	optdepends = ttf-jetbrains-mono: monospace font for the terminal
 	optdepends = xclip: X11 clipboard fallback (not needed under Wayland)
 	provides = smedja
-	source_x86_64 = smedja-linux-x86_64.tar.gz::https://github.com/mwigge/smedja/releases/download/v0.19.5/smedja-linux-x86_64.tar.gz
-	sha256sums_x86_64 = dcb443458adaed2e34fe7e695e11ca382c00c4947134b88484a303efa6e7f6dd
-	source_aarch64 = smedja-linux-aarch64.tar.gz::https://github.com/mwigge/smedja/releases/download/v0.19.5/smedja-linux-aarch64.tar.gz
+	source_x86_64 = smedja-linux-x86_64.tar.gz::https://github.com/mwigge/smedja/releases/download/v0.20.0/smedja-linux-x86_64.tar.gz
+	sha256sums_x86_64 = 691b1c834f31bb826f63da3bd34a7c7134ffe4aa813b21497a2f13ea3a6d2a91
+	source_aarch64 = smedja-linux-aarch64.tar.gz::https://github.com/mwigge/smedja/releases/download/v0.20.0/smedja-linux-aarch64.tar.gz
 	sha256sums_aarch64 = SKIP
 
 pkgname = smedja
