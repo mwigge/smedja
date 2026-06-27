@@ -599,6 +599,7 @@ fn build_router(
     route!(router, "metrics.summary", state, handlers::metrics::summary);
     route!(router, "savings.summary", state, handlers::savings::summary);
     route!(router, "cowork.set", state, handlers::audit::set);
+    route!(router, "cowork.set_mode", state, handlers::audit::set_mode);
     route!(router, "cowork.approve", state, handlers::audit::approve);
     route!(router, "cowork.deny", state, handlers::audit::deny);
     route!(router, "cowork.modify", state, handlers::audit::modify);
