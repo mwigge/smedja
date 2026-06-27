@@ -170,6 +170,37 @@ pub(crate) async fn query(_state: HandlerState, params: Value) -> Result<Value, 
     Ok(json!({ "symbols": out }))
 }
 
+/// Handles `graph.status`.
+///
+/// Params: `{ workspace?: string }`.
+/// Response: `{ indexed: <count>, exists: <bool>, workspace: <path> }`.
+///
+/// Reports the symbol count of the *already-built* graph for a workspace so the
+/// TUI can show real status (e.g. after `smj workspace index`) instead of always
+/// "graph: /index to build". `exists=false` / `indexed=0` when not yet indexed.
+pub(crate) async fn status(_state: HandlerState, params: Value) -> Result<Value, RpcError> {
+    let workspace = resolve_workspace(&params);
+    let db_path = graph_db_path(&workspace);
+    let exists = db_path.exists();
+    let count = if exists {
+        tokio::task::spawn_blocking(move || -> usize {
+            GraphStore::open(&db_path)
+                .ok()
+                .and_then(|s| s.symbol_count("workspace").ok())
+                .unwrap_or(0)
+        })
+        .await
+        .unwrap_or(0)
+    } else {
+        0
+    };
+    Ok(json!({
+        "indexed": count,
+        "exists": exists,
+        "workspace": workspace.display().to_string(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

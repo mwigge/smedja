@@ -635,6 +635,7 @@ fn build_router(
     route!(router, "lsp.diagnostics", state, handlers::lsp::diagnostics);
     route!(router, "graph.index", state, handlers::graph::index);
     route!(router, "graph.query", state, handlers::graph::query);
+    route!(router, "graph.status", state, handlers::graph::status);
     route!(router, "vault.reembed", state, handlers::vault::reembed);
 
     // quota.limit — reads SMEDJA_DAILY_TOKEN_LIMIT env var; no handler state needed.

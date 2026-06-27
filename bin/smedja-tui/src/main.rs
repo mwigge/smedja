@@ -401,6 +401,8 @@ pub(crate) struct AppState {
     cowork_modify_input: String,
     /// Timestamp of the last `cowork.pending` poll.
     last_cowork_poll: Option<std::time::Instant>,
+    /// Timestamp of the last `graph.status` poll (refreshes the right-bar count).
+    last_graph_poll: Option<std::time::Instant>,
     /// NDJSON stream receiver for the current in-flight turn.
     stream_rx: Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>,
     /// Accumulated thinking-token text for the current in-flight turn.
@@ -3609,6 +3611,7 @@ async fn main() -> Result<()> {
         cowork_modify_mode: false,
         cowork_modify_input: String::new(),
         last_cowork_poll: None,
+        last_graph_poll: None,
         stream_rx: None,
         current_thinking: String::new(),
         thinking_expanded: false,
@@ -4249,6 +4252,29 @@ async fn main() -> Result<()> {
                     state.pending_cowork.iter().map(|i| i.id.clone()).collect();
                 parsed.retain(|i| !existing_ids.contains(&i.id));
                 state.pending_cowork.extend(parsed);
+            }
+        }
+
+        // Graph status poll: reflect the real indexed symbol count for the
+        // workspace every 5 s, so the right-bar shows "N symbols" after an index
+        // built outside this session (e.g. `smj workspace index`) instead of
+        // always "graph: /index to build".
+        let should_poll_graph = state
+            .last_graph_poll
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(5));
+        if should_poll_graph {
+            state.last_graph_poll = Some(std::time::Instant::now());
+            if let Ok(ws) = std::env::current_dir() {
+                if let Ok(v) = client
+                    .call("graph.status", json!({ "workspace": ws.display().to_string() }))
+                    .await
+                {
+                    if v.get("exists").and_then(Value::as_bool).unwrap_or(false) {
+                        if let Some(n) = v.get("indexed").and_then(Value::as_u64) {
+                            state.graph_symbols = usize::try_from(n).ok();
+                        }
+                    }
+                }
             }
         }
 
@@ -5830,6 +5856,7 @@ mod tests {
             cowork_modify_mode: false,
             cowork_modify_input: String::new(),
             last_cowork_poll: None,
+        last_graph_poll: None,
             stream_rx: None,
             current_thinking: String::new(),
             thinking_expanded: false,
