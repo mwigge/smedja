@@ -69,7 +69,11 @@ pub(crate) fn current_span_ids() -> (Option<String>, Option<String>) {
 #[must_use]
 pub(crate) fn parse_session_mode_to_role(mode: &str) -> Option<AgentRole> {
     match mode {
-        "impl" => Some(AgentRole::Impl),
+        "impl" | "code" => Some(AgentRole::Impl),
+        "plan" => Some(AgentRole::Plan),
+        "research" => Some(AgentRole::Research),
+        "debug" => Some(AgentRole::Debug),
+        "ask" | "explain" => Some(AgentRole::Ask),
         "test" => Some(AgentRole::Test),
         "review" => Some(AgentRole::Review),
         "sre" => Some(AgentRole::Sre),

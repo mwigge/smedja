@@ -100,9 +100,11 @@ impl Assayer {
                 RoutingRule::new(Some(AgentRole::Review), None, claude_deep()),
                 // Sre × * → Claude/Deep
                 RoutingRule::new(Some(AgentRole::Sre), None, claude_deep()),
-                // Orchestrator × * → Claude/Deep (planning + delegation; the
-                // "orchestration on deep, implementation on local" split)
-                RoutingRule::new(Some(AgentRole::Orchestrator), None, claude_deep()),
+                // Orchestrator × * → Claude/Fast. (This is also the default
+                // fallback for a no-mode turn, so it stays cheap; the
+                // "orchestration on deep" split is realised in the Phase-4
+                // delegation loop, which plans on deep explicitly.)
+                RoutingRule::new(Some(AgentRole::Orchestrator), None, claude_fast()),
             ],
         }
     }
@@ -225,9 +227,9 @@ mod tests {
         assert_eq!(a.route(AgentRole::Plan, Complexity::Coding), claude_deep());
         assert_eq!(a.route(AgentRole::Research, Complexity::Simple), claude_deep());
         assert_eq!(a.route(AgentRole::Debug, Complexity::Complex), claude_deep());
-        assert_eq!(a.route(AgentRole::Orchestrator, Complexity::Coding), claude_deep());
-        // Ask is read-only Q&A → claude/fast (latency over depth).
+        // Ask + Orchestrator (the cheap default fallback) → claude/fast.
         assert_eq!(a.route(AgentRole::Ask, Complexity::Simple), claude_fast());
+        assert_eq!(a.route(AgentRole::Orchestrator, Complexity::Coding), claude_fast());
     }
 
     #[test]
@@ -275,21 +277,21 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_routes_to_claude_deep() {
-        // Orchestration plans + delegates, so it runs on the strong model
-        // (the "orchestration on deep, implementation on local" split).
+    fn orchestrator_routes_to_claude_fast() {
+        // The default fallback for a no-mode turn — kept cheap. Deep
+        // orchestration is realised in the Phase-4 delegation loop.
         let assayer = Assayer::default_rules();
         assert_eq!(
             assayer.route(AgentRole::Orchestrator, Complexity::Simple),
-            claude_deep()
+            claude_fast()
         );
         assert_eq!(
             assayer.route(AgentRole::Orchestrator, Complexity::Coding),
-            claude_deep()
+            claude_fast()
         );
         assert_eq!(
             assayer.route(AgentRole::Orchestrator, Complexity::Complex),
-            claude_deep()
+            claude_fast()
         );
     }
 
