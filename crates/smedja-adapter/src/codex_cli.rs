@@ -46,6 +46,7 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
         .map_or_else(String::new, |m| m.content.clone());
     let resume_id = opts.provider_session_id.clone();
     let model = opts.model.clone();
+    let perm_mode = opts.permission_mode.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::spawn(async move {
@@ -67,9 +68,24 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
             command.arg("exec");
         }
 
-        command
-            .arg("--json")
-            .arg("--dangerously-bypass-approvals-and-sandbox");
+        // `codex exec` runs autonomously — it has no per-tool approval hook like
+        // claude, so smedja's permission mode maps to codex's sandbox level
+        // instead. Auto keeps the full bypass; Plan makes codex read-only; every
+        // other mode contains it to the workspace. (Read-only/workspace-write
+        // run non-interactively, so codex never hangs waiting for an approval
+        // smedja can't answer here.)
+        command.arg("--json");
+        match perm_mode.as_deref() {
+            Some("auto") => {
+                command.arg("--dangerously-bypass-approvals-and-sandbox");
+            }
+            Some("plan") => {
+                command.arg("--sandbox").arg("read-only");
+            }
+            _ => {
+                command.arg("--sandbox").arg("workspace-write");
+            }
+        }
 
         if !model.is_empty() {
             command.arg("-m").arg(&model);
@@ -412,6 +428,7 @@ mod tests {
             tools: None,
             provider_session_id: session_id.map(str::to_owned),
             smedja_session_id: None,
+            permission_mode: None,
             stable_prefix_len: None,
             cache_strategy: crate::types::CacheStrategy::None,
         }

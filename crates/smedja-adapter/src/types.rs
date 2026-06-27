@@ -96,6 +96,12 @@ pub struct CallOptions {
     /// consult. `None` for non-interactive / API-only calls.
     #[serde(default)]
     pub smedja_session_id: Option<String>,
+    /// The session's permission mode (`ask`/`accept_edits`/`plan`/`auto`),
+    /// threaded to adapters that can only enforce it coarsely — `codex exec`
+    /// runs autonomously, so the mode maps to its `--sandbox` level rather than
+    /// a per-tool gate. `None` leaves the adapter default.
+    #[serde(default)]
+    pub permission_mode: Option<String>,
     /// Number of leading messages (after the system prompt) that form the
     /// stable KV-cache prefix.
     ///
@@ -187,6 +193,7 @@ mod tests {
             tools: None,
             provider_session_id: None,
             smedja_session_id: None,
+            permission_mode: None,
             stable_prefix_len: None,
             cache_strategy: CacheStrategy::None,
         }

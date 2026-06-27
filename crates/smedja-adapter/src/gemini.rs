@@ -365,6 +365,7 @@ mod tests {
             tools: None,
             provider_session_id: None,
             smedja_session_id: None,
+            permission_mode: None,
             stable_prefix_len: None,
             cache_strategy: crate::types::CacheStrategy::None,
         };
@@ -385,6 +386,7 @@ mod tests {
             tools: None,
             provider_session_id: None,
             smedja_session_id: None,
+            permission_mode: None,
             stable_prefix_len: None,
             cache_strategy: crate::types::CacheStrategy::None,
         };
@@ -405,6 +407,7 @@ mod tests {
             tools: None,
             provider_session_id: None,
             smedja_session_id: None,
+            permission_mode: None,
             stable_prefix_len: Some(2),
             cache_strategy: strategy,
         }
