@@ -32,8 +32,9 @@ use statusbar::ModuleCtx;
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, KeyboardEnhancementFlags,
-    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyCode, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -3392,7 +3393,12 @@ impl Drop for TerminalGuard {
         // raw mode / alt screen, so the host terminal is left in legacy state.
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
     }
 }
 
@@ -3652,7 +3658,7 @@ async fn main() -> Result<()> {
 
     let _guard = TerminalGuard; // instantiate immediately so Drop restores terminal on any panic
     enable_raw_mode().context("enable raw mode")?;
-    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)
+    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)
         .context("enter alternate screen")?;
     // Negotiate the kitty keyboard protocol so the host terminal emits CSI-u
     // sequences: this is what lets us distinguish Shift+Enter from Enter and see
@@ -3785,6 +3791,17 @@ async fn main() -> Result<()> {
                             }
                         _ => {}
                     },
+                    Event::Paste(text) => {
+                        // Insert the whole paste as a single edit at the cursor.
+                        // Because we don't process it key-by-key, embedded
+                        // newlines stay literal (no accidental submit) — pasting
+                        // a multi-line URL/snippet just lands in the input.
+                        let cur = state.input_cursor.min(state.input.len());
+                        state.input.insert_str(cur, &text);
+                        state.input_cursor = cur + text.len();
+                        let completions = filtered_completions(&state.input);
+                        state.slash_completions = completions;
+                    }
                     Event::Resize(_, _) => {
                         // Clamp scroll after resize so we don't end up past the
                         // last available line.
