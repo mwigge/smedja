@@ -43,6 +43,17 @@ impl AgentRole {
         )
     }
 
+    /// Capability tags the role needs from its routed client (AgentField-style).
+    /// A router should prefer a client that advertises these — e.g. Research
+    /// needs `web`/`pdf`/`vision`, which today only the external CLIs provide.
+    #[must_use]
+    pub fn capabilities(self) -> &'static [&'static str] {
+        match self {
+            AgentRole::Research => &["web", "pdf", "vision"],
+            _ => &[],
+        }
+    }
+
     /// Lowercase identifier for the role (used for routing rationale, role-skill
     /// file lookup, etc.).
     #[must_use]
