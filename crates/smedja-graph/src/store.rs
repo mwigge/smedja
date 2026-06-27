@@ -130,12 +130,7 @@ impl GraphStore {
 
         let mut total_new = 0usize;
 
-        for entry in walkdir::WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(std::result::Result::ok)
-            .filter(|e| e.file_type().is_file())
-        {
+        for entry in crate::indexer::workspace_files(root) {
             let abs_path = entry.path();
 
             let ext = abs_path.extension().and_then(|s| s.to_str()).unwrap_or("");
