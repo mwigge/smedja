@@ -25,6 +25,7 @@ use crate::{ingot_err, missing_param};
 pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, RpcError> {
     let ig = state.ingot;
     let lsp_manager = Arc::clone(&state.lsp_manager);
+    let pool = Arc::clone(&state.provider_pool);
     let startup_runner = state.startup_runner;
     let startup_model = state.startup_model;
     let title = params
@@ -52,6 +53,18 @@ pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, 
         .get("task_description")
         .and_then(Value::as_str)
         .map(str::to_owned);
+
+    // Inherit the runner + model from the most recent prior session so the
+    // last-used client (codex→codex) and tier (deep→deep) carry across restarts.
+    // `list_sessions` is ordered oldest→newest, so the last entry is the most
+    // recent. A session that never overrode the defaults leaves these `None`,
+    // which correctly falls back to the startup defaults.
+    let (inherited_runner, inherited_model) = ig
+        .list_sessions()
+        .await
+        .ok()
+        .and_then(|mut sessions| sessions.pop())
+        .map_or((None, None), |s| (s.runner_override, s.model_override));
 
     let now = Timestamp::now();
     let session_id = Uuid::new_v4();
@@ -86,8 +99,8 @@ pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, 
         title: title.clone().unwrap_or_default(),
         cowork_mode,
         workspace_root: workspace.clone(),
-        model_override: None,
-        runner_override: None,
+        model_override: inherited_model.clone(),
+        runner_override: inherited_runner.clone(),
     };
 
     ig.create_session(session.clone())
@@ -108,19 +121,33 @@ pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, 
     // The gate map is owned by build_router; session.create handles the DB flag
     // only here. Callers that need the gate active must also call cowork.set.
 
-    let tier = if startup_runner.contains("local") {
-        "local"
-    } else {
-        "fast"
-    };
+    // Effective runner/model = inherited override, else the startup default.
+    let effective_runner = inherited_runner.unwrap_or_else(|| startup_runner.to_string());
+    let effective_model = inherited_model.unwrap_or_else(|| startup_model.to_string());
+    // Derive the tier from the provider pool by (runner, model) so the right
+    // label (e.g. "deep") follows the inherited model; fall back to the
+    // runner's first entry, then to a coarse heuristic.
+    let entries = pool.list_all_entries();
+    let tier = entries
+        .iter()
+        .find(|(r, _, m)| *r == effective_runner && *m == effective_model)
+        .or_else(|| entries.iter().find(|(r, _, _)| *r == effective_runner))
+        .map(|(_, t, _)| t.to_string())
+        .unwrap_or_else(|| {
+            if effective_runner.contains("local") {
+                "local".to_owned()
+            } else {
+                "fast".to_owned()
+            }
+        });
     Ok(json!({
         "id": session.id,
         "title": title,
         "created_at": session.created_at,
         "cowork_mode": cowork_mode,
         "task_id": task_id,
-        "runner": &*startup_runner,
-        "model": &*startup_model,
+        "runner": effective_runner,
+        "model": effective_model,
         "tier": tier,
     }))
 }
