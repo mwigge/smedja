@@ -1315,10 +1315,15 @@ fn build_window_title(
 
 #[must_use]
 fn truncate_cwd(cwd: &str, max: usize) -> String {
-    if cwd.len() <= max {
+    let n = cwd.chars().count();
+    if n <= max {
         return cwd.to_owned();
     }
-    format!("\u{2026}{}", &cwd[cwd.len() - max..])
+    // Byte offset of the start of the last `max` chars — always a char boundary,
+    // so a multibyte path component can't panic the slice (a raw `cwd.len()-max`
+    // byte index can land mid-UTF-8).
+    let start = cwd.char_indices().nth(n - max).map_or(0, |(i, _)| i);
+    format!("\u{2026}{}", &cwd[start..])
 }
 
 // ── Subcommand handlers ────────────────────────────────────────────────────────
@@ -1977,6 +1982,17 @@ mod tests {
         let short = "/short";
         let result = truncate_cwd(short, 40);
         assert_eq!(result, "/short");
+    }
+
+    #[test]
+    fn truncate_cwd_multibyte_does_not_panic_on_boundary() {
+        use super::truncate_cwd;
+        // A path whose tail boundary falls inside multibyte chars: a raw byte
+        // slice would panic here. Each `é` is 2 bytes, `ä` 2, `语` 3.
+        let path = "/home/josé/projets/café/编程语言/source";
+        let result = truncate_cwd(path, 10);
+        assert!(result.starts_with('\u{2026}'));
+        assert_eq!(result.chars().count(), 11, "ellipsis + last 10 chars");
     }
 
     #[test]

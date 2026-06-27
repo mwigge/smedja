@@ -30,31 +30,31 @@ use ratatui::style::Color;
 
 /// Main terminal background — `#0b0d0f` near-black from the SVG mockups.
 pub const FORGE_BG: Color = Color::Rgb(11, 13, 15);
-/// Inner panel fill — `#111316`, slightly lighter than the base.
-pub const FORGE_PANEL: Color = Color::Rgb(17, 19, 22);
-/// Header fill for title rows inside panels — `#211811` warm near-black.
-pub const FORGE_HEADER: Color = Color::Rgb(33, 24, 17);
+/// Inner panel fill — `#181b1f`, lifted off the base so panels read as raised.
+pub const FORGE_PANEL: Color = Color::Rgb(24, 27, 31);
+/// Header fill for title rows inside panels — `#2b1f15` warm near-black.
+pub const FORGE_HEADER: Color = Color::Rgb(43, 31, 21);
 
-/// Primary border colour — `#a9652f` copper/rust (prominent panel outlines).
-pub const FORGE_BORDER: Color = Color::Rgb(169, 101, 47);
-/// Dim border — `#3b2a1f` for inner dividers and secondary outlines.
-pub const FORGE_BORDER_DIM: Color = Color::Rgb(59, 42, 31);
+/// Primary border colour — `#c98042` copper/rust (prominent panel outlines).
+pub const FORGE_BORDER: Color = Color::Rgb(201, 128, 66);
+/// Dim border — `#68503c` for inner dividers — bright enough to actually see.
+pub const FORGE_BORDER_DIM: Color = Color::Rgb(104, 80, 60);
 
-/// Primary amber text — `#d99b55`.  Main body text, labels.
-pub const FORGE_TEXT: Color = Color::Rgb(217, 155, 85);
-/// Bright amber — `#f7c77e`.  Headings, highlights, active items.
-pub const FORGE_TEXT_BRIGHT: Color = Color::Rgb(247, 199, 126);
-/// Dim label — `#8f765b`.  Metadata, footers, secondary annotations.
-pub const FORGE_TEXT_DIM: Color = Color::Rgb(143, 118, 91);
+/// Primary amber text — `#ebb67c`.  Main body text, labels (lifted for contrast).
+pub const FORGE_TEXT: Color = Color::Rgb(235, 182, 124);
+/// Bright amber — `#ffda9c`.  Headings, highlights, active items.
+pub const FORGE_TEXT_BRIGHT: Color = Color::Rgb(255, 218, 156);
+/// Dim label — `#b6a28a`.  Metadata, footers — dimmer than body but legible.
+pub const FORGE_TEXT_DIM: Color = Color::Rgb(182, 162, 138);
 /// Accent amber — `#ffb24a`.  In-flight spinner highlights, selected rows.
 pub const FORGE_ACCENT: Color = Color::Rgb(255, 178, 74);
 
-/// Error state — `#d65f2e` forge red-orange (SVG traffic-light red).
-pub const FORGE_ERROR: Color = Color::Rgb(214, 95, 46);
-/// Success state — `#5d946b` forge green (SVG traffic-light green).
-pub const FORGE_SUCCESS: Color = Color::Rgb(93, 148, 107);
-/// Warning state — amber `#d99b55` (same as primary text — warm caution).
-pub const FORGE_WARN: Color = Color::Rgb(217, 155, 85);
+/// Error state — `#f07848` forge red-orange (SVG traffic-light red).
+pub const FORGE_ERROR: Color = Color::Rgb(240, 120, 72);
+/// Success state — `#7aca8e` forge green (SVG traffic-light green, brightened).
+pub const FORGE_SUCCESS: Color = Color::Rgb(122, 202, 142);
+/// Warning state — yellow `#f3c55c`, distinct from primary amber text.
+pub const FORGE_WARN: Color = Color::Rgb(243, 197, 92);
 
 /// `local` tier — `#4eb9b2` warm teal (distinct from amber, still warm).
 pub const FORGE_LOCAL: Color = Color::Rgb(78, 185, 178);
