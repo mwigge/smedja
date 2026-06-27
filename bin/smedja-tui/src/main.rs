@@ -1213,11 +1213,34 @@ fn save_generator_output(output_type: &OutputType, content: &str, state: &mut Ap
     }
 }
 
-fn render_input_with_cursor(input: &str, cursor: usize) -> String {
-    let cursor = cursor.min(input.len());
-    let before = &input[..cursor];
-    let after = &input[cursor..];
-    format!("{before}_{after}")
+/// Maximum visual rows the input field grows to before it scrolls internally.
+const INPUT_MAX_ROWS: u16 = 6;
+
+/// Character-wraps `text` (honouring embedded `'\n'`) to `width` columns and
+/// returns the visual rows. A plain column wrap — no word boundaries — matching
+/// the fixed-width input echo, so the field's height and the cursor's row can be
+/// computed the same way ratatui will render it. `width` is clamped to ≥1.
+fn wrap_input_rows(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for logical in text.split('\n') {
+        let mut cur = String::new();
+        let mut cur_w = 0usize;
+        for ch in logical.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if cur_w + cw > width && !cur.is_empty() {
+                rows.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            cur.push(ch);
+            cur_w += cw;
+        }
+        rows.push(cur);
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
 }
 
 fn prev_char_boundary(s: &str, pos: usize) -> usize {
@@ -2695,16 +2718,45 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         area,
     );
 
+    // Build the input echo (prefix + visible cursor) and compute how many
+    // visual rows it needs, so the input field grows and wraps instead of
+    // running off the right edge ("typing blind"). The cursor's row drives an
+    // internal scroll once the field hits its row cap.
+    let input_w = area.width.max(1) as usize;
+    let (input_display, input_cursor_row) = if let Some(ref var) = state.secret_var {
+        // Masked secret entry — never echo the value (e.g. an API key).
+        let dots = "\u{2022}".repeat(state.input.chars().count());
+        (format!("{var} (hidden): {dots}\u{2588}"), 0usize)
+    } else {
+        let cur = state.input_cursor.min(state.input.len());
+        let head = format!("> {}", &state.input[..cur]);
+        let cursor_row = wrap_input_rows(&head, input_w).len().saturating_sub(1);
+        (format!("{head}_{}", &state.input[cur..]), cursor_row)
+    };
+    let input_rows: u16 = if state.history_search_mode {
+        2
+    } else if state.secret_var.is_some() {
+        1
+    } else {
+        u16::try_from(wrap_input_rows(&input_display, input_w).len())
+            .unwrap_or(INPUT_MAX_ROWS)
+            .clamp(1, INPUT_MAX_ROWS)
+    };
+    // Scroll the field so the cursor's row stays visible once input overflows.
+    let input_scroll = u16::try_from(input_cursor_row)
+        .unwrap_or(0)
+        .saturating_sub(input_rows.saturating_sub(1));
+
     // L122: outer vertical split:
     //   row 0 = status bar (1 row)
     //   row 1 = body (fill)
     //   row 2 = action log (5 rows)
-    //   row 3 = input (1 row)
+    //   row 3 = input (grows to wrap, capped at INPUT_MAX_ROWS)
     let outer = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
         Constraint::Length(5),
-        Constraint::Length(if state.history_search_mode { 2 } else { 1 }),
+        Constraint::Length(input_rows),
     ])
     .split(area);
 
@@ -2898,29 +2950,9 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     // L122: 5-row area using the existing ActionLog widget.
     state.action_log.render(action_log_area, frame);
 
-    // -- Input area -----------------------------------------------------------
-    // L128: show continuation prefix when input contains a newline.
-    let input_display = if let Some(ref var) = state.secret_var {
-        // Masked secret entry — never echo the value (e.g. an API key).
-        let dots = "\u{2022}".repeat(state.input.chars().count());
-        format!("{var} (hidden): {dots}\u{2588}")
-    } else if state.input.contains('\n') {
-        // Show the last logical line with the cursor placed correctly within it.
-        let prefix_len = state.input.rfind('\n').map_or(0, |i| i + 1);
-        let cursor_in_line = state.input_cursor.saturating_sub(prefix_len);
-        let last_line = &state.input[prefix_len..];
-        format!(
-            "... {}",
-            render_input_with_cursor(last_line, cursor_in_line)
-        )
-    } else {
-        format!(
-            "> {}",
-            render_input_with_cursor(&state.input, state.input_cursor)
-        )
-    };
-    // Prompt feedback: right-aligned char + estimated token count.
-    // Shown when the input is non-empty so it doesn't clutter the idle bar.
+    // -- Input area (auto-growing + wrapped; display/height computed above) ----
+    // Prompt feedback: right-aligned char + estimated token count. Shown only
+    // when the input is a single row, so it can never overlap wrapped text.
     let counter_text = if !state.input.is_empty() {
         let chars = state.input.chars().count();
         #[allow(clippy::integer_division)]
@@ -2930,7 +2962,6 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         String::new()
     };
     let counter_len = counter_text.chars().count() as u16;
-    let input_w = input_area.width;
     let counter_style = if state.no_color {
         Style::default()
     } else {
@@ -2938,9 +2969,11 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
             .fg(p.text_dim)
             .add_modifier(Modifier::DIM)
     };
-    // Only split if the counter fits without squashing the input.
-    if counter_len > 0 && counter_len + 4 < input_w {
-        let input_sub_w = input_w - counter_len;
+    let input_para = Paragraph::new(input_display)
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .scroll((input_scroll, 0));
+    if input_rows == 1 && counter_len > 0 && counter_len + 4 < input_area.width {
+        let input_sub_w = input_area.width - counter_len;
         let input_sub =
             ratatui::layout::Rect::new(input_area.x, input_area.y, input_sub_w, input_area.height);
         let counter_rect = ratatui::layout::Rect::new(
@@ -2949,13 +2982,13 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
             counter_len,
             input_area.height,
         );
-        frame.render_widget(Paragraph::new(input_display), input_sub);
+        frame.render_widget(input_para, input_sub);
         frame.render_widget(
             Paragraph::new(Span::styled(counter_text, counter_style)),
             counter_rect,
         );
     } else {
-        frame.render_widget(Paragraph::new(input_display), input_area);
+        frame.render_widget(input_para, input_area);
     }
 
     if let Some(search_area) = search_bar_area {
@@ -6101,23 +6134,23 @@ mod tests {
     // --- input cursor tests ---
 
     #[test]
-    fn render_input_with_cursor_splits_at_position() {
-        assert_eq!(render_input_with_cursor("hello", 2), "he_llo");
+    fn wrap_input_rows_splits_long_line() {
+        // 25 chars at width 10 → 3 rows (10/10/5).
+        let rows = wrap_input_rows(&"x".repeat(25), 10);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].chars().count(), 10);
+        assert_eq!(rows[2].chars().count(), 5);
     }
 
     #[test]
-    fn render_input_with_cursor_at_zero() {
-        assert_eq!(render_input_with_cursor("hello", 0), "_hello");
+    fn wrap_input_rows_honours_newlines() {
+        let rows = wrap_input_rows("ab\ncd", 80);
+        assert_eq!(rows, vec!["ab".to_string(), "cd".to_string()]);
     }
 
     #[test]
-    fn render_input_with_cursor_at_end() {
-        assert_eq!(render_input_with_cursor("hello", 5), "hello_");
-    }
-
-    #[test]
-    fn render_input_with_cursor_empty_input() {
-        assert_eq!(render_input_with_cursor("", 0), "_");
+    fn wrap_input_rows_empty_is_one_row() {
+        assert_eq!(wrap_input_rows("", 10).len(), 1);
     }
 
     #[test]
