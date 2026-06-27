@@ -184,6 +184,12 @@ tools  = ["read_file", "otel_query", "metric_query", "log_tail"]
 
 The assayer routes by **role + complexity**, not just complexity. A simple fix stays local; an architecture review goes to claude deep. No manual model selection per task.
 
+**Role set.** Task-type roles (not per-language — language is detected context): `code`/`impl`, `plan`, `research`, `debug`, `ask`, `review`, `test`, `sre`, plus the domain roles `data` (SQL) and `iac` (infra), and `orchestrator`. Each has a default `(client, tier)` and a permission profile — read-only roles (plan/research/review/ask/orchestrator) can't mutate; `iac` always confirms. Set the active role with `/agent <role>`.
+
+**Per-role rules/skills.** Each role auto-loads its discipline from `.smedja/roles/<role>.md` (and `roles/<role>/*.md`) into the system prompt — e.g. a review checklist, research source-hygiene, IaC safety rules — alongside the always-on `.smedja/skills/`.
+
+**Tiers as a control.** `/tier local|fast|deep` resolves the runner's model for that tier and pins it; the last runner + tier persist across restarts. A cost-aware tier ladder (deep→fast→local) is available for orchestrated descent.
+
 ### Local model lifecycle
 
 The `local` runner is a control plane over external local-serving tools — smedja **orchestrates**, it does not serve. Inference, weight downloads, quantisation, and GPU placement stay in those tools; smedja drives install via shell-out, reads the model inventory and a GPU snapshot, and issues hot-swap requests over HTTP.
@@ -330,17 +336,23 @@ Modules evaluated in parallel (rayon) on every render tick, < 50ms target:
 
 TOML-configured, Starship-compatible module format. The milliways-specific modules (`tier`, `model`, `context_pct`, `milliways_task`) sit alongside the standard set with the same detection + format + style fields — existing Starship config is portable.
 
-### Cowork Gate
+### Approval & turn control
 
-In cowork mode, every tool call pauses for approval — not just Codex, every runner. The daemon-side gate (`cowork.set` / `cowork.approve` / `cowork.deny` / `cowork.modify` RPC methods) is fully implemented and tested.
+**Stop and check.** Mutating tool calls (write/edit/shell) gate by default — *ask-on-mutation* — for **every** client, gated where each one actually executes its tools:
+
+- **claude** — a `PreToolUse` hook (`--settings` → `smj tool-gate` → the daemon) gates each tool; disable with `SMEDJA_TOOL_GATE=off`.
+- **codex** — the permission mode maps to its `--sandbox` level (read-only / workspace-write / full).
+- **minimax / local / API** — gated in-process at the orchestrator's tool loop.
 
 <div align="center">
-  <img src="assets/diagrams/readme-cowork-gate.png" alt="cowork approval gate for an edit_file tool call" width="900" />
+  <img src="assets/diagrams/readme-cowork-gate.png" alt="approval gate for an edit_file tool call" width="900" />
 </div>
 
-Deny sends the reason back as a tool error — the agent re-plans from there. Modify replaces the arguments before execution. Every decision is recorded in `smedja-ingot` as an audit event with `tool_name`, `decision`, and `agent_reasoning`.
+A pending approval surfaces as the inline widget — **`y`** approve, **`n`** deny, **`m`** modify (or `/approve`). Deny returns the reason as a tool error so the agent re-plans; modify rewrites the arguments before execution. Reads always pass.
 
-**Current state:** Enable cowork mode from `smedja-tui` with `/cowork on`. Approval prompts appear as text lines in the agent block. An interactive inline approval widget (keyboard `y`/`n`/`m` shortcuts) is on the roadmap.
+**Permission modes** — cycle with **Shift-Tab**: `ask` (stop on every mutation) → `accept_edits` (auto-approve known edits, ask on shell/unknown) → `plan` (read-only) → `auto` (no gate). Read-only **roles** (plan/research/review/ask/orchestrator) can never mutate regardless of mode; high-risk **IaC** mutations are *always* confirmed even in `auto`.
+
+**Interrupt** — press **Esc** during a turn to stop a runaway agent: the streaming subprocess is killed and the turn ends.
 
 ### Context Rail
 
@@ -570,8 +582,9 @@ See [`docs/tui.md`](docs/tui.md) for the complete manual. Quick reference below.
 
 | Command | What it does |
 |---------|-------------|
-| `/agent [id]` | Run a named agent; omit id to list available agents |
-| `/approve [id]` | Approve a pending cowork item; omit id to list pending |
+| `/agent [role]` | Set the agent role; omit to list. Roles: `code`/`impl`, `plan`, `research`, `debug`, `ask`, `review`, `test`, `sre`, `data`, `iac`, `orchestrator` — each routes to a default (client, tier) and auto-loads its rules from `.smedja/roles/<role>.md` |
+| `/approve [id]` | Approve a pending approval; omit id to list pending (or use the inline `y`/`n`/`m` widget) |
+| `/cowork on\|off\|status` | Toggle/inspect cowork approval mode for the session |
 | `/briefing` | Show the session briefing |
 | `/clear` | Clear the message display (keeps session data) |
 | `/drawio <slug>` | Generate a draw.io mxGraph XML diagram |
@@ -592,7 +605,7 @@ See [`docs/tui.md`](docs/tui.md) for the complete manual. Quick reference below.
 | `/switch [runner]` | Switch AI runner interactively or directly |
 | `/takeover <runner>` | Fork the session to a new runner |
 | `/test [cargo\|npm\|go\|py]` | Run the project test suite; auto-detects manifest |
-| `/tier <t>` | Set tier: `local \| fast \| deep` |
+| `/tier <t>` | Set tier: `local \| fast \| deep` — resolves the runner's model for that tier and pins it (persists across restarts) |
 | `/version` | Print current version and check for a newer release |
 | `/upgrade` | Download and install the latest release in-place |
 
@@ -620,7 +633,9 @@ Fragments are expanded into your message before the turn runs:
 | `Ctrl-K` | Kill from cursor to end of line (push to kill ring) |
 | `Ctrl-U` | Kill from start of line to cursor (push to kill ring) |
 | `Ctrl-Y` | Yank most recent kill at cursor |
-| `Esc` | Enter scroll/normal mode |
+| `Shift-Tab` | Cycle the permission mode: `ask → accept_edits → plan → auto` |
+| paste | Bracketed paste — multi-line text (URLs, snippets) lands as one edit, no premature submit |
+| `Esc` | Interrupt the in-flight turn if one is running; otherwise enter scroll/normal mode |
 
 ### Key Bindings — Scroll / Normal Mode
 
@@ -653,6 +668,8 @@ Fragments are expanded into your message before the turn runs:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `SMEDJA_SOCK` | `$XDG_RUNTIME_DIR/smdjad.sock` | Override daemon socket path |
+| `SMEDJA_WORKSPACE` | *(daemon cwd)* | Workspace root for the code-graph and LSP when not announced by a client |
+| `SMEDJA_TOOL_GATE` | `on` | Set to `off` to disable the claude PreToolUse approval hook |
 | `SMEDJA_DAILY_TOKEN_LIMIT` | *(unset — no limit)* | Daily token budget; shown in the `/quota` panel as a usage bar |
 | `SMEDJA_SANDBOX_MODE` | `auto` | Sandbox fallback: `auto \| required \| off` |
 | `SMEDJA_SANDBOX_NETWORK` | `none` | Subprocess network policy: `none \| allowlist \| open` |

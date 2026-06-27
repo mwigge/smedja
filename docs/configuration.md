@@ -45,6 +45,53 @@ smj workspace agents init   # writes .smedja/agents.toml
 smj workspace agents show   # print the resolved role→runner→tier→model table
 ```
 
+**Role set.** Task-type roles (language is detected context, not a role):
+`code`/`impl`, `plan`, `research`, `debug`, `ask`, `review`, `test`, `sre`,
+the domain roles `data` (SQL) and `iac` (infra-as-code), and `orchestrator`.
+Read-only roles (`plan`/`research`/`review`/`ask`/`orchestrator`) can never
+mutate the workspace; `iac` mutations are always confirmed even in `auto` mode.
+Select the active role with `/agent <role>` in the TUI.
+
+---
+
+## `.smedja/roles/` — per-role rules & skills
+
+Each role auto-loads its own discipline into the system prompt whenever it is
+active: the file `.smedja/roles/<role>.md` plus every `*.md` under
+`.smedja/roles/<role>/`. These are injected alongside the always-on
+`.smedja/skills/*.md`. Use them for role-specific rules — a review checklist, a
+research source-hygiene policy, IaC safety rules, language conventions, etc.
+
+```
+.smedja/roles/
+  plan.md         # planning rules
+  review.md       # review checklist
+  research.md     # source-hygiene + citation rules
+  iac.md          # infra safety (apply/destroy always confirmed)
+  code/           # multiple .md files, sorted by name
+    rust.md
+    style.md
+```
+
+---
+
+## Permission modes
+
+Mutating tool calls gate by default (*ask-on-mutation*). Cycle the session
+permission mode with **Shift-Tab** in the TUI, or set it via the
+`cowork.set_mode` RPC:
+
+| Mode | Behaviour |
+|------|-----------|
+| `ask` (default) | Stop and confirm every mutation (write/edit/shell) |
+| `accept_edits` | Auto-approve known file edits; still ask on shell/unknown tools |
+| `plan` | Read-only — all mutations denied |
+| `auto` | Auto-approve everything (no gate) |
+
+Reads always pass. Read-only roles and high-risk `iac` mutations override the
+mode (always read-only / always-confirm respectively). Disable the claude
+PreToolUse approval hook with `SMEDJA_TOOL_GATE=off`.
+
 ---
 
 ## `.smedja/loop.json`
