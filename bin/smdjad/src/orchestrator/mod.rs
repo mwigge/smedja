@@ -1510,7 +1510,7 @@ mod tests {
                 runner: key.0,
                 tier: key.1,
                 runner_name,
-                default_model: "test-model",
+                default_model: "test-model".to_owned(),
             },
         )
     }

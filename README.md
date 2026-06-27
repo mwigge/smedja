@@ -670,6 +670,7 @@ Fragments are expanded into your message before the turn runs:
 | `SMEDJA_SOCK` | `$XDG_RUNTIME_DIR/smdjad.sock` | Override daemon socket path |
 | `SMEDJA_WORKSPACE` | *(daemon cwd)* | Workspace root for the code-graph and LSP when not announced by a client |
 | `SMEDJA_TOOL_GATE` | `on` | Set to `off` to disable the claude PreToolUse approval hook |
+| `SMEDJA_MODEL_<RUNNER>_<TIER>` | *(built-in default)* | Pin a tier's model so new releases need no rebuild — e.g. `SMEDJA_MODEL_CLAUDE_DEEP=claude-opus-5`, `SMEDJA_MODEL_CODEX_FAST=gpt-6`. `<RUNNER>` ∈ `CLAUDE`/`CODEX`/`COPILOT`/`MINIMAX`/`LOCAL`; `<TIER>` ∈ `FAST`/`DEEP`/`LOCAL` |
 | `SMEDJA_DAILY_TOKEN_LIMIT` | *(unset — no limit)* | Daily token budget; shown in the `/quota` panel as a usage bar |
 | `SMEDJA_SANDBOX_MODE` | `auto` | Sandbox fallback: `auto \| required \| off` |
 | `SMEDJA_SANDBOX_NETWORK` | `none` | Subprocess network policy: `none \| allowlist \| open` |

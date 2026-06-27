@@ -92,8 +92,39 @@ pub struct ProviderEntry {
     pub tier: Tier,
     /// Short identifier used in logs and the session-resume store key.
     pub runner_name: &'static str,
-    /// Default model name when no `SMEDJA_MODEL` env var or session override is set.
-    pub default_model: &'static str,
+    /// Default model name when no session override is set. Resolved at pool-build
+    /// time from a built-in default or a `SMEDJA_MODEL_<RUNNER>_<TIER>` env override
+    /// (see [`model_default`]).
+    pub default_model: String,
+}
+
+/// Resolves the default model for a `(runner, tier)` pair, honouring an env
+/// override so newly released models don't require a recompile:
+///
+/// ```text
+/// SMEDJA_MODEL_<RUNNER>_<TIER>   e.g.  SMEDJA_MODEL_CLAUDE_DEEP=claude-opus-5
+/// ```
+///
+/// `<RUNNER>` is the runner name's first segment upper-cased (`claude-cli` →
+/// `CLAUDE`, `codex-cli` → `CODEX`); `<TIER>` is `FAST` | `DEEP` | `LOCAL`.
+/// Falls back to `builtin` when the env var is unset or blank.
+#[must_use]
+pub fn model_default(runner_name: &str, tier: Tier, builtin: &str) -> String {
+    let runner_key = runner_name
+        .split('-')
+        .next()
+        .unwrap_or(runner_name)
+        .to_ascii_uppercase();
+    let tier_key = match tier {
+        Tier::Fast => "FAST",
+        Tier::Deep => "DEEP",
+        Tier::Local => "LOCAL",
+    };
+    let env_key = format!("SMEDJA_MODEL_{runner_key}_{tier_key}");
+    std::env::var(&env_key)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| builtin.to_owned())
 }
 
 /// Map from `(Runner, Tier)` to a concrete provider instance.
@@ -226,11 +257,11 @@ impl ProviderPool {
 
     /// Default model name for the pool's primary provider.
     #[must_use]
-    pub fn default_model(&self) -> &'static str {
+    pub fn default_model(&self) -> &str {
         self.default
             .as_ref()
             .and_then(|d| self.entries.get(d))
-            .map_or("", |e| e.default_model)
+            .map_or("", |e| e.default_model.as_str())
     }
 
     /// Returns the default pool entry, or `None` when the pool is empty.
@@ -263,7 +294,7 @@ impl ProviderPool {
     ///
     /// Sorted by runner name then tier so callers get a stable, human-readable order.
     #[must_use]
-    pub fn list_all_entries(&self) -> Vec<(&'static str, &'static str, &'static str)> {
+    pub fn list_all_entries(&self) -> Vec<(&'static str, &'static str, &str)> {
         let tier_str = |t: &Tier| match t {
             Tier::Fast => "fast",
             Tier::Deep => "deep",
@@ -272,7 +303,9 @@ impl ProviderPool {
         let mut out: Vec<_> = self
             .entries
             .iter()
-            .map(|((_, tier), entry)| (entry.runner_name, tier_str(tier), entry.default_model))
+            .map(|((_, tier), entry)| {
+                (entry.runner_name, tier_str(tier), entry.default_model.as_str())
+            })
             .collect();
         out.sort_by_key(|&(runner, tier, _)| (runner, tier));
         out
@@ -342,7 +375,8 @@ pub async fn build_provider_pool() -> ProviderPool {
                         runner: $runner,
                         tier: $tier,
                         runner_name: $name,
-                        default_model: $model,
+                        // Built-in default, overridable via SMEDJA_MODEL_<RUNNER>_<TIER>.
+                        default_model: model_default($name, $tier, $model),
                     },
                 )
                 .is_none()
@@ -371,7 +405,7 @@ pub async fn build_provider_pool() -> ProviderPool {
                     Tier::Deep,
                     pd,
                     "claude-cli",
-                    "claude-sonnet-4-6"
+                    "claude-opus-4-8"
                 );
             }
             info!(runner = "claude-cli", "provider ready");
@@ -409,12 +443,12 @@ pub async fn build_provider_pool() -> ProviderPool {
             Tier::Fast,
             p_fast,
             "codex-cli",
-            "gpt-4o-mini"
+            "gpt-5.5"
         );
         info!(runner = "codex-cli", "provider ready");
     } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         let p = OpenAiProvider::new("https://api.openai.com", key);
-        add!(Runner::Codex, Tier::Fast, p, "openai", "gpt-4o-mini");
+        add!(Runner::Codex, Tier::Fast, p, "openai", "gpt-5.5");
         info!(runner = "openai", "provider ready");
     } else {
         warn!(
@@ -425,7 +459,7 @@ pub async fn build_provider_pool() -> ProviderPool {
 
     // 3. Copilot
     if let Some(p) = CopilotProvider::detect() {
-        add!(Runner::Copilot, Tier::Fast, p, "copilot", "gpt-4o-mini");
+        add!(Runner::Copilot, Tier::Fast, p, "copilot", "gpt-5.5");
         info!(runner = "copilot", "provider ready");
     }
 
@@ -437,7 +471,7 @@ pub async fn build_provider_pool() -> ProviderPool {
 
     // 5. Minimax
     if let Some(p) = MinimaxProvider::detect() {
-        add!(Runner::Local, Tier::Fast, p, "minimax", "abab6.5s-chat");
+        add!(Runner::Local, Tier::Fast, p, "minimax", "MiniMax-M2");
         info!(runner = "minimax", "provider ready");
     }
 
@@ -497,6 +531,31 @@ pub async fn build_provider_pool() -> ProviderPool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn model_default_uses_builtin_then_env_override() {
+        // Use a unique runner key so the env var can't collide with a real one.
+        let key = "SMEDJA_MODEL_ZZTEST_DEEP";
+        std::env::remove_var(key);
+        assert_eq!(
+            model_default("zztest-cli", Tier::Deep, "builtin-x"),
+            "builtin-x",
+            "falls back to the built-in when unset"
+        );
+        std::env::set_var(key, "  ");
+        assert_eq!(
+            model_default("zztest", Tier::Deep, "builtin-x"),
+            "builtin-x",
+            "blank env override is ignored"
+        );
+        std::env::set_var(key, "future-model-9");
+        assert_eq!(
+            model_default("zztest-cli", Tier::Deep, "builtin-x"),
+            "future-model-9",
+            "env override wins so new models need no recompile"
+        );
+        std::env::remove_var(key);
+    }
+
     struct NullProvider;
     impl smedja_adapter::Provider for NullProvider {
         fn stream_chat(
@@ -524,7 +583,7 @@ mod tests {
                         runner: key.0,
                         tier: key.1,
                         runner_name,
-                        default_model,
+                        default_model: default_model.to_owned(),
                     },
                 )
                 .is_none()
