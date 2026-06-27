@@ -44,6 +44,151 @@ struct PendingApproval {
 #[derive(Default)]
 pub struct CoworkGate {
     pending: Arc<Mutex<HashMap<ApprovalId, PendingApproval>>>,
+    /// Per-session permission mode driving the gate policy (Shift+Tab cycles it
+    /// from the TUI). Defaults to [`PermissionMode::Ask`].
+    mode: Arc<Mutex<PermissionMode>>,
+}
+
+/// Per-session permission mode controlling how mutating tool calls are gated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    /// Stop and ask before every mutation (edit/write/shell). The default.
+    #[default]
+    Ask,
+    /// Auto-approve known file edits; still ask before shell/unknown tools.
+    AcceptEdits,
+    /// Read-only: deny all mutations (the agent may only read/analyse/plan).
+    Plan,
+    /// Auto-approve everything (no gate).
+    Auto,
+}
+
+impl PermissionMode {
+    /// Parses a mode name leniently; anything unrecognised falls back to `Ask`.
+    #[must_use]
+    pub fn parse_lenient(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "accept_edits" | "acceptedits" | "edits" => Self::AcceptEdits,
+            "plan" => Self::Plan,
+            "auto" => Self::Auto,
+            _ => Self::Ask,
+        }
+    }
+
+    /// Stable lowercase identifier (round-trips with [`Self::parse_lenient`]).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::AcceptEdits => "accept_edits",
+            Self::Plan => "plan",
+            Self::Auto => "auto",
+        }
+    }
+
+    /// Next mode in the Shift+Tab cycle: Ask → AcceptEdits → Plan → Auto → Ask.
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            Self::Ask => Self::AcceptEdits,
+            Self::AcceptEdits => Self::Plan,
+            Self::Plan => Self::Auto,
+            Self::Auto => Self::Ask,
+        }
+    }
+}
+
+/// The policy's verdict for a single tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionDecision {
+    /// Run the tool without asking.
+    Allow,
+    /// Block the tool outright (e.g. a mutation in `Plan` mode).
+    Deny,
+    /// Suspend on the cowork gate for a human decision.
+    Ask,
+}
+
+/// Coarse risk class of a tool, by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolKind {
+    /// Read-only (never gated).
+    ReadOnly,
+    /// A known file mutation (auto-approved in `AcceptEdits`).
+    Edit,
+    /// Shell/command execution *or* an unknown tool — always needs explicit
+    /// approval outside `Auto` (fail-safe: unknown tools are treated as exec).
+    Exec,
+}
+
+fn tool_kind(tool: &str) -> ToolKind {
+    let t = tool.to_ascii_lowercase();
+    // Shell / arbitrary command execution — the most dangerous class.
+    if t.contains("bash")
+        || t.contains("shell")
+        || t.contains("run_command")
+        || t == "exec"
+        || t.starts_with("exec_")
+    {
+        return ToolKind::Exec;
+    }
+    // Read-only tools (the daemon's read-safe set plus common read verbs).
+    const READ: &[&str] = &[
+        "read_file",
+        "list_files",
+        "smedja_vault_search",
+        "smedja_retrieve",
+        "graph_query",
+        "otel_query",
+        "metric_query",
+        "log_tail",
+    ];
+    if READ.contains(&t.as_str())
+        || t.starts_with("read")
+        || t.starts_with("list")
+        || t.starts_with("get")
+        || t.starts_with("search")
+        || t.starts_with("query")
+        || t.starts_with("grep")
+        || t.starts_with("glob")
+        || t.starts_with("view")
+    {
+        return ToolKind::ReadOnly;
+    }
+    // Known mutating edit tools.
+    const EDIT: &[&str] = &[
+        "write_file",
+        "edit_file",
+        "smedja_vault_store",
+        "apply_patch",
+        "str_replace",
+        "create_file",
+        "delete_file",
+        "write",
+        "edit",
+        "patch",
+    ];
+    if EDIT.contains(&t.as_str()) {
+        return ToolKind::Edit;
+    }
+    // Unknown → conservative: treat as exec so it is never auto-approved by
+    // AcceptEdits.
+    ToolKind::Exec
+}
+
+/// Evaluates the permission decision for a tool call under `mode`. Pure; the
+/// blocking/asking happens in [`gate_tool`].
+#[must_use]
+pub fn evaluate(mode: PermissionMode, tool: &str) -> PermissionDecision {
+    match (mode, tool_kind(tool)) {
+        (_, ToolKind::ReadOnly) | (PermissionMode::Auto, _) => PermissionDecision::Allow,
+        (PermissionMode::Plan, _) => PermissionDecision::Deny,
+        (PermissionMode::AcceptEdits, ToolKind::Edit) => PermissionDecision::Allow,
+        (PermissionMode::AcceptEdits, ToolKind::Exec) | (PermissionMode::Ask, _) => {
+            PermissionDecision::Ask
+        }
+    }
 }
 
 impl CoworkGate {
@@ -126,6 +271,54 @@ impl CoworkGate {
             .collect()
     }
 
+    /// Gates a single tool call under the gate's current [`PermissionMode`]:
+    /// allow/deny outright per [`evaluate`], or — for `Ask` — suspend on the
+    /// gate (≤30 min) until the user decides. Returns the resolved [`Decision`].
+    pub async fn gate_tool(
+        &self,
+        step_n: u32,
+        tool: &str,
+        args_scrubbed: serde_json::Value,
+        reasoning: &str,
+    ) -> Decision {
+        let mode = self.mode().await;
+        match evaluate(mode, tool) {
+            PermissionDecision::Allow => Decision::Approve,
+            PermissionDecision::Deny => Decision::Deny(format!("blocked by {} mode", mode.as_str())),
+            PermissionDecision::Ask => {
+                self.intercept(
+                    ApprovalPrompt {
+                        step_n,
+                        tool: tool.to_owned(),
+                        args_scrubbed,
+                        reasoning: reasoning.to_owned(),
+                        plan_summary: String::new(),
+                    },
+                    30 * 60,
+                )
+                .await
+            }
+        }
+    }
+
+    /// The gate's current permission mode.
+    pub async fn mode(&self) -> PermissionMode {
+        *self.mode.lock().await
+    }
+
+    /// Sets the permission mode; returns the new value.
+    pub async fn set_mode(&self, mode: PermissionMode) -> PermissionMode {
+        *self.mode.lock().await = mode;
+        mode
+    }
+
+    /// Cycles to the next permission mode (Shift+Tab); returns the new value.
+    pub async fn cycle_mode(&self) -> PermissionMode {
+        let mut m = self.mode.lock().await;
+        *m = m.next();
+        *m
+    }
+
     async fn resolve(&self, id: &str, decision: Decision) -> bool {
         let mut pending = self.pending.lock().await;
         if let Some(entry) = pending.remove(id) {
@@ -151,6 +344,84 @@ mod tests {
             reasoning: "list files".into(),
             plan_summary: "exploration".into(),
         }
+    }
+
+    #[test]
+    fn evaluate_policy_matrix() {
+        // Read-only is always allowed, regardless of mode.
+        assert_eq!(evaluate(PermissionMode::Ask, "read_file"), PermissionDecision::Allow);
+        assert_eq!(evaluate(PermissionMode::Plan, "graph_query"), PermissionDecision::Allow);
+        // Auto allows everything.
+        assert_eq!(evaluate(PermissionMode::Auto, "bash"), PermissionDecision::Allow);
+        assert_eq!(evaluate(PermissionMode::Auto, "write_file"), PermissionDecision::Allow);
+        // Plan denies every mutation (read-only mode).
+        assert_eq!(evaluate(PermissionMode::Plan, "write_file"), PermissionDecision::Deny);
+        assert_eq!(evaluate(PermissionMode::Plan, "exec_bash"), PermissionDecision::Deny);
+        // Ask asks on every mutation.
+        assert_eq!(evaluate(PermissionMode::Ask, "write_file"), PermissionDecision::Ask);
+        assert_eq!(evaluate(PermissionMode::Ask, "bash"), PermissionDecision::Ask);
+        // AcceptEdits: known edits auto-allow; shell + unknown still ask.
+        assert_eq!(evaluate(PermissionMode::AcceptEdits, "edit_file"), PermissionDecision::Allow);
+        assert_eq!(evaluate(PermissionMode::AcceptEdits, "write_file"), PermissionDecision::Allow);
+        assert_eq!(evaluate(PermissionMode::AcceptEdits, "bash"), PermissionDecision::Ask);
+        assert_eq!(evaluate(PermissionMode::AcceptEdits, "mystery_tool"), PermissionDecision::Ask);
+    }
+
+    #[test]
+    fn permission_mode_roundtrip_and_cycle() {
+        for m in [
+            PermissionMode::Ask,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Plan,
+            PermissionMode::Auto,
+        ] {
+            assert_eq!(PermissionMode::parse_lenient(m.as_str()), m);
+        }
+        assert_eq!(PermissionMode::parse_lenient("garbage"), PermissionMode::Ask);
+        assert_eq!(PermissionMode::parse_lenient("accept-edits"), PermissionMode::AcceptEdits);
+        // Full Shift+Tab cycle returns to start.
+        assert_eq!(
+            PermissionMode::Ask.next().next().next().next(),
+            PermissionMode::Ask
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_tool_allow_deny_and_ask_paths() {
+        let gate = CoworkGate::default(); // Ask mode by default.
+        // Read-only: allowed, no pending entry.
+        assert!(matches!(
+            gate.gate_tool(1, "read_file", json!({}), "").await,
+            Decision::Approve
+        ));
+        assert!(gate.list_pending().await.is_empty());
+
+        // Plan mode denies a write outright.
+        gate.set_mode(PermissionMode::Plan).await;
+        assert!(matches!(
+            gate.gate_tool(1, "write_file", json!({}), "").await,
+            Decision::Deny(_)
+        ));
+
+        // Ask mode suspends; approving concurrently resolves it.
+        let gate = Arc::new(CoworkGate::default());
+        let g2 = Arc::clone(&gate);
+        let h = tokio::spawn(async move {
+            g2.gate_tool(1, "write_file", json!({ "path": "x" }), "edit").await
+        });
+        let id = {
+            let mut found = None;
+            for _ in 0..1000 {
+                if let Some((id, _)) = gate.list_pending().await.first() {
+                    found = Some(id.clone());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            found.expect("pending approval should appear")
+        };
+        assert!(gate.approve(&id).await);
+        assert!(matches!(h.await.unwrap(), Decision::Approve));
     }
 
     #[tokio::test]
