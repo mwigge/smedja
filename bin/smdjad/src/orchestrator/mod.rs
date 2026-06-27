@@ -512,7 +512,7 @@ impl TurnOrchestrator {
                 .collect();
             let mut injected_count = 0usize;
             if !nouns.is_empty() {
-                let graph_db_path = workspace_root.join(".smedja").join("graph.db");
+                let graph_db_path = crate::handlers::graph::graph_db_path(&workspace_root);
                 if graph_db_path.exists() {
                     match smedja_graph::GraphStore::open(&graph_db_path) {
                         Ok(store) => {

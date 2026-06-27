@@ -613,7 +613,7 @@ pub(crate) async fn execute_tool(
             let query = input.get("query").and_then(Value::as_str).unwrap_or("");
             let depth =
                 u8::try_from(input.get("depth").and_then(Value::as_u64).unwrap_or(2)).unwrap_or(2);
-            let graph_db_path = workspace.join(".smedja").join("graph.db");
+            let graph_db_path = crate::handlers::graph::graph_db_path(workspace);
             if !graph_db_path.exists() {
                 tracing::debug!("graph.db not found; returning empty symbols");
                 return serde_json::json!({ "symbols": [] }).to_string();

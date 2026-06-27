@@ -148,7 +148,7 @@ fn maybe_reindex_workspace(cwd: PathBuf) {
             let mut span =
                 opentelemetry::trace::Tracer::start(&tracer, "smedja.workspace.index");
             let start = std::time::Instant::now();
-            let db_path = bg_cwd.join(".smedja").join("graph.db");
+            let db_path = crate::handlers::graph::graph_db_path(&bg_cwd);
             let bg_cwd_clone = bg_cwd.clone();
             let symbol_count = tokio::task::spawn_blocking(move || {
                 smedja_graph::GraphStore::open(&db_path)

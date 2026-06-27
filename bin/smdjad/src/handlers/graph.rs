@@ -32,9 +32,41 @@ fn resolve_workspace(params: &Value) -> PathBuf {
         )
 }
 
-/// Returns the graph database path for a workspace root: `<root>/.smedja/graph.db`.
-fn graph_db_path(workspace: &std::path::Path) -> PathBuf {
-    workspace.join(".smedja").join("graph.db")
+/// Returns the graph database path for a workspace root.
+///
+/// The database lives under the daemon's writable state directory rather than
+/// inside the workspace. `smdjad` runs sandboxed (`ProtectSystem=strict`,
+/// `ProtectHome=read-only`) with only `~/.config/smedja`, `~/.local/share/smedja`
+/// and `$XDG_RUNTIME_DIR` writable, so it cannot create `<workspace>/.smedja`.
+/// The path is keyed by a stable SHA-256 of the canonicalised workspace so that
+/// `index` and `query` (and the executor/orchestrator readers) always agree:
+/// `~/.local/share/smedja/graphs/<hash>/graph.db`.
+///
+/// Falls back to the in-workspace `<root>/.smedja/graph.db` only when `$HOME`
+/// is unset (e.g. unusual unsandboxed callers).
+pub(crate) fn graph_db_path(workspace: &std::path::Path) -> PathBuf {
+    let Some(home) = crate::dirs_home() else {
+        return workspace.join(".smedja").join("graph.db");
+    };
+    // Canonicalise so different relative/symlinked spellings of the same
+    // workspace map to one DB; fall back to the raw path when it cannot be
+    // resolved (index and query both hash the same input, so they stay aligned).
+    let canonical = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let hash = {
+        use sha2::{Digest as _, Sha256};
+        format!(
+            "{:x}",
+            Sha256::digest(canonical.to_string_lossy().as_bytes())
+        )
+    };
+    home.join(".local")
+        .join("share")
+        .join("smedja")
+        .join("graphs")
+        .join(hash)
+        .join("graph.db")
 }
 
 fn graph_err(e: &smedja_graph::GraphError) -> RpcError {
@@ -136,4 +168,56 @@ pub(crate) async fn query(_state: HandlerState, params: Value) -> Result<Value, 
         .collect();
 
     Ok(json!({ "symbols": out }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A single test owns the HOME env var: separate `#[test]`s would race on it
+    // under the parallel test runner.
+    #[test]
+    fn graph_db_path_is_writable_stable_and_per_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        let ws1 = tempfile::tempdir().unwrap();
+        let ws2 = tempfile::tempdir().unwrap();
+
+        // SAFETY: single-threaded test section; HOME restored before returning.
+        let prev_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+
+        let a = graph_db_path(ws1.path());
+        let b = graph_db_path(ws1.path());
+        let other = graph_db_path(ws2.path());
+
+        unsafe {
+            match prev_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        // Same workspace → same DB path (index and query must agree).
+        assert_eq!(a, b);
+        // Different workspaces → different DBs.
+        assert_ne!(a, other);
+        // DB sits under the sandbox-writable state dir, never inside the workspace.
+        assert!(
+            a.starts_with(
+                home.path()
+                    .join(".local")
+                    .join("share")
+                    .join("smedja")
+                    .join("graphs")
+            ),
+            "{a:?}"
+        );
+        assert!(
+            !a.starts_with(ws1.path()),
+            "must not live inside the workspace: {a:?}"
+        );
+        assert_eq!(a.file_name().and_then(|n| n.to_str()), Some("graph.db"));
+    }
 }
