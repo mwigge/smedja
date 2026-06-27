@@ -6,3 +6,10 @@ Cargo.lock
 *.db-wal
 /tmp/smedja-tasks/
 .DS_Store
+
+# Internal / AI-helper artifacts — kept outside the repo (in ../smedja-internal/).
+# These are spec-driven-dev / planning / review docs, not part of the product.
+/openspec/
+/DELIVERY.md
+/review_*.md
+/docs/checklist-*.md
