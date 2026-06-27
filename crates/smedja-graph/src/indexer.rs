@@ -8,6 +8,62 @@ use uuid::Uuid;
 use crate::error::GraphError;
 use crate::types::SymbolKind;
 
+/// Directory names never worth indexing: VCS metadata, build output, vendored
+/// dependencies, caches, and our own state dir. Pruned during traversal so an
+/// accidental `/index` over a huge tree (e.g. `$HOME`, or a repo with a large
+/// `target/`) doesn't walk hundreds of thousands of files and hang.
+const PRUNE_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".jj",
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    "out",
+    "vendor",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".cache",
+    ".next",
+    ".gradle",
+    ".tox",
+    ".smedja",
+];
+
+/// Depth cap as a safety net against pathological / symlink-cyclic trees.
+const MAX_INDEX_DEPTH: usize = 32;
+
+/// True when `entry` is a directory that should not be descended into: a name
+/// in [`PRUNE_DIRS`], or any hidden directory (`.`-prefixed). The walk root
+/// itself (`depth == 0`) is never pruned, so indexing a hidden or pruned-named
+/// directory directly still works.
+fn is_pruned_dir(entry: &walkdir::DirEntry) -> bool {
+    if entry.depth() == 0 || !entry.file_type().is_dir() {
+        return false;
+    }
+    entry.file_name().to_str().is_some_and(|name| {
+        PRUNE_DIRS.contains(&name) || (name.starts_with('.') && name.len() > 1)
+    })
+}
+
+/// Bounded recursive file walk shared by the full and incremental indexers:
+/// prunes build/VCS/dependency/cache directories and caps depth so indexing
+/// stays fast and finite regardless of the root passed in.
+pub(crate) fn workspace_files(root: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
+    walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .max_depth(MAX_INDEX_DEPTH)
+        .into_iter()
+        .filter_entry(|e| !is_pruned_dir(e))
+        .filter_map(std::result::Result::ok)
+        .filter(|e| e.file_type().is_file())
+}
+
 /// tree-sitter query for Rust source files.
 ///
 /// Captures function items, struct/enum/trait/impl definitions, constants,
@@ -264,12 +320,7 @@ pub(crate) fn index_directory(
 ) -> Result<usize, GraphError> {
     let mut total = 0usize;
 
-    for entry in walkdir::WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(std::result::Result::ok)
-        .filter(|e| e.file_type().is_file())
-    {
+    for entry in workspace_files(root) {
         let abs_path = entry.path();
         let ext = abs_path.extension().and_then(|s| s.to_str()).unwrap_or("");
 
@@ -470,5 +521,22 @@ mod tests {
         let lines: Vec<&str> = (0..20).map(|_| "x").collect();
         let snippet = build_snippet(&lines, 0, 19);
         assert_eq!(snippet.lines().count(), 10);
+    }
+
+    #[test]
+    fn workspace_files_prunes_build_vcs_and_hidden_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        // A real source file we expect to see.
+        std::fs::write(r.join("keep.rs"), "fn a() {}").unwrap();
+        // Pruned: build output, VCS, vendored deps, our state dir, hidden dir.
+        for d in ["target", ".git", "node_modules", ".smedja", ".hidden"] {
+            std::fs::create_dir_all(r.join(d)).unwrap();
+            std::fs::write(r.join(d).join("buried.rs"), "fn b() {}").unwrap();
+        }
+        let found: Vec<String> = workspace_files(r)
+            .map(|e| e.path().strip_prefix(r).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(found, vec!["keep.rs".to_string()], "got {found:?}");
     }
 }

@@ -331,13 +331,16 @@ pub(crate) async fn dispatch_slash(
         // TUI's working directory, NOT the daemon's). The graph is auto-injected
         // into the agent's context once built.
         "index" => {
-            let workspace = if args.is_empty() {
-                std::env::current_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default()
-            } else {
-                args.to_owned()
-            };
+            // Require an explicit path: defaulting to the TUI's cwd silently
+            // indexed the wrong (often huge, e.g. $HOME) tree and hung.
+            if args.trim().is_empty() {
+                push_system_message(
+                    state,
+                    "/index error: <path to repo missing> — usage: /index <path>".to_owned(),
+                );
+                return Ok(true);
+            }
+            let workspace = args.to_owned();
             push_system_message(state, format!("indexing code graph: {workspace}\u{2026}"));
             let text = match client
                 .call("graph.index", json!({ "workspace": workspace }))
