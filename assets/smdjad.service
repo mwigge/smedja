@@ -20,6 +20,10 @@ StandardOutput=journal
 StandardError=journal
 KillMode=mixed
 Environment=XDG_RUNTIME_DIR=/run/user/%U
+# Runner CLIs (codex, opencode, npm-global tools) commonly install under the
+# user's home bins, which a systemd user service does NOT inherit. Put them on
+# PATH so the provider pool can detect them at startup.
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
 
 # ── Sandboxing ────────────────────────────────────────────────────────────
 # smdjad's whole job is to run coding agents (claude-cli, codex, opencode) and
