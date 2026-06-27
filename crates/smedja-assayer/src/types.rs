@@ -23,6 +23,10 @@ pub enum AgentRole {
     Review,
     /// Handles site reliability and observability.
     Sre,
+    /// Database/SQL work: schema, queries, migrations.
+    Data,
+    /// Infrastructure-as-code (terraform/k8s/…). High-risk: apply/destroy ops.
+    Iac,
     /// Coordinates and orchestrates multi-agent workflows.
     Orchestrator,
 }
@@ -50,8 +54,18 @@ impl AgentRole {
     pub fn capabilities(self) -> &'static [&'static str] {
         match self {
             AgentRole::Research => &["web", "pdf", "vision"],
+            AgentRole::Data => &["sql"],
+            AgentRole::Iac => &["iac"],
             _ => &[],
         }
+    }
+
+    /// High-risk roles whose mutations are always confirmed (never auto-approved),
+    /// because they perform dangerous, hard-to-reverse operations — e.g.
+    /// Infra-as-Code `apply`/`destroy`.
+    #[must_use]
+    pub fn is_high_risk(self) -> bool {
+        matches!(self, AgentRole::Iac)
     }
 
     /// Lowercase identifier for the role (used for routing rationale, role-skill
@@ -67,6 +81,8 @@ impl AgentRole {
             AgentRole::Test => "test",
             AgentRole::Review => "review",
             AgentRole::Sre => "sre",
+            AgentRole::Data => "data",
+            AgentRole::Iac => "iac",
             AgentRole::Orchestrator => "orchestrator",
         }
     }

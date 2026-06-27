@@ -137,6 +137,10 @@ impl Assayer {
                 RoutingRule::new(Some(AgentRole::Review), None, claude_deep()),
                 // Sre × * → Claude/Deep
                 RoutingRule::new(Some(AgentRole::Sre), None, claude_deep()),
+                // Data (SQL) × * → Claude/Deep (schema/query work wants depth)
+                RoutingRule::new(Some(AgentRole::Data), None, claude_deep()),
+                // Iac × * → Claude/Deep (dangerous infra ops; depth + always-ask)
+                RoutingRule::new(Some(AgentRole::Iac), None, claude_deep()),
                 // Orchestrator × * → Claude/Fast. (This is also the default
                 // fallback for a no-mode turn, so it stays cheap; the
                 // "orchestration on deep" split is realised in the Phase-4
@@ -256,6 +260,19 @@ mod tests {
     }
 
     // ------------------------------------------------------------------ tests
+
+    #[test]
+    fn domain_roles_route_and_iac_is_high_risk() {
+        let a = Assayer::default_rules();
+        assert_eq!(a.route(AgentRole::Data, Complexity::Coding), claude_deep());
+        assert_eq!(a.route(AgentRole::Iac, Complexity::Complex), claude_deep());
+        // IaC is high-risk (always-confirm); others are not.
+        assert!(AgentRole::Iac.is_high_risk());
+        assert!(!AgentRole::Data.is_high_risk());
+        assert!(!AgentRole::Impl.is_high_risk());
+        assert_eq!(AgentRole::Data.capabilities(), &["sql"]);
+        assert_eq!(AgentRole::Iac.capabilities(), &["iac"]);
+    }
 
     #[test]
     fn research_carries_capability_tags() {

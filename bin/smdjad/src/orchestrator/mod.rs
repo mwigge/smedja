@@ -967,7 +967,21 @@ impl TurnOrchestrator {
                         };
                         let args_scrubbed = serde_json::from_str(&tool_input)
                             .unwrap_or(serde_json::Value::Null);
-                        match gate.gate_tool(0, &tool_name, args_scrubbed, "").await {
+                        // High-risk roles (IaC) always confirm a mutation — never
+                        // auto-approved even in Auto/AcceptEdits — because the ops
+                        // (apply/destroy) are dangerous and hard to reverse.
+                        let decision = if role.is_high_risk()
+                            && crate::cowork::evaluate(
+                                crate::cowork::PermissionMode::Plan,
+                                &tool_name,
+                            ) == crate::cowork::PermissionDecision::Deny
+                        {
+                            gate.gate_tool_forced_ask(0, &tool_name, args_scrubbed, "")
+                                .await
+                        } else {
+                            gate.gate_tool(0, &tool_name, args_scrubbed, "").await
+                        };
+                        match decision {
                             Decision::Approve => None,
                             Decision::Deny(reason) => Some(format!("denied: {reason}")),
                             Decision::Modify(new_input) => {
