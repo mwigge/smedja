@@ -291,7 +291,29 @@ async fn run_turn(
     embedder: Arc<dyn embedder_port::Embedder>,
     provider_sessions: orchestrator::ProviderSessions,
     cache_aligners: orchestrator::CacheAligners,
+    turn_registry: handlers::TurnRegistry,
 ) {
+    // Deregister-on-drop: removes this turn's abort handle from the registry
+    // whether the turn completes normally *or* is aborted by `turn.cancel`
+    // (aborting drops this future, which runs the guard's destructor). This is
+    // race-free vs. the worker's insert — the guard only removes on drop, which
+    // can only happen after the turn has started running.
+    struct Deregister {
+        registry: handlers::TurnRegistry,
+        turn_id: String,
+    }
+    impl Drop for Deregister {
+        fn drop(&mut self) {
+            if let Ok(mut reg) = self.registry.lock() {
+                reg.remove(&self.turn_id);
+            }
+        }
+    }
+    let _dereg = Deregister {
+        registry: turn_registry,
+        turn_id: turn_id.clone(),
+    };
+
     orchestrator::TurnOrchestrator::new(
         ingot,
         dispatcher,
@@ -331,6 +353,7 @@ fn spawn_worker(
     provider_sessions: orchestrator::ProviderSessions,
     cache_aligners: orchestrator::CacheAligners,
     mut work_rx: tokio::sync::mpsc::Receiver<(String, String)>,
+    turn_registry: handlers::TurnRegistry,
 ) -> tokio::task::JoinHandle<tokio::task::JoinSet<()>> {
     tokio::spawn(async move {
         let mut set = tokio::task::JoinSet::new();
@@ -349,9 +372,26 @@ fn spawn_worker(
             let em = Arc::clone(&embedder);
             let ps = Arc::clone(&provider_sessions);
             let ca = Arc::clone(&cache_aligners);
-            set.spawn(run_turn(
-                ig, dp, session_id, turn_id, g, pl, as_, pt, vt, em, ps, ca,
+            let reg = Arc::clone(&turn_registry);
+            let handle = set.spawn(run_turn(
+                ig,
+                dp,
+                session_id,
+                turn_id.clone(),
+                g,
+                pl,
+                as_,
+                pt,
+                vt,
+                em,
+                ps,
+                ca,
+                Arc::clone(&turn_registry),
             ));
+            // Register the abort handle so `turn.cancel` can interrupt this turn.
+            if let Ok(mut map) = reg.lock() {
+                map.insert(turn_id, handle);
+            }
             // Reap finished tasks so the set tracks only in-flight work.
             while set.try_join_next().is_some() {}
             tracing::debug!(in_flight = set.len(), "turn spawned");
@@ -459,6 +499,7 @@ fn build_router(
     task_set: &Arc<Mutex<tokio::task::JoinSet<()>>>,
     lsp_manager: &Arc<smedja_lsp::LspManager>,
     work_tx: tokio::sync::mpsc::Sender<(String, String)>,
+    turn_registry: handlers::TurnRegistry,
 ) -> Router {
     let mut router = Router::new();
 
@@ -483,6 +524,7 @@ fn build_router(
         startup_model: Arc::clone(startup_model),
         lsp_manager: Arc::clone(lsp_manager),
         work_tx,
+        turn_registry,
     };
 
     router.register("ping", |_| async { Ok(json!("pong")) });
@@ -545,6 +587,7 @@ fn build_router(
     route!(router, "session.cost", state, handlers::cost::cost);
     route!(router, "runner.list", state, handlers::session::runner_list);
     route!(router, "turn.submit", state, handlers::turn::submit);
+    route!(router, "turn.cancel", state, handlers::turn::cancel);
     // Blocks until terminal status or 60 s deadline; event-driven, no poll.
     route!(router, "turn.subscribe", state, handlers::turn::subscribe);
     route!(router, "task.get", state, handlers::task::get);
@@ -1005,6 +1048,12 @@ async fn main() -> anyhow::Result<()> {
     // dropped (server dropped on select! exit), which closes work_rx.
     let work_tx_shutdown = work_tx.clone();
 
+    // Registry of in-flight turns for `turn.cancel` (ESC interrupt). Shared
+    // between the RPC router (cancel handler) and the worker (which registers
+    // each turn's abort handle).
+    let turn_registry: handlers::TurnRegistry =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
     let router = build_router(
         &ingot,
         &dispatcher,
@@ -1021,6 +1070,7 @@ async fn main() -> anyhow::Result<()> {
         &task_set,
         &lsp_manager,
         work_tx,
+        Arc::clone(&turn_registry),
     );
 
     let worker_handle = spawn_worker(
@@ -1035,6 +1085,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&provider_sessions),
         Arc::clone(&cache_aligners),
         work_rx,
+        Arc::clone(&turn_registry),
     );
 
     // Background daily maintenance: prune old sessions and VACUUM both databases.

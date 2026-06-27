@@ -69,4 +69,14 @@ pub(crate) struct HandlerState {
     /// Direct channel to the turn worker — bypasses the broadcast so `Started`
     /// events are never dropped even under high diagnostic/delta burst.
     pub(crate) work_tx: tokio::sync::mpsc::Sender<(String, String)>,
+    /// In-flight turns keyed by `turn_id` → the `AbortHandle` of their
+    /// `run_turn` task, so `turn.cancel` can stop a runaway turn. The worker
+    /// inserts on spawn; the turn removes itself when it finishes; `turn.cancel`
+    /// removes on abort.
+    pub(crate) turn_registry: TurnRegistry,
 }
+
+/// Maps an in-flight `turn_id` to the [`tokio::task::AbortHandle`] of its
+/// `run_turn` task (see [`HandlerState::turn_registry`]).
+pub(crate) type TurnRegistry =
+    Arc<std::sync::Mutex<HashMap<String, tokio::task::AbortHandle>>>;

@@ -150,6 +150,48 @@ pub(crate) async fn subscribe(state: HandlerState, params: Value) -> Result<Valu
     .await
 }
 
+/// Handles `turn.cancel`: aborts an in-flight turn (ESC interrupt).
+///
+/// Looks up the turn's `AbortHandle` in the registry, aborts the `run_turn`
+/// task (the subprocess dies via `kill_on_drop`), marks the task failed, and
+/// publishes a terminal `Failed` event so `turn.subscribe` resolves.
+///
+/// # Errors
+///
+/// Returns an error when `task_id` is missing.
+pub(crate) async fn cancel(state: HandlerState, params: Value) -> Result<Value, RpcError> {
+    let task_id = params
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| missing_param("task_id"))?
+        .to_owned();
+
+    let aborted = state
+        .turn_registry
+        .lock()
+        .map(|mut reg| reg.remove(&task_id).map(|h| h.abort()).is_some())
+        .unwrap_or(false);
+
+    if aborted {
+        let session_id = state
+            .ingot
+            .get_task(&task_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|t| t.session_id)
+            .unwrap_or_default();
+        let _ = state.ingot.update_task_status(&task_id, "failed").await;
+        state.dispatcher.publish(TurnEvent::fail(
+            session_id,
+            task_id.clone(),
+            "interrupted by user",
+        ));
+    }
+
+    Ok(json!({ "task_id": task_id, "cancelled": aborted }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +218,55 @@ mod tests {
 
     fn empty_gates() -> Arc<Mutex<HashMap<String, Arc<CoworkGate>>>> {
         Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    /// Behavioral oracle for the interrupt: the registry remove+abort that
+    /// `turn.cancel` performs must actually stop the run task (it never reaches
+    /// completion), and a missing turn id reports "not cancelled".
+    #[tokio::test]
+    async fn turn_cancel_registry_abort_stops_the_task() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let registry: crate::handlers::TurnRegistry =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mut set = tokio::task::JoinSet::new();
+        let completed = Arc::new(AtomicBool::new(false));
+
+        let flag = Arc::clone(&completed);
+        let id = "turn-under-test".to_owned();
+        let handle = set.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+        registry.lock().unwrap().insert(id.clone(), handle);
+
+        // Exactly what `cancel` does:
+        let aborted = registry
+            .lock()
+            .unwrap()
+            .remove(&id)
+            .map(|h| h.abort())
+            .is_some();
+        assert!(aborted, "present turn must report cancelled");
+
+        let joined = set.join_next().await;
+        assert!(
+            matches!(joined, Some(Err(ref e)) if e.is_cancelled()),
+            "task must be cancelled, got {joined:?}"
+        );
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "the aborted task must never reach completion"
+        );
+
+        // A missing id reports not-cancelled.
+        let missing = registry
+            .lock()
+            .unwrap()
+            .remove("nope")
+            .map(|h| h.abort())
+            .is_some();
+        assert!(!missing);
     }
 
     #[tokio::test]

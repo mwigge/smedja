@@ -1891,6 +1891,29 @@ async fn handle_key(
     }
 
     // ------------------------------------------------------------------
+    // ESC interrupts an in-flight turn (kills the runaway stream) while
+    // staying in the prompt. Guarded so it never steals ESC from a sub-mode
+    // that uses it for its own cancel.
+    // ------------------------------------------------------------------
+    if key.code == KeyCode::Esc
+        && state.pending_task_id.is_some()
+        && !state.slash_popup_visible
+        && !state.history_search_mode
+        && state.secret_var.is_none()
+        && !state.selection_mode
+    {
+        if let Some(task_id) = state.pending_task_id.take() {
+            let _ = client
+                .call("turn.cancel", json!({ "task_id": task_id }))
+                .await;
+            state.turn_in_flight = false;
+            state.stream_rx = None;
+            push_system_message(state, "\u{2298} interrupted");
+        }
+        return Ok(());
+    }
+
+    // ------------------------------------------------------------------
     // Slash-completion popup intercepts most keys when visible.
     // ------------------------------------------------------------------
     if state.slash_popup_visible {
