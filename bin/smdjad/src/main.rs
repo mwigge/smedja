@@ -552,6 +552,7 @@ fn build_router(
         state,
         handlers::session::set_runner
     );
+    route!(router, "session.set_tier", state, handlers::session::set_tier);
     route!(
         router,
         "session.set_mode",

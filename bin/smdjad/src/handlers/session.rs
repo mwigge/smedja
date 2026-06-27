@@ -435,6 +435,92 @@ pub(crate) async fn set_model(state: HandlerState, params: Value) -> Result<Valu
     Ok(json!({ "session_id": session_id, "model": model }))
 }
 
+/// Parses a runner name (tolerating the `-cli` suffix, e.g. `claude-cli`) into
+/// a [`Runner`]. Returns `None` for unknown runners.
+fn parse_runner_name(s: &str) -> Option<smedja_assayer::Runner> {
+    use smedja_assayer::Runner;
+    match s.trim().to_ascii_lowercase().split('-').next()? {
+        "claude" => Some(Runner::Claude),
+        "codex" => Some(Runner::Codex),
+        "local" => Some(Runner::Local),
+        "copilot" => Some(Runner::Copilot),
+        "minimax" => Some(Runner::Minimax),
+        "berget" => Some(Runner::Berget),
+        _ => None,
+    }
+}
+
+/// Parses a tier name into a [`Tier`]. Returns `None` for unknown tiers.
+fn parse_tier_name(s: &str) -> Option<smedja_assayer::Tier> {
+    use smedja_assayer::Tier;
+    match s.trim().to_ascii_lowercase().as_str() {
+        "fast" => Some(Tier::Fast),
+        "local" => Some(Tier::Local),
+        "deep" => Some(Tier::Deep),
+        _ => None,
+    }
+}
+
+/// Handles `session.set_tier`: makes `/tier` meaningful by resolving the
+/// session's current runner + the requested tier to a concrete model (via the
+/// provider pool) and pinning it as the session's `model_override`. So
+/// `/tier deep` actually runs on the runner's deep model (and persists across
+/// restarts via the model-override inheritance in `create`).
+///
+/// # Errors
+///
+/// Returns an error when `session_id`/`tier` is missing, the tier is unknown,
+/// or no model is configured for the (runner, tier) pair.
+pub(crate) async fn set_tier(state: HandlerState, params: Value) -> Result<Value, RpcError> {
+    let ig = state.ingot;
+    let pool = state.provider_pool;
+    let session_id = params["session_id"]
+        .as_str()
+        .ok_or_else(|| missing_param("session_id"))?
+        .to_owned();
+    let tier_str = params["tier"]
+        .as_str()
+        .ok_or_else(|| missing_param("tier"))?
+        .to_owned();
+    let tier = parse_tier_name(&tier_str)
+        .ok_or_else(|| RpcError::new(codes::INVALID_PARAMS, format!("unknown tier: {tier_str}")))?;
+
+    // Resolve the session's effective runner (override, else the startup default).
+    let runner_str = ig
+        .get_session(&session_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| s.runner_override)
+        .unwrap_or_else(|| state.startup_runner.to_string());
+    let runner = parse_runner_name(&runner_str).ok_or_else(|| {
+        RpcError::new(codes::INVALID_PARAMS, format!("unknown runner: {runner_str}"))
+    })?;
+
+    // (runner, tier) → model, falling back through the eligible ring.
+    let model = pool
+        .get(runner, tier)
+        .or_else(|| pool.eligible_ring(runner, tier).into_iter().next())
+        .map(|e| e.default_model.to_owned())
+        .ok_or_else(|| {
+            RpcError::new(
+                codes::INVALID_PARAMS,
+                format!("no model configured for {runner_str} @ {tier_str}"),
+            )
+        })?;
+
+    ig.update_session_model_override(&session_id, &model)
+        .await
+        .map_err(|e| ingot_err(&e))?;
+
+    Ok(json!({
+        "session_id": session_id,
+        "tier": tier_str,
+        "runner": runner_str,
+        "model": model,
+    }))
+}
+
 /// Handles `session.set_runner`.
 ///
 /// # Errors
@@ -750,6 +836,26 @@ pub(crate) async fn history(state: HandlerState, params: Value) -> Result<Value,
 mod tests {
     use super::*;
     use smedja_ingot::{Ingot, IngotHandle};
+
+    #[test]
+    fn parse_runner_name_tolerates_cli_suffix_and_rejects_unknown() {
+        use smedja_assayer::Runner;
+        assert_eq!(parse_runner_name("claude"), Some(Runner::Claude));
+        assert_eq!(parse_runner_name("claude-cli"), Some(Runner::Claude));
+        assert_eq!(parse_runner_name("codex-cli"), Some(Runner::Codex));
+        assert_eq!(parse_runner_name("LOCAL"), Some(Runner::Local));
+        assert_eq!(parse_runner_name("minimax"), Some(Runner::Minimax));
+        assert_eq!(parse_runner_name("nope"), None);
+    }
+
+    #[test]
+    fn parse_tier_name_maps_known_tiers() {
+        use smedja_assayer::Tier;
+        assert_eq!(parse_tier_name("fast"), Some(Tier::Fast));
+        assert_eq!(parse_tier_name("deep"), Some(Tier::Deep));
+        assert_eq!(parse_tier_name("local"), Some(Tier::Local));
+        assert_eq!(parse_tier_name("ultra"), None);
+    }
 
     fn handle() -> IngotHandle {
         IngotHandle::new(Ingot::open_in_memory().unwrap())
