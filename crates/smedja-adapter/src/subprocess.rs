@@ -48,6 +48,9 @@ impl Provider for SubprocessProvider {
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
+                // So an interrupted turn (turn.cancel aborts the run task) kills
+                // the child instead of leaking a runaway process.
+                .kill_on_drop(true)
                 .spawn()
             {
                 Ok(c) => c,

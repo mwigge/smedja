@@ -64,7 +64,10 @@ fn stream_claude_cli(messages: &[Message], _opts: &CallOptions) -> DeltaStream {
             .arg("--verbose")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            // So an interrupted turn (turn.cancel aborts the run task) kills the
+            // child instead of leaking a runaway `claude` process.
+            .kill_on_drop(true);
 
         let mut child = match command.spawn() {
             Ok(child) => child,

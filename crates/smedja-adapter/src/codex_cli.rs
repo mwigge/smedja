@@ -78,7 +78,10 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
         command
             .arg(&prompt)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // So an interrupted turn (turn.cancel aborts the run task) kills the
+            // child instead of leaking a runaway `codex` process.
+            .kill_on_drop(true);
 
         let mut child = match command.spawn() {
             Ok(c) => c,
