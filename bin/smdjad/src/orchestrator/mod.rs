@@ -753,6 +753,7 @@ impl TurnOrchestrator {
                     Some(all_tools.clone())
                 },
                 provider_session_id,
+                smedja_session_id: Some(session_id.clone()),
                 stable_prefix_len,
                 cache_strategy,
             };

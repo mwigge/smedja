@@ -91,6 +91,11 @@ pub struct CallOptions {
     /// Provider-native session identifier used by CLI adapters that support
     /// resume semantics.
     pub provider_session_id: Option<String>,
+    /// smedja's own session id, threaded to external-CLI adapters (claude/codex)
+    /// so their tool-approval hooks can tell the daemon which session's gate to
+    /// consult. `None` for non-interactive / API-only calls.
+    #[serde(default)]
+    pub smedja_session_id: Option<String>,
     /// Number of leading messages (after the system prompt) that form the
     /// stable KV-cache prefix.
     ///
@@ -181,6 +186,7 @@ mod tests {
             system: None,
             tools: None,
             provider_session_id: None,
+            smedja_session_id: None,
             stable_prefix_len: None,
             cache_strategy: CacheStrategy::None,
         }

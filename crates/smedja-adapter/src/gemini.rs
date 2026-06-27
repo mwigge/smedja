@@ -364,6 +364,7 @@ mod tests {
             system: Some("Be helpful.".to_owned()),
             tools: None,
             provider_session_id: None,
+            smedja_session_id: None,
             stable_prefix_len: None,
             cache_strategy: crate::types::CacheStrategy::None,
         };
@@ -383,6 +384,7 @@ mod tests {
             system: None,
             tools: None,
             provider_session_id: None,
+            smedja_session_id: None,
             stable_prefix_len: None,
             cache_strategy: crate::types::CacheStrategy::None,
         };
@@ -402,6 +404,7 @@ mod tests {
             system: Some("system prompt".to_owned()),
             tools: None,
             provider_session_id: None,
+            smedja_session_id: None,
             stable_prefix_len: Some(2),
             cache_strategy: strategy,
         }

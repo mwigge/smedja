@@ -106,6 +106,7 @@ mod tests {
             system: None,
             tools: None,
             provider_session_id: None,
+            smedja_session_id: None,
             stable_prefix_len: None,
             cache_strategy: crate::types::CacheStrategy::None,
         };
@@ -143,6 +144,7 @@ mod tests {
             system: None,
             tools: None,
             provider_session_id: None,
+            smedja_session_id: None,
             stable_prefix_len: None,
             cache_strategy: crate::types::CacheStrategy::None,
         };
