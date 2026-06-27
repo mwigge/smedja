@@ -20,11 +20,15 @@ use crate::client::LspClient;
 use crate::types::{Diagnostic, LspSnapshot, ServerState, ServerStatus};
 
 /// Supported language servers, in priority order.
-/// Only servers whose binary is on `$PATH` are started.
+/// A server is started only when its binary is on `$PATH` **and** the workspace
+/// contains one of its `markers` — otherwise clangd (etc.) would start on a Rust
+/// project just because the binary happens to be installed.
 struct ServerSpec {
     name: &'static str,
     binary: &'static str,
     args: &'static [&'static str],
+    /// Project-root marker files that indicate this language is in use.
+    markers: &'static [&'static str],
 }
 
 const SERVERS: &[ServerSpec] = &[
@@ -32,28 +36,38 @@ const SERVERS: &[ServerSpec] = &[
         name: "rust-analyzer",
         binary: "rust-analyzer",
         args: &[],
+        markers: &["Cargo.toml"],
     },
     ServerSpec {
         name: "pyright",
         binary: "pyright-langserver",
         args: &["--stdio"],
+        markers: &["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"],
     },
     ServerSpec {
         name: "gopls",
         binary: "gopls",
         args: &[],
+        markers: &["go.mod", "go.work"],
     },
     ServerSpec {
         name: "typescript-language-server",
         binary: "typescript-language-server",
         args: &["--stdio"],
+        markers: &["package.json", "tsconfig.json"],
     },
     ServerSpec {
         name: "clangd",
         binary: "clangd",
         args: &[],
+        markers: &["compile_commands.json", "CMakeLists.txt", "Makefile", ".clangd"],
     },
 ];
+
+/// True when `workspace` contains at least one of `spec`'s project markers.
+fn workspace_has_marker(workspace: &std::path::Path, spec: &ServerSpec) -> bool {
+    spec.markers.iter().any(|m| workspace.join(m).exists())
+}
 
 /// Internal event sent from a per-server task to the aggregator.
 enum ServerEvent {
@@ -133,7 +147,13 @@ impl LspManager {
 }
 
 async fn run_all(workspace: PathBuf, watch_tx: watch::Sender<LspSnapshot>) {
-    let available: Vec<&ServerSpec> = SERVERS.iter().filter(|s| which(s.binary).is_ok()).collect();
+    // Start a server only when its binary exists AND the workspace actually uses
+    // that language (a project marker is present) — so e.g. clangd does not run
+    // on a Rust repo just because clangd is installed.
+    let available: Vec<&ServerSpec> = SERVERS
+        .iter()
+        .filter(|s| which(s.binary).is_ok() && workspace_has_marker(&workspace, s))
+        .collect();
 
     if available.is_empty() {
         tracing::debug!("no LSP servers found on PATH");
@@ -341,5 +361,33 @@ fn build_snapshot(
     LspSnapshot {
         servers,
         diagnostics,
+    }
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::{workspace_has_marker, SERVERS};
+
+    #[test]
+    fn marker_gating_starts_only_relevant_servers() {
+        let dir = std::env::temp_dir().join(format!(
+            "smedja-lsp-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), b"[package]\n").unwrap();
+
+        let spec = |name: &str| SERVERS.iter().find(|s| s.name == name).unwrap();
+        // A Rust project starts rust-analyzer but NOT clangd / gopls / tsserver.
+        assert!(workspace_has_marker(&dir, spec("rust-analyzer")));
+        assert!(!workspace_has_marker(&dir, spec("clangd")));
+        assert!(!workspace_has_marker(&dir, spec("gopls")));
+        assert!(!workspace_has_marker(&dir, spec("typescript-language-server")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
