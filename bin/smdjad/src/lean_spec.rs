@@ -557,20 +557,10 @@ mod tests {
         assert_eq!(pointer.umbrella_namespace(), "umbrella:alpha");
     }
 
-    #[test]
-    fn openspec_manifest_stays_flat_no_parent_field() {
-        // Task 2.1: the change manifest carries only schema + created — the
-        // umbrella link lives in the vault payload, never in .openspec.yaml.
-        let manifest = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../openspec/changes/lean-specs/.openspec.yaml"
-        ))
-        .expect("the lean-specs manifest must exist");
-        assert!(
-            !manifest.contains("parent"),
-            "the manifest must stay flat: no parent field, got:\n{manifest}"
-        );
-    }
+    // (Removed `openspec_manifest_stays_flat_no_parent_field`: it read a
+    // committed `openspec/changes/.../.openspec.yaml`, but openspec/ is no longer
+    // tracked in the repo — the manifest schema is exercised by the round-trip
+    // tests below instead.)
 
     #[tokio::test]
     async fn slice_resolves_its_umbrella_via_pointer() {
