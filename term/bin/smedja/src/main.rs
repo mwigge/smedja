@@ -2155,4 +2155,43 @@ mod tests {
         let bytes = encode_key(&Key::Character(SmolStr::new("A")), true, false, true, false, 1);
         assert_eq!(bytes, Some(b"\x1b[97;6u".to_vec()));
     }
+
+    /// Conformance table for `encode_key` covering the regression surface
+    /// (caps, control keys, meta, modified Enter) in both legacy and kitty
+    /// modes. New input bugs of these shapes should fail here first.
+    #[test]
+    fn encode_key_conformance_table() {
+        use super::encode_key;
+        use winit::keyboard::{Key, NamedKey, SmolStr};
+        let chr = |s: &str| Key::Character(SmolStr::new(s));
+        let enter = || Key::Named(NamedKey::Enter);
+
+        // (desc, key, shift, alt, ctrl, sup, kbd_flags, expected)
+        let cases: Vec<(&str, Key, bool, bool, bool, bool, u8, &[u8])> = vec![
+            ("plain a / legacy", chr("a"), false, false, false, false, 0, b"a".as_slice()),
+            ("plain a / kitty", chr("a"), false, false, false, false, 1, b"a"),
+            // Caps: Shift+letter must send the uppercase glyph, not base+shift.
+            ("Shift+A / legacy", chr("A"), true, false, false, false, 0, b"A"),
+            ("Shift+A / kitty", chr("A"), true, false, false, false, 1, b"A"),
+            // Control keys → C0 / CSI-u.
+            ("Ctrl+C / legacy", chr("c"), false, false, true, false, 0, b"\x03"),
+            ("Ctrl+G / kitty", chr("g"), false, false, true, false, 1, b"\x1b[103;5u"),
+            ("Ctrl+Shift+A / kitty", chr("A"), true, false, true, false, 1, b"\x1b[97;6u"),
+            // Meta.
+            ("Alt+b / legacy", chr("b"), false, true, false, false, 0, b"\x1bb"),
+            // Enter variants.
+            ("Enter / legacy", enter(), false, false, false, false, 0, b"\r"),
+            ("Enter / kitty no-mods", enter(), false, false, false, false, 1, b"\r"),
+            ("Shift+Enter / kitty", enter(), true, false, false, false, 1, b"\x1b[13;2u"),
+        ];
+
+        for (desc, key, shift, alt, ctrl, sup, flags, expected) in cases {
+            let got = encode_key(&key, shift, alt, ctrl, sup, flags);
+            assert_eq!(
+                got.as_deref(),
+                Some(expected),
+                "{desc}: got {got:?}, want {expected:?}"
+            );
+        }
+    }
 }
