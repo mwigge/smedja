@@ -199,19 +199,21 @@ impl TurnOrchestrator {
 
         // 2. Route this turn to a provider via the assayer.
         //    Role comes from session.mode; complexity is conservatively Coding for now.
+        // Active role from session.mode — hoisted so it can also drive role-bound
+        // skill injection further down.
+        let session_mode = {
+            ingot
+                .get_session(&session_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|s| s.mode)
+        };
+        let role = session_mode
+            .as_deref()
+            .and_then(crate::common::parse_session_mode_to_role)
+            .unwrap_or(AgentRole::Orchestrator);
         let route = {
-            let session_mode = {
-                ingot
-                    .get_session(&session_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.mode)
-            };
-            let role = session_mode
-                .as_deref()
-                .and_then(crate::common::parse_session_mode_to_role)
-                .unwrap_or(AgentRole::Orchestrator);
             let complexity = Complexity::Coding;
             let decision = assayer.route_decision(role, complexity);
             tracing::debug!(
@@ -337,6 +339,24 @@ impl TurnOrchestrator {
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to load workspace skills; continuing without");
                     base
+                }
+            };
+            // Role-bound rules/skills: inject the active role's pack
+            // (`.smedja/roles/<role>.md` / `roles/<role>/*.md`) so each role
+            // carries its own discipline (e.g. review checklist, research
+            // source-hygiene, planning rules).
+            let with_skills = match smedja_memory::load_role_skills(&workspace_root, role.label()) {
+                Ok(role_skills) if !role_skills.is_empty() => {
+                    let joined = role_skills.join("\n\n");
+                    format!(
+                        "{with_skills}\n\n<role_skills role=\"{}\">\n{joined}\n</role_skills>",
+                        role.label()
+                    )
+                }
+                Ok(_) => with_skills,
+                Err(e) => {
+                    tracing::warn!(error = %e, role = role.label(), "failed to load role skills; continuing without");
+                    with_skills
                 }
             };
             // Always-on, steer-first foundational discipline: the directive is

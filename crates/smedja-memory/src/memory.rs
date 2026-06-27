@@ -321,6 +321,42 @@ impl WorkingMemory {
     }
 }
 
+/// Loads role-specific rules/skills for `role` from a workspace: the file
+/// `<dir>/.smedja/roles/<role>.md` and every `*.md` under
+/// `<dir>/.smedja/roles/<role>/`. Returns their contents (the single file first,
+/// then the directory's files sorted by name), or an empty vec when none exist.
+///
+/// This binds a set of rules/skills to each agent role — the orchestrator
+/// injects them whenever that role is active, alongside the workspace skills.
+///
+/// # Errors
+///
+/// Returns an `io::Error` if a present file cannot be read.
+pub fn load_role_skills(dir: &std::path::Path, role: &str) -> Result<Vec<String>, std::io::Error> {
+    let roles_dir = dir.join(".smedja").join("roles");
+    let mut out = Vec::new();
+
+    let single = roles_dir.join(format!("{role}.md"));
+    if single.is_file() {
+        out.push(std::fs::read_to_string(&single)?);
+    }
+
+    let role_dir = roles_dir.join(role);
+    if role_dir.is_dir() {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(&role_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                files.push(std::fs::read_to_string(&path)?);
+            }
+        }
+        files.sort();
+        out.extend(files);
+    }
+
+    Ok(out)
+}
+
 /// Loads workspace skill files from `<dir>/.smedja/skills/*.md`.
 ///
 /// Returns an empty [`Vec`] when the directory is absent or no `.md` files
@@ -559,6 +595,23 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let result = super::load_workspace_skills(tmp.path()).unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn load_role_skills_reads_file_and_dir_for_the_role_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roles = tmp.path().join(".smedja").join("roles");
+        std::fs::create_dir_all(roles.join("review")).unwrap();
+        std::fs::write(roles.join("review.md"), b"top review rule").unwrap();
+        std::fs::write(roles.join("review").join("a_extra.md"), b"extra A").unwrap();
+        std::fs::write(roles.join("plan.md"), b"a plan rule").unwrap();
+
+        let review = super::load_role_skills(tmp.path(), "review").unwrap();
+        assert_eq!(review, vec!["top review rule".to_owned(), "extra A".to_owned()]);
+
+        // A role with no pack yields nothing; an unrelated role isn't mixed in.
+        assert!(super::load_role_skills(tmp.path(), "research").unwrap().is_empty());
+        assert_eq!(super::load_role_skills(tmp.path(), "plan").unwrap(), vec!["a plan rule".to_owned()]);
     }
 
     #[test]
