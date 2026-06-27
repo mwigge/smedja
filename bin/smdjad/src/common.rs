@@ -342,12 +342,18 @@ fn summarize_tool_input(input: &serde_json::Value) -> String {
 /// Summarises a tool result as `↳ <status> · <first-line preview>` (or a char
 /// count when there is no textual preview), classifying obvious failures.
 fn summarize_tool_result(content: &str) -> String {
-    let lc = content.trim_start().to_lowercase();
-    let status = if lc.starts_with("error") || lc.starts_with("permission denied") {
-        "error"
-    } else {
-        "ok"
-    };
+    let lc = content.to_lowercase();
+    // Strong, unambiguous failure signatures — checked anywhere in the result so
+    // errors like "EROFS: read-only file system" aren't mislabelled "ok".
+    let is_err = lc.trim_start().starts_with("error")
+        || lc.contains("permission denied")
+        || lc.contains("read-only file system")
+        || lc.contains("erofs")
+        || lc.contains("operation not permitted")
+        || lc.contains("no such file or directory")
+        || lc.contains("command not found")
+        || lc.contains("was blocked");
+    let status = if is_err { "error" } else { "ok" };
     let first = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let preview = truncate_summary(first, 100);
     if preview.is_empty() {
@@ -388,6 +394,9 @@ mod tests {
         assert!(ok.starts_with("↳ ok · hello world"), "{ok}");
         let err = summarize_tool_result("error: nope");
         assert!(err.starts_with("↳ error ·"), "{err}");
+        // Failure signatures anywhere in the body are caught, not just at the start.
+        let erofs = summarize_tool_result("EROFS: read-only file system, mkdir '/x'");
+        assert!(erofs.starts_with("↳ error ·"), "{erofs}");
         // No textual preview → fall back to a char count, never a tool_use_id.
         let empty = summarize_tool_result("");
         assert!(empty.starts_with("↳ ok · 0 chars"), "{empty}");
