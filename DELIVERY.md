@@ -22,8 +22,16 @@ If `scripts/smoke-test.sh` does not pass, do not check the box.
 | smedja-tui | turn submission + response | working — `turn.submit` queues a task; `turn.subscribe` polls until `done=true` |
 | smedja-tui | connect banner | working — shows socket path, session ID, provider, tier on startup |
 | smedja-tui | status bar tier | working — reads tier from session response; falls back to `"default"` |
-| smedja-tui | cowork gate (slash command) | working — `/cowork on|off|status` sends `cowork.set`; `/cowork status` reads live from `session.get`; approval prompts shown as text |
-| smedja-tui | cowork gate (inline widget) | roadmap — keyboard `y`/`n`/`m` approval widget not implemented |
+| smedja-tui | cowork gate (slash command) | working — `/cowork on|off|status` sends `cowork.set` |
+| smedja-tui | cowork gate (inline widget) | working — keyboard `y`/`n`/`m` approval widget; populated by the real `cowork.pending` poll while a turn is in flight |
+| approval | permission policy (ask-on-mutation default) | working — `PermissionMode {Ask,AcceptEdits,Plan,Auto}` + `evaluate()`; Shift+Tab cycles the mode (`cowork.set_mode`); read tools pass, mutations gated |
+| approval | claude (external CLI) | working — PreToolUse hook (`--settings` → `smj tool-gate` → `cowork.gate_tool`) gates each tool; fails open if the daemon is down |
+| approval | codex (external CLI) | partial — no per-tool hook in `codex exec`; permission mode maps to `--sandbox` (Plan=read-only, else workspace-write, Auto=full) |
+| approval | minimax / local / API | working — in-process gate at the orchestrator tool loop |
+| turn control | interrupt (ESC) | working — `turn.cancel` aborts the run task; subprocesses reaped via `kill_on_drop` |
+| smedja-tui | clipboard paste | working — bracketed paste (`Event::Paste`) inserts multi-line text as one edit; terminal reads via `wl-paste`/`xclip`/`pbpaste` |
+| codegraph | TUI status | working — `graph.status` polled every 5 s shows the real indexed symbol count |
+| LSP | server selection | working — gated on project markers (Cargo.toml→rust-analyzer, compile_commands→clangd, …) so unrelated servers don't start |
 | agent bridge (st-agent → smdjad) | wired | working — `spawn_agent_bridge` subscribes to pane events; tier and model propagated from `TurnStart` |
 | smedja-vault | storage + cosine retrieval | working — SQLite BLOB store with full-scan cosine-similarity query |
 | smedja-vault | `smedja_vault_search` tool (daemon) | in progress — tool registered in daemon; returns empty results pending wiring |
