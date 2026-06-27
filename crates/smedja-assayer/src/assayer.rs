@@ -258,6 +258,16 @@ mod tests {
     // ------------------------------------------------------------------ tests
 
     #[test]
+    fn research_carries_capability_tags() {
+        assert_eq!(
+            AgentRole::Research.capabilities(),
+            &["web", "pdf", "vision"]
+        );
+        assert!(AgentRole::Impl.capabilities().is_empty());
+        assert!(AgentRole::Plan.capabilities().is_empty());
+    }
+
+    #[test]
     fn descending_tier_ladder_steps_down_and_caps() {
         assert_eq!(super::descending_tier(0), Tier::Deep);
         assert_eq!(super::descending_tier(1), Tier::Fast);
