@@ -46,7 +46,7 @@ use st_agent::{AgentChunk, SharedAgentManager, SharedPaneState};
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Parser)]
-#[command(name = "smedja", about = "GPU-accelerated terminal emulator")]
+#[command(name = "smedja", version, about = "GPU-accelerated terminal emulator")]
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,

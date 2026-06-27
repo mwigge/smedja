@@ -31,7 +31,7 @@ tools  = ["read_file", "bash"]
 "#;
 
 #[derive(Parser)]
-#[command(name = "smj", about = "smedja control CLI")]
+#[command(name = "smj", version, about = "smedja control CLI")]
 struct Cli {
     /// smdjad socket path (overrides `XDG_RUNTIME_DIR`)
     #[arg(long, env = "SMEDJA_SOCK", global = true)]

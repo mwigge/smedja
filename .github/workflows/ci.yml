@@ -41,6 +41,9 @@ jobs:
       - name: format check
         run: cargo fmt --all -- --check
 
+      - name: version consistency
+        run: cargo run -q -p xtask -- check-versions
+
       - name: clippy (pedantic, warnings as errors)
         run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic
 

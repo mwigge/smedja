@@ -37,6 +37,8 @@ enum Command {
         #[arg(long)]
         threshold: Option<f64>,
     },
+    /// Assert every version literal agrees with `[workspace.package] version`.
+    CheckVersions,
 }
 
 fn main() -> Result<()> {
@@ -44,6 +46,107 @@ fn main() -> Result<()> {
     match cli.command {
         Command::GenRpcTypes => gen_rpc_types(),
         Command::Eval { suite, threshold } => run_eval(&suite, threshold),
+        Command::CheckVersions => check_versions(),
+    }
+}
+
+/// Reads `[workspace.package] version` from a root `Cargo.toml`.
+fn workspace_version(toml: &str) -> Option<String> {
+    let mut in_section = false;
+    for line in toml.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_section = t == "[workspace.package]";
+            continue;
+        }
+        if in_section {
+            if let Some(rest) = t.strip_prefix("version") {
+                if let Some(val) = rest.trim_start().strip_prefix('=') {
+                    return Some(val.trim().trim_matches('"').to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// True when `[package.metadata.bundle]` hardcodes its own `version`, which
+/// silently drifts from the workspace (it should inherit `version.workspace`).
+fn bundle_hardcodes_version(toml: &str) -> bool {
+    let mut in_bundle = false;
+    for line in toml.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        if t.starts_with('[') {
+            in_bundle = t == "[package.metadata.bundle]";
+            continue;
+        }
+        if in_bundle && t.strip_prefix("version").is_some_and(|r| r.trim_start().starts_with('=')) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Finds `<key><sep>value` on its own line (e.g. `pkgver=` or `pkgver = `),
+/// returning the trimmed value. Handles the leading-tab `.SRCINFO` form.
+fn line_value(text: &str, key: &str) -> Option<String> {
+    text.lines().find_map(|l| {
+        // Accept either `key=value` (PKGBUILD) or `key = value` (.SRCINFO).
+        let rest = l.trim().strip_prefix(key)?.trim_start();
+        let rest = rest.strip_prefix('=').unwrap_or(rest);
+        Some(rest.trim().to_owned())
+    })
+}
+
+/// Asserts that the AUR PKGBUILD/.SRCINFO `pkgver` and the absence of a
+/// hardcoded bundle version all agree with `[workspace.package] version`.
+///
+/// # Errors
+///
+/// Returns an error (and prints each offender) when any source disagrees, so
+/// `cargo xtask check-versions` can gate CI against version drift.
+fn check_versions() -> Result<()> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .context("xtask crate has no parent (workspace root)")?
+        .to_path_buf();
+    let read = |rel: &str| -> Result<String> {
+        let p = root.join(rel);
+        std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))
+    };
+
+    let want = workspace_version(&read("Cargo.toml")?)
+        .context("[workspace.package] version not found in Cargo.toml")?;
+
+    let mut errs: Vec<String> = Vec::new();
+    let mut check_pkgver = |rel: &str, key: &str| match read(rel).map(|s| line_value(&s, key)) {
+        Ok(Some(v)) if v == want => {}
+        Ok(Some(v)) => errs.push(format!("{rel}: pkgver {v} != workspace {want}")),
+        Ok(None) => errs.push(format!("{rel}: no `{key}` line")),
+        Err(e) => errs.push(format!("{rel}: {e}")),
+    };
+    check_pkgver("assets/PKGBUILD", "pkgver");
+    check_pkgver("assets/.SRCINFO", "pkgver");
+
+    if read("term/bin/smedja/Cargo.toml").is_ok_and(|s| bundle_hardcodes_version(&s)) {
+        errs.push(
+            "term/bin/smedja/Cargo.toml: [package.metadata.bundle] hardcodes `version` — \
+             remove it so the bundle tracks version.workspace"
+                .to_owned(),
+        );
+    }
+
+    if errs.is_empty() {
+        println!("version check OK — all sources agree on {want}");
+        Ok(())
+    } else {
+        for e in &errs {
+            eprintln!("\u{2717} {e}");
+        }
+        anyhow::bail!("{} version mismatch(es)", errs.len())
     }
 }
 
