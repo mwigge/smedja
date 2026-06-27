@@ -79,6 +79,8 @@ fn parse_role(s: &str) -> Option<AgentRole> {
         "test" => Some(AgentRole::Test),
         "review" => Some(AgentRole::Review),
         "sre" => Some(AgentRole::Sre),
+        "data" | "sql" => Some(AgentRole::Data),
+        "iac" | "infra" => Some(AgentRole::Iac),
         "orchestrator" => Some(AgentRole::Orchestrator),
         _ => None,
     }
@@ -130,6 +132,9 @@ mod tests {
         assert_eq!(parse_role("ask"), Some(AgentRole::Ask));
         assert_eq!(parse_role("review"), Some(AgentRole::Review));
         assert_eq!(parse_role("orchestrator"), Some(AgentRole::Orchestrator));
+        assert_eq!(parse_role("sql"), Some(AgentRole::Data));
+        assert_eq!(parse_role("iac"), Some(AgentRole::Iac));
+        assert_eq!(parse_role("infra"), Some(AgentRole::Iac));
         assert_eq!(parse_role("bogus"), None);
     }
 

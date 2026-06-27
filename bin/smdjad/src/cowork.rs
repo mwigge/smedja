@@ -301,6 +301,29 @@ impl CoworkGate {
         }
     }
 
+    /// Like [`Self::gate_tool`] but always suspends for a human decision,
+    /// ignoring the mode's allow/auto — for high-risk roles (IaC) whose
+    /// mutations must be confirmed even under AcceptEdits/Auto.
+    pub async fn gate_tool_forced_ask(
+        &self,
+        step_n: u32,
+        tool: &str,
+        args_scrubbed: serde_json::Value,
+        reasoning: &str,
+    ) -> Decision {
+        self.intercept(
+            ApprovalPrompt {
+                step_n,
+                tool: tool.to_owned(),
+                args_scrubbed,
+                reasoning: reasoning.to_owned(),
+                plan_summary: String::new(),
+            },
+            30 * 60,
+        )
+        .await
+    }
+
     /// The gate's current permission mode.
     pub async fn mode(&self) -> PermissionMode {
         *self.mode.lock().await
