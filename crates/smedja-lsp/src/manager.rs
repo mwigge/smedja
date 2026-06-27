@@ -94,6 +94,9 @@ pub struct LspManager {
     rx: watch::Receiver<LspSnapshot>,
     /// Handle to the `run_all` background task; aborted on `shutdown()`.
     runner: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The workspace the servers are currently rooted at, so re-rooting can be a
+    /// no-op when unchanged.
+    current_ws: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl Default for LspManager {
@@ -112,6 +115,7 @@ impl LspManager {
             tx,
             rx,
             runner: std::sync::Mutex::new(None),
+            current_ws: std::sync::Mutex::new(None),
         }
     }
 
@@ -130,11 +134,28 @@ impl LspManager {
     /// Detects servers available on `$PATH` and starts them for `workspace`.
     /// Returns immediately; all I/O runs in background tokio tasks.
     pub fn start(&self, workspace: PathBuf) {
+        *self.current_ws.lock().unwrap_or_else(|e| e.into_inner()) = Some(workspace.clone());
         let tx = self.tx.clone();
         let handle = tokio::spawn(async move {
             run_all(workspace, tx).await;
         });
         *self.runner.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    }
+
+    /// Re-roots the language servers at `workspace` when it differs from the
+    /// current root (a no-op otherwise). Used when the daemon learns a session's
+    /// real project directory — it boots rooted at the daemon cwd (often `$HOME`,
+    /// where no project markers exist, so nothing starts), and this points it at
+    /// the actual repo so e.g. rust-analyzer starts for a `Cargo.toml` project.
+    pub fn ensure_workspace(&self, workspace: PathBuf) {
+        {
+            let cur = self.current_ws.lock().unwrap_or_else(|e| e.into_inner());
+            if cur.as_deref() == Some(workspace.as_path()) {
+                return;
+            }
+        }
+        self.shutdown();
+        self.start(workspace);
     }
 
     /// Aborts the background server manager and all child processes.
