@@ -1,7 +1,7 @@
 # Maintainer: Morgan Wigge <morgan@wigge.nu>
 # To release: bump pkgver, run updpkgsums, then makepkg --printsrcinfo > .SRCINFO && git push
 pkgname=smedja
-pkgver=0.20.1
+pkgver=0.20.2
 pkgrel=1
 pkgdesc="GPU-accelerated terminal emulator and AI orchestration forge"
 arch=('x86_64' 'aarch64')
@@ -14,7 +14,7 @@ provides=('smedja')
 
 source_x86_64=("smedja-linux-x86_64.tar.gz::https://github.com/mwigge/smedja/releases/download/v${pkgver}/smedja-linux-x86_64.tar.gz")
 source_aarch64=("smedja-linux-aarch64.tar.gz::https://github.com/mwigge/smedja/releases/download/v${pkgver}/smedja-linux-aarch64.tar.gz")
-sha256sums_x86_64=('f96d51331341971bed604d63879fab860b4f8b3f24c466f2eb6e5f832b474174')
+sha256sums_x86_64=('3c39b8a03738e5e34ec5530c05063c2cd987cd8d95919c816ed6badc19ac58e3')
 sha256sums_aarch64=('SKIP')
 
 package() {
