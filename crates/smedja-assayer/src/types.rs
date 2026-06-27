@@ -28,6 +28,21 @@ pub enum AgentRole {
 }
 
 impl AgentRole {
+    /// Whether this role is read-only: it must never mutate the workspace
+    /// (write/edit/shell), regardless of the session permission mode. Used to
+    /// hard-deny mutating tool calls for analysis/planning/research roles.
+    #[must_use]
+    pub fn is_read_only(self) -> bool {
+        matches!(
+            self,
+            AgentRole::Plan
+                | AgentRole::Research
+                | AgentRole::Review
+                | AgentRole::Ask
+                | AgentRole::Orchestrator
+        )
+    }
+
     /// Lowercase identifier for the role (used for routing rationale, role-skill
     /// file lookup, etc.).
     #[must_use]

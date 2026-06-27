@@ -221,6 +221,22 @@ mod tests {
     // ------------------------------------------------------------------ tests
 
     #[test]
+    fn read_only_roles_are_classified() {
+        for r in [
+            AgentRole::Plan,
+            AgentRole::Research,
+            AgentRole::Review,
+            AgentRole::Ask,
+            AgentRole::Orchestrator,
+        ] {
+            assert!(r.is_read_only(), "{} should be read-only", r.label());
+        }
+        for r in [AgentRole::Impl, AgentRole::Debug, AgentRole::Test, AgentRole::Sre] {
+            assert!(!r.is_read_only(), "{} should be able to mutate", r.label());
+        }
+    }
+
+    #[test]
     fn new_roles_route_to_expected_client_and_tier() {
         let a = Assayer::default_rules();
         // Planning / research / debug / orchestration → claude/deep.

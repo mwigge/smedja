@@ -945,7 +945,19 @@ impl TurnOrchestrator {
                     // AcceptEdits are toggled from the TUI (cowork.set_mode).
                     // The gate is created on demand so gating works without an
                     // explicit `/cowork on`.
-                    let cowork_denied = {
+                    let cowork_denied = if role.is_read_only()
+                        && crate::cowork::evaluate(
+                            crate::cowork::PermissionMode::Plan,
+                            &tool_name,
+                        ) == crate::cowork::PermissionDecision::Deny
+                    {
+                        // Read-only roles (plan/research/review/ask/orchestrator)
+                        // can never mutate, regardless of the permission mode.
+                        Some(format!(
+                            "denied: the {} role is read-only and cannot run {tool_name}",
+                            role.label()
+                        ))
+                    } else {
                         let gate = {
                             let mut g = gates.lock().await;
                             Arc::clone(
