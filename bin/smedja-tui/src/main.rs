@@ -675,8 +675,16 @@ pub(crate) async fn submit(input: &str, state: &mut AppState, client: &mut Clien
             tokio::spawn(start_stream_reader(sock, tid, tx));
 
             // "queued" is operational noise — route it to the actions log, not
-            // the message box (keeps the conversation clean).
-            push_action_log(state, format!("queued (task: {task_id})"));
+            // the message box (keeps the conversation clean). Lead with the
+            // session id (same 12-char form as the session rail) so the queued
+            // task can be tied back to its session; the task id is a separate
+            // per-turn handle and is shown short, after.
+            let sid = &state.session_id[..state.session_id.len().min(12)];
+            let short_task = &task_id[..task_id.len().min(8)];
+            push_action_log(
+                state,
+                format!("queued · session {sid} · task {short_task}"),
+            );
             None
         }
         Err(ref e) => Some(format!("error: {e}")),
@@ -3691,10 +3699,18 @@ async fn main() -> Result<()> {
                             }
                         }
                         // Dragging extends the selection to the cell under cursor.
+                        // Dragging past the top/bottom edge auto-scrolls so a
+                        // selection can run beyond the visible region.
                         MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
                             if state.selection_mode {
-                                if let Some(pos) =
-                                    state.main_panel.pos_at(mouse_ev.column, mouse_ev.row)
+                                if state.main_panel.row_above(mouse_ev.row) {
+                                    state.main_panel.scroll_up();
+                                } else if state.main_panel.row_below(mouse_ev.row) {
+                                    state.main_panel.scroll_down();
+                                }
+                                if let Some(pos) = state
+                                    .main_panel
+                                    .pos_at_clamped(mouse_ev.column, mouse_ev.row)
                                 {
                                     state.selection_end = pos;
                                 }

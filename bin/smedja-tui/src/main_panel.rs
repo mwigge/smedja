@@ -700,6 +700,35 @@ impl MainPanel {
         Some((line, col.min(ce)))
     }
 
+    /// Like [`Self::pos_at`], but clamps the pointer into the panel so a drag
+    /// that runs past the top or bottom edge still resolves to the first/last
+    /// visible position. Returns `None` only before the panel has an area.
+    /// Used together with [`Self::row_above`]/[`Self::row_below`] for
+    /// auto-scrolling drag-selection.
+    #[must_use]
+    pub fn pos_at_clamped(&self, x: u16, y: u16) -> Option<(usize, usize)> {
+        let r = self.last_inner;
+        if r.width == 0 || r.height == 0 {
+            return None;
+        }
+        let cy = y.clamp(r.y, r.y + r.height - 1);
+        self.pos_at(x.max(r.x), cy)
+    }
+
+    /// True when row `y` sits above the panel's visible area (drag past the top).
+    #[must_use]
+    pub fn row_above(&self, y: u16) -> bool {
+        let r = self.last_inner;
+        r.height != 0 && y < r.y
+    }
+
+    /// True when row `y` sits below the panel's visible area (drag past the bottom).
+    #[must_use]
+    pub fn row_below(&self, y: u16) -> bool {
+        let r = self.last_inner;
+        r.height != 0 && y >= r.y + r.height
+    }
+
     /// Number of characters in logical line `idx` (0 if out of range) — lets the
     /// keyboard visual mode select whole lines by column.
     #[must_use]
