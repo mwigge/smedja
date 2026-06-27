@@ -742,6 +742,17 @@ impl TurnOrchestrator {
                 None,
             );
 
+            // The session's permission mode (default Ask), threaded so external
+            // CLIs that can't gate per-tool (codex) can still map it to a
+            // sandbox level.
+            let perm_mode = {
+                let gate = gates.lock().await.get(&session_id).cloned();
+                match gate {
+                    Some(g) => g.mode().await.as_str().to_owned(),
+                    None => crate::cowork::PermissionMode::default().as_str().to_owned(),
+                }
+            };
+
             let mut opts = CallOptions {
                 model: entry_model.clone(),
                 max_tokens: Some(2048),
@@ -754,6 +765,7 @@ impl TurnOrchestrator {
                 },
                 provider_session_id,
                 smedja_session_id: Some(session_id.clone()),
+                permission_mode: Some(perm_mode),
                 stable_prefix_len,
                 cache_strategy,
             };
