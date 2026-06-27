@@ -301,6 +301,26 @@ pub(crate) async fn dispatch_slash(
         "tier" => {
             let text = apply_tier(args, state);
             push_system_message(state, text);
+            // Make the tier meaningful: ask the daemon to resolve (runner, tier)
+            // → model and pin it, so turns actually run on the chosen tier's
+            // model (and it persists across restarts).
+            if matches!(args, "fast" | "deep" | "local") {
+                match client
+                    .call(
+                        "session.set_tier",
+                        json!({ "session_id": state.session_id, "tier": args }),
+                    )
+                    .await
+                {
+                    Ok(v) => {
+                        if let Some(m) = v.get("model").and_then(Value::as_str) {
+                            state.model = Some(m.to_owned());
+                            push_system_message(state, format!("model → {m}"));
+                        }
+                    }
+                    Err(e) => push_system_message(state, format!("session.set_tier error: {e}")),
+                }
+            }
             Ok(true)
         }
         // `/memory` lists this session's stored memory (the long-term turn
