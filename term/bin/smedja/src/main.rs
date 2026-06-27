@@ -1722,12 +1722,20 @@ fn encode_key(
     if kbd_flags != 0 && any_mod {
         match key {
             Key::Character(s) => {
-                if let Some(c) = s.chars().next() {
-                    // Report the base (unshifted) codepoint; the shift state is
-                    // carried in the modifier field.
-                    let cp = c.to_ascii_lowercase() as u32;
-                    return Some(format!("\x1b[{cp};{modifier}u").into_bytes());
+                // Shift alone on a printable key is *consumed* into the shifted
+                // glyph (Shift+a → "A"), so it must be sent as literal text — only
+                // Ctrl/Alt/Super need CSI-u disambiguation. Encoding shift-only as
+                // `base-codepoint;shift u` made the receiving app insert the
+                // unshifted (lowercase) character — i.e. no capital letters.
+                if ctrl || alt || sup {
+                    if let Some(c) = s.chars().next() {
+                        // Base (unshifted) codepoint; modifiers in the field.
+                        let cp = c.to_ascii_lowercase() as u32;
+                        return Some(format!("\x1b[{cp};{modifier}u").into_bytes());
+                    }
                 }
+                // Shift-only (or no recognised char): fall through to legacy,
+                // which emits the actual shifted text bytes.
             }
             Key::Named(named) => {
                 if let Some(cp) = kitty_functional_codepoint(named) {
@@ -2090,5 +2098,24 @@ mod tests {
         // No modifiers → falls through to the legacy base encoding.
         let bytes = encode_key(&Key::Named(NamedKey::Enter), false, false, false, false, 1);
         assert_eq!(bytes, Some(b"\r".to_vec()));
+    }
+
+    #[test]
+    fn shift_letter_sends_uppercase_text_in_kitty_mode() {
+        use super::encode_key;
+        use winit::keyboard::{Key, SmolStr};
+        // Shift+A in kitty mode must send the literal "A", not `CSI 97;2 u`,
+        // otherwise the receiving app inserts a lowercase 'a' (no capitals).
+        let bytes = encode_key(&Key::Character(SmolStr::new("A")), true, false, false, false, 1);
+        assert_eq!(bytes, Some(b"A".to_vec()));
+    }
+
+    #[test]
+    fn ctrl_shift_letter_still_uses_csi_u_in_kitty_mode() {
+        use super::encode_key;
+        use winit::keyboard::{Key, SmolStr};
+        // Ctrl+Shift+A → CSI 97 ; 6 u (a=97, ctrl+shift mod = 1+1+4 = 6).
+        let bytes = encode_key(&Key::Character(SmolStr::new("A")), true, false, true, false, 1);
+        assert_eq!(bytes, Some(b"\x1b[97;6u".to_vec()));
     }
 }
