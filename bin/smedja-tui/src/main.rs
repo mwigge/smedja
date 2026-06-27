@@ -643,9 +643,8 @@ pub(crate) async fn submit(input: &str, state: &mut AppState, client: &mut Clien
     };
     // Author chip + message body. Reset the assistant chip latch so the next
     // response emits its own "▌ <runner>" boundary on a fresh line.
-    state
-        .main_panel
-        .push_styled_line(author_chip("you", palette().accent, state.no_color));
+    let you_accent = palette().accent;
+    push_author_chip(&mut state.main_panel, "you", you_accent, state.no_color);
     state.main_panel.push_line(user_msg.text.clone());
     state.assistant_open = false;
     state.messages.push(user_msg);
@@ -898,6 +897,16 @@ pub(crate) fn format_tool_detail(name: &str, full: &str) -> Vec<String> {
 /// Builds an author chip line (`▌ you` / `▌ claude`) marking a turn boundary so
 /// messages have clear authorship. Pushed on its own line; the message body
 /// follows beneath it.
+/// Pushes an author chip, preceded by a blank spacer line (a turn separator)
+/// when the panel already has content — so successive turns read as distinct
+/// blocks instead of one running mass of text.
+fn push_author_chip(panel: &mut main_panel::MainPanel, label: &str, color: Color, no_color: bool) {
+    if !panel.is_empty() {
+        panel.push_styled_line(Line::from(""));
+    }
+    panel.push_styled_line(author_chip(label, color, no_color));
+}
+
 fn author_chip(label: &str, color: Color, no_color: bool) -> Line<'static> {
     let style = if no_color {
         Style::default().add_modifier(Modifier::BOLD)
@@ -3853,11 +3862,7 @@ async fn main() -> Result<()> {
                             if !state.assistant_open {
                                 let color = theme::runner_color(&state.runner);
                                 let label = theme::runner_label(&state.runner).to_lowercase();
-                                state.main_panel.push_styled_line(author_chip(
-                                    &label,
-                                    color,
-                                    state.no_color,
-                                ));
+                                push_author_chip(&mut state.main_panel, &label, color, state.no_color);
                                 state.main_panel.push_line(String::new());
                                 state.assistant_open = true;
                             }
