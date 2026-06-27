@@ -71,7 +71,11 @@ pub fn load_rules(workspace_dir: &Path) -> Result<Vec<RoutingRule>, String> {
 
 fn parse_role(s: &str) -> Option<AgentRole> {
     match s {
-        "impl" => Some(AgentRole::Impl),
+        "impl" | "code" => Some(AgentRole::Impl),
+        "plan" => Some(AgentRole::Plan),
+        "research" => Some(AgentRole::Research),
+        "debug" => Some(AgentRole::Debug),
+        "ask" => Some(AgentRole::Ask),
         "test" => Some(AgentRole::Test),
         "review" => Some(AgentRole::Review),
         "sre" => Some(AgentRole::Sre),
@@ -114,6 +118,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rules = load_rules(dir.path()).unwrap();
         assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn parse_role_covers_the_full_role_set() {
+        assert_eq!(parse_role("code"), Some(AgentRole::Impl));
+        assert_eq!(parse_role("impl"), Some(AgentRole::Impl));
+        assert_eq!(parse_role("plan"), Some(AgentRole::Plan));
+        assert_eq!(parse_role("research"), Some(AgentRole::Research));
+        assert_eq!(parse_role("debug"), Some(AgentRole::Debug));
+        assert_eq!(parse_role("ask"), Some(AgentRole::Ask));
+        assert_eq!(parse_role("review"), Some(AgentRole::Review));
+        assert_eq!(parse_role("orchestrator"), Some(AgentRole::Orchestrator));
+        assert_eq!(parse_role("bogus"), None);
     }
 
     #[test]

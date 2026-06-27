@@ -86,14 +86,23 @@ impl Assayer {
                     Some(Complexity::Complex),
                     claude_deep(),
                 ),
+                // Plan × * → Claude/Deep (architecture/planning wants the strong model)
+                RoutingRule::new(Some(AgentRole::Plan), None, claude_deep()),
+                // Research × * → Claude/Deep (web/pdf/vision + synthesis)
+                RoutingRule::new(Some(AgentRole::Research), None, claude_deep()),
+                // Debug × * → Claude/Deep (tracing root causes benefits from depth)
+                RoutingRule::new(Some(AgentRole::Debug), None, claude_deep()),
+                // Ask × * → Local/Fast (read-only Q&A, latency over depth)
+                RoutingRule::new(Some(AgentRole::Ask), None, claude_fast()),
                 // Test × * → Local/Local
                 RoutingRule::new(Some(AgentRole::Test), None, local()),
                 // Review × * → Claude/Deep
                 RoutingRule::new(Some(AgentRole::Review), None, claude_deep()),
                 // Sre × * → Claude/Deep
                 RoutingRule::new(Some(AgentRole::Sre), None, claude_deep()),
-                // Orchestrator × * → Claude/Fast
-                RoutingRule::new(Some(AgentRole::Orchestrator), None, claude_fast()),
+                // Orchestrator × * → Claude/Deep (planning + delegation; the
+                // "orchestration on deep, implementation on local" split)
+                RoutingRule::new(Some(AgentRole::Orchestrator), None, claude_deep()),
             ],
         }
     }
@@ -155,6 +164,10 @@ impl Assayer {
 fn role_label(role: AgentRole) -> &'static str {
     match role {
         AgentRole::Impl => "impl",
+        AgentRole::Plan => "plan",
+        AgentRole::Research => "research",
+        AgentRole::Debug => "debug",
+        AgentRole::Ask => "ask",
         AgentRole::Test => "test",
         AgentRole::Review => "review",
         AgentRole::Sre => "sre",
@@ -216,6 +229,18 @@ mod tests {
     // ------------------------------------------------------------------ tests
 
     #[test]
+    fn new_roles_route_to_expected_client_and_tier() {
+        let a = Assayer::default_rules();
+        // Planning / research / debug / orchestration → claude/deep.
+        assert_eq!(a.route(AgentRole::Plan, Complexity::Coding), claude_deep());
+        assert_eq!(a.route(AgentRole::Research, Complexity::Simple), claude_deep());
+        assert_eq!(a.route(AgentRole::Debug, Complexity::Complex), claude_deep());
+        assert_eq!(a.route(AgentRole::Orchestrator, Complexity::Coding), claude_deep());
+        // Ask is read-only Q&A → claude/fast (latency over depth).
+        assert_eq!(a.route(AgentRole::Ask, Complexity::Simple), claude_fast());
+    }
+
+    #[test]
     fn impl_simple_routes_to_local() {
         let assayer = Assayer::default_rules();
         assert_eq!(
@@ -260,19 +285,21 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_routes_to_claude_fast() {
+    fn orchestrator_routes_to_claude_deep() {
+        // Orchestration plans + delegates, so it runs on the strong model
+        // (the "orchestration on deep, implementation on local" split).
         let assayer = Assayer::default_rules();
         assert_eq!(
             assayer.route(AgentRole::Orchestrator, Complexity::Simple),
-            claude_fast()
+            claude_deep()
         );
         assert_eq!(
             assayer.route(AgentRole::Orchestrator, Complexity::Coding),
-            claude_fast()
+            claude_deep()
         );
         assert_eq!(
             assayer.route(AgentRole::Orchestrator, Complexity::Complex),
-            claude_fast()
+            claude_deep()
         );
     }
 

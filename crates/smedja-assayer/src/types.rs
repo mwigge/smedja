@@ -7,8 +7,16 @@ pub const MAX_ROLE_DEPTH: u8 = 4;
 /// The agent role that determines routing behaviour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentRole {
-    /// Implements features and fixes bugs.
+    /// Implements features and fixes bugs (the "Code" role).
     Impl,
+    /// Designs architecture and writes an implementation plan; makes no edits.
+    Plan,
+    /// Gathers information from the web, PDFs, and images. Read-only + network.
+    Research,
+    /// Troubleshoots, traces, and fixes issues.
+    Debug,
+    /// Answers questions about the codebase without touching files.
+    Ask,
     /// Writes and validates tests.
     Test,
     /// Reviews code for correctness and style.
