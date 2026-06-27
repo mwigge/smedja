@@ -74,7 +74,7 @@ Type a `/` in the input bar to open the autocomplete popup. Commands are filtere
 | `/switch` | Open an interactive runner picker |
 | `/switch <runner>` | Switch to the named runner immediately |
 | `/takeover <runner>` | Fork the current session to a new runner (keeps history) |
-| `/tier <t>` | Set the routing tier: `local`, `fast`, or `deep` |
+| `/tier <t>` | Set the routing tier: `local`, `fast`, or `deep`. Resolves the runner's model for that tier and pins it as the session model; the last runner + tier persist across restarts |
 | `/login` | Authenticate with the current runner (OAuth / API key flow) |
 
 ### Loop Engine
@@ -86,14 +86,19 @@ Type a `/` in the input bar to open the autocomplete popup. Commands are filtere
 | `/loop create <goal>` | Start a new loop for the given goal |
 | `/loop cancel` | Cancel the running loop |
 
-### Agent and Cowork
+### Roles, Approval, and Cowork
 
 | Command | Description |
 |---------|-------------|
-| `/agent` | List available named agents |
-| `/agent <id>` | Run the named agent |
-| `/approve` | List pending cowork items |
-| `/approve <id>` | Approve the named cowork item |
+| `/agent` | List roles |
+| `/agent <role>` | Set the active role: `code`/`impl`, `plan`, `research`, `debug`, `ask`, `review`, `test`, `sre`, `data`, `iac`, `orchestrator`. Each routes to a default `(client, tier)` and auto-loads `.smedja/roles/<role>.md` |
+| `/cowork on\|off\|status` | Toggle / inspect cowork approval mode |
+| `/approve` | List pending approvals |
+| `/approve <id>` | Approve a pending approval (or use the inline `y`/`n`/`m` widget) |
+
+**Approval** — mutating tool calls gate by default (ask-on-mutation) for every client. A pending approval shows an inline widget: `y` approve, `n` deny, `m` modify. Reads always pass; read-only roles can never mutate; `iac` always confirms.
+
+**Permission mode** — cycle with **Shift-Tab**: `ask → accept_edits → plan → auto`.
 
 ### Code and Review
 
@@ -153,7 +158,7 @@ Fragments are expanded daemon-side when the turn is received. They let you injec
 | `@shell <cmd>` | The stdout of a shell command. When cowork mode is on, the command pauses for approval before running. |
 
 > **Note:** `@shell` fragments are expanded daemon-side before the turn is submitted to the model.
-> Cowork approval gates `@shell` execution at submission time, not during turn tool-call execution.
+> `@shell` is gated at submission time. Separately, the agent's own tool calls during a turn are gated by the permission policy (ask-on-mutation by default) — see **Roles, Approval, and Cowork** above.
 
 ---
 
@@ -174,7 +179,9 @@ The input bar is a line editor with Emacs-style movement and a kill ring.
 | `Ctrl-K` | Kill from cursor to end of line (push text to kill ring) |
 | `Ctrl-U` | Kill from start of line to cursor (push text to kill ring) |
 | `Ctrl-Y` | Yank the most recent kill ring entry at the cursor |
-| `Esc` | Enter scroll / normal mode |
+| `Shift-Tab` | Cycle the permission mode: `ask → accept_edits → plan → auto` |
+| paste | Bracketed paste — multi-line text inserts as one edit (no premature submit) |
+| `Esc` | Interrupt the in-flight turn if one is running; otherwise enter scroll / normal mode |
 
 The kill ring holds up to 16 entries (VecDeque, oldest dropped on overflow). `Ctrl-Y` always yanks the most recent entry.
 
