@@ -24,6 +24,7 @@ use crate::{ingot_err, missing_param};
 #[allow(clippy::too_many_lines)] // session bootstrap + background index kept inline
 pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, RpcError> {
     let ig = state.ingot;
+    let lsp_manager = Arc::clone(&state.lsp_manager);
     let startup_runner = state.startup_runner;
     let startup_model = state.startup_model;
     let title = params
@@ -40,6 +41,13 @@ pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, 
         .get("cowork_mode")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // The client's working directory (the project repo). Stored on the session
+    // and used to root the LSP + code-graph, instead of the daemon's cwd.
+    let workspace = params
+        .get("workspace")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     let task_description: Option<String> = params
         .get("task_description")
         .and_then(Value::as_str)
@@ -77,7 +85,7 @@ pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, 
         mode,
         title: title.clone().unwrap_or_default(),
         cowork_mode,
-        workspace_root: None,
+        workspace_root: workspace.clone(),
         model_override: None,
         runner_override: None,
     };
@@ -86,8 +94,15 @@ pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, 
         .await
         .map_err(|e| ingot_err(&e))?;
 
-    // Auto-index: check workspace.toml in cwd; if stale, index in background.
-    maybe_reindex_workspace(crate::common::workspace_root());
+    // Root the LSP and the auto-index at the client's workspace (its repo),
+    // falling back to the daemon cwd when none was supplied. This is what makes
+    // rust-analyzer start for the project and the graph reflect the right repo,
+    // instead of the daemon's $HOME.
+    let ws_path = workspace
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::common::workspace_root);
+    lsp_manager.ensure_workspace(ws_path.clone());
+    maybe_reindex_workspace(ws_path);
 
     // When cowork_mode is requested, register the per-session gate.
     // The gate map is owned by build_router; session.create handles the DB flag

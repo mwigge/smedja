@@ -353,6 +353,9 @@ pub(crate) async fn dispatch_slash(
                         .and_then(Value::as_str)
                         .unwrap_or(&workspace);
                     state.graph_symbols = usize::try_from(n).ok();
+                    // Remember this as the workspace whose graph status the
+                    // right-bar tracks (survives across the rest of the session).
+                    state.graph_workspace = Some(ws.to_owned());
                     format!(
                         "\u{25c6} code graph: {n} symbols indexed ({ws}) — auto-injected into agent context"
                     )

@@ -292,6 +292,9 @@ pub(crate) struct AppState {
     /// Current permission mode (`ask`/`accept_edits`/`plan`/`auto`), cycled with
     /// Shift+Tab via `cowork.set_mode` and shown in the status bar.
     permission_mode: String,
+    /// Workspace whose code-graph status the right-bar reflects — the last
+    /// `/index <path>`, falling back to the TUI's cwd.
+    graph_workspace: Option<String>,
     /// Symbol count from the last `/index` this session (`None` = not indexed
     /// here yet). Surfaced as a code-graph status under the LSP panel.
     graph_symbols: Option<usize>,
@@ -559,8 +562,16 @@ struct ResolvedSession {
 async fn resolve_session(client: &mut Client, start: SessionStart) -> Result<ResolvedSession> {
     match start {
         SessionStart::Create => {
+            // Announce our working directory as the workspace so the daemon
+            // roots the LSP + code-graph at the project (not its own $HOME).
+            let workspace = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
             let resp = client
-                .call("session.create", json!({ "title": "smedja" }))
+                .call(
+                    "session.create",
+                    json!({ "title": "smedja", "workspace": workspace }),
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("session.create failed: {e}"))?;
             Ok(ResolvedSession {
@@ -3557,6 +3568,7 @@ async fn main() -> Result<()> {
         quit: false,
         quit_armed: false,
         permission_mode: "ask".to_owned(),
+        graph_workspace: None,
         graph_symbols: None,
         tool_details: Vec::new(),
         pending_tool: None,
@@ -4264,11 +4276,13 @@ async fn main() -> Result<()> {
             .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(5));
         if should_poll_graph {
             state.last_graph_poll = Some(std::time::Instant::now());
-            if let Ok(ws) = std::env::current_dir() {
-                if let Ok(v) = client
-                    .call("graph.status", json!({ "workspace": ws.display().to_string() }))
-                    .await
-                {
+            let ws = state.graph_workspace.clone().or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.display().to_string())
+            });
+            if let Some(ws) = ws {
+                if let Ok(v) = client.call("graph.status", json!({ "workspace": ws })).await {
                     if v.get("exists").and_then(Value::as_bool).unwrap_or(false) {
                         if let Some(n) = v.get("indexed").and_then(Value::as_u64) {
                             state.graph_symbols = usize::try_from(n).ok();
@@ -5802,6 +5816,7 @@ mod tests {
             quit: false,
             quit_armed: false,
         permission_mode: "ask".to_owned(),
+        graph_workspace: None,
             graph_symbols: None,
             tool_details: Vec::new(),
             pending_tool: None,
