@@ -199,6 +199,13 @@ const MIGRATIONS: &[(i64, &str)] = &[
          CREATE INDEX IF NOT EXISTS idx_tokens_saved_source \
              ON tokens_saved_ledger(source);",
     ),
+    // Value panel: attribute token cost to the active openspec change so the
+    // value panel can show cumulative burn per change. NULL on rows written
+    // before this migration (no change was active or smdjad was not updated).
+    (
+        25,
+        "ALTER TABLE audit_events ADD COLUMN change_name TEXT;",
+    ),
 ];
 
 /// Aggregated statistics for a single multi-agent conversation.
@@ -507,6 +514,24 @@ impl Ingot {
     #[must_use = "check the Result and inspect the returned events"]
     pub fn list_audit_events(&self, session_id: &str) -> Result<Vec<AuditEvent>, IngotError> {
         audit::list_by_session(&self.conn, session_id)
+    }
+
+    /// Returns the sum of `input_tok + output_tok` across all audit events with
+    /// the given `change_name`. Returns `Ok(0)` when no matching rows exist or when
+    /// the `change_name` column is absent on a pre-migration database.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned token total"]
+    pub fn cost_for_change(&self, change_name: &str) -> Result<u64, IngotError> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(input_tok + output_tok), 0) \
+             FROM audit_events WHERE change_name = ?1",
+            rusqlite::params![change_name],
+            |row| row.get(0),
+        )?;
+        Ok(total.max(0).cast_unsigned())
     }
 
     /// Persists a timeline event and, when the event carries a `conversation_id`,

@@ -136,6 +136,7 @@ impl RoleRunner for LoopRoleRunner {
             Arc::clone(&self.embedder),
             Arc::clone(&self.provider_sessions),
             Arc::clone(&self.cache_aligners),
+            Some(self.change_name.clone()),
         );
         // Safety: `orchestrator.run()` uses structured concurrency — `drain_stream`
         // internally awaits without spawning background tasks, so dropping the

@@ -843,6 +843,10 @@ pub(crate) async fn dispatch_slash(
             trigger_quality_review(state, client).await;
             Ok(true)
         }
+        "value" => {
+            show_value_report(state);
+            Ok(true)
+        }
         "review" => {
             let mut params = parse_review_scope(args);
 
@@ -1400,4 +1404,17 @@ pub(crate) async fn trigger_quality_review(state: &mut AppState, client: &mut Cl
             state.quality_review_in_progress = false;
         }
     }
+}
+
+/// Prints a Markdown ROI report for the active openspec change to the main panel.
+pub(crate) fn show_value_report(state: &mut AppState) {
+    let snap = &state.value_snapshot;
+    let change = snap.change_name.as_deref().unwrap_or("(no active change)");
+    let cost_dollars = snap.cost_usd_micros as f64 / 1_000_000.0;
+    let report = format!(
+        "## value report\n\n| field | value |\n|---|---|\n| change | {change} |\n| tokens | {} |\n| cost | ${cost_dollars:.4} |\n| quality avg | {}/100 |\n| roi estimate | {} (estimate) |",
+        snap.token_cost, snap.quality_avg, snap.estimated_value
+    );
+    push_system_message(state, report);
+    state.panels.value = true;
 }

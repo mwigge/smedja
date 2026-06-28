@@ -142,6 +142,7 @@ async fn webhook_alert(
             error_kind: None,
             error_count: None,
             tool_call_id: None,
+            change_name: None,
         };
         normalised.push((alert, event));
     }

@@ -67,6 +67,9 @@ pub struct AuditEvent {
     /// Tool-call identifier for correlation with tool responses.
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// Active openspec change name when this event was recorded, if any.
+    #[serde(default)]
+    pub change_name: Option<String>,
 }
 
 impl Default for AuditEvent {
@@ -95,6 +98,7 @@ impl Default for AuditEvent {
             error_kind: None,
             error_count: None,
             tool_call_id: None,
+            change_name: None,
         }
     }
 }
@@ -111,9 +115,9 @@ pub(crate) fn insert(conn: &rusqlite::Connection, event: &AuditEvent) -> Result<
          (id, ts, session_id, turn_id, action_type, actor, tool_name, \
           input_tok, output_tok, latency_ms, traceparent, tier, role_id, \
           conversation_id, trace_id, span_id, parent_span_id, \
-          agent_name, operation_name, status, error_kind, error_count, tool_call_id) \
+          agent_name, operation_name, status, error_kind, error_count, tool_call_id, change_name) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
-                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
         rusqlite::params![
             event.id.to_string(),
             event.ts.as_micros(),
@@ -138,6 +142,7 @@ pub(crate) fn insert(conn: &rusqlite::Connection, event: &AuditEvent) -> Result<
             event.error_kind,
             event.error_count,
             event.tool_call_id,
+            event.change_name,
         ],
     )?;
     Ok(())
@@ -173,6 +178,7 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEvent> {
         error_kind: row.get(20)?,
         error_count: row.get(21)?,
         tool_call_id: row.get(22)?,
+        change_name: row.get(23)?,
     })
 }
 
@@ -180,7 +186,7 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEvent> {
 const SELECT_COLS: &str = "id, ts, session_id, turn_id, action_type, actor, tool_name, \
      input_tok, output_tok, latency_ms, traceparent, tier, role_id, \
      conversation_id, trace_id, span_id, parent_span_id, \
-     agent_name, operation_name, status, error_kind, error_count, tool_call_id";
+     agent_name, operation_name, status, error_kind, error_count, tool_call_id, change_name";
 
 /// Returns all [`AuditEvent`]s for the given `session_id`, ordered by `ts` ascending.
 ///
@@ -276,6 +282,7 @@ mod tests {
             error_kind: None,
             error_count: None,
             tool_call_id: None,
+            change_name: None,
         }
     }
 
@@ -342,6 +349,7 @@ mod tests {
             error_kind: None,
             error_count: None,
             tool_call_id: None,
+            change_name: None,
         };
         ingot.insert_audit_event(&ev).unwrap();
         let results = ingot.list_audit_events("s").unwrap();
@@ -351,5 +359,56 @@ mod tests {
         assert_eq!(results[0].role_id.as_deref(), Some("test-role-id"));
         assert_eq!(results[0].conversation_id.as_deref(), Some("conv-nullable"));
         assert_eq!(results[0].trace_id.as_deref(), Some("tid-1"));
+    }
+
+    #[test]
+    fn cost_for_change_sums_tokens_by_change_name() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let mut ev = sample_event("session-x");
+        ev.change_name = Some("smedja-quality-panel".to_string());
+        ev.input_tok = 1_000;
+        ev.output_tok = 500;
+        ingot.insert_audit_event(&ev).unwrap();
+
+        let mut ev2 = sample_event("session-x");
+        ev2.change_name = Some("smedja-quality-panel".to_string());
+        ev2.input_tok = 2_000;
+        ev2.output_tok = 300;
+        ingot.insert_audit_event(&ev2).unwrap();
+
+        // Different change — must not be included.
+        let mut ev3 = sample_event("session-x");
+        ev3.change_name = Some("other-change".to_string());
+        ev3.input_tok = 9_999;
+        ev3.output_tok = 9_999;
+        ingot.insert_audit_event(&ev3).unwrap();
+
+        let total = ingot.cost_for_change("smedja-quality-panel").unwrap();
+        assert_eq!(total, 1_000 + 500 + 2_000 + 300);
+    }
+
+    #[test]
+    fn cost_for_change_returns_zero_when_no_match() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        assert_eq!(ingot.cost_for_change("no-such-change").unwrap(), 0);
+    }
+
+    #[test]
+    fn cost_for_change_ignores_null_change_name_rows() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        // Row with no change_name (pre-migration style).
+        let ev = sample_event("session-legacy");
+        ingot.insert_audit_event(&ev).unwrap();
+        assert_eq!(ingot.cost_for_change("").unwrap(), 0);
+    }
+
+    #[test]
+    fn change_name_round_trips() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let mut ev = sample_event("session-rt");
+        ev.change_name = Some("my-change".to_string());
+        ingot.insert_audit_event(&ev).unwrap();
+        let results = ingot.list_audit_events("session-rt").unwrap();
+        assert_eq!(results[0].change_name.as_deref(), Some("my-change"));
     }
 }
