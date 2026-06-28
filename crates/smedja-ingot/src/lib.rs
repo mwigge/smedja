@@ -832,6 +832,15 @@ impl Ingot {
         session::update_cowork_mode(&self.conn, session_id, enabled)
     }
 
+    /// Sets the human-readable `title` for the session identified by `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    pub fn update_session_title(&self, session_id: &str, title: &str) -> Result<(), IngotError> {
+        session::update_title(&self.conn, session_id, title)
+    }
+
     // mcp_servers ------------------------------------------------------------
 
     /// Registers (or replaces) an [`McpServer`] in the registry.

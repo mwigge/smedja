@@ -100,6 +100,20 @@ pub(crate) fn methodology_directive(
     ))
 }
 
+/// Derives a short title (≤10 words) from raw user turn content.
+///
+/// Strips any auto-injected context blocks (e.g. `<graph_symbols>`) that start
+/// after a blank line and takes the first ten whitespace-separated words of the
+/// remaining text.
+pub(crate) fn derive_title(content: &str) -> String {
+    let clean = content.split("\n\n<").next().unwrap_or(content).trim();
+    clean
+        .split_whitespace()
+        .take(10)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Owns all the shared resources needed to execute a single agent turn.
 pub(crate) struct TurnOrchestrator {
     ingot: IngotHandle,
@@ -1192,6 +1206,18 @@ impl TurnOrchestrator {
                 .map_or(0, |v| i64::try_from(v.len()).unwrap_or(i64::MAX))
         };
 
+        // 6b. Auto-generate a title for the session on the very first completed
+        // turn, if no title was set at creation time. Uses the user message
+        // (task.title) without the injected graph block, truncated to 10 words.
+        if turn_n == 0 && session.as_ref().is_none_or(|s| s.title.is_empty()) {
+            let auto_title = derive_title(&task.title);
+            if !auto_title.is_empty() {
+                if let Err(e) = ingot.update_session_title(&session_id, &auto_title).await {
+                    tracing::debug!(error = %e, "failed to auto-set session title; continuing");
+                }
+            }
+        }
+
         // 7. Record cost entry.
         {
             let cost_usd =
@@ -1996,5 +2022,32 @@ mod tests {
                 "a message changing inside the prior sealed boundary must report Mutated"
             );
         }
+    }
+
+    // --- derive_title tests ---
+
+    #[test]
+    fn derive_title_takes_first_ten_words() {
+        let input = "one two three four five six seven eight nine ten eleven twelve";
+        let title = super::derive_title(input);
+        assert_eq!(title, "one two three four five six seven eight nine ten");
+    }
+
+    #[test]
+    fn derive_title_short_input_unchanged() {
+        let title = super::derive_title("fix the bug");
+        assert_eq!(title, "fix the bug");
+    }
+
+    #[test]
+    fn derive_title_strips_graph_injection_block() {
+        let input = "refactor auth module\n\n<graph_symbols>\nsome code\n</graph_symbols>";
+        let title = super::derive_title(input);
+        assert_eq!(title, "refactor auth module");
+    }
+
+    #[test]
+    fn derive_title_empty_input_returns_empty() {
+        assert_eq!(super::derive_title(""), "");
     }
 }

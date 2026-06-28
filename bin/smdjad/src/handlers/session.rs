@@ -1,5 +1,5 @@
 //! Session RPC handlers:
-//! `session.create/list/get/delete/fork/set_model/set_runner/set_mode/`
+//! `session.create/list/get/delete/fork/set_model/set_runner/set_mode/set_title/`
 //! `context/token_usage/takeover` and `runner.list`.
 
 use std::path::PathBuf;
@@ -550,6 +550,27 @@ pub(crate) async fn set_runner(state: HandlerState, params: Value) -> Result<Val
         .await
         .map_err(|e| ingot_err(&e))?;
     Ok(json!({ "session_id": session_id, "runner": canonical }))
+}
+
+/// Handles `session.set_title`: overwrites the session's human-readable title.
+///
+/// # Errors
+///
+/// Returns an error when `session_id`/`title` is missing or the ingot write fails.
+pub(crate) async fn set_title(state: HandlerState, params: Value) -> Result<Value, RpcError> {
+    let ig = state.ingot;
+    let session_id = params["session_id"]
+        .as_str()
+        .ok_or_else(|| missing_param("session_id"))?
+        .to_owned();
+    let title = params["title"]
+        .as_str()
+        .ok_or_else(|| missing_param("title"))?
+        .to_owned();
+    ig.update_session_title(&session_id, &title)
+        .await
+        .map_err(|e| ingot_err(&e))?;
+    Ok(json!({ "session_id": session_id, "title": title }))
 }
 
 /// Handles `session.set_mode`.

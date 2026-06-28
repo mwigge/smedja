@@ -325,6 +325,23 @@ impl IngotHandle {
             .await
     }
 
+    /// Sets the human-readable `title` for a session.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPDATE, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn update_session_title(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> Result<(), IngotError> {
+        let session_id = session_id.to_owned();
+        let title = title.to_owned();
+        self.run_blocking(move |ig| ig.update_session_title(&session_id, &title))
+            .await
+    }
+
     // ── mcp_servers ──────────────────────────────────────────────────────────
 
     /// Registers (or replaces) an [`McpServer`].
