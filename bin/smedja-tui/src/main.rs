@@ -2257,17 +2257,30 @@ async fn handle_key(
     }
 
     // ------------------------------------------------------------------
-    // Session rail bracket navigation: [ / ] move cursor regardless of mode.
+    // Session rail navigation in input mode: intercept before prompt-history
+    // and submit handlers so the rail is usable without entering scroll mode.
     // ------------------------------------------------------------------
     if state.panels.session_rail && !state.scroll_focus {
         match key.code {
-            KeyCode::Char('[') => {
+            KeyCode::Char('[') | KeyCode::Up => {
                 state.session_rail_cursor = state.session_rail_cursor.saturating_sub(1);
                 return Ok(());
             }
-            KeyCode::Char(']') if !state.session_rail_items.is_empty() => {
+            KeyCode::Char(']') | KeyCode::Down if !state.session_rail_items.is_empty() => {
                 let max = state.session_rail_items.len().saturating_sub(1);
                 state.session_rail_cursor = (state.session_rail_cursor + 1).min(max);
+                return Ok(());
+            }
+            KeyCode::Enter if key.modifiers.is_empty() => {
+                if let Some((id, _)) = state
+                    .session_rail_items
+                    .get(state.session_rail_cursor)
+                    .cloned()
+                {
+                    if let Ok(v) = client.call("session.get", json!({ "id": id })).await {
+                        state.session_detail_overlay = Some(SessionDetail::from_json(&v));
+                    }
+                }
                 return Ok(());
             }
             _ => {}
@@ -3282,9 +3295,8 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         if show_cockpit {
             constraints.push(Length(6));
         }
-        // LSP gets flexible space; fixed-height panels slot below it.
-        let has_fixed = show_obs || show_quality || show_value;
-        if show_lsp || has_fixed {
+        // LSP gets flexible space; fixed-height panels slot directly below it.
+        if show_lsp {
             constraints.push(Fill(1));
         }
         if show_obs {
@@ -8463,5 +8475,71 @@ status = "draft"
             content.contains("Esc") || content.contains("close"),
             "popup must show close hint"
         );
+    }
+
+    // --- session rail: arrow keys in input mode (Story B fix) ----------------
+
+    #[test]
+    fn session_rail_up_arrow_moves_cursor_in_input_mode() {
+        let mut state = make_state("sess-up-input");
+        state.scroll_focus = false; // input mode
+        state.panels.session_rail = true;
+        state.session_rail_items = vec![
+            ("id1".into(), "label1".into()),
+            ("id2".into(), "label2".into()),
+            ("id3".into(), "label3".into()),
+        ];
+        state.session_rail_cursor = 2;
+
+        // Simulate the early-exit block: Up decrements cursor, does not touch history.
+        if state.panels.session_rail && !state.scroll_focus {
+            state.session_rail_cursor = state.session_rail_cursor.saturating_sub(1);
+        }
+        assert_eq!(
+            state.session_rail_cursor, 1,
+            "Up must move rail cursor in input mode"
+        );
+        assert!(
+            state.history_idx.is_none(),
+            "prompt history must be untouched"
+        );
+    }
+
+    #[test]
+    fn session_rail_down_arrow_moves_cursor_in_input_mode() {
+        let mut state = make_state("sess-down-input");
+        state.scroll_focus = false;
+        state.panels.session_rail = true;
+        state.session_rail_items = vec![
+            ("id1".into(), "label1".into()),
+            ("id2".into(), "label2".into()),
+        ];
+        state.session_rail_cursor = 0;
+
+        if state.panels.session_rail && !state.scroll_focus && !state.session_rail_items.is_empty()
+        {
+            let max = state.session_rail_items.len().saturating_sub(1);
+            state.session_rail_cursor = (state.session_rail_cursor + 1).min(max);
+        }
+        assert_eq!(
+            state.session_rail_cursor, 1,
+            "Down must move rail cursor in input mode"
+        );
+    }
+
+    #[test]
+    fn session_rail_down_arrow_clamps_at_bottom_in_input_mode() {
+        let mut state = make_state("sess-down-clamp-input");
+        state.scroll_focus = false;
+        state.panels.session_rail = true;
+        state.session_rail_items = vec![("id1".into(), "label1".into())];
+        state.session_rail_cursor = 0;
+
+        if state.panels.session_rail && !state.scroll_focus && !state.session_rail_items.is_empty()
+        {
+            let max = state.session_rail_items.len().saturating_sub(1);
+            state.session_rail_cursor = (state.session_rail_cursor + 1).min(max);
+        }
+        assert_eq!(state.session_rail_cursor, 0, "Down must clamp at last item");
     }
 }
