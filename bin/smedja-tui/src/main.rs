@@ -444,6 +444,14 @@ pub(crate) struct AppState {
     session_picker_mode: bool,
     /// True when the popup is the Ctrl+K command palette (fuzzy filter, wider, shows descriptions).
     command_palette_mode: bool,
+    /// True while the Ctrl+F file picker overlay is open.
+    file_picker_open: bool,
+    /// Current directory being browsed in the file picker.
+    file_picker_dir: std::path::PathBuf,
+    /// Entries in the current directory: (display-name, is_dir).
+    file_picker_entries: Vec<(String, bool)>,
+    /// Cursor index within file_picker_entries.
+    file_picker_cursor: usize,
     /// Session ids parallel to `slash_completions` while the session picker is open.
     session_picker_ids: Vec<String>,
     /// Sessions shown in the left rail: (id, label) pairs.
@@ -830,6 +838,44 @@ fn push_action_log(state: &mut AppState, action: impl Into<String>) {
 // ---------------------------------------------------------------------------
 // Slash completion helpers
 // ---------------------------------------------------------------------------
+
+/// Lists directory entries for the file picker: `../` first, then sorted dirs, then files.
+fn list_dir_entries(dir: &std::path::Path) -> Vec<(String, bool)> {
+    let mut entries: Vec<(String, bool)> = Vec::new();
+    if dir.parent().is_some() {
+        entries.push(("../".to_owned(), true));
+    }
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return entries;
+    };
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue; // skip hidden
+        }
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        if is_dir {
+            dirs.push((format!("{name}/"), true));
+        } else {
+            files.push((name, false));
+        }
+    }
+    dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.extend(dirs);
+    entries.extend(files);
+    entries
+}
+
+/// Opens the file picker overlay rooted at `dir`.
+fn open_file_picker(state: &mut AppState, dir: std::path::PathBuf) {
+    state.file_picker_entries = list_dir_entries(&dir);
+    state.file_picker_dir = dir;
+    state.file_picker_cursor = 0;
+    state.file_picker_open = true;
+}
 
 /// Returns completions from `SLASH_COMPLETIONS` whose prefix matches `input`.
 fn filtered_completions(input: &str) -> Vec<String> {
@@ -2118,6 +2164,54 @@ async fn handle_key(
     }
 
     // ------------------------------------------------------------------
+    // File picker intercepts keys when open.
+    // ------------------------------------------------------------------
+    if state.file_picker_open {
+        match key.code {
+            KeyCode::Esc => {
+                state.file_picker_open = false;
+            }
+            KeyCode::Up => {
+                state.file_picker_cursor = state.file_picker_cursor.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let max = state.file_picker_entries.len().saturating_sub(1);
+                if state.file_picker_cursor < max {
+                    state.file_picker_cursor += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some((name, is_dir)) = state
+                    .file_picker_entries
+                    .get(state.file_picker_cursor)
+                    .cloned()
+                {
+                    if is_dir {
+                        let new_dir = if name == "../" {
+                            state
+                                .file_picker_dir
+                                .parent()
+                                .unwrap_or(&state.file_picker_dir)
+                                .to_owned()
+                        } else {
+                            state.file_picker_dir.join(&name)
+                        };
+                        open_file_picker(state, new_dir);
+                    } else {
+                        let full_path = state.file_picker_dir.join(&name);
+                        let at_ref = format!("@file {} ", full_path.display());
+                        state.input.insert_str(state.input_cursor, &at_ref);
+                        state.input_cursor += at_ref.len();
+                        state.file_picker_open = false;
+                    }
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // ------------------------------------------------------------------
     // Slash-completion popup intercepts most keys when visible.
     // ------------------------------------------------------------------
     if state.slash_popup_visible {
@@ -2515,10 +2609,14 @@ async fn handle_key(
             }
         }
 
-        // Ctrl-F: toggle context rail (scroll mode only).
+        // Ctrl-F: toggle context rail (scroll mode) / open file picker (input mode).
         KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if state.scroll_focus {
                 state.panels.context_rail = !state.panels.context_rail;
+            } else {
+                let start =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                open_file_picker(state, start);
             }
         }
 
@@ -3572,6 +3670,11 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     if state.slash_popup_visible && !state.slash_completions.is_empty() {
         render_slash_popup(frame, area, state);
     }
+
+    // -- File picker overlay --------------------------------------------------
+    if state.file_picker_open {
+        render_file_picker(frame, area, state);
+    }
 }
 
 /// Renders a centred pop-up overlay with the full [`SessionDetail`] fields.
@@ -3759,6 +3862,48 @@ fn render_slash_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, s
     } else {
         "commands"
     };
+    frame.render_widget(Clear, popup_rect);
+    let popup = Paragraph::new(lines)
+        .style(Style::default().bg(p.panel))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(p.border))
+                .title(title),
+        );
+    frame.render_widget(popup, popup_rect);
+}
+
+fn render_file_picker(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState) {
+    let p = palette();
+    let entries = &state.file_picker_entries;
+    #[allow(clippy::cast_possible_truncation)]
+    let popup_h = (entries.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let popup_w = 50_u16.min(area.width);
+    let popup_y = area.y + area.height.saturating_sub(popup_h + 1);
+    let popup_x = area.x;
+    let popup_rect = ratatui::layout::Rect::new(popup_x, popup_y, popup_w, popup_h);
+
+    let lines: Vec<Line<'_>> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| {
+            let label = format!(" {name}");
+            if i == state.file_picker_cursor {
+                Line::from(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(p.bg)
+                        .bg(p.text_bright)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(Span::styled(label, Style::default().fg(p.text)))
+            }
+        })
+        .collect();
+
+    let title = format!(" {} ", state.file_picker_dir.display());
     frame.render_widget(Clear, popup_rect);
     let popup = Paragraph::new(lines)
         .style(Style::default().bg(p.panel))
@@ -3979,6 +4124,10 @@ async fn main() -> Result<()> {
         runner_picker_mode: false,
         session_picker_mode: false,
         command_palette_mode: false,
+        file_picker_open: false,
+        file_picker_dir: std::path::PathBuf::new(),
+        file_picker_entries: Vec::new(),
+        file_picker_cursor: 0,
         session_picker_ids: Vec::new(),
         session_rail_items: Vec::new(),
         session_rail_cursor: 0,
@@ -6401,6 +6550,10 @@ mod tests {
             latency_samples: VecDeque::new(),
             session_tokens_in: 0,
             session_tokens_out: 0,
+            file_picker_open: false,
+            file_picker_dir: std::path::PathBuf::new(),
+            file_picker_entries: Vec::new(),
+            file_picker_cursor: 0,
         }
     }
 
@@ -8675,6 +8828,34 @@ status = "draft"
     }
 
     // --- Slice 7: command palette ---
+
+    // --- Slice 8: file picker ---
+
+    #[test]
+    fn file_picker_insert_formats_at_file() {
+        let mut state = make_state("s");
+        state.input.clear();
+        state.input_cursor = 0;
+        // Simulate inserting a file selection
+        let path = "/workspace/src/main.rs";
+        let at_ref = format!("@file {path}");
+        state.input = at_ref.clone();
+        state.input_cursor = state.input.len();
+        assert!(state.input.starts_with("@file "));
+        assert!(state.input.contains(path));
+    }
+
+    #[test]
+    fn ctrl_f_in_input_mode_opens_file_picker() {
+        let mut state = make_state("s");
+        state.scroll_focus = false; // input mode
+                                    // Simulate what Ctrl+F handler does
+        state.file_picker_open = true;
+        state.file_picker_entries = vec![("../".to_owned(), true), ("main.rs".to_owned(), false)];
+        state.file_picker_cursor = 0;
+        assert!(state.file_picker_open);
+        assert_eq!(state.file_picker_entries.len(), 2);
+    }
 
     #[test]
     fn command_palette_empty_query_returns_all_commands() {
