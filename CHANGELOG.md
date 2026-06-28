@@ -6,6 +6,14 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.20.7] — 2026-06-28
+
+### Fixed
+
+- **Codex trust check** — `codex exec` now runs with `current_dir` set to the session workspace root and `--skip-git-repo-check`, resolving the `Not inside a trusted directory` error when smdjad is rooted outside the indexed project repo.
+
+---
+
 ## [0.20.6] — 2026-06-28
 
 ### Added
