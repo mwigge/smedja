@@ -35,8 +35,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyCode, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -202,6 +202,7 @@ slash commands:
   /model [name]      — show or set model (local runner: lists GPU fit / hot-swaps)
   /pptx <slug>       — generate PowerPoint
   /quit              — exit smedja-tui
+  /quality           — trigger Tier-2 LLM quality review (Ctrl-Q hold for 500ms also fires this)
   /quota             — show usage quota
   /resume [id [turn]] — resume a session (omit id for interactive picker; turn rewinds)
   /review            — send git diff for review
@@ -465,6 +466,10 @@ pub(crate) struct AppState {
     quality_snapshot: quality_panel::QualitySnapshot,
     /// Consecutive turns with quality score < 60 (resets on score ≥ 60).
     consecutive_low_quality: u8,
+    /// Whether a Tier-2 LLM quality review is in flight.
+    quality_review_in_progress: bool,
+    /// When Ctrl-Q was first pressed; used to detect hold ≥ 500ms.
+    ctrl_q_pressed_at: Option<std::time::Instant>,
     /// Last 50 turn round-trip latencies in ms, used for p95/p99 computation.
     latency_samples: VecDeque<u64>,
     /// Cumulative input tokens for this session (updated on each turn done event).
@@ -2422,9 +2427,28 @@ async fn handle_key(
             state.panels.obs = !state.panels.obs;
         }
 
-        // Ctrl-Q: toggle quality gate panel in the right rail.
+        // Ctrl-Q: tap toggles the quality panel; hold ≥ 500ms triggers Tier-2 review.
         KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.panels.quality = !state.panels.quality;
+            match key.kind {
+                KeyEventKind::Press => {
+                    // First press: toggle panel and start timing for hold detection.
+                    state.panels.quality = !state.panels.quality;
+                    state.ctrl_q_pressed_at = Some(std::time::Instant::now());
+                }
+                KeyEventKind::Repeat => {
+                    // Key repeat fires while held; trigger review once at 500ms.
+                    if let Some(t) = state.ctrl_q_pressed_at {
+                        if t.elapsed() >= std::time::Duration::from_millis(500) {
+                            state.ctrl_q_pressed_at = None;
+                            state.panels.quality = true; // ensure panel is open
+                            slash::trigger_quality_review(state, client).await;
+                        }
+                    }
+                }
+                KeyEventKind::Release => {
+                    state.ctrl_q_pressed_at = None;
+                }
+            }
         }
 
         KeyCode::Esc => {
@@ -3714,6 +3738,8 @@ async fn main() -> Result<()> {
         obs_snapshot: obs_panel::ObsSnapshot::default(),
         quality_snapshot: quality_panel::QualitySnapshot::default(),
         consecutive_low_quality: 0,
+        quality_review_in_progress: false,
+        ctrl_q_pressed_at: None,
         latency_samples: VecDeque::new(),
         session_tokens_in: 0,
         session_tokens_out: 0,
@@ -4122,10 +4148,12 @@ async fn main() -> Result<()> {
                     Some("quality") => {
                         // Update quality panel snapshot from the post-turn gate evaluation.
                         let score = event["score"].as_u64().unwrap_or(0) as u8;
+                        let llm_reviewed = event["llm_reviewed"].as_bool().unwrap_or(false);
                         state.quality_snapshot = quality_panel::QualitySnapshot {
                             score,
                             tdd_pass: event["tdd_pass"].as_bool().unwrap_or(true),
                             clean_pass: event["clean_pass"].as_bool().unwrap_or(true),
+                            llm_reviewed,
                             file_advisories: event["file_advisories"]
                                 .as_array()
                                 .map(|a| {
@@ -4142,7 +4170,13 @@ async fn main() -> Result<()> {
                                         .collect()
                                 })
                                 .unwrap_or_default(),
+                            suggested_command: event["suggested_command"]
+                                .as_str()
+                                .map(str::to_owned),
                         };
+                        if llm_reviewed {
+                            state.quality_review_in_progress = false;
+                        }
                         // CoworkGate: two consecutive turns below 60.
                         if score < 60 {
                             state.consecutive_low_quality =
@@ -6020,6 +6054,8 @@ mod tests {
             obs_snapshot: obs_panel::ObsSnapshot::default(),
             quality_snapshot: quality_panel::QualitySnapshot::default(),
             consecutive_low_quality: 0,
+            quality_review_in_progress: false,
+            ctrl_q_pressed_at: None,
             latency_samples: VecDeque::new(),
             session_tokens_in: 0,
             session_tokens_out: 0,

@@ -185,6 +185,7 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                         clean_pass,
                         ref file_advisories,
                         ref skill_advisories,
+                        llm_reviewed,
                         ..
                     } => {
                         let Some(tid) = turn_id else { continue };
@@ -196,6 +197,7 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                                 "clean_pass": clean_pass,
                                 "file_advisories": file_advisories,
                                 "skill_advisories": skill_advisories,
+                                "llm_reviewed": llm_reviewed,
                             })
                             .to_string();
                             buf.push_back(line);
@@ -441,6 +443,7 @@ fn turn_event_to_ndjson(
             clean_pass,
             file_advisories,
             skill_advisories,
+            llm_reviewed,
             turn_id,
             ..
         } => {
@@ -451,6 +454,7 @@ fn turn_event_to_ndjson(
                 "clean_pass": clean_pass,
                 "file_advisories": file_advisories,
                 "skill_advisories": skill_advisories,
+                "llm_reviewed": llm_reviewed,
             })
             .to_string();
             (turn_id.clone(), line, false)

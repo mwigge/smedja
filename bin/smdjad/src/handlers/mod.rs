@@ -35,6 +35,7 @@ pub(crate) mod loops;
 pub(crate) mod lsp;
 pub(crate) mod mcp;
 pub(crate) mod metrics;
+pub(crate) mod quality;
 pub(crate) mod routing;
 pub(crate) mod savings;
 pub(crate) mod session;

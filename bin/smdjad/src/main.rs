@@ -23,6 +23,7 @@ pub mod orchestrator;
 pub mod price_table;
 pub mod provider_pool;
 pub mod quality_hook;
+pub mod quality_runner;
 pub mod sandbox;
 pub mod security;
 pub mod stream_server;
@@ -648,6 +649,7 @@ fn build_router(
     route!(router, "graph.query", state, handlers::graph::query);
     route!(router, "graph.status", state, handlers::graph::status);
     route!(router, "vault.reembed", state, handlers::vault::reembed);
+    route!(router, "quality.review", state, handlers::quality::review);
 
     // quota.limit — reads SMEDJA_DAILY_TOKEN_LIMIT env var; no handler state needed.
     router.register("quota.limit", |_| async {

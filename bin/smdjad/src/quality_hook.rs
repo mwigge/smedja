@@ -83,7 +83,7 @@ fn parse_quality_toml(content: &str) -> Option<usize> {
 /// Runs `git diff HEAD~1` in `workspace_root` and returns the unified diff text.
 /// Returns an empty string if git is not available or the working tree has no
 /// prior commit.
-fn git_diff(workspace_root: &Path) -> String {
+pub fn git_diff(workspace_root: &Path) -> String {
     let Ok(out) = Command::new("git")
         .args(["diff", "HEAD~1"])
         .current_dir(workspace_root)
@@ -98,6 +98,11 @@ fn git_diff(workspace_root: &Path) -> String {
 }
 
 /// Returns `(path, line_count)` pairs for files changed since `HEAD~1`.
+/// Public alias used by the `quality.review` handler.
+pub fn changed_file_sizes_for_review(workspace_root: &Path) -> Vec<(PathBuf, usize)> {
+    changed_file_sizes(workspace_root)
+}
+
 fn changed_file_sizes(workspace_root: &Path) -> Vec<(PathBuf, usize)> {
     let Ok(out) = Command::new("git")
         .args(["diff", "--name-only", "HEAD~1"])
@@ -159,6 +164,7 @@ pub fn run_after_turn(
         clean_pass: score.clean_pass,
         file_advisories,
         skill_advisories,
+        llm_reviewed: false,
         turn_id,
         correlation: CorrelationCtx::default(),
     };
