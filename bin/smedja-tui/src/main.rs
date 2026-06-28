@@ -2273,30 +2273,19 @@ async fn handle_key(
     }
 
     // ------------------------------------------------------------------
-    // Session rail navigation in input mode: intercept before prompt-history
-    // and submit handlers so the rail is usable without entering scroll mode.
+    // Session rail cursor navigation in input mode.
+    // Only Up/Down are intercepted — Enter always submits the prompt, and
+    // [ / ] are valid prompt characters. Enter opens the detail in scroll mode.
     // ------------------------------------------------------------------
     if state.panels.session_rail && !state.scroll_focus {
         match key.code {
-            KeyCode::Char('[') | KeyCode::Up => {
+            KeyCode::Up => {
                 state.session_rail_cursor = state.session_rail_cursor.saturating_sub(1);
                 return Ok(());
             }
-            KeyCode::Char(']') | KeyCode::Down if !state.session_rail_items.is_empty() => {
+            KeyCode::Down if !state.session_rail_items.is_empty() => {
                 let max = state.session_rail_items.len().saturating_sub(1);
                 state.session_rail_cursor = (state.session_rail_cursor + 1).min(max);
-                return Ok(());
-            }
-            KeyCode::Enter if key.modifiers.is_empty() => {
-                if let Some((id, _)) = state
-                    .session_rail_items
-                    .get(state.session_rail_cursor)
-                    .cloned()
-                {
-                    if let Ok(v) = client.call("session.get", json!({ "id": id })).await {
-                        state.session_detail_overlay = Some(SessionDetail::from_json(&v));
-                    }
-                }
                 return Ok(());
             }
             _ => {}
@@ -3309,14 +3298,14 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         }
         constraints.push(Length(1)); // context row
         if show_cockpit {
-            constraints.push(Length(6));
+            constraints.push(Length(5));
         }
         // LSP gets flexible space; fixed-height panels slot directly below it.
         if show_lsp {
             constraints.push(Fill(1));
         }
         if show_obs {
-            constraints.push(Length(9));
+            constraints.push(Length(6));
         }
         if show_quality {
             constraints.push(Length(8));
