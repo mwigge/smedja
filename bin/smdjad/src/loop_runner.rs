@@ -65,6 +65,7 @@ pub(crate) struct LoopRoleRunner {
     embedder: Arc<dyn crate::embedder_port::Embedder>,
     provider_sessions: crate::orchestrator::ProviderSessions,
     cache_aligners: crate::orchestrator::CacheAligners,
+    lsp_manager: Arc<smedja_lsp::LspManager>,
     workspace_root: PathBuf,
     agent_timeout_s: u64,
     /// Umbrella change name — the namespace key (`umbrella:<change_name>`) the
@@ -137,6 +138,7 @@ impl RoleRunner for LoopRoleRunner {
             Arc::clone(&self.provider_sessions),
             Arc::clone(&self.cache_aligners),
             Some(self.change_name.clone()),
+            Arc::clone(&self.lsp_manager),
         );
         // Safety: `orchestrator.run()` uses structured concurrency — `drain_stream`
         // internally awaits without spawning background tasks, so dropping the
@@ -305,7 +307,7 @@ async fn read_pending_slices(workspace_root: &Path, change_name: &str) -> Vec<St
 /// verification gate and bounded fix retries — persisting status through the
 /// ingot as it goes.
 #[allow(clippy::too_many_arguments)] // forwards the turn-orchestrator dependencies
-#[tracing::instrument(skip(ingot, dispatcher, gates, pool, assayer, price_table, vault, embedder, provider_sessions, cache_aligners, workspace_root), fields(loop_id = %loop_id, change = %change_name))]
+#[tracing::instrument(skip(ingot, dispatcher, gates, pool, assayer, price_table, vault, embedder, provider_sessions, cache_aligners, lsp_manager, workspace_root), fields(loop_id = %loop_id, change = %change_name))]
 pub(crate) async fn run(
     ingot: IngotHandle,
     dispatcher: Arc<Dispatcher>,
@@ -317,6 +319,7 @@ pub(crate) async fn run(
     embedder: Arc<dyn crate::embedder_port::Embedder>,
     provider_sessions: crate::orchestrator::ProviderSessions,
     cache_aligners: crate::orchestrator::CacheAligners,
+    lsp_manager: Arc<smedja_lsp::LspManager>,
     loop_id: String,
     change_name: String,
     workspace_root: PathBuf,
@@ -377,6 +380,7 @@ pub(crate) async fn run(
         embedder,
         provider_sessions,
         cache_aligners,
+        lsp_manager,
         workspace_root: workspace_root.clone(),
         agent_timeout_s: config.limits.agent_timeout_s,
         change_name: change_name.clone(),
@@ -652,6 +656,7 @@ mod tests {
             Arc::new(crate::embedder_port::FnvEmbedder::new()),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
+            Arc::new(smedja_lsp::LspManager::new()),
             "loop-missing".to_owned(),
             "demo".to_owned(),
             ws.path().to_path_buf(),
@@ -702,6 +707,7 @@ mod tests {
             Arc::new(crate::embedder_port::FnvEmbedder::new()),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
+            Arc::new(smedja_lsp::LspManager::new()),
             "loop-empty".to_owned(),
             "demo".to_owned(),
             ws.path().to_path_buf(),

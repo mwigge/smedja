@@ -202,6 +202,7 @@ pub(crate) async fn run(state: HandlerState, params: Value) -> Result<Value, Rpc
         Arc::clone(&state.embedder),
         Arc::clone(&state.provider_sessions),
         Arc::clone(&state.cache_aligners),
+        Arc::clone(&state.lsp_manager),
         bg_loop_id,
         change_name,
         workspace_root,
