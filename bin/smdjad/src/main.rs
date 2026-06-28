@@ -295,6 +295,7 @@ async fn run_turn(
     cache_aligners: orchestrator::CacheAligners,
     turn_registry: handlers::TurnRegistry,
     active_change: Option<Arc<str>>,
+    lsp_manager: Arc<smedja_lsp::LspManager>,
 ) {
     // Deregister-on-drop: removes this turn's abort handle from the registry
     // whether the turn completes normally *or* is aborted by `turn.cancel`
@@ -329,6 +330,7 @@ async fn run_turn(
         provider_sessions,
         cache_aligners,
         active_change.as_deref().map(str::to_owned),
+        lsp_manager,
     )
     .run(session_id, turn_id)
     .await;
@@ -359,6 +361,7 @@ fn spawn_worker(
     mut work_rx: tokio::sync::mpsc::Receiver<(String, String)>,
     turn_registry: handlers::TurnRegistry,
     active_change: Option<Arc<str>>,
+    lsp_manager: Arc<smedja_lsp::LspManager>,
 ) -> tokio::task::JoinHandle<tokio::task::JoinSet<()>> {
     tokio::spawn(async move {
         let mut set = tokio::task::JoinSet::new();
@@ -378,6 +381,7 @@ fn spawn_worker(
             let ca = Arc::clone(&cache_aligners);
             let reg = Arc::clone(&turn_registry);
             let ac = active_change.clone();
+            let lsp = Arc::clone(&lsp_manager);
             let handle = set.spawn(run_turn(
                 ig,
                 dp,
@@ -393,6 +397,7 @@ fn spawn_worker(
                 ca,
                 Arc::clone(&turn_registry),
                 ac,
+                lsp,
             ));
             // Register the abort handle so `turn.cancel` can interrupt this turn.
             if let Ok(mut map) = reg.lock() {
@@ -1125,6 +1130,7 @@ async fn main() -> anyhow::Result<()> {
         work_rx,
         Arc::clone(&turn_registry),
         active_change,
+        Arc::clone(&lsp_manager),
     );
 
     // Background daily maintenance: prune old sessions and VACUUM both databases.

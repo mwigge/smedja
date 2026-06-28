@@ -114,6 +114,57 @@ pub(crate) fn derive_title(content: &str) -> String {
         .join(" ")
 }
 
+/// Formats the current LSP snapshot into a `<lsp_diagnostics>` context block.
+///
+/// Returns `None` when there are no errors or warnings (info / hints are skipped).
+/// At most 20 diagnostic lines are included; a trailing note is appended when
+/// the list is truncated.
+pub(crate) fn format_lsp_diagnostics(snapshot: &smedja_lsp::LspSnapshot) -> Option<String> {
+    use smedja_lsp::types::Severity;
+    const MAX: usize = 20;
+    let relevant: Vec<_> = snapshot
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d.severity, Severity::Error | Severity::Warning))
+        .collect();
+    if relevant.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<String> = relevant
+        .iter()
+        .take(MAX)
+        .map(|d| {
+            let sev = match d.severity {
+                Severity::Error => "error",
+                Severity::Warning => "warning",
+                _ => "info",
+            };
+            let code = d
+                .code
+                .as_deref()
+                .map_or_else(String::new, |c| format!(" [{c}]"));
+            format!(
+                "{} {}:{}: {}{}",
+                sev,
+                d.file.display(),
+                d.line,
+                d.message,
+                code
+            )
+        })
+        .collect();
+    if relevant.len() > MAX {
+        lines.push(format!(
+            "... and {} more (only the first {MAX} shown)",
+            relevant.len() - MAX
+        ));
+    }
+    Some(format!(
+        "<lsp_diagnostics>\n{}\n</lsp_diagnostics>",
+        lines.join("\n")
+    ))
+}
+
 /// Owns all the shared resources needed to execute a single agent turn.
 pub(crate) struct TurnOrchestrator {
     ingot: IngotHandle,
@@ -127,6 +178,7 @@ pub(crate) struct TurnOrchestrator {
     provider_sessions: ProviderSessions,
     cache_aligners: CacheAligners,
     active_change: Option<String>,
+    lsp_manager: Arc<smedja_lsp::LspManager>,
 }
 
 impl TurnOrchestrator {
@@ -143,6 +195,7 @@ impl TurnOrchestrator {
         provider_sessions: ProviderSessions,
         cache_aligners: CacheAligners,
         active_change: Option<String>,
+        lsp_manager: Arc<smedja_lsp::LspManager>,
     ) -> Self {
         Self {
             ingot,
@@ -156,6 +209,7 @@ impl TurnOrchestrator {
             provider_sessions,
             cache_aligners,
             active_change,
+            lsp_manager,
         }
     }
 
@@ -608,6 +662,11 @@ impl TurnOrchestrator {
                 smedja.turn.graph_symbols_injected = injected_count,
                 "graph symbol injection"
             );
+            // Append current LSP diagnostics (errors + warnings only) so the
+            // model sees live compiler feedback alongside the user's question.
+            if let Some(diag_block) = format_lsp_diagnostics(&self.lsp_manager.snapshot()) {
+                let _ = write!(content, "\n\n{diag_block}");
+            }
             content
         };
 
@@ -1614,6 +1673,7 @@ mod tests {
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             None,
+            Arc::new(smedja_lsp::LspManager::new()),
         )
     }
 
@@ -1912,6 +1972,7 @@ mod tests {
             provider_sessions,
             cache_aligners,
             None,
+            Arc::new(smedja_lsp::LspManager::new()),
         );
 
         let session_id = "sess-does-not-exist".to_owned();
@@ -2062,5 +2123,70 @@ mod tests {
     #[test]
     fn derive_title_empty_input_returns_empty() {
         assert_eq!(super::derive_title(""), "");
+    }
+
+    // --- format_lsp_diagnostics tests ---
+
+    #[test]
+    fn format_lsp_diagnostics_empty_snapshot_returns_none() {
+        let snap = smedja_lsp::LspSnapshot::default();
+        assert!(super::format_lsp_diagnostics(&snap).is_none());
+    }
+
+    #[test]
+    fn format_lsp_diagnostics_errors_and_warnings_included() {
+        use smedja_lsp::types::{Diagnostic, Severity};
+        use std::path::PathBuf;
+        let snap = smedja_lsp::LspSnapshot {
+            servers: vec![],
+            diagnostics: vec![
+                Diagnostic {
+                    file: PathBuf::from("src/main.rs"),
+                    line: 42,
+                    col: 1,
+                    severity: Severity::Error,
+                    code: Some("E0308".to_owned()),
+                    message: "mismatched types".to_owned(),
+                },
+                Diagnostic {
+                    file: PathBuf::from("src/lib.rs"),
+                    line: 17,
+                    col: 5,
+                    severity: Severity::Warning,
+                    code: None,
+                    message: "unused variable".to_owned(),
+                },
+            ],
+        };
+        let block = super::format_lsp_diagnostics(&snap).unwrap();
+        assert!(block.contains("<lsp_diagnostics>"));
+        assert!(block.contains("src/main.rs:42"));
+        assert!(block.contains("mismatched types"));
+        assert!(block.contains("src/lib.rs:17"));
+        assert!(block.contains("unused variable"));
+    }
+
+    #[test]
+    fn format_lsp_diagnostics_caps_at_twenty_lines() {
+        use smedja_lsp::types::{Diagnostic, Severity};
+        use std::path::PathBuf;
+        let diags: Vec<Diagnostic> = (0..30)
+            .map(|i| Diagnostic {
+                file: PathBuf::from("src/main.rs"),
+                line: i,
+                col: 1,
+                severity: Severity::Error,
+                code: None,
+                message: format!("err {i}"),
+            })
+            .collect();
+        let snap = smedja_lsp::LspSnapshot {
+            servers: vec![],
+            diagnostics: diags,
+        };
+        let block = super::format_lsp_diagnostics(&snap).unwrap();
+        let lines: Vec<&str> = block.lines().collect();
+        // header + up to 20 diag lines + footer + optional truncation line
+        assert!(lines.len() <= 23, "too many lines: {}", lines.len());
     }
 }
