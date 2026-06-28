@@ -704,7 +704,7 @@ impl ReviewTurn for ProviderReviewTurn {
                 .model_override
                 .clone()
                 .or_else(|| std::env::var("SMEDJA_MODEL").ok())
-                .unwrap_or_else(|| entry.default_model.to_owned());
+                .unwrap_or_else(|| entry.default_model.clone());
             let opts = CallOptions {
                 model,
                 max_tokens: Some(2048),

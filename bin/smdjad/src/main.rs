@@ -488,7 +488,7 @@ macro_rules! route {
     }};
 }
 
-#[allow(clippy::too_many_arguments)] // startup wiring: each arg is a distinct resource
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn build_router(
     ingot: &IngotHandle,
     dispatcher: &Arc<Dispatcher>,

@@ -66,8 +66,8 @@ impl QualityLlmReview {
 /// Maps the primary provider name to an adversary reviewer model from the
 /// opposite provider family so the review is not self-confirming.
 ///
-/// - Primary is OpenAI/Codex → use Anthropic Haiku
-/// - Primary is anything else (Anthropic/Claude/local) → use OpenAI GPT-4o-mini
+/// - Primary is `OpenAI`/`Codex` → use Anthropic Haiku
+/// - Primary is anything else (Anthropic/Claude/local) → use `OpenAI` `GPT-4o-mini`
 #[must_use]
 pub fn quality_reviewer_model(primary_provider: &str) -> &'static str {
     let lc = primary_provider.to_ascii_lowercase();

@@ -108,9 +108,10 @@ fn is_diff_marker(text: &str) -> bool {
 /// Parses inline markdown in a prose line — `` `code` ``, `**bold**`, `*italic*`
 /// — into styled spans, returning `None` when there is no markup (so the common
 /// path stays a cheap plain line). Conservative to avoid false positives: emphasis
-/// markers must hug non-space text (CommonMark flanking), so `a * b` and bullet
+/// markers must hug non-space text (`CommonMark` flanking), so `a * b` and bullet
 /// `* item` are left alone. The returned line's flattened text drops the markers,
 /// matching what is displayed (and what gets copied).
+#[allow(clippy::many_single_char_names)]
 fn inline_markdown_spans(text: &str) -> Option<Line<'static>> {
     let p = palette();
     let chars: Vec<char> = text.chars().collect();
@@ -659,11 +660,13 @@ impl MainPanel {
 
         // Cache the inner rect and the per-visual-row → logical-line map so a
         // later mouse click can resolve which message line it landed on.
+        #[allow(clippy::cast_possible_truncation)]
+        let (panel_w, panel_h) = (inner_w as u16, inner_h as u16);
         self.last_inner = Rect::new(
             area.x.saturating_add(1),
             area.y.saturating_add(1),
-            inner_w as u16,
-            inner_h as u16,
+            panel_w,
+            panel_h,
         );
         self.row_logical = visual_logical.get(start..end).unwrap_or(&[]).to_vec();
         self.row_charbounds = visual_bounds.get(start..end).unwrap_or(&[]).to_vec();
@@ -874,6 +877,7 @@ impl Default for MainPanel {
 /// surrounding the math are stripped.  `$$...$$` display-math is also handled
 /// (treated the same as inline).
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn render_math(text: &str) -> String {
     // Symbol table: LaTeX command (without backslash) → Unicode string.
     const SYMBOLS: &[(&str, &str)] = &[

@@ -61,6 +61,7 @@ fn percentile(samples: &VecDeque<u64>, pct: usize) -> Option<u64> {
     Some(sorted[idx])
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn fmt_ms(ms: u64) -> String {
     if ms >= 60_000 {
         format!("{:.1}m", ms as f64 / 60_000.0)
@@ -71,6 +72,7 @@ fn fmt_ms(ms: u64) -> String {
     }
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn fmt_tok(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -153,6 +155,11 @@ fn labeled_gauge(prefix: &str, suffix: &str, value: u64, max: u64, width: usize)
     Line::from(spans)
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn fill_bar(value: u64, max: u64, width: usize, color: ratatui::style::Color) -> Line<'static> {
     if width == 0 {
         return Line::default();
@@ -185,6 +192,11 @@ impl<'a> ObsPanel<'a> {
         Self { snapshot }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
     pub fn render(&self, area: Rect, frame: &mut Frame) {
         if area.height < 3 {
             return;
@@ -293,7 +305,7 @@ impl<'a> ObsPanel<'a> {
             lines.push(Line::from(vec![
                 Span::styled("cache ", Style::default().fg(p.text_dim)),
                 Span::styled(
-                    fmt_tok(snap.cache_saved.max(0) as u64),
+                    fmt_tok(snap.cache_saved.cast_unsigned()),
                     Style::default().fg(p.success),
                 ),
                 Span::raw(" saved"),

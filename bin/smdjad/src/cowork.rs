@@ -87,7 +87,7 @@ impl PermissionMode {
         }
     }
 
-    /// Next mode in the Shift+Tab cycle: Ask → AcceptEdits → Plan → Auto → Ask.
+    /// Next mode in the `Shift+Tab` cycle: `Ask` → `AcceptEdits` → `Plan` → `Auto` → `Ask`.
     #[must_use]
     pub fn next(self) -> Self {
         match self {
@@ -134,6 +134,7 @@ fn tool_kind(tool: &str) -> ToolKind {
         return ToolKind::Exec;
     }
     // Read-only tools (the daemon's read-safe set plus common read verbs).
+    #[allow(clippy::items_after_statements)]
     const READ: &[&str] = &[
         "read_file",
         "list_files",
@@ -157,6 +158,7 @@ fn tool_kind(tool: &str) -> ToolKind {
         return ToolKind::ReadOnly;
     }
     // Known mutating edit tools.
+    #[allow(clippy::items_after_statements)]
     const EDIT: &[&str] = &[
         "write_file",
         "edit_file",
@@ -305,8 +307,8 @@ impl CoworkGate {
     }
 
     /// Like [`Self::gate_tool`] but always suspends for a human decision,
-    /// ignoring the mode's allow/auto — for high-risk roles (IaC) whose
-    /// mutations must be confirmed even under AcceptEdits/Auto.
+    /// ignoring the mode's allow/auto — for high-risk roles (`IaC`) whose
+    /// mutations must be confirmed even under `AcceptEdits`/`Auto`.
     pub async fn gate_tool_forced_ask(
         &self,
         step_n: u32,

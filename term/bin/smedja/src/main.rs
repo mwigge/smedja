@@ -379,14 +379,24 @@ impl App {
             .renderer
             .as_ref()
             .map_or(0, st_render::Renderer::top_bar_height_px);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let phys_x = (win_x * sf) as u32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let phys_y = (win_y * sf) as u32;
         let grid_y = phys_y.saturating_sub(top_bar_h);
         let cw = st_glyph::char_advance_width(eff_font).max(1.0);
         let ch = st_glyph::line_height(eff_font).max(1.0);
-        #[allow(clippy::cast_possible_truncation)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_precision_loss,
+            clippy::cast_sign_loss
+        )]
         let col = ((phys_x as f32 / cw) as u16).min(grid.cols.saturating_sub(1));
-        #[allow(clippy::cast_possible_truncation)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_precision_loss,
+            clippy::cast_sign_loss
+        )]
         let row = ((grid_y as f32 / ch) as u16).min(grid.rows.saturating_sub(1));
         Some((col, row, grid.mouse_mode, grid.mouse_sgr))
     }
@@ -1161,13 +1171,16 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => {
                 // Number of lines scrolled (positive = wheel up = into history).
                 let lines: i32 = match delta {
+                    #[allow(clippy::cast_possible_truncation)]
                     MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
                     MouseScrollDelta::PixelDelta(pos) => {
                         let sf = self.renderer.as_ref().map_or(1.0_f64, |r| r.scale_factor);
                         #[allow(clippy::cast_possible_truncation)]
                         let eff_font = self.config.font.size * sf as f32;
                         let line_h = f64::from(st_glyph::line_height(eff_font).max(1.0));
-                        (pos.y / line_h).round() as i32
+                        #[allow(clippy::cast_possible_truncation)]
+                        let lines = (pos.y / line_h).round() as i32;
+                        lines
                     }
                 };
                 if lines == 0 {
@@ -1668,6 +1681,7 @@ fn key_to_pty_bytes(key: &Key) -> Option<Vec<u8>> {
 
 /// Kitty keyboard-protocol modifier parameter: `1 + bitfield`, where the
 /// bitfield is `shift=1, alt=2, ctrl=4, super=8`.
+#[allow(clippy::fn_params_excessive_bools)]
 fn kitty_modifier(shift: bool, alt: bool, ctrl: bool, sup: bool) -> u8 {
     let mut bits = 0u8;
     if shift {
@@ -1688,6 +1702,7 @@ fn kitty_modifier(shift: bool, alt: bool, ctrl: bool, sup: bool) -> u8 {
 /// Functional-key codepoints used by the kitty keyboard protocol's `CSI cp ; mod u`
 /// encoding for the keys we disambiguate. Arrows/navigation use the legacy
 /// `CSI 1 ; mod <final>` form instead and are not listed here.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn kitty_functional_codepoint(named: &NamedKey) -> Option<u32> {
     Some(match named {
         NamedKey::Enter => 13,
@@ -1721,6 +1736,7 @@ fn ctrl_byte(c: char) -> Option<u8> {
 /// Legacy escape sequence for a modified navigation/named key using the xterm
 /// `CSI 1 ; <mod> <final>` (cursor) or `CSI <n> ; <mod> ~` (tilde) form.
 /// Returns `None` for keys without a navigation encoding.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn modified_named_legacy(named: &NamedKey, modifier: u8) -> Option<Vec<u8>> {
     let cursor = |final_byte: char| Some(format!("\x1b[1;{modifier}{final_byte}").into_bytes());
     let tilde = |n: u8| Some(format!("\x1b[{n};{modifier}~").into_bytes());
@@ -1749,6 +1765,7 @@ fn modified_named_legacy(named: &NamedKey, modifier: u8) -> Option<Vec<u8>> {
 /// - **Legacy mode** (`kbd_flags == 0`): Ctrl+<char> becomes a C0 control byte,
 ///   Alt+<char> is ESC-prefixed, modified navigation keys use the xterm
 ///   `CSI 1 ; mod` form, and everything else is the unmodified base encoding.
+#[allow(clippy::fn_params_excessive_bools)]
 fn encode_key(
     key: &Key,
     shift: bool,
@@ -2221,6 +2238,7 @@ mod tests {
     /// (caps, control keys, meta, modified Enter) in both legacy and kitty
     /// modes. New input bugs of these shapes should fail here first.
     #[test]
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
     fn encode_key_conformance_table() {
         use super::encode_key;
         use winit::keyboard::{Key, NamedKey, SmolStr};

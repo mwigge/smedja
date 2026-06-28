@@ -21,6 +21,7 @@ pub(crate) async fn status(state: HandlerState, _params: Value) -> Result<Value,
 
 /// Core of `lsp.status`, parameterised on a snapshot so it is testable without
 /// constructing a full [`HandlerState`] or live language server processes.
+#[allow(clippy::needless_pass_by_value)]
 fn status_from_snapshot(snap: smedja_lsp::LspSnapshot) -> Value {
     let servers: Vec<Value> = snap
         .servers

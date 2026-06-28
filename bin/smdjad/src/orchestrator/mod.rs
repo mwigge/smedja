@@ -712,7 +712,7 @@ impl TurnOrchestrator {
                 .model
                 .clone()
                 .or_else(|| std::env::var("SMEDJA_MODEL").ok())
-                .unwrap_or_else(|| entry.default_model.to_owned());
+                .unwrap_or_else(|| entry.default_model.clone());
             let entry_model = session
                 .as_ref()
                 .and_then(|s| s.model_override.clone())
@@ -893,7 +893,7 @@ impl TurnOrchestrator {
                         provider_sessions
                             .lock()
                             .await
-                            .insert(session_store_key.to_owned(), native_session_id);
+                            .insert(session_store_key.clone(), native_session_id);
                     }
                 }
                 total_input_tokens = total_input_tokens.saturating_add(input_tokens);

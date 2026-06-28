@@ -16,7 +16,7 @@ impl SkillAdvisory {
     }
 }
 
-/// Heuristic signals: (diff_pattern, expected_skill, reason)
+/// Heuristic signals: (`diff_pattern`, `expected_skill`, `reason`)
 const SIGNALS: &[(&str, &str, &str)] = &[
     // New test functions → TDD workflow should be active.
     ("#[test]", "/tdd-workflow", "diff adds tests"),

@@ -171,7 +171,7 @@ enum Cmd {
         #[command(subcommand)]
         action: GovCmd,
     },
-    /// Internal: Claude Code PreToolUse approval hook. Reads the hook payload on
+    /// Internal: Claude Code `PreToolUse` approval hook. Reads the hook payload on
     /// stdin and emits a permission decision; installed via `--settings`.
     #[command(hide = true)]
     ToolGate,
@@ -189,7 +189,7 @@ enum GovCmd {
     Transition {
         /// Artifact ID (e.g. WI-003).
         id: String,
-        /// New status: planned, in_progress, done, cancelled.
+        /// New status: `planned`, `in_progress`, `done`, `cancelled`.
         status: String,
     },
     /// Create a new work item.
@@ -584,7 +584,7 @@ enum TermCmd {
         #[arg(long)]
         prefix: Option<PathBuf>,
     },
-    /// Convert a WezTerm configuration to smedja terminal integration format.
+    /// Convert a `WezTerm` configuration to smedja terminal integration format.
     ConvertWezterm,
 }
 
@@ -735,9 +735,9 @@ fn default_socket_path() -> PathBuf {
     PathBuf::from(base).join("smdjad.sock")
 }
 
-/// `smj tool-gate`: Claude Code PreToolUse hook. Reads the hook payload from
+/// `smj tool-gate`: Claude Code `PreToolUse` hook. Reads the hook payload from
 /// stdin, asks the daemon (`cowork.gate_tool`) whether the tool may run —
-/// blocking on the user when the policy says "ask" — and emits the PreToolUse
+/// blocking on the user when the policy says "ask" — and emits the `PreToolUse`
 /// permission decision on stdout.
 ///
 /// Fails OPEN (allow) when the daemon is unreachable so a misconfigured gate
@@ -1999,6 +1999,7 @@ async fn main() -> Result<()> {
                 GovCmd::Create { title, description } => {
                     let wi_dir = ws.join("gov").join("work-items");
                     std::fs::create_dir_all(&wi_dir)?;
+                    #[allow(clippy::cast_possible_truncation)]
                     let next_n: u32 = std::fs::read_dir(&wi_dir)
                         .into_iter()
                         .flatten()

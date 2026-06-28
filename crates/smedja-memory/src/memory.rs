@@ -341,10 +341,10 @@ pub fn load_role_skills(dir: &std::path::Path, role: &str) -> Result<Vec<String>
         out.push(std::fs::read_to_string(&single)?);
     }
 
-    let role_dir = roles_dir.join(role);
-    if role_dir.is_dir() {
+    let role_specific_dir = roles_dir.join(role);
+    if role_specific_dir.is_dir() {
         let mut files = Vec::new();
-        for entry in std::fs::read_dir(&role_dir)? {
+        for entry in std::fs::read_dir(&role_specific_dir)? {
             let path = entry?.path();
             if path.extension().and_then(|e| e.to_str()) == Some("md") {
                 files.push(std::fs::read_to_string(&path)?);

@@ -30,6 +30,7 @@ pub fn evaluate(
     let file_size_pass = file_size::check(changed_files, threshold).is_empty();
     let skill_inject_pass = skill_inject::check(diff, session_skills).is_empty();
 
+    #[allow(clippy::cast_possible_truncation)]
     let score = [tdd_pass, clean_pass, file_size_pass, skill_inject_pass]
         .iter()
         .filter(|&&p| p)

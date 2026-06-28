@@ -266,6 +266,7 @@ note: scroll wheel scrolls the main panel; drag the mouse over messages to mark
 /// Grouped here so new panels only require adding one field instead of
 /// threading a top-level boolean through `AppState` and every test helper.
 #[derive(Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct PanelVisibility {
     /// Context rail (right, Ctrl-F).
     context_rail: bool,
@@ -428,7 +429,7 @@ pub(crate) struct AppState {
     thinking_expanded: bool,
     /// Kill ring for Ctrl-K / Ctrl-U / Ctrl-Y input editing (max 16 entries).
     kill_ring: VecDeque<String>,
-    /// Name of the agent/role active in the current in-flight turn (from CorrelationCtx).
+    /// Name of the agent/role active in the current in-flight turn (from `CorrelationCtx`).
     active_agent_name: Option<String>,
     /// Path of the smdjad stream socket (`<rpc_sock>.stream`).
     stream_sock_path: PathBuf,
@@ -467,7 +468,7 @@ pub(crate) struct AppState {
     lsp_snapshot: smedja_lsp::LspSnapshot,
     /// Observability snapshot — updated from turn events + metrics polls.
     obs_snapshot: obs_panel::ObsSnapshot,
-    /// Quality gate snapshot — updated on each TurnEvent::QualitySnapshot.
+    /// Quality gate snapshot — updated on each `TurnEvent::QualitySnapshot`.
     quality_snapshot: quality_panel::QualitySnapshot,
     /// Consecutive turns with quality score < 60 (resets on score ≥ 60).
     consecutive_low_quality: u8,
@@ -839,7 +840,7 @@ pub(crate) fn push_system_message(state: &mut AppState, text: impl Into<String>)
 }
 
 /// Maps a tool name to a compact `(glyph, short-label)` pair so cards stay tidy
-/// — e.g. the verbose "ToolSearch" becomes "⌕ search". Unknown tools fall back
+/// — e.g. the verbose `ToolSearch` becomes "⌕ search". Unknown tools fall back
 /// to a lowercased, length-capped name.
 fn tool_glyph_label(name: &str) -> (&'static str, String) {
     match name {
@@ -1119,11 +1120,12 @@ pub(crate) fn format_resume_rows(list: &serde_json::Value) -> Vec<String> {
                     s_val.to_owned()
                 } else if let Some(n) = s.get("updated_at").and_then(serde_json::Value::as_f64) {
                     // epoch microseconds → relative display
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let secs = (n / 1_000_000.0) as i64;
+                    #[allow(clippy::cast_possible_wrap)]
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
+                        .map_or(0, |d| d.as_secs() as i64);
                     let ago = now - secs;
                     if ago < 60 {
                         format!("{ago}s ago")
@@ -1649,8 +1651,7 @@ pub(crate) async fn run_upgrade(latest_tag: &str) -> String {
         .args(["--user", "restart", "smdjad"])
         .status()
         .await
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
 
     let mut msg = if failed.is_empty() {
         format!(
@@ -2945,6 +2946,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     );
 
     // -- Body: optional session rail | main panel | optional context rail ------
+    #[allow(clippy::items_after_statements)]
     const SESSION_RAIL_W: u16 = 28;
 
     // First carve out the optional left session rail.
@@ -3103,6 +3105,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         let est_tok = chars / 4;
         format!("{chars}c ≈{est_tok}tok")
     };
+    #[allow(clippy::cast_possible_truncation)]
     let counter_len = counter_text.chars().count() as u16;
     let counter_style = if state.no_color {
         Style::default()
@@ -4166,6 +4169,7 @@ async fn main() -> Result<()> {
                     }
                     Some("quality") => {
                         // Update quality panel snapshot from the post-turn gate evaluation.
+                        #[allow(clippy::cast_possible_truncation)]
                         let score = event["score"].as_u64().unwrap_or(0) as u8;
                         let llm_reviewed = event["llm_reviewed"].as_bool().unwrap_or(false);
                         state.quality_snapshot = quality_panel::QualitySnapshot {
@@ -4554,6 +4558,7 @@ async fn main() -> Result<()> {
 
         // Independent obs-panel poll (session.cost) — runs even when the metrics
         // overlay is closed so the obs rail always shows current cost.
+        #[allow(clippy::items_after_statements)]
         const OBS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
         let obs_due = state
             .last_obs_poll
@@ -4583,6 +4588,7 @@ async fn main() -> Result<()> {
         }
 
         // Poll smdjad for LSP state every 5 s (single canonical source).
+        #[allow(clippy::items_after_statements)]
         const LSP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
         let lsp_due = state
             .lsp_last_poll
@@ -4650,6 +4656,7 @@ const METRICS_SINCE_WINDOW_MICROS: i64 = 24 * 3_600 * 1_000_000;
 ///
 /// State field: `"starting"` | `"ready"` | `"degraded: <reason>"` (daemon format).
 /// Severity field: `"error"` | `"warning"` | `"info"` | `"hint"` (daemon format).
+#[allow(clippy::cast_precision_loss)]
 pub(crate) fn format_token_count(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -4815,7 +4822,7 @@ pub(crate) struct GovArtifact {
     /// Artifact kind: "work-item", "rfc", or "adr"
     pub(crate) kind: String,
     pub(crate) title: String,
-    /// "planned" | "in_progress" | "done" | "cancelled" | "draft" | "accepted" | "superseded"
+    /// `"planned"` | `"in_progress"` | `"done"` | `"cancelled"` | `"draft"` | `"accepted"` | `"superseded"`
     pub(crate) status: String,
 }
 
@@ -5987,6 +5994,7 @@ mod tests {
     use ratatui::Terminal;
 
     /// Constructs a minimal `AppState` for testing without a daemon connection.
+    #[allow(clippy::too_many_lines)]
     fn make_state(session_id: &str) -> AppState {
         AppState {
             session_id: session_id.to_owned(),

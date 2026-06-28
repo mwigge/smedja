@@ -58,6 +58,7 @@ pub type GateResult = Result<(), MethodologyViolation>;
 /// A score ≥ 60 is green; < 60 is advisory (yellow); two consecutive turns
 /// below 60 trigger the `CoworkGate` interrupt.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct QualityScore {
     /// Composite 0–100 score.
     pub score: u8,
