@@ -68,7 +68,9 @@ pub async fn serve(listener: UnixListener, dispatcher: Arc<Dispatcher>, ingot: I
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             };
-            let mut agent_event = turn_event_to_agent_event(&event);
+            let Some(mut agent_event) = turn_event_to_agent_event(&event) else {
+                continue;
+            };
             // Enrich TurnEnd with the cumulative token-economy figure so the
             // st-statusbar EfficiencyModule can render it. Sourced from the
             // savings ledger; advisory — a query error leaves the fields None
@@ -133,35 +135,35 @@ async fn handle_connection(stream: UnixStream, subs: SubList) {
 /// - [`TurnEvent::ToolCalled`] → [`AgentEvent::ToolCall`]
 /// - [`TurnEvent::AssistantDelta`] → [`AgentEvent::StreamDelta`]
 /// - [`TurnEvent::Completed`] / [`TurnEvent::Failed`] → [`AgentEvent::TurnEnd`]
-fn turn_event_to_agent_event(event: &TurnEvent) -> AgentEvent {
+fn turn_event_to_agent_event(event: &TurnEvent) -> Option<AgentEvent> {
     match event {
         TurnEvent::Started {
             session_id,
             turn_id,
             ..
-        } => AgentEvent::TurnStart {
+        } => Some(AgentEvent::TurnStart {
             turn_id: Some(turn_id.clone()),
             session_id: Some(session_id.clone()),
-        },
+        }),
         TurnEvent::ToolCalled {
             tool_name,
             input_summary,
             turn_id,
             ..
-        } => AgentEvent::ToolCall {
+        } => Some(AgentEvent::ToolCall {
             turn_id: turn_id.clone(),
             tool: Some(tool_name.clone()),
             summary: Some(input_summary.clone()),
-        },
+        }),
         TurnEvent::AssistantDelta {
             content, turn_id, ..
         }
         | TurnEvent::ThinkingDelta {
             content, turn_id, ..
-        } => AgentEvent::StreamDelta {
+        } => Some(AgentEvent::StreamDelta {
             turn_id: turn_id.clone(),
             content: Some(content.clone()),
-        },
+        }),
         TurnEvent::Completed {
             session_id,
             turn_id,
@@ -171,13 +173,15 @@ fn turn_event_to_agent_event(event: &TurnEvent) -> AgentEvent {
             session_id,
             turn_id,
             ..
-        } => AgentEvent::TurnEnd {
+        } => Some(AgentEvent::TurnEnd {
             turn_id: Some(turn_id.clone()),
             session_id: Some(session_id.clone()),
             // Filled in by enrich_turn_end_savings once the ledger is consulted.
             tokens_saved: None,
             efficiency_ratio: None,
-        },
+        }),
+        // Quality snapshots are internal signals — not surfaced to agent event consumers.
+        TurnEvent::QualitySnapshot { .. } => None,
     }
 }
 
@@ -226,8 +230,9 @@ mod tests {
     use std::path::Path;
 
     /// Maps a [`TurnEvent`] to an envelope wire line (pure mapper, no enrichment).
-    fn turn_event_to_agent_event_line(event: &TurnEvent) -> String {
-        AgentEventEnvelope::new(turn_event_to_agent_event(event)).to_json_line()
+    /// Returns `None` for events that do not produce an agent event.
+    fn turn_event_to_agent_event_line(event: &TurnEvent) -> Option<String> {
+        turn_event_to_agent_event(event).map(|ev| AgentEventEnvelope::new(ev).to_json_line())
     }
 
     #[test]
@@ -246,7 +251,7 @@ mod tests {
                 ..CorrelationCtx::default()
             },
         };
-        let line = turn_event_to_agent_event_line(&event);
+        let line = turn_event_to_agent_event_line(&event).expect("must produce event");
         assert!(!line.contains('\n'), "wire line must be newline-free");
         let env = AgentEventEnvelope::from_json_line(&line).expect("must decode");
         assert_eq!(
@@ -272,8 +277,10 @@ mod tests {
             correlation: CorrelationCtx::default(),
             tool_call_id: None,
         };
-        let env = AgentEventEnvelope::from_json_line(&turn_event_to_agent_event_line(&event))
-            .expect("must decode");
+        let env = AgentEventEnvelope::from_json_line(
+            &turn_event_to_agent_event_line(&event).expect("must produce event"),
+        )
+        .expect("must decode");
         assert_eq!(
             env.event,
             AgentEvent::ToolCall {
@@ -291,8 +298,10 @@ mod tests {
             turn_id: Some("t1".into()),
             correlation: CorrelationCtx::default(),
         };
-        let env = AgentEventEnvelope::from_json_line(&turn_event_to_agent_event_line(&event))
-            .expect("must decode");
+        let env = AgentEventEnvelope::from_json_line(
+            &turn_event_to_agent_event_line(&event).expect("must produce event"),
+        )
+        .expect("must decode");
         assert_eq!(
             env.event,
             AgentEvent::StreamDelta {
@@ -312,8 +321,10 @@ mod tests {
             traceparent: Some("00-abc123def456-0102030405060708-01".into()),
             correlation: CorrelationCtx::default(),
         };
-        let env = AgentEventEnvelope::from_json_line(&turn_event_to_agent_event_line(&completed))
-            .expect("must decode");
+        let env = AgentEventEnvelope::from_json_line(
+            &turn_event_to_agent_event_line(&completed).expect("must produce event"),
+        )
+        .expect("must decode");
         assert_eq!(
             env.event,
             AgentEvent::TurnEnd {
@@ -330,8 +341,10 @@ mod tests {
             reason: "timeout".into(),
             correlation: CorrelationCtx::default(),
         };
-        let env = AgentEventEnvelope::from_json_line(&turn_event_to_agent_event_line(&failed))
-            .expect("must decode");
+        let env = AgentEventEnvelope::from_json_line(
+            &turn_event_to_agent_event_line(&failed).expect("must produce event"),
+        )
+        .expect("must decode");
         assert_eq!(
             env.event,
             AgentEvent::TurnEnd {

@@ -178,6 +178,29 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                         }
                         cleanup_tid = Some(turn_id.clone());
                     }
+                    TurnEvent::QualitySnapshot {
+                        ref turn_id,
+                        score,
+                        tdd_pass,
+                        clean_pass,
+                        ref file_advisories,
+                        ref skill_advisories,
+                        ..
+                    } => {
+                        let Some(tid) = turn_id else { continue };
+                        if let Some(buf) = store.get_mut(tid) {
+                            let line = json!({
+                                "type": "quality",
+                                "score": score,
+                                "tdd_pass": tdd_pass,
+                                "clean_pass": clean_pass,
+                                "file_advisories": file_advisories,
+                                "skill_advisories": skill_advisories,
+                            })
+                            .to_string();
+                            buf.push_back(line);
+                        }
+                    }
                 }
             } // lock released here
               // Schedule buffer eviction after TTL so late-connecting stream
@@ -411,6 +434,26 @@ fn turn_event_to_ndjson(
             } else {
                 (None, String::new(), false)
             }
+        }
+        TurnEvent::QualitySnapshot {
+            score,
+            tdd_pass,
+            clean_pass,
+            file_advisories,
+            skill_advisories,
+            turn_id,
+            ..
+        } => {
+            let line = json!({
+                "type": "quality",
+                "score": score,
+                "tdd_pass": tdd_pass,
+                "clean_pass": clean_pass,
+                "file_advisories": file_advisories,
+                "skill_advisories": skill_advisories,
+            })
+            .to_string();
+            (turn_id.clone(), line, false)
         }
     }
 }
