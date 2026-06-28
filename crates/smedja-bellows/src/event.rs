@@ -145,6 +145,36 @@ pub enum TurnEvent {
         #[serde(flatten)]
         correlation: CorrelationCtx,
     },
+
+    /// Tier-1 quality gate snapshot emitted after each completed turn.
+    ///
+    /// The score (0–100) is the composite of four deterministic gates, each
+    /// contributing 25 points.  File and skill advisories are human-readable
+    /// strings suitable for direct display in the quality panel.
+    ///
+    /// This variant is advisory-only: it never blocks the turn loop.  A score
+    /// below 60 for two consecutive turns triggers a `CoworkGate` soft interrupt
+    /// in the TUI.
+    QualitySnapshot {
+        /// Composite 0–100 quality score.
+        score: u8,
+        /// Whether the TDD backstop passed (25 pts).
+        tdd_pass: bool,
+        /// Whether the clean gate passed (25 pts).
+        clean_pass: bool,
+        /// Human-readable file-size advisory strings, one per flagged file.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        file_advisories: Vec<String>,
+        /// Human-readable skill-inject advisory strings, one per missing skill.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skill_advisories: Vec<String>,
+        /// Turn identifier; correlates this snapshot with the completed turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        /// Correlation context (trace, conversation, agent, status).
+        #[serde(flatten)]
+        correlation: CorrelationCtx,
+    },
 }
 
 // ── Constructors ──────────────────────────────────────────────────────────────
@@ -488,5 +518,97 @@ mod tests {
             !json.contains("trace_id"),
             "None correlation fields must be omitted; got: {json}"
         );
+    }
+
+    #[test]
+    fn quality_snapshot_roundtrips_with_all_fields() {
+        let ev = TurnEvent::QualitySnapshot {
+            score: 75,
+            tdd_pass: true,
+            clean_pass: true,
+            file_advisories: vec!["src/main.rs 7880 L (threshold 600)".into()],
+            skill_advisories: vec!["/security-review — diff touches auth headers".into()],
+            turn_id: Some("t-qs-1".into()),
+            correlation: CorrelationCtx {
+                conversation_id: Some("conv-qs".into()),
+                ..CorrelationCtx::default()
+            },
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let decoded: TurnEvent = serde_json::from_str(&json).unwrap();
+        if let TurnEvent::QualitySnapshot {
+            score,
+            tdd_pass,
+            clean_pass,
+            file_advisories,
+            skill_advisories,
+            turn_id,
+            correlation,
+        } = decoded
+        {
+            assert_eq!(score, 75);
+            assert!(tdd_pass);
+            assert!(clean_pass);
+            assert_eq!(file_advisories.len(), 1);
+            assert!(file_advisories[0].contains("7880"));
+            assert_eq!(skill_advisories.len(), 1);
+            assert!(skill_advisories[0].contains("/security-review"));
+            assert_eq!(turn_id.as_deref(), Some("t-qs-1"));
+            assert_eq!(correlation.conversation_id.as_deref(), Some("conv-qs"));
+        } else {
+            panic!("wrong variant after roundtrip");
+        }
+    }
+
+    #[test]
+    fn quality_snapshot_omits_empty_advisory_vecs() {
+        let ev = TurnEvent::QualitySnapshot {
+            score: 100,
+            tdd_pass: true,
+            clean_pass: true,
+            file_advisories: vec![],
+            skill_advisories: vec![],
+            turn_id: None,
+            correlation: CorrelationCtx::default(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(
+            !json.contains("file_advisories"),
+            "empty vecs must be omitted from JSON; got: {json}"
+        );
+        assert!(
+            !json.contains("skill_advisories"),
+            "empty vecs must be omitted from JSON; got: {json}"
+        );
+        assert!(
+            !json.contains("turn_id"),
+            "None turn_id must be omitted; got: {json}"
+        );
+    }
+
+    #[test]
+    fn quality_snapshot_deserializes_without_optional_fields() {
+        // Older producers may omit advisory vecs and turn_id.
+        let json = r#"{"QualitySnapshot":{"score":50,"tdd_pass":false,"clean_pass":true}}"#;
+        let ev: TurnEvent = serde_json::from_str(json).unwrap();
+        if let TurnEvent::QualitySnapshot {
+            score,
+            tdd_pass,
+            clean_pass,
+            file_advisories,
+            skill_advisories,
+            turn_id,
+            ..
+        } = ev
+        {
+            assert_eq!(score, 50);
+            assert!(!tdd_pass);
+            assert!(clean_pass);
+            assert!(file_advisories.is_empty());
+            assert!(skill_advisories.is_empty());
+            assert!(turn_id.is_none());
+        } else {
+            panic!("wrong variant");
+        }
     }
 }

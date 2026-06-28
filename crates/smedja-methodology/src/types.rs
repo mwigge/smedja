@@ -43,3 +43,38 @@ impl MethodologyViolation {
 
 /// The result type for all methodology gate checks.
 pub type GateResult = Result<(), MethodologyViolation>;
+
+/// Composite quality score for a single turn's diff.
+///
+/// Four gates each contribute 25 points for a maximum of 100:
+///
+/// | Gate | Points | Fails when |
+/// |---|---|---|
+/// | TDD backstop | 25 | [`tdd::TddVerdict::Advisory`] |
+/// | Clean gate | 25 | any violation |
+/// | File size | 25 | any file over threshold |
+/// | Skill inject | 25 | any missing skill advisory |
+///
+/// A score ≥ 60 is green; < 60 is advisory (yellow); two consecutive turns
+/// below 60 trigger the `CoworkGate` interrupt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualityScore {
+    /// Composite 0–100 score.
+    pub score: u8,
+    /// Whether the TDD gate passed (25 pts).
+    pub tdd_pass: bool,
+    /// Whether the clean gate passed (25 pts).
+    pub clean_pass: bool,
+    /// Whether the file-size gate passed (no advisories, 25 pts).
+    pub file_size_pass: bool,
+    /// Whether the skill-inject gate passed (no advisories, 25 pts).
+    pub skill_inject_pass: bool,
+}
+
+impl QualityScore {
+    /// Returns `true` when the score is at or above the green threshold (60).
+    #[must_use]
+    pub fn is_green(&self) -> bool {
+        self.score >= 60
+    }
+}

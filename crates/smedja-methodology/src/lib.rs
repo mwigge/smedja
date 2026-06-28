@@ -17,8 +17,14 @@
 
 pub mod clean;
 pub mod config;
+pub mod file_size;
+pub mod quality;
+pub mod skill_inject;
 pub mod tdd;
 pub mod types;
 
 pub use config::{MethodologyConfig, MethodologyConfigError};
-pub use types::{GateResult, MethodologyViolation, Mode, SessionConfig};
+pub use file_size::FileSizeAdvisory;
+pub use quality::evaluate as quality_evaluate;
+pub use skill_inject::SkillAdvisory;
+pub use types::{GateResult, MethodologyViolation, Mode, QualityScore, SessionConfig};

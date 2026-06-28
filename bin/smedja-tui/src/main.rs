@@ -7,6 +7,7 @@ mod lsp_panel;
 pub mod main_panel;
 mod metrics_view;
 mod obs_panel;
+mod quality_panel;
 pub(crate) mod slash;
 mod staging;
 mod statusbar;
@@ -242,6 +243,7 @@ keybindings (scroll/normal mode):
   Ctrl-F             — toggle context rail
   Ctrl-L             — toggle LSP diagnostic panel
   Ctrl-O             — toggle observability panel
+  Ctrl-Q             — toggle quality gate panel
   Ctrl-W             — toggle session browser (left rail)
   [ / ]              — move cursor up / down in session rail
   mouse drag         — mark lines in the messages panel; release copies them
@@ -273,6 +275,8 @@ struct PanelVisibility {
     obs: bool,
     /// Role cockpit panel (right rail, Ctrl-A).
     role_cockpit: bool,
+    /// Quality gate panel (right rail, Ctrl-Q).
+    quality: bool,
 }
 
 #[allow(clippy::struct_excessive_bools)] // AppState is a TUI dispatch table; enum-splitting would add indirection without clarity
@@ -457,6 +461,10 @@ pub(crate) struct AppState {
     lsp_snapshot: smedja_lsp::LspSnapshot,
     /// Observability snapshot — updated from turn events + metrics polls.
     obs_snapshot: obs_panel::ObsSnapshot,
+    /// Quality gate snapshot — updated on each TurnEvent::QualitySnapshot.
+    quality_snapshot: quality_panel::QualitySnapshot,
+    /// Consecutive turns with quality score < 60 (resets on score ≥ 60).
+    consecutive_low_quality: u8,
     /// Last 50 turn round-trip latencies in ms, used for p95/p99 computation.
     latency_samples: VecDeque<u64>,
     /// Cumulative input tokens for this session (updated on each turn done event).
@@ -2414,6 +2422,11 @@ async fn handle_key(
             state.panels.obs = !state.panels.obs;
         }
 
+        // Ctrl-Q: toggle quality gate panel in the right rail.
+        KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.panels.quality = !state.panels.quality;
+        }
+
         KeyCode::Esc => {
             if state.secret_var.take().is_some() {
                 // Cancel masked secret entry; discard whatever was typed.
@@ -3112,26 +3125,32 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         frame.render_widget(search_widget, search_area);
     }
 
-    // -- Right rail: context | role cockpit | LSP panel | obs panel ----------
-    // The rail is split vertically into 1–4 sections. Context (1 row) is always
-    // present; role cockpit, LSP, and obs panels are individually toggled.
+    // -- Right rail: context | role cockpit | LSP panel | obs panel | quality panel ----------
+    // The rail is split vertically into 1–5 sections. Context (1 row) is always
+    // present; role cockpit, LSP, obs, and quality panels are individually toggled.
     if let Some(rail_rect) = rail_area {
         use Constraint::{Fill, Length};
 
         let show_cockpit = state.panels.role_cockpit;
         let show_lsp = state.panels.lsp;
         let show_obs = state.panels.obs;
+        let show_quality = state.panels.quality;
 
         // Build constraint list dynamically so Layout never gets zero-length.
         let mut constraints: Vec<Constraint> = vec![Length(1)]; // context row
         if show_cockpit {
             constraints.push(Length(6));
         }
-        if show_lsp && show_obs {
+        // LSP gets flexible space; obs and quality get fixed heights below it.
+        let has_fixed = show_obs || show_quality;
+        if show_lsp || has_fixed {
             constraints.push(Fill(1));
+        }
+        if show_obs {
             constraints.push(Length(9));
-        } else if show_lsp || show_obs {
-            constraints.push(Fill(1));
+        }
+        if show_quality {
+            constraints.push(Length(10));
         }
 
         let rail_chunks = Layout::vertical(constraints).split(rail_rect);
@@ -3164,6 +3183,13 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         // ── Observability panel ───────────────────────────────────────────
         if show_obs && ci < rail_chunks.len() {
             obs_panel::ObsPanel::new(&state.obs_snapshot).render(rail_chunks[ci], frame);
+            ci += 1;
+        }
+
+        // ── Quality gate panel ────────────────────────────────────────────
+        if show_quality && ci < rail_chunks.len() {
+            quality_panel::QualityPanel::new(&state.quality_snapshot)
+                .render(rail_chunks[ci], frame);
         }
     }
 
@@ -3629,6 +3655,7 @@ async fn main() -> Result<()> {
             lsp: true,
             obs: true,
             role_cockpit: false,
+            quality: false,
         },
         metrics_snapshot: Vec::new(),
         savings_snapshot: metrics_view::SavingsSnapshot::default(),
@@ -3685,6 +3712,8 @@ async fn main() -> Result<()> {
         lsp_last_poll: None,
         lsp_snapshot: smedja_lsp::LspSnapshot::default(),
         obs_snapshot: obs_panel::ObsSnapshot::default(),
+        quality_snapshot: quality_panel::QualitySnapshot::default(),
+        consecutive_low_quality: 0,
         latency_samples: VecDeque::new(),
         session_tokens_in: 0,
         session_tokens_out: 0,
@@ -4089,6 +4118,49 @@ async fn main() -> Result<()> {
                             state.block_store.push(block);
                         }
                         turn_done = true;
+                    }
+                    Some("quality") => {
+                        // Update quality panel snapshot from the post-turn gate evaluation.
+                        let score = event["score"].as_u64().unwrap_or(0) as u8;
+                        state.quality_snapshot = quality_panel::QualitySnapshot {
+                            score,
+                            tdd_pass: event["tdd_pass"].as_bool().unwrap_or(true),
+                            clean_pass: event["clean_pass"].as_bool().unwrap_or(true),
+                            file_advisories: event["file_advisories"]
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|v| v.as_str().map(str::to_owned))
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            skill_advisories: event["skill_advisories"]
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|v| v.as_str().map(str::to_owned))
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                        };
+                        // CoworkGate: two consecutive turns below 60.
+                        if score < 60 {
+                            state.consecutive_low_quality =
+                                state.consecutive_low_quality.saturating_add(1);
+                            if state.consecutive_low_quality >= 2 {
+                                state.pending_cowork.push(cowork_widget::CoworkItem {
+                                    id: format!("quality-gate-{score}"),
+                                    tool: "quality-gate".to_owned(),
+                                    step_n: 0,
+                                    args_display: format!(
+                                        "Score {score}/100 for 2 consecutive turns — address findings?"
+                                    ),
+                                    reasoning: "Quality score below 60 for 2 turns.".to_owned(),
+                                });
+                            }
+                        } else {
+                            state.consecutive_low_quality = 0;
+                        }
                     }
                     _ => {}
                 }
@@ -5890,6 +5962,7 @@ mod tests {
                 lsp: true,
                 obs: true,
                 role_cockpit: false,
+                quality: false,
             },
             metrics_snapshot: Vec::new(),
             savings_snapshot: metrics_view::SavingsSnapshot::default(),
@@ -5945,6 +6018,8 @@ mod tests {
             lsp_last_poll: None,
             lsp_snapshot: smedja_lsp::LspSnapshot::default(),
             obs_snapshot: obs_panel::ObsSnapshot::default(),
+            quality_snapshot: quality_panel::QualitySnapshot::default(),
+            consecutive_low_quality: 0,
             latency_samples: VecDeque::new(),
             session_tokens_in: 0,
             session_tokens_out: 0,

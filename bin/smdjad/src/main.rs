@@ -22,6 +22,7 @@ pub mod methodology_gate;
 pub mod orchestrator;
 pub mod price_table;
 pub mod provider_pool;
+pub mod quality_hook;
 pub mod sandbox;
 pub mod security;
 pub mod stream_server;
@@ -1117,6 +1118,39 @@ async fn main() -> anyhow::Result<()> {
                     warn!(error = %e, "database vacuum failed");
                 }
                 tokio::time::sleep(std::time::Duration::from_hours(24)).await;
+            }
+        });
+    }
+
+    // Post-turn quality gate subscriber: reacts to every TurnEvent::Completed by
+    // running the four Tier-1 deterministic gates and dispatching QualitySnapshot.
+    // All errors in the hook are swallowed — this must never stall the turn loop.
+    {
+        let mut quality_rx = dispatcher.subscribe();
+        let quality_dispatcher = Arc::clone(&dispatcher);
+        let quality_workspace = workspace_root.clone();
+        let session_skills = quality_hook::discover_session_skills(&workspace_root);
+        let file_size_threshold = quality_hook::load_file_size_threshold(&workspace_root);
+        tokio::spawn(async move {
+            loop {
+                let events = smedja_bellows::drain_ready(&mut quality_rx);
+                for ev in events {
+                    if let TurnEvent::Completed { turn_id, .. } = ev {
+                        let disp = Arc::clone(&quality_dispatcher);
+                        let ws = quality_workspace.clone();
+                        let skills = session_skills.clone();
+                        tokio::task::spawn_blocking(move || {
+                            quality_hook::run_after_turn(
+                                Some(turn_id),
+                                ws,
+                                skills,
+                                file_size_threshold,
+                                disp,
+                            );
+                        });
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
         });
     }
