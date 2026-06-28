@@ -130,9 +130,9 @@ pub(crate) fn format_memory(history: &Value, context: Option<&Value>, sid: &str)
                 if let Some(msgs) = msgs {
                     for m in msgs {
                         let role = m.get("role").and_then(Value::as_str).unwrap_or("");
-                        let content = m.get("content").and_then(Value::as_str).unwrap_or("");
+                        let msg_text = m.get("content").and_then(Value::as_str).unwrap_or("");
                         let preview: String =
-                            content.split_whitespace().collect::<Vec<_>>().join(" ");
+                            msg_text.split_whitespace().collect::<Vec<_>>().join(" ");
                         let preview: String = preview.chars().take(72).collect();
                         if role == "user" && user.is_empty() {
                             user = preview;
@@ -527,11 +527,13 @@ pub(crate) async fn dispatch_slash(
                 transition_args if transition_args.starts_with("transition ") => {
                     let rest = transition_args.trim_start_matches("transition ").trim();
                     // Validate status before delegating to gov_transition.
-                    let status_arg = rest.split_once(' ').map(|x| x.1).unwrap_or("").trim();
+                    #[allow(clippy::items_after_statements)]
                     const VALID_WI_STATUSES: &[&str] =
                         &["planned", "in_progress", "done", "cancelled"];
+                    #[allow(clippy::items_after_statements)]
                     const VALID_DOC_STATUSES: &[&str] =
                         &["draft", "accepted", "rejected", "superseded"];
+                    let status_arg = rest.split_once(' ').map_or("", |x| x.1).trim();
                     let id_prefix = rest.split('-').next().unwrap_or("");
                     let valid_statuses = if id_prefix.eq_ignore_ascii_case("WI") {
                         VALID_WI_STATUSES
@@ -1043,6 +1045,7 @@ pub(crate) async fn dispatch_slash(
             let limit = state.obs_snapshot.daily_tokens_limit;
             let text = match (used, limit) {
                 (Some(u), Some(l)) if l > 0 => {
+                    #[allow(clippy::cast_precision_loss)]
                     let pct = (u as f64 / l as f64 * 100.0).min(100.0);
                     format!(
                         "quota: {}/{} tokens used ({:.1}%)",
@@ -1410,6 +1413,7 @@ pub(crate) async fn trigger_quality_review(state: &mut AppState, client: &mut Cl
 pub(crate) fn show_value_report(state: &mut AppState) {
     let snap = &state.value_snapshot;
     let change = snap.change_name.as_deref().unwrap_or("(no active change)");
+    #[allow(clippy::cast_precision_loss)]
     let cost_dollars = snap.cost_usd_micros as f64 / 1_000_000.0;
     let report = format!(
         "## value report\n\n| field | value |\n|---|---|\n| change | {change} |\n| tokens | {} |\n| cost | ${cost_dollars:.4} |\n| quality avg | {}/100 |\n| roi estimate | {} (estimate) |",

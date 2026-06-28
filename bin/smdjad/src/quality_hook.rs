@@ -109,6 +109,7 @@ fn parse_quality_toml(content: &str) -> Option<usize> {
 /// Runs `git diff HEAD~1` in `workspace_root` and returns the unified diff text.
 /// Returns an empty string if git is not available or the working tree has no
 /// prior commit.
+#[must_use]
 pub fn git_diff(workspace_root: &Path) -> String {
     let Ok(out) = Command::new("git")
         .args(["diff", "HEAD~1"])
@@ -125,6 +126,7 @@ pub fn git_diff(workspace_root: &Path) -> String {
 
 /// Returns `(path, line_count)` pairs for files changed since `HEAD~1`.
 /// Public alias used by the `quality.review` handler.
+#[must_use]
 pub fn changed_file_sizes_for_review(workspace_root: &Path) -> Vec<(PathBuf, usize)> {
     changed_file_sizes(workspace_root)
 }
@@ -155,6 +157,7 @@ fn changed_file_sizes(workspace_root: &Path) -> Vec<(PathBuf, usize)> {
 ///
 /// This function is intended to be called from a spawned Tokio task.  Any
 /// error is logged and suppressed — it must never propagate to the turn loop.
+#[allow(clippy::needless_pass_by_value)]
 pub fn run_after_turn(
     turn_id: Option<String>,
     workspace_root: PathBuf,

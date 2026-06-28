@@ -71,6 +71,7 @@ impl Widget for CodeWidget<'_> {
         let lines = build_lines(self.source, self.language);
         let visible = lines.iter().skip(self.scroll).take(area.height as usize);
         for (row, styled) in visible.enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
             let y = area.y + row as u16;
             let rendered_line: Line<'_> = match &styled.spans {
                 Some(pre) => pre.clone(),

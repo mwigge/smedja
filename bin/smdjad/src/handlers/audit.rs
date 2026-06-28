@@ -95,7 +95,7 @@ pub(crate) async fn set_mode(state: HandlerState, params: Value) -> Result<Value
     Ok(json!({ "session_id": session_id, "mode": new_mode.as_str() }))
 }
 
-/// Handles `cowork.gate_tool`: the PreToolUse hook entry point for external CLIs
+/// Handles `cowork.gate_tool`: the `PreToolUse` hook entry point for external CLIs
 /// (claude via `smj tool-gate`). Evaluates the session's permission policy and
 /// blocks on the user when it says "ask". Returns `{decision, reason}` where
 /// `decision` is `"allow"` or `"deny"`.

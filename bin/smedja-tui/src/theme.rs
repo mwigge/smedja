@@ -58,9 +58,9 @@ pub const FORGE_WARN: Color = Color::Rgb(243, 197, 92);
 
 /// `local` tier — `#4eb9b2` warm teal (distinct from amber, still warm).
 pub const FORGE_LOCAL: Color = Color::Rgb(78, 185, 178);
-/// `fast` tier — `#f7c77e` bright gold (same as FORGE_TEXT_BRIGHT).
+/// `fast` tier — `#f7c77e` bright gold (same as `FORGE_TEXT_BRIGHT`).
 pub const FORGE_FAST: Color = Color::Rgb(247, 199, 126);
-/// `deep` tier — `#a9652f` copper (same as FORGE_BORDER — the heavy hitter).
+/// `deep` tier — `#a9652f` copper (same as `FORGE_BORDER` — the heavy hitter).
 pub const FORGE_DEEP: Color = Color::Rgb(169, 101, 47);
 
 /// Default code text — `#ccd0da` cool near-white.
@@ -77,9 +77,9 @@ pub const CODE_COMMENT: Color = Color::Rgb(84, 110, 122);
 pub const CODE_TYPE: Color = Color::Rgb(130, 170, 255);
 /// Macro invocations — `#f78c6c` warm orange.
 pub const CODE_MACRO: Color = Color::Rgb(247, 140, 108);
-/// Diff added lines — reuse FORGE_SUCCESS green.
+/// Diff added lines — reuse `FORGE_SUCCESS` green.
 pub const CODE_ADDED: Color = FORGE_SUCCESS;
-/// Diff removed lines — reuse FORGE_ERROR red.
+/// Diff removed lines — reuse `FORGE_ERROR` red.
 pub const CODE_REMOVED: Color = FORGE_ERROR;
 
 // ---------------------------------------------------------------------------

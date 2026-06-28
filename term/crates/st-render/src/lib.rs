@@ -351,6 +351,10 @@ pub struct GlyphAtlas {
 
 impl GlyphAtlas {
     /// Creates a new [`GlyphAtlas`] backed by `device`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ATLAS_SIZE` does not fit in `i32` (compile-time invariant).
     #[must_use]
     pub fn new(device: &wgpu::Device) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -424,6 +428,10 @@ impl GlyphAtlas {
     /// if not yet cached.
     ///
     /// Returns `None` if the atlas is full or rasterisation fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a rasterised glyph dimension does not fit in `i32`.
     pub fn get_or_insert(
         &mut self,
         _device: &wgpu::Device,
@@ -1313,6 +1321,10 @@ impl Renderer {
     ///
     /// Must be called when the window moves to a display with a different DPI.
     /// Clears cached glyphs so they are re-rasterised at the new scale.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ATLAS_SIZE` does not fit in `i32` (compile-time invariant).
     pub fn update_scale_factor(&mut self, sf: f64) {
         if (self.scale_factor - sf).abs() > f64::EPSILON {
             self.scale_factor = sf;

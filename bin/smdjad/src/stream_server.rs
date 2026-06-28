@@ -74,6 +74,7 @@ fn evict_and_push(buf: &mut std::collections::VecDeque<String>, line: String) {
 /// stream clients can still replay it; callers should call
 /// [`cleanup_turn`](cleanup_turn) after a short delay to reclaim memory.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
     let store: DeltaStore = Arc::new(Mutex::new(HashMap::new()));
     let store_inner = Arc::clone(&store);

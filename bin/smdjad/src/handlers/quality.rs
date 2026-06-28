@@ -34,8 +34,7 @@ pub(crate) async fn review(state: HandlerState, params: Value) -> Result<Value, 
     let workspace_root = session
         .workspace_root
         .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
 
     let primary_provider = session.runner_override.unwrap_or_default();
     let reviewer_model = quality_runner::quality_reviewer_model(&primary_provider);

@@ -169,8 +169,7 @@ pub(crate) async fn cancel(state: HandlerState, params: Value) -> Result<Value, 
     let aborted = state
         .turn_registry
         .lock()
-        .map(|mut reg| reg.remove(&task_id).map(|h| h.abort()).is_some())
-        .unwrap_or(false);
+        .is_ok_and(|mut reg| reg.remove(&task_id).map(|h| h.abort()).is_some());
 
     if aborted {
         let session_id = state

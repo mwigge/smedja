@@ -111,9 +111,7 @@ pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, 
     // falling back to the daemon cwd when none was supplied. This is what makes
     // rust-analyzer start for the project and the graph reflect the right repo,
     // instead of the daemon's $HOME.
-    let ws_path = workspace
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(crate::common::workspace_root);
+    let ws_path = workspace.map_or_else(crate::common::workspace_root, std::path::PathBuf::from);
     lsp_manager.ensure_workspace(ws_path.clone());
     maybe_reindex_workspace(ws_path);
 
@@ -132,14 +130,16 @@ pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, 
         .iter()
         .find(|(r, _, m)| *r == effective_runner && *m == effective_model)
         .or_else(|| entries.iter().find(|(r, _, _)| *r == effective_runner))
-        .map(|(_, t, _)| t.to_string())
-        .unwrap_or_else(|| {
-            if effective_runner.contains("local") {
-                "local".to_owned()
-            } else {
-                "fast".to_owned()
-            }
-        });
+        .map_or_else(
+            || {
+                if effective_runner.contains("local") {
+                    "local".to_owned()
+                } else {
+                    "fast".to_owned()
+                }
+            },
+            |(_, t, _)| t.to_string(),
+        );
     Ok(json!({
         "id": session.id,
         "title": title,
@@ -158,6 +158,7 @@ pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, 
 ///
 /// Errors are logged and swallowed — re-indexing is advisory and must not fail
 /// the `session.create` RPC call that triggers it.
+#[allow(clippy::needless_pass_by_value)]
 fn maybe_reindex_workspace(cwd: PathBuf) {
     let toml_path = cwd.join(".smedja").join("workspace.toml");
     let needs_index = if toml_path.exists() {
@@ -500,7 +501,7 @@ pub(crate) async fn set_tier(state: HandlerState, params: Value) -> Result<Value
     let model = pool
         .get(runner, tier)
         .or_else(|| pool.eligible_ring(runner, tier).into_iter().next())
-        .map(|e| e.default_model.to_owned())
+        .map(|e| e.default_model.clone())
         .ok_or_else(|| {
             RpcError::new(
                 codes::INVALID_PARAMS,
