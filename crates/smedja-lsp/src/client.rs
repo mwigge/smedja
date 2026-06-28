@@ -202,22 +202,27 @@ fn parse_diagnostics(workspace: &Path, params: &Value) -> Vec<Diagnostic> {
         .unwrap_or_default();
     let file = uri_to_rel_path(workspace, uri);
 
-    let items = match params.get("diagnostics").and_then(Value::as_array) {
-        Some(a) => a,
-        None => return Vec::new(),
+    let Some(items) = params.get("diagnostics").and_then(Value::as_array) else {
+        return Vec::new();
     };
 
     let mut out: Vec<Diagnostic> = items
         .iter()
         .filter_map(|d| {
-            let line = d["range"]["start"]["line"]
-                .as_u64()
-                .unwrap_or(0)
-                .saturating_add(1) as u32;
-            let col = d["range"]["start"]["character"]
-                .as_u64()
-                .unwrap_or(0)
-                .saturating_add(1) as u32;
+            let line = u32::try_from(
+                d["range"]["start"]["line"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .saturating_add(1),
+            )
+            .unwrap_or(u32::MAX);
+            let col = u32::try_from(
+                d["range"]["start"]["character"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .saturating_add(1),
+            )
+            .unwrap_or(u32::MAX);
             let severity_n = d.get("severity").and_then(Value::as_u64).unwrap_or(1);
             let code = d
                 .get("code")

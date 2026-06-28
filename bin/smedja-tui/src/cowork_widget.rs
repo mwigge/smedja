@@ -3,10 +3,10 @@
 //! Rendered as a centred overlay when a tool call is awaiting human approval.
 //! Keyboard shortcuts: `y` approve, `n` deny, `m` modify (enter instruction mode).
 
+use crate::theme::palette;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
-use crate::theme::palette;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
@@ -72,9 +72,7 @@ impl Widget for CoworkWidget<'_> {
             Line::from(vec![
                 Span::styled(
                     " [y] ",
-                    Style::default()
-                        .fg(p.success)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(p.success).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("approve  "),
                 Span::styled(
@@ -84,9 +82,7 @@ impl Widget for CoworkWidget<'_> {
                 Span::raw("deny  "),
                 Span::styled(
                     "[m] ",
-                    Style::default()
-                        .fg(p.accent)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("modify"),
             ])
@@ -110,9 +106,7 @@ impl Widget for CoworkWidget<'_> {
             .border_style(Style::default().fg(p.border))
             .title(Span::styled(
                 title,
-                Style::default()
-                    .fg(p.text)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             ))
             .title_alignment(Alignment::Left);
 

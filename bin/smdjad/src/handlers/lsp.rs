@@ -135,7 +135,10 @@ mod tests {
         let resp = status_from_snapshot(snap);
         let servers = resp["servers"].as_array().unwrap();
         assert_eq!(servers.len(), 3);
-        let names: Vec<&str> = servers.iter().map(|v| v["name"].as_str().unwrap()).collect();
+        let names: Vec<&str> = servers
+            .iter()
+            .map(|v| v["name"].as_str().unwrap())
+            .collect();
         assert!(names.contains(&"rust-analyzer"));
         assert!(names.contains(&"pyright"));
         assert!(names.contains(&"gopls"));

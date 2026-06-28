@@ -83,7 +83,10 @@ fn bundle_hardcodes_version(toml: &str) -> bool {
             in_bundle = t == "[package.metadata.bundle]";
             continue;
         }
-        if in_bundle && t.strip_prefix("version").is_some_and(|r| r.trim_start().starts_with('=')) {
+        if in_bundle
+            && t.strip_prefix("version")
+                .is_some_and(|r| r.trim_start().starts_with('='))
+        {
             return true;
         }
     }

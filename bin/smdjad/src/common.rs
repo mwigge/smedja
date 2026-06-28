@@ -5,6 +5,7 @@
 //! `main` entrypoint — so the orchestrator and executor depend on it rather than
 //! depending upward on the binary's `main.rs` free functions.
 
+use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt as _;
@@ -232,7 +233,7 @@ pub(crate) async fn drain_stream(
                 // A human-readable one-line summary (the command, path, pattern…)
                 // instead of raw truncated JSON.
                 let input_summary = summarize_tool_input(&input);
-                full_response.push_str(&format!("▶ {name}: {input_summary}\n"));
+                let _ = writeln!(full_response, "▶ {name}: {input_summary}");
                 // The full input (capped) backs the on-demand detail view.
                 let full_input: String = input.to_string().chars().take(4096).collect();
                 // Publish ONLY the structured tool_call event; the UI renders the
@@ -299,7 +300,10 @@ pub(crate) async fn drain_stream(
 /// Collapses a string to a single trimmed line and caps it at `max` display
 /// chars with an ellipsis — for compact tool summaries.
 fn truncate_summary(s: &str, max: usize) -> String {
-    let one_line: String = s.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
+    let one_line: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
     let trimmed = one_line.split_whitespace().collect::<Vec<_>>().join(" ");
     if trimmed.chars().count() > max {
         let cut: String = trimmed.chars().take(max).collect();

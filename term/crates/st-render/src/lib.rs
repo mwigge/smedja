@@ -63,6 +63,7 @@ pub enum RenderError {
 /// glyph-shaping flags here: bold/italic pick the font variant, `wide` centres a
 /// double-width glyph over two columns, and underline/strikethrough draw rules.
 #[derive(Debug, Clone, PartialEq, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Cell {
     /// The Unicode scalar displayed in this cell.
     pub ch: char,
@@ -388,8 +389,8 @@ impl GlyphAtlas {
             texture,
             view,
             alpha_alloc: etagere::AtlasAllocator::new(etagere::size2(
-                ATLAS_SIZE as i32,
-                ATLAS_SIZE as i32,
+                i32::try_from(ATLAS_SIZE).expect("ATLAS_SIZE fits i32"),
+                i32::try_from(ATLAS_SIZE).expect("ATLAS_SIZE fits i32"),
             )),
             frame: 0,
             glyphs: HashMap::new(),
@@ -521,7 +522,10 @@ impl GlyphAtlas {
         // If nothing is evictable the glyph is skipped (returns None) for this
         // frame; it is re-warmed next frame once room frees up.
         let alloc = loop {
-            if let Some(a) = self.alpha_alloc.allocate(etagere::size2(w as i32, h as i32)) {
+            if let Some(a) = self.alpha_alloc.allocate(etagere::size2(
+                i32::try_from(w).expect("glyph width fits i32"),
+                i32::try_from(h).expect("glyph height fits i32"),
+            )) {
                 break a;
             }
             let victim = self
@@ -530,15 +534,12 @@ impl GlyphAtlas {
                 .filter(|(_, e)| e.id.is_some() && e.last_used < self.frame)
                 .min_by_key(|(_, e)| e.last_used)
                 .map(|(k, e)| (*k, e.id));
-            match victim {
-                Some((vkey, Some(vid))) => {
-                    self.alpha_alloc.deallocate(vid);
-                    self.glyphs.remove(&vkey);
-                }
-                _ => {
-                    tracing::debug!("glyph atlas full and nothing evictable — skipping glyph");
-                    return None;
-                }
+            if let Some((vkey, Some(vid))) = victim {
+                self.alpha_alloc.deallocate(vid);
+                self.glyphs.remove(&vkey);
+            } else {
+                tracing::debug!("glyph atlas full and nothing evictable — skipping glyph");
+                return None;
             }
         };
         #[allow(clippy::cast_sign_loss)]
@@ -1317,8 +1318,8 @@ impl Renderer {
             self.scale_factor = sf;
             self.atlas.glyphs.clear();
             self.atlas.alpha_alloc = etagere::AtlasAllocator::new(etagere::size2(
-                ATLAS_SIZE as i32,
-                ATLAS_SIZE as i32,
+                i32::try_from(ATLAS_SIZE).expect("ATLAS_SIZE fits i32"),
+                i32::try_from(ATLAS_SIZE).expect("ATLAS_SIZE fits i32"),
             ));
         }
     }
@@ -1751,19 +1752,37 @@ impl Renderer {
                 let t = 2.0 / self.size.height as f32; // ~1px thick in NDC
                 let mut rule = |ytop: f32, ybot: f32| {
                     verts.extend_from_slice(&[
-                        BgVertex { position: [x0, ytop], color: fg },
-                        BgVertex { position: [x1, ytop], color: fg },
-                        BgVertex { position: [x0, ybot], color: fg },
-                        BgVertex { position: [x1, ytop], color: fg },
-                        BgVertex { position: [x1, ybot], color: fg },
-                        BgVertex { position: [x0, ybot], color: fg },
+                        BgVertex {
+                            position: [x0, ytop],
+                            color: fg,
+                        },
+                        BgVertex {
+                            position: [x1, ytop],
+                            color: fg,
+                        },
+                        BgVertex {
+                            position: [x0, ybot],
+                            color: fg,
+                        },
+                        BgVertex {
+                            position: [x1, ytop],
+                            color: fg,
+                        },
+                        BgVertex {
+                            position: [x1, ybot],
+                            color: fg,
+                        },
+                        BgVertex {
+                            position: [x0, ybot],
+                            color: fg,
+                        },
                     ]);
                 };
                 if cell.underline {
                     rule(y1 + t * 2.0, y1);
                 }
                 if cell.strikethrough {
-                    let ymid = (y0 + y1) / 2.0;
+                    let ymid = f32::midpoint(y0, y1);
                     rule(ymid + t, ymid - t);
                 }
             }
@@ -1952,10 +1971,10 @@ impl Renderer {
             }
             // Look up glyph entry from atlas (read-only view — we cannot call
             // get_or_insert here because we'd need &mut self; use cached value).
-            let Some(&entry) = self
-                .atlas
-                .glyphs
-                .get(&(cell.ch, cell.bold, cell.italic, eff_font_key))
+            let Some(&entry) =
+                self.atlas
+                    .glyphs
+                    .get(&(cell.ch, cell.bold, cell.italic, eff_font_key))
             else {
                 tracing::warn!(ch = %cell.ch, "glyph atlas miss — cell skipped");
                 continue;

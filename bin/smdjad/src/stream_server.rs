@@ -31,10 +31,10 @@ use smedja_bellows::{Dispatcher, TurnEvent};
 /// Maximum NDJSON lines buffered per turn before the oldest are discarded.
 const MAX_BUFFER_PER_TURN: usize = 8192;
 
-/// Maximum seconds to wait for a turn to start emitting events after a stream
-/// connection arrives.  If the `task_id` is valid but the turn has not yet fired
-/// `Started`, the subscriber waits up to this duration before giving up.
-const STREAM_TIMEOUT_SECS: u64 = 90;
+/// Maximum seconds to keep a client stream open while waiting for live turn
+/// events. This must be longer than the provider drain timeout so slow model
+/// streams are not reported as stream transport failures.
+const STREAM_TIMEOUT_SECS: u64 = 600;
 
 /// Seconds to retain a terminal turn's buffer after completion before auto-eviction.
 /// This window allows late-connecting stream clients to still replay the turn.
@@ -227,7 +227,8 @@ pub async fn serve(listener: UnixListener, store: DeltaStore, dispatcher: Arc<Di
         tokio::spawn(async move {
             let Ok(permit) = sem.acquire_owned().await else {
                 let (_, mut writer) = tokio::io::split(stream);
-                let msg = serde_json::json!({"type":"error","message":"at_capacity"}).to_string() + "\n";
+                let msg =
+                    serde_json::json!({"type":"error","message":"at_capacity"}).to_string() + "\n";
                 let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, msg.as_bytes()).await;
                 return;
             };

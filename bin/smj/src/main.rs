@@ -1035,8 +1035,7 @@ async fn main() -> Result<()> {
                                 )
                                 .await
                                 .context("session.messages failed")?;
-                            let messages =
-                                resp["messages"].as_array().cloned().unwrap_or_default();
+                            let messages = resp["messages"].as_array().cloned().unwrap_or_default();
                             println!("# Session {id}\n");
                             for msg in &messages {
                                 let role = msg["role"].as_str().unwrap_or("unknown");
@@ -1139,8 +1138,9 @@ async fn main() -> Result<()> {
                     let mut all_costs: Vec<serde_json::Value> = Vec::new();
                     for sess in &sessions {
                         let sid = sess["id"].as_str().unwrap_or_default();
-                        if let Ok(cost_resp) =
-                            client.call("session.cost", json!({"session_id": sid})).await
+                        if let Ok(cost_resp) = client
+                            .call("session.cost", json!({"session_id": sid}))
+                            .await
                         {
                             all_costs.push(cost_resp);
                         }
@@ -1155,8 +1155,9 @@ async fn main() -> Result<()> {
                     let mut total_cost = 0.0f64;
                     for sess in &sessions {
                         let sid = sess["id"].as_str().unwrap_or_default();
-                        if let Ok(cost_resp) =
-                            client.call("session.cost", json!({"session_id": sid})).await
+                        if let Ok(cost_resp) = client
+                            .call("session.cost", json!({"session_id": sid}))
+                            .await
                         {
                             if let Some(rows) = cost_resp["breakdown"].as_array() {
                                 for row in rows {
@@ -1523,7 +1524,11 @@ async fn main() -> Result<()> {
                 .await
                 .with_context(|| format!("smdjad not running ({})", sock.display()))?;
             match action {
-                LoopCmd::Run { change, max_slices, follow } => {
+                LoopCmd::Run {
+                    change,
+                    max_slices,
+                    follow,
+                } => {
                     let resp = client
                         .call(
                             "loop.create",
@@ -1546,8 +1551,11 @@ async fn main() -> Result<()> {
                             p.push(".stream");
                             std::path::PathBuf::from(p)
                         };
-                        follow_loop(&stream_sock, &loop_id).await
-                            .unwrap_or_else(|e| eprintln!("warning: could not follow loop stream: {e}"));
+                        follow_loop(&stream_sock, &loop_id)
+                            .await
+                            .unwrap_or_else(|e| {
+                                eprintln!("warning: could not follow loop stream: {e}");
+                            });
                     }
                 }
                 LoopCmd::Status { change } => {
@@ -1933,7 +1941,7 @@ async fn main() -> Result<()> {
                             .flatten()
                             .filter(|e| e.path().extension().is_some_and(|x| x == "toml"))
                             .collect();
-                        entries.sort_by_key(|e| e.file_name());
+                        entries.sort_by_key(std::fs::DirEntry::file_name);
                         for entry in entries {
                             let path = entry.path();
                             let text = std::fs::read_to_string(&path).unwrap_or_default();
@@ -1968,27 +1976,24 @@ async fn main() -> Result<()> {
                     let gov_dir = ws.join("gov");
                     let id_upper = id.to_uppercase();
                     let found = find_gov_artifact(&gov_dir, &id_upper);
-                    match found {
-                        Some(path) => {
-                            let text = std::fs::read_to_string(&path)?;
-                            let updated = text
-                                .lines()
-                                .map(|l| {
-                                    if l.trim_start().starts_with("status") {
-                                        format!("status = \"{status}\"")
-                                    } else {
-                                        l.to_owned()
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            std::fs::write(&path, updated)?;
-                            println!("{id_upper}: status \u{2192} {status}");
-                        }
-                        None => {
-                            eprintln!("error: artifact '{id}' not found in gov/");
-                            std::process::exit(1);
-                        }
+                    if let Some(path) = found {
+                        let text = std::fs::read_to_string(&path)?;
+                        let updated = text
+                            .lines()
+                            .map(|l| {
+                                if l.trim_start().starts_with("status") {
+                                    format!("status = \"{status}\"")
+                                } else {
+                                    l.to_owned()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        std::fs::write(&path, updated)?;
+                        println!("{id_upper}: status \u{2192} {status}");
+                    } else {
+                        eprintln!("error: artifact '{id}' not found in gov/");
+                        std::process::exit(1);
                     }
                 }
                 GovCmd::Create { title, description } => {
@@ -2302,9 +2307,7 @@ async fn connect_or_exit(sock: &std::path::Path) -> Client {
     match Client::connect(sock).await {
         Ok(c) => c,
         Err(e) => {
-            let kind = e
-                .downcast_ref::<std::io::Error>()
-                .map(std::io::Error::kind);
+            let kind = e.downcast_ref::<std::io::Error>().map(std::io::Error::kind);
             match kind {
                 Some(std::io::ErrorKind::NotFound) => {
                     eprintln!("error: smdjad is not running (socket not found)");
@@ -2316,10 +2319,7 @@ async fn connect_or_exit(sock: &std::path::Path) -> Client {
                     eprintln!("  Check that you are running as the correct user");
                 }
                 _ => {
-                    eprintln!(
-                        "error: cannot connect to smdjad ({}): {e}",
-                        sock.display()
-                    );
+                    eprintln!("error: cannot connect to smdjad ({}): {e}", sock.display());
                 }
             }
             std::process::exit(1);
@@ -2585,7 +2585,8 @@ async fn follow_loop(stream_sock: &std::path::Path, loop_id: &str) -> anyhow::Re
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
-    let mut stream = UnixStream::connect(stream_sock).await
+    let mut stream = UnixStream::connect(stream_sock)
+        .await
         .context("cannot connect to stream socket")?;
     let req = format!("{{\"task_id\":\"{loop_id}\"}}\n");
     stream.write_all(req.as_bytes()).await?;

@@ -108,7 +108,8 @@ fn retrieve_store() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
 
 /// Insertion-order tracker for the retrieve store LRU eviction.
 fn retrieve_store_order() -> &'static tokio::sync::Mutex<std::collections::VecDeque<String>> {
-    static ORDER: OnceLock<tokio::sync::Mutex<std::collections::VecDeque<String>>> = OnceLock::new();
+    static ORDER: OnceLock<tokio::sync::Mutex<std::collections::VecDeque<String>>> =
+        OnceLock::new();
     ORDER.get_or_init(|| tokio::sync::Mutex::new(std::collections::VecDeque::new()))
 }
 
