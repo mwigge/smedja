@@ -249,7 +249,8 @@ keybindings (scroll/normal mode):
   Ctrl-Q             — toggle quality gate panel
   Ctrl-V             — toggle value / ROI panel (Ctrl-V in input mode pastes)
   Ctrl-W             — toggle session browser (left rail)
-  [ / ]              — move cursor up / down in session rail
+  Alt+↑ / Alt+↓     — move cursor up / down in session rail (input mode)
+  [ / ]              — move cursor up / down in session rail (scroll mode)
   mouse drag         — mark lines in the messages panel; release copies them
   v                  — start line selection (visual mode)
   y                  — yank selection to clipboard
@@ -2273,11 +2274,11 @@ async fn handle_key(
     }
 
     // ------------------------------------------------------------------
-    // Session rail cursor navigation in input mode.
-    // Only Up/Down are intercepted — Enter always submits the prompt, and
-    // [ / ] are valid prompt characters. Enter opens the detail in scroll mode.
+    // Session rail cursor navigation in input mode — Alt+↑/↓ only, so
+    // plain Up/Down remain available for prompt history.
     // ------------------------------------------------------------------
-    if state.panels.session_rail && !state.scroll_focus {
+    if state.panels.session_rail && !state.scroll_focus && key.modifiers.contains(KeyModifiers::ALT)
+    {
         match key.code {
             KeyCode::Up => {
                 state.session_rail_cursor = state.session_rail_cursor.saturating_sub(1);
@@ -3145,11 +3146,23 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
                 .fg(p.text_dim)
                 .add_modifier(Modifier::ITALIC)
         };
-        let mut spans = vec![Span::styled(
-            format!("{frame_char} thinking\u{2026}"),
-            spinner_style,
-        )];
-        if !state.current_thinking.is_empty() {
+        // Label adapts to what the model is actually doing right now.
+        let (label, show_thinking_preview) =
+            if let Some((_, ref name, ref inp)) = state.pending_tool {
+                let inp_short: String = inp.chars().take(40).collect();
+                let ellipsis = if inp.chars().count() > 40 {
+                    "\u{2026}"
+                } else {
+                    ""
+                };
+                (format!("{frame_char} {name}: {inp_short}{ellipsis}"), false)
+            } else if !state.current_thinking.is_empty() {
+                (format!("{frame_char} thinking\u{2026}"), true)
+            } else {
+                (format!("{frame_char} working\u{2026}"), false)
+            };
+        let mut spans = vec![Span::styled(label, spinner_style)];
+        if show_thinking_preview {
             // Show the last ~50 chars of thinking so users see live progress.
             let preview: String = state
                 .current_thinking
@@ -6535,8 +6548,8 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(
-            content.contains("thinking") || content.contains('\u{283f}'),
-            "buffer should contain thinking indicator when turn_in_flight is true"
+            content.contains("thinking") || content.contains("working"),
+            "buffer should contain spinner indicator when turn_in_flight is true"
         );
     }
 
