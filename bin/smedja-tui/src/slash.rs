@@ -839,6 +839,10 @@ pub(crate) async fn dispatch_slash(
             }
             Ok(true)
         }
+        "quality" => {
+            trigger_quality_review(state, client).await;
+            Ok(true)
+        }
         "review" => {
             let mut params = parse_review_scope(args);
 
@@ -1366,5 +1370,34 @@ pub(crate) async fn dispatch_slash(
             Ok(true)
         }
         _ => Ok(false),
+    }
+}
+
+/// Fires a Tier-2 LLM quality review via the `quality.review` RPC.
+///
+/// Shows `[quality review in progress…]` in the quality panel while awaiting.
+/// On completion or error the panel is updated via the normal `QualitySnapshot`
+/// bellows event.
+pub(crate) async fn trigger_quality_review(state: &mut AppState, client: &mut Client) {
+    if state.quality_review_in_progress {
+        push_system_message(state, "quality review already in progress");
+        return;
+    }
+    state.quality_review_in_progress = true;
+    state.panels.quality = true;
+    push_system_message(state, "[quality review in progress\u{2026}]");
+
+    let session_id = state.session_id.clone();
+    match client
+        .call("quality.review", json!({ "session_id": session_id }))
+        .await
+    {
+        Ok(_) => {
+            // The review runs async in smdjad; result arrives as QualitySnapshot event.
+        }
+        Err(e) => {
+            push_system_message(state, format!("quality.review error: {e}"));
+            state.quality_review_in_progress = false;
+        }
     }
 }

@@ -19,10 +19,14 @@ pub struct QualitySnapshot {
     pub tdd_pass: bool,
     /// Whether the clean-code gate passed.
     pub clean_pass: bool,
+    /// Whether this snapshot was produced by a Tier-2 LLM review.
+    pub llm_reviewed: bool,
     /// Human-readable file-size advisories (one per flagged file).
     pub file_advisories: Vec<String>,
     /// Human-readable skill-inject advisories (one per missing skill).
     pub skill_advisories: Vec<String>,
+    /// Slash command suggested by the LLM reviewer, if any.
+    pub suggested_command: Option<String>,
 }
 
 impl QualitySnapshot {
@@ -94,12 +98,27 @@ impl<'a> QualityPanel<'a> {
             inner_w,
         ));
 
+        // ── Suggested command hint (dim, LLM-reviewed only) ──────────────────
+        if let Some(ref cmd) = snap.suggested_command {
+            let hint: String = cmd.chars().take(inner_w).collect();
+            lines.push(Line::from(vec![Span::styled(
+                hint,
+                Style::default().fg(p.text_dim),
+            )]));
+        }
+
+        let title = if snap.llm_reviewed {
+            " quality [llm] "
+        } else {
+            " quality "
+        };
+
         frame.render_widget(
             Paragraph::new(lines).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(p.border))
-                    .title(" quality "),
+                    .title(title),
             ),
             area,
         );
@@ -150,7 +169,7 @@ mod tests {
             tdd_pass: true,
             clean_pass: true,
             file_advisories: vec!["main.rs 7880 L (threshold 600)".into()],
-            skill_advisories: vec![],
+            ..QualitySnapshot::default()
         };
         let rendered = render_snapshot(&snap, 30, 10);
         assert!(rendered.contains("quality"), "title present: {rendered}");

@@ -168,6 +168,10 @@ pub enum TurnEvent {
         /// Human-readable skill-inject advisory strings, one per missing skill.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         skill_advisories: Vec<String>,
+        /// Whether the score was produced by a Tier-2 LLM review (not just
+        /// the deterministic Tier-1 gates).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        llm_reviewed: bool,
         /// Turn identifier; correlates this snapshot with the completed turn.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
@@ -528,6 +532,7 @@ mod tests {
             clean_pass: true,
             file_advisories: vec!["src/main.rs 7880 L (threshold 600)".into()],
             skill_advisories: vec!["/security-review — diff touches auth headers".into()],
+            llm_reviewed: false,
             turn_id: Some("t-qs-1".into()),
             correlation: CorrelationCtx {
                 conversation_id: Some("conv-qs".into()),
@@ -542,6 +547,7 @@ mod tests {
             clean_pass,
             file_advisories,
             skill_advisories,
+            llm_reviewed,
             turn_id,
             correlation,
         } = decoded
@@ -549,6 +555,7 @@ mod tests {
             assert_eq!(score, 75);
             assert!(tdd_pass);
             assert!(clean_pass);
+            assert!(!llm_reviewed);
             assert_eq!(file_advisories.len(), 1);
             assert!(file_advisories[0].contains("7880"));
             assert_eq!(skill_advisories.len(), 1);
@@ -568,6 +575,7 @@ mod tests {
             clean_pass: true,
             file_advisories: vec![],
             skill_advisories: vec![],
+            llm_reviewed: false,
             turn_id: None,
             correlation: CorrelationCtx::default(),
         };
