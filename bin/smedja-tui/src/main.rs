@@ -1120,6 +1120,22 @@ fn replay_history(state: &mut AppState, history: &serde_json::Value) {
         max_turn = max_turn.max(turn_n);
     }
     state.turn_n = max_turn;
+
+    // Seed latency samples from audit events so the p95/p99 sparkline has
+    // historical data rather than starting blank on every session load.
+    if let Some(audit) = history.get("audit").and_then(serde_json::Value::as_array) {
+        for ev in audit {
+            if let Some(ms) = ev.get("latency_ms").and_then(serde_json::Value::as_u64) {
+                if ms > 0 {
+                    if state.latency_samples.len() >= LATENCY_SAMPLE_CAP {
+                        state.latency_samples.pop_front();
+                    }
+                    state.latency_samples.push_back(ms);
+                }
+            }
+        }
+        state.obs_snapshot.latency_samples = state.latency_samples.clone();
+    }
 }
 
 /// Formats `session.list` rows for the `/resume` picker.
@@ -6073,6 +6089,37 @@ mod tests {
         replay_history(&mut state, &history);
         assert_eq!(state.block_store.len(), 0);
         assert_eq!(state.turn_n, 0);
+    }
+
+    #[test]
+    fn replay_history_seeds_latency_samples_from_audit() {
+        let mut state = make_state("latency-seed-session");
+        let history = serde_json::json!({
+            "session_id": "latency-seed-session",
+            "turns": [],
+            "audit": [
+                { "latency_ms": 1200 },
+                { "latency_ms": 800 },
+                { "latency_ms": 0 },       // zero must be skipped
+                { "latency_ms": 2500 },
+            ],
+        });
+        replay_history(&mut state, &history);
+        // Zero latency is excluded; the three valid samples must be seeded.
+        assert_eq!(
+            state.latency_samples.len(),
+            3,
+            "latency_samples must be seeded from audit (zero excluded)"
+        );
+        assert!(state.latency_samples.contains(&1200));
+        assert!(state.latency_samples.contains(&800));
+        assert!(state.latency_samples.contains(&2500));
+        // The obs_snapshot must reflect the seeded samples for p95/p99.
+        assert_eq!(
+            state.obs_snapshot.latency_samples.len(),
+            3,
+            "obs_snapshot must be updated"
+        );
     }
 
     #[test]
