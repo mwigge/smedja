@@ -2,9 +2,9 @@
 
 use std::collections::VecDeque;
 
+use crate::theme::palette;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use crate::theme::palette;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;

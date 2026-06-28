@@ -1,8 +1,8 @@
 //! `MainPanel` widget — scrollable message area with diff-aware line styling.
 
+use crate::theme::palette;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use crate::theme::palette;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -40,9 +40,7 @@ fn wrap_line_to(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
             cur_w += cw;
         }
         if !chunk.is_empty() {
-            rows.last_mut()
-                .unwrap()
-                .push(Span::styled(chunk, style));
+            rows.last_mut().unwrap().push(Span::styled(chunk, style));
         }
     }
     rows.into_iter().map(Line::from).collect()
@@ -157,7 +155,10 @@ fn inline_markdown_spans(text: &str) -> Option<Line<'static>> {
                     spans.push(Span::raw(std::mem::take(&mut buf)));
                 }
                 let inner: String = chars[i + 2..close].iter().collect();
-                spans.push(Span::styled(inner, Style::default().add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(
+                    inner,
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
                 i = close + 2;
                 found = true;
                 continue;
@@ -219,7 +220,9 @@ fn table_row_spans(text: &str) -> Line<'static> {
     let cells = table_cells(text);
     let is_delim = !cells.is_empty()
         && cells.iter().all(|c| {
-            c.contains('-') && c.chars().all(|ch| ch == '-' || ch == ':' || ch.is_whitespace())
+            c.contains('-')
+                && c.chars()
+                    .all(|ch| ch == '-' || ch == ':' || ch.is_whitespace())
         });
     let mut spans: Vec<Span<'static>> = Vec::new();
     if is_delim {
@@ -388,7 +391,6 @@ impl MainPanel {
     ///
     /// Auto-scrolls to follow new content when the view is already at the bottom.
     pub fn push_line(&mut self, text: String) {
-
         // Tool-result meta lines ("↳ ok · …") render dim and on their own line,
         // never as code/diff — short-circuit before fence/prefix classification.
         if !self.in_code_block && text.starts_with('↳') {
@@ -564,7 +566,7 @@ impl MainPanel {
 
         let search_needle = search_query
             .filter(|q| !q.is_empty())
-            .map(|q| q.to_lowercase());
+            .map(str::to_lowercase);
 
         // Style one logical line into a single ratatui `Line` (selection / search
         // / cached rich spans / prefix classification), matching the previous
@@ -598,7 +600,11 @@ impl MainPanel {
                 ))
             } else if let Some(ref rich) = sl.spans {
                 if no_color {
-                    let text = rich.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+                    let text = rich
+                        .spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>();
                     Line::raw(text)
                 } else {
                     rich.clone()
@@ -740,7 +746,11 @@ impl MainPanel {
     /// across lines with newlines. Order-independent.
     #[must_use]
     pub fn selection_text(&self, anchor: (usize, usize), end: (usize, usize)) -> String {
-        let (lo, hi) = if anchor <= end { (anchor, end) } else { (end, anchor) };
+        let (lo, hi) = if anchor <= end {
+            (anchor, end)
+        } else {
+            (end, anchor)
+        };
         let mut out = String::new();
         for line in lo.0..=hi.0 {
             let Some(sl) = self.lines.get(line) else {
@@ -1246,10 +1256,17 @@ mod tests {
         panel.push_line(" context".into());
         panel.push_line("```".into());
 
-        let hunk = panel.lines.iter().find(|l| l.text.starts_with("@@")).unwrap();
+        let hunk = panel
+            .lines
+            .iter()
+            .find(|l| l.text.starts_with("@@"))
+            .unwrap();
         assert!(hunk.spans.is_some(), "hunk header should be styled");
         let added = panel.lines.iter().find(|l| l.text == "+added").unwrap();
-        assert!(added.spans.is_some(), "added line should carry gutter spans");
+        assert!(
+            added.spans.is_some(),
+            "added line should carry gutter spans"
+        );
         // Gutter is display-only — the backing text stays clean for copy/yank.
         assert_eq!(added.text, "+added");
     }
@@ -1280,14 +1297,17 @@ mod tests {
         assert!(is_table_row("| a | b |"));
         assert!(!is_table_row("no pipes here"));
         assert!(!is_table_row("trailing pipe a |")); // no leading pipe
-        assert_eq!(table_cells("| a | b |"), vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(
+            table_cells("| a | b |"),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
 
         let mut panel = MainPanel::new();
         panel.push_line("| Name | Age |".into());
         panel.push_line("|------|-----|".into());
         panel.push_line("| Ann  | 30  |".into());
         // All three rendered as styled lines; copy text stays the raw markdown.
-        for sl in panel.lines.iter() {
+        for sl in &panel.lines {
             assert!(sl.spans.is_some());
         }
         assert_eq!(panel.lines[0].text, "| Name | Age |");
@@ -1345,7 +1365,7 @@ mod tests {
         let mut panel = MainPanel::new();
         panel.push_line("hello world".into()); // line 0
         panel.push_line("second line".into()); // line 1
-        // Partial within one line: chars [0,5) of line 0 → "hello".
+                                               // Partial within one line: chars [0,5) of line 0 → "hello".
         assert_eq!(panel.selection_text((0, 0), (0, 5)), "hello");
         // Order-independent.
         assert_eq!(panel.selection_text((0, 5), (0, 0)), "hello");

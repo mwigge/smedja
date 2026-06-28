@@ -182,9 +182,10 @@ fn tool_kind(tool: &str) -> ToolKind {
 #[must_use]
 pub fn evaluate(mode: PermissionMode, tool: &str) -> PermissionDecision {
     match (mode, tool_kind(tool)) {
-        (_, ToolKind::ReadOnly) | (PermissionMode::Auto, _) => PermissionDecision::Allow,
+        (_, ToolKind::ReadOnly)
+        | (PermissionMode::Auto, _)
+        | (PermissionMode::AcceptEdits, ToolKind::Edit) => PermissionDecision::Allow,
         (PermissionMode::Plan, _) => PermissionDecision::Deny,
-        (PermissionMode::AcceptEdits, ToolKind::Edit) => PermissionDecision::Allow,
         (PermissionMode::AcceptEdits, ToolKind::Exec) | (PermissionMode::Ask, _) => {
             PermissionDecision::Ask
         }
@@ -284,7 +285,9 @@ impl CoworkGate {
         let mode = self.mode().await;
         match evaluate(mode, tool) {
             PermissionDecision::Allow => Decision::Approve,
-            PermissionDecision::Deny => Decision::Deny(format!("blocked by {} mode", mode.as_str())),
+            PermissionDecision::Deny => {
+                Decision::Deny(format!("blocked by {} mode", mode.as_str()))
+            }
             PermissionDecision::Ask => {
                 self.intercept(
                     ApprovalPrompt {
@@ -372,22 +375,58 @@ mod tests {
     #[test]
     fn evaluate_policy_matrix() {
         // Read-only is always allowed, regardless of mode.
-        assert_eq!(evaluate(PermissionMode::Ask, "read_file"), PermissionDecision::Allow);
-        assert_eq!(evaluate(PermissionMode::Plan, "graph_query"), PermissionDecision::Allow);
+        assert_eq!(
+            evaluate(PermissionMode::Ask, "read_file"),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            evaluate(PermissionMode::Plan, "graph_query"),
+            PermissionDecision::Allow
+        );
         // Auto allows everything.
-        assert_eq!(evaluate(PermissionMode::Auto, "bash"), PermissionDecision::Allow);
-        assert_eq!(evaluate(PermissionMode::Auto, "write_file"), PermissionDecision::Allow);
+        assert_eq!(
+            evaluate(PermissionMode::Auto, "bash"),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            evaluate(PermissionMode::Auto, "write_file"),
+            PermissionDecision::Allow
+        );
         // Plan denies every mutation (read-only mode).
-        assert_eq!(evaluate(PermissionMode::Plan, "write_file"), PermissionDecision::Deny);
-        assert_eq!(evaluate(PermissionMode::Plan, "exec_bash"), PermissionDecision::Deny);
+        assert_eq!(
+            evaluate(PermissionMode::Plan, "write_file"),
+            PermissionDecision::Deny
+        );
+        assert_eq!(
+            evaluate(PermissionMode::Plan, "exec_bash"),
+            PermissionDecision::Deny
+        );
         // Ask asks on every mutation.
-        assert_eq!(evaluate(PermissionMode::Ask, "write_file"), PermissionDecision::Ask);
-        assert_eq!(evaluate(PermissionMode::Ask, "bash"), PermissionDecision::Ask);
+        assert_eq!(
+            evaluate(PermissionMode::Ask, "write_file"),
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            evaluate(PermissionMode::Ask, "bash"),
+            PermissionDecision::Ask
+        );
         // AcceptEdits: known edits auto-allow; shell + unknown still ask.
-        assert_eq!(evaluate(PermissionMode::AcceptEdits, "edit_file"), PermissionDecision::Allow);
-        assert_eq!(evaluate(PermissionMode::AcceptEdits, "write_file"), PermissionDecision::Allow);
-        assert_eq!(evaluate(PermissionMode::AcceptEdits, "bash"), PermissionDecision::Ask);
-        assert_eq!(evaluate(PermissionMode::AcceptEdits, "mystery_tool"), PermissionDecision::Ask);
+        assert_eq!(
+            evaluate(PermissionMode::AcceptEdits, "edit_file"),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            evaluate(PermissionMode::AcceptEdits, "write_file"),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            evaluate(PermissionMode::AcceptEdits, "bash"),
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            evaluate(PermissionMode::AcceptEdits, "mystery_tool"),
+            PermissionDecision::Ask
+        );
     }
 
     #[test]
@@ -400,8 +439,14 @@ mod tests {
         ] {
             assert_eq!(PermissionMode::parse_lenient(m.as_str()), m);
         }
-        assert_eq!(PermissionMode::parse_lenient("garbage"), PermissionMode::Ask);
-        assert_eq!(PermissionMode::parse_lenient("accept-edits"), PermissionMode::AcceptEdits);
+        assert_eq!(
+            PermissionMode::parse_lenient("garbage"),
+            PermissionMode::Ask
+        );
+        assert_eq!(
+            PermissionMode::parse_lenient("accept-edits"),
+            PermissionMode::AcceptEdits
+        );
         // Full Shift+Tab cycle returns to start.
         assert_eq!(
             PermissionMode::Ask.next().next().next().next(),
@@ -412,7 +457,7 @@ mod tests {
     #[tokio::test]
     async fn gate_tool_allow_deny_and_ask_paths() {
         let gate = CoworkGate::default(); // Ask mode by default.
-        // Read-only: allowed, no pending entry.
+                                          // Read-only: allowed, no pending entry.
         assert!(matches!(
             gate.gate_tool(1, "read_file", json!({}), "").await,
             Decision::Approve
@@ -430,7 +475,8 @@ mod tests {
         let gate = Arc::new(CoworkGate::default());
         let g2 = Arc::clone(&gate);
         let h = tokio::spawn(async move {
-            g2.gate_tool(1, "write_file", json!({ "path": "x" }), "edit").await
+            g2.gate_tool(1, "write_file", json!({ "path": "x" }), "edit")
+                .await
         });
         let id = {
             let mut found = None;

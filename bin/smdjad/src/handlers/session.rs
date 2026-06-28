@@ -169,8 +169,8 @@ fn maybe_reindex_workspace(cwd: PathBuf) {
                 .and_then(|v| v.as_str())
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .is_none_or(|ts| {
-                    let age = chrono::Utc::now()
-                        .signed_duration_since(ts.with_timezone(&chrono::Utc));
+                    let age =
+                        chrono::Utc::now().signed_duration_since(ts.with_timezone(&chrono::Utc));
                     age.num_hours() >= 24
                 })
         } else {
@@ -187,8 +187,7 @@ fn maybe_reindex_workspace(cwd: PathBuf) {
         tokio::task::spawn(async move {
             use opentelemetry::trace::Span as _;
             let tracer = opentelemetry::global::tracer("smedja");
-            let mut span =
-                opentelemetry::trace::Tracer::start(&tracer, "smedja.workspace.index");
+            let mut span = opentelemetry::trace::Tracer::start(&tracer, "smedja.workspace.index");
             let start = std::time::Instant::now();
             let db_path = crate::handlers::graph::graph_db_path(&bg_cwd);
             let bg_cwd_clone = bg_cwd.clone();
@@ -216,8 +215,7 @@ fn maybe_reindex_workspace(cwd: PathBuf) {
             ));
             span.end();
             let ts = chrono::Utc::now().to_rfc3339();
-            let new_content =
-                format!("[graph]\nauto_index = true\nlast_indexed_at = \"{ts}\"\n");
+            let new_content = format!("[graph]\nauto_index = true\nlast_indexed_at = \"{ts}\"\n");
             if let Err(e) = std::fs::write(&bg_toml, new_content) {
                 tracing::warn!(error = %e, "failed to update workspace.toml after auto-index");
             }
@@ -316,10 +314,7 @@ pub(crate) async fn fork(state: HandlerState, params: Value) -> Result<Value, Rp
 
 /// Core of `session.fork`, parameterised on the ingot handle so it is testable
 /// without constructing a full [`HandlerState`].
-async fn fork_with(
-    ig: &smedja_ingot::IngotHandle,
-    session_id: String,
-) -> Result<Value, RpcError> {
+async fn fork_with(ig: &smedja_ingot::IngotHandle, session_id: String) -> Result<Value, RpcError> {
     // Each DB call acquires and immediately releases the lock so other
     // concurrent RPC handlers (including turn.subscribe's polling loop)
     // are not serialised behind the entire fork sequence.
@@ -494,7 +489,10 @@ pub(crate) async fn set_tier(state: HandlerState, params: Value) -> Result<Value
         .and_then(|s| s.runner_override)
         .unwrap_or_else(|| state.startup_runner.to_string());
     let runner = parse_runner_name(&runner_str).ok_or_else(|| {
-        RpcError::new(codes::INVALID_PARAMS, format!("unknown runner: {runner_str}"))
+        RpcError::new(
+            codes::INVALID_PARAMS,
+            format!("unknown runner: {runner_str}"),
+        )
     })?;
 
     // (runner, tier) → model, falling back through the eligible ring.
@@ -892,16 +890,17 @@ mod tests {
         let ig = handle();
         let id_a = Uuid::new_v4();
         let id_b = Uuid::new_v4();
-        ig.create_session(sample_session(id_a, "alpha")).await.unwrap();
-        ig.create_session(sample_session(id_b, "beta")).await.unwrap();
+        ig.create_session(sample_session(id_a, "alpha"))
+            .await
+            .unwrap();
+        ig.create_session(sample_session(id_b, "beta"))
+            .await
+            .unwrap();
 
         let resp = list_with(&ig).await.unwrap();
         let arr = resp.as_array().unwrap();
         assert_eq!(arr.len(), 2, "expected two sessions");
-        let titles: Vec<&str> = arr
-            .iter()
-            .map(|v| v["title"].as_str().unwrap())
-            .collect();
+        let titles: Vec<&str> = arr.iter().map(|v| v["title"].as_str().unwrap()).collect();
         assert!(titles.contains(&"alpha"), "missing 'alpha'");
         assert!(titles.contains(&"beta"), "missing 'beta'");
     }
@@ -933,7 +932,9 @@ mod tests {
     async fn fork_has_checkpoint_false_when_no_checkpoint() {
         let ig = handle();
         let parent_id = Uuid::new_v4();
-        ig.create_session(sample_session(parent_id, "s")).await.unwrap();
+        ig.create_session(sample_session(parent_id, "s"))
+            .await
+            .unwrap();
 
         let resp = fork_with(&ig, parent_id.to_string()).await.unwrap();
         assert_eq!(resp["has_checkpoint"], false);
@@ -943,7 +944,9 @@ mod tests {
     async fn fork_copies_checkpoint_into_forked_session() {
         let ig = handle();
         let parent_id = Uuid::new_v4();
-        ig.create_session(sample_session(parent_id, "s")).await.unwrap();
+        ig.create_session(sample_session(parent_id, "s"))
+            .await
+            .unwrap();
         ig.save_checkpoint(Checkpoint {
             id: Uuid::new_v4(),
             session_id: parent_id.to_string(),

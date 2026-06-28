@@ -46,9 +46,10 @@ fn is_pruned_dir(entry: &walkdir::DirEntry) -> bool {
     if entry.depth() == 0 || !entry.file_type().is_dir() {
         return false;
     }
-    entry.file_name().to_str().is_some_and(|name| {
-        PRUNE_DIRS.contains(&name) || (name.starts_with('.') && name.len() > 1)
-    })
+    entry
+        .file_name()
+        .to_str()
+        .is_some_and(|name| PRUNE_DIRS.contains(&name) || (name.starts_with('.') && name.len() > 1))
 }
 
 /// Bounded recursive file walk shared by the full and incremental indexers:
@@ -535,7 +536,13 @@ mod tests {
             std::fs::write(r.join(d).join("buried.rs"), "fn b() {}").unwrap();
         }
         let found: Vec<String> = workspace_files(r)
-            .map(|e| e.path().strip_prefix(r).unwrap().to_string_lossy().into_owned())
+            .map(|e| {
+                e.path()
+                    .strip_prefix(r)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
         assert_eq!(found, vec!["keep.rs".to_string()], "got {found:?}");
     }

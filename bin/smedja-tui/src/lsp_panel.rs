@@ -4,9 +4,9 @@
 //! status line per running language server followed by the highest-severity
 //! diagnostics that fit in the available height.
 
+use crate::theme::palette;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use crate::theme::palette;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -69,8 +69,8 @@ impl<'a> LspPanel<'a> {
                 break;
             }
             let (dot, color) = match &server.state {
-                ServerState::Starting => ("\u{25cc}", p.warn),    // ◌
-                ServerState::Ready => ("\u{25cf}", p.success),    // ●
+                ServerState::Starting => ("\u{25cc}", p.warn),     // ◌
+                ServerState::Ready => ("\u{25cf}", p.success),     // ●
                 ServerState::Degraded(_) => ("\u{2717}", p.error), // ✗
             };
             let name_max = w.saturating_sub(2); // dot + space

@@ -42,7 +42,12 @@ const SERVERS: &[ServerSpec] = &[
         name: "pyright",
         binary: "pyright-langserver",
         args: &["--stdio"],
-        markers: &["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"],
+        markers: &[
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "requirements.txt",
+        ],
     },
     ServerSpec {
         name: "gopls",
@@ -60,7 +65,12 @@ const SERVERS: &[ServerSpec] = &[
         name: "clangd",
         binary: "clangd",
         args: &[],
-        markers: &["compile_commands.json", "CMakeLists.txt", "Makefile", ".clangd"],
+        markers: &[
+            "compile_commands.json",
+            "CMakeLists.txt",
+            "Makefile",
+            ".clangd",
+        ],
     },
 ];
 
@@ -134,12 +144,18 @@ impl LspManager {
     /// Detects servers available on `$PATH` and starts them for `workspace`.
     /// Returns immediately; all I/O runs in background tokio tasks.
     pub fn start(&self, workspace: PathBuf) {
-        *self.current_ws.lock().unwrap_or_else(|e| e.into_inner()) = Some(workspace.clone());
+        *self
+            .current_ws
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(workspace.clone());
         let tx = self.tx.clone();
         let handle = tokio::spawn(async move {
             run_all(workspace, tx).await;
         });
-        *self.runner.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        *self
+            .runner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
     }
 
     /// Re-roots the language servers at `workspace` when it differs from the
@@ -149,7 +165,10 @@ impl LspManager {
     /// the actual repo so e.g. rust-analyzer starts for a `Cargo.toml` project.
     pub fn ensure_workspace(&self, workspace: PathBuf) {
         {
-            let cur = self.current_ws.lock().unwrap_or_else(|e| e.into_inner());
+            let cur = self
+                .current_ws
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if cur.as_deref() == Some(workspace.as_path()) {
                 return;
             }
@@ -161,7 +180,12 @@ impl LspManager {
     /// Aborts the background server manager and all child processes.
     /// Child processes are killed because `LspClient` uses `kill_on_drop(true)`.
     pub fn shutdown(&self) {
-        if let Some(h) = self.runner.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(h) = self
+            .runner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
             h.abort();
         }
     }
@@ -200,7 +224,7 @@ async fn run_all(workspace: PathBuf, watch_tx: watch::Sender<LspSnapshot>) {
     for spec in &available {
         let name = spec.name.to_owned();
         let binary = spec.binary.to_owned();
-        let args: Vec<String> = spec.args.iter().map(|s| s.to_string()).collect();
+        let args: Vec<String> = spec.args.iter().map(ToString::to_string).collect();
         let ws = workspace.clone();
         let etx = event_tx.clone();
 
@@ -407,7 +431,10 @@ mod marker_tests {
         assert!(workspace_has_marker(&dir, spec("rust-analyzer")));
         assert!(!workspace_has_marker(&dir, spec("clangd")));
         assert!(!workspace_has_marker(&dir, spec("gopls")));
-        assert!(!workspace_has_marker(&dir, spec("typescript-language-server")));
+        assert!(!workspace_has_marker(
+            &dir,
+            spec("typescript-language-server")
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -21,12 +21,12 @@ smedja-assayer  = { path = "../../crates/smedja-assayer" }
 smedja-eval     = { path = "../../crates/smedja-eval" }
 smedja-ingot    = { path = "../../crates/smedja-ingot" }
 smedja-plugins  = { path = "../../crates/smedja-plugins" }
-smedja-security = { path = "../../crates/smedja-security" }
 smedja-rpc      = { path = "../../crates/smedja-rpc" }
+smedja-security = { path = "../../crates/smedja-security" }
 tokio           = { workspace = true }
-which           = { workspace = true }
 tracing         = { workspace = true }
 tracing-subscriber = { workspace = true }
+which           = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

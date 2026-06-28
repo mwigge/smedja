@@ -261,13 +261,19 @@ mod tests {
         let t1 = mk("first", 1000.0, sid);
         ingot.create_task(&t2).unwrap();
         ingot.create_task(&t1).unwrap();
-        ingot.set_task_response(&t1.id.to_string(), "ans-first").unwrap();
-        ingot.set_task_response(&t2.id.to_string(), "ans-second").unwrap();
+        ingot
+            .set_task_response(&t1.id.to_string(), "ans-first")
+            .unwrap();
+        ingot
+            .set_task_response(&t2.id.to_string(), "ans-second")
+            .unwrap();
 
         // A completed turn in a different session — must be excluded.
         let other_t = mk("other", 1500.0, other);
         ingot.create_task(&other_t).unwrap();
-        ingot.set_task_response(&other_t.id.to_string(), "ans-other").unwrap();
+        ingot
+            .set_task_response(&other_t.id.to_string(), "ans-other")
+            .unwrap();
 
         // An in-flight (planned, no response) turn in `sid` — must be excluded.
         ingot.create_task(&mk("pending", 3000.0, sid)).unwrap();

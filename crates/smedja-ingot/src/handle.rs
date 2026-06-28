@@ -1006,6 +1006,10 @@ impl IngotHandle {
 
     /// Deletes old terminated sessions and orphaned dependent rows.
     /// See [`Ingot::prune_old_sessions`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError`] on database failure.
     pub async fn prune_old_sessions(&self, older_than_days: u64) -> Result<usize, IngotError> {
         self.run_blocking(move |ig| ig.prune_old_sessions(older_than_days))
             .await
@@ -1013,8 +1017,12 @@ impl IngotHandle {
 
     /// Checkpoints the WAL and rebuilds the database to reclaim space.
     /// See [`Ingot::vacuum`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError`] on database failure.
     pub async fn vacuum(&self) -> Result<(), IngotError> {
-        self.run_blocking(|ig| ig.vacuum()).await
+        self.run_blocking(Ingot::vacuum).await
     }
 }
 

@@ -308,7 +308,12 @@ mod tests {
         ] {
             assert!(r.is_read_only(), "{} should be read-only", r.label());
         }
-        for r in [AgentRole::Impl, AgentRole::Debug, AgentRole::Test, AgentRole::Sre] {
+        for r in [
+            AgentRole::Impl,
+            AgentRole::Debug,
+            AgentRole::Test,
+            AgentRole::Sre,
+        ] {
             assert!(!r.is_read_only(), "{} should be able to mutate", r.label());
         }
     }
@@ -318,11 +323,20 @@ mod tests {
         let a = Assayer::default_rules();
         // Planning / research / debug / orchestration → claude/deep.
         assert_eq!(a.route(AgentRole::Plan, Complexity::Coding), claude_deep());
-        assert_eq!(a.route(AgentRole::Research, Complexity::Simple), claude_deep());
-        assert_eq!(a.route(AgentRole::Debug, Complexity::Complex), claude_deep());
+        assert_eq!(
+            a.route(AgentRole::Research, Complexity::Simple),
+            claude_deep()
+        );
+        assert_eq!(
+            a.route(AgentRole::Debug, Complexity::Complex),
+            claude_deep()
+        );
         // Ask + Orchestrator (the cheap default fallback) → claude/fast.
         assert_eq!(a.route(AgentRole::Ask, Complexity::Simple), claude_fast());
-        assert_eq!(a.route(AgentRole::Orchestrator, Complexity::Coding), claude_fast());
+        assert_eq!(
+            a.route(AgentRole::Orchestrator, Complexity::Coding),
+            claude_fast()
+        );
     }
 
     #[test]

@@ -345,7 +345,9 @@ impl App {
     fn paste_from_clipboard(&mut self) {
         let Some(pty) = &mut self.pty else { return };
         let bracketed = pty.grid.lock().bracketed_paste;
-        let Some(text) = read_clipboard_text() else { return };
+        let Some(text) = read_clipboard_text() else {
+            return;
+        };
         if text.is_empty() {
             return;
         }
@@ -373,7 +375,10 @@ impl App {
         let sf = self.renderer.as_ref().map_or(1.0_f64, |r| r.scale_factor);
         #[allow(clippy::cast_possible_truncation)]
         let eff_font = self.config.font.size * sf as f32;
-        let top_bar_h = self.renderer.as_ref().map_or(0, |r| r.top_bar_height_px());
+        let top_bar_h = self
+            .renderer
+            .as_ref()
+            .map_or(0, st_render::Renderer::top_bar_height_px);
         let phys_x = (win_x * sf) as u32;
         let phys_y = (win_y * sf) as u32;
         let grid_y = phys_y.saturating_sub(top_bar_h);
@@ -663,35 +668,36 @@ impl ApplicationHandler<UserEvent> for App {
                         // can go stale after row shifts (scroll regions, IL/DL),
                         // and the renderer positions by the field — a stale value
                         // draws the cell at the wrong Y, overlapping the top rows.
-                        let cells: Vec<st_render::Cell> = if grid.scroll_offset <= 0 || grid.alt_screen {
-                            grid.cells
-                                .iter()
-                                .enumerate()
-                                .flat_map(|(r, row)| {
-                                    row.iter().enumerate().map(move |(c, cell)| {
-                                        render_cell(
-                                            cell,
-                                            u16::try_from(c).unwrap_or(u16::MAX),
-                                            u16::try_from(r).unwrap_or(u16::MAX),
-                                        )
+                        let cells: Vec<st_render::Cell> =
+                            if grid.scroll_offset <= 0 || grid.alt_screen {
+                                grid.cells
+                                    .iter()
+                                    .enumerate()
+                                    .flat_map(|(r, row)| {
+                                        row.iter().enumerate().map(move |(c, cell)| {
+                                            render_cell(
+                                                cell,
+                                                u16::try_from(c).unwrap_or(u16::MAX),
+                                                u16::try_from(r).unwrap_or(u16::MAX),
+                                            )
+                                        })
                                     })
-                                })
-                                .collect()
-                        } else {
-                            grid.visible_rows(grid.scroll_offset)
-                                .iter()
-                                .enumerate()
-                                .flat_map(|(r, row)| {
-                                    row.iter().enumerate().map(move |(col, c)| {
-                                        render_cell(
-                                            c,
-                                            u16::try_from(col).unwrap_or(u16::MAX),
-                                            u16::try_from(r).unwrap_or(u16::MAX),
-                                        )
+                                    .collect()
+                            } else {
+                                grid.visible_rows(grid.scroll_offset)
+                                    .iter()
+                                    .enumerate()
+                                    .flat_map(|(r, row)| {
+                                        row.iter().enumerate().map(move |(col, c)| {
+                                            render_cell(
+                                                c,
+                                                u16::try_from(col).unwrap_or(u16::MAX),
+                                                u16::try_from(r).unwrap_or(u16::MAX),
+                                            )
+                                        })
                                     })
-                                })
-                                .collect()
-                        };
+                                    .collect()
+                            };
                         let non_blank = cells.iter().filter(|c| c.ch != ' ').count();
                         drop(grid);
                         debug!(
@@ -1071,8 +1077,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // Send mouse motion events when a button is held (ButtonEvent mode)
                 // or unconditionally (AnyEvent mode).
                 if self.pty.is_some() {
-                    let Some((col, row, mode, sgr)) =
-                        self.pointer_cell(position.x, position.y)
+                    let Some((col, row, mode, sgr)) = self.pointer_cell(position.x, position.y)
                     else {
                         return;
                     };
@@ -2077,9 +2082,23 @@ mod tests {
         use super::encode_key;
         use winit::keyboard::{Key, SmolStr};
         // Ctrl+C → 0x03, Ctrl+G → 0x07 — the bug that broke all control keys.
-        let c = encode_key(&Key::Character(SmolStr::new("c")), false, false, true, false, 0);
+        let c = encode_key(
+            &Key::Character(SmolStr::new("c")),
+            false,
+            false,
+            true,
+            false,
+            0,
+        );
         assert_eq!(c, Some(vec![0x03]));
-        let g = encode_key(&Key::Character(SmolStr::new("g")), false, false, true, false, 0);
+        let g = encode_key(
+            &Key::Character(SmolStr::new("g")),
+            false,
+            false,
+            true,
+            false,
+            0,
+        );
         assert_eq!(g, Some(vec![0x07]));
     }
 
@@ -2087,7 +2106,14 @@ mod tests {
     fn alt_char_is_esc_prefixed_in_legacy_mode() {
         use super::encode_key;
         use winit::keyboard::{Key, SmolStr};
-        let b = encode_key(&Key::Character(SmolStr::new("b")), false, true, false, false, 0);
+        let b = encode_key(
+            &Key::Character(SmolStr::new("b")),
+            false,
+            true,
+            false,
+            false,
+            0,
+        );
         assert_eq!(b, Some(vec![0x1b, b'b']));
     }
 
@@ -2095,7 +2121,14 @@ mod tests {
     fn plain_char_is_literal_in_legacy_mode() {
         use super::encode_key;
         use winit::keyboard::{Key, SmolStr};
-        let a = encode_key(&Key::Character(SmolStr::new("a")), false, false, false, false, 0);
+        let a = encode_key(
+            &Key::Character(SmolStr::new("a")),
+            false,
+            false,
+            false,
+            false,
+            0,
+        );
         assert_eq!(a, Some(b"a".to_vec()));
     }
 
@@ -2104,7 +2137,14 @@ mod tests {
         use super::encode_key;
         use winit::keyboard::{Key, NamedKey};
         // Ctrl+ArrowRight → CSI 1 ; 5 C
-        let r = encode_key(&Key::Named(NamedKey::ArrowRight), false, false, true, false, 0);
+        let r = encode_key(
+            &Key::Named(NamedKey::ArrowRight),
+            false,
+            false,
+            true,
+            false,
+            0,
+        );
         assert_eq!(r, Some(b"\x1b[1;5C".to_vec()));
     }
 
@@ -2124,7 +2164,14 @@ mod tests {
         use super::encode_key;
         use winit::keyboard::{Key, SmolStr};
         // Ctrl+G with flags active → CSI 103 ; 5 u (g=103, ctrl mod=5).
-        let bytes = encode_key(&Key::Character(SmolStr::new("g")), false, false, true, false, 1);
+        let bytes = encode_key(
+            &Key::Character(SmolStr::new("g")),
+            false,
+            false,
+            true,
+            false,
+            1,
+        );
         assert_eq!(bytes, Some(b"\x1b[103;5u".to_vec()));
     }
 
@@ -2143,7 +2190,14 @@ mod tests {
         use winit::keyboard::{Key, SmolStr};
         // Shift+A in kitty mode must send the literal "A", not `CSI 97;2 u`,
         // otherwise the receiving app inserts a lowercase 'a' (no capitals).
-        let bytes = encode_key(&Key::Character(SmolStr::new("A")), true, false, false, false, 1);
+        let bytes = encode_key(
+            &Key::Character(SmolStr::new("A")),
+            true,
+            false,
+            false,
+            false,
+            1,
+        );
         assert_eq!(bytes, Some(b"A".to_vec()));
     }
 
@@ -2152,7 +2206,14 @@ mod tests {
         use super::encode_key;
         use winit::keyboard::{Key, SmolStr};
         // Ctrl+Shift+A → CSI 97 ; 6 u (a=97, ctrl+shift mod = 1+1+4 = 6).
-        let bytes = encode_key(&Key::Character(SmolStr::new("A")), true, false, true, false, 1);
+        let bytes = encode_key(
+            &Key::Character(SmolStr::new("A")),
+            true,
+            false,
+            true,
+            false,
+            1,
+        );
         assert_eq!(bytes, Some(b"\x1b[97;6u".to_vec()));
     }
 
@@ -2168,21 +2229,120 @@ mod tests {
 
         // (desc, key, shift, alt, ctrl, sup, kbd_flags, expected)
         let cases: Vec<(&str, Key, bool, bool, bool, bool, u8, &[u8])> = vec![
-            ("plain a / legacy", chr("a"), false, false, false, false, 0, b"a".as_slice()),
-            ("plain a / kitty", chr("a"), false, false, false, false, 1, b"a"),
+            (
+                "plain a / legacy",
+                chr("a"),
+                false,
+                false,
+                false,
+                false,
+                0,
+                b"a".as_slice(),
+            ),
+            (
+                "plain a / kitty",
+                chr("a"),
+                false,
+                false,
+                false,
+                false,
+                1,
+                b"a",
+            ),
             // Caps: Shift+letter must send the uppercase glyph, not base+shift.
-            ("Shift+A / legacy", chr("A"), true, false, false, false, 0, b"A"),
-            ("Shift+A / kitty", chr("A"), true, false, false, false, 1, b"A"),
+            (
+                "Shift+A / legacy",
+                chr("A"),
+                true,
+                false,
+                false,
+                false,
+                0,
+                b"A",
+            ),
+            (
+                "Shift+A / kitty",
+                chr("A"),
+                true,
+                false,
+                false,
+                false,
+                1,
+                b"A",
+            ),
             // Control keys → C0 / CSI-u.
-            ("Ctrl+C / legacy", chr("c"), false, false, true, false, 0, b"\x03"),
-            ("Ctrl+G / kitty", chr("g"), false, false, true, false, 1, b"\x1b[103;5u"),
-            ("Ctrl+Shift+A / kitty", chr("A"), true, false, true, false, 1, b"\x1b[97;6u"),
+            (
+                "Ctrl+C / legacy",
+                chr("c"),
+                false,
+                false,
+                true,
+                false,
+                0,
+                b"\x03",
+            ),
+            (
+                "Ctrl+G / kitty",
+                chr("g"),
+                false,
+                false,
+                true,
+                false,
+                1,
+                b"\x1b[103;5u",
+            ),
+            (
+                "Ctrl+Shift+A / kitty",
+                chr("A"),
+                true,
+                false,
+                true,
+                false,
+                1,
+                b"\x1b[97;6u",
+            ),
             // Meta.
-            ("Alt+b / legacy", chr("b"), false, true, false, false, 0, b"\x1bb"),
+            (
+                "Alt+b / legacy",
+                chr("b"),
+                false,
+                true,
+                false,
+                false,
+                0,
+                b"\x1bb",
+            ),
             // Enter variants.
-            ("Enter / legacy", enter(), false, false, false, false, 0, b"\r"),
-            ("Enter / kitty no-mods", enter(), false, false, false, false, 1, b"\r"),
-            ("Shift+Enter / kitty", enter(), true, false, false, false, 1, b"\x1b[13;2u"),
+            (
+                "Enter / legacy",
+                enter(),
+                false,
+                false,
+                false,
+                false,
+                0,
+                b"\r",
+            ),
+            (
+                "Enter / kitty no-mods",
+                enter(),
+                false,
+                false,
+                false,
+                false,
+                1,
+                b"\r",
+            ),
+            (
+                "Shift+Enter / kitty",
+                enter(),
+                true,
+                false,
+                false,
+                false,
+                1,
+                b"\x1b[13;2u",
+            ),
         ];
 
         for (desc, key, shift, alt, ctrl, sup, flags, expected) in cases {

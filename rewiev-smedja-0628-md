@@ -1,0 +1,124 @@
+# smedja Code Quality and Functional Review
+
+Review date: 2026-06-28
+Repository: `/data/src/smedja`
+
+## Executive Summary
+
+smedja is a serious Rust workspace with broad test coverage and a coherent modular split across daemon, CLI, provider adapters, routing, storage, memory, TUI, and terminal crates. The project builds and the full workspace test suite passes.
+
+The README promise is only partially delivered. The strongest implemented areas are provider adapters, RPC, storage, vault search, route selection, cowork gate primitives, token/cost accounting, TUI rendering state, and terminal support libraries. The largest gaps are product-level orchestration claims: multi-agent worktree isolation, the full OpenSpec loop pipeline, committed default `.smedja/agents.toml`, native edit/write tool support, and some documented CLI commands. Several README notes correctly mark roadmap or incomplete items, but other sections read as current capability while the code is still scaffold-level.
+
+## Verification Run
+
+- `cargo test --workspace --all-targets`: passed.
+- `cargo fmt --all -- --check`: failed. Many files are not rustfmt-clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: failed. Clippy reports `await_holding_lock` in async tests under `smedja-adapter`.
+- Source scale: 338 Rust files, 72,365 Rust LOC.
+- Test count by annotation: 966 `#[test]` / `#[tokio::test]` occurrences.
+- Worktree had untracked `.claude/`, `.github/prompts/`, and `.github/skills/` before this review.
+
+## Findings
+
+### High: `smj loop run` does not implement the README pipeline
+
+README promises: "`smj loop run` takes one OpenSpec task at a time through planning, red/green implementation, deterministic verification, read-only review, and bounded fix retries" (`README.md:76`).
+
+The daemon `loop.run` implementation reads `openspec/changes/<change>/tasks.md`, extracts unchecked tasks, creates one session and `planned` tasks, publishes a `TurnEvent::Started`, then polls the task status until something else changes it (`bin/smdjad/src/main.rs:2182`, `bin/smdjad/src/main.rs:2238`, `bin/smdjad/src/main.rs:2282`). It then checks off the task and marks the loop complete (`bin/smdjad/src/main.rs:2296`, `bin/smdjad/src/main.rs:2311`, `bin/smdjad/src/main.rs:2314`).
+
+I did not find the promised planning/red/green/review/fix retry execution inside this path. The verification helper exists in `crates/smedja-loop/src/verify.rs:45`, but the loop runner does not call it. This is the main functional gap: the product claim is a loop engine, while the code currently looks like a task-state scaffold.
+
+### High: Documented committed role config is absent, and generated config does not match the parser or README
+
+README says role defaults live in `.smedja/agents.toml` and are "committed to the repo" (`README.md:51`). There is no `.smedja/agents.toml` in the repository.
+
+The parser expects fields like `runner`, `tier`, `model`, and `tools` (`crates/smedja-assayer/src/config.rs:11`). The CLI-generated starter template writes `description` and `bash` fields instead (`bin/smj/src/main.rs:10`). Those generated fields are ignored by the parser, so `smj workspace agents init` creates a file that does not configure the routing model described by the README.
+
+Impact: users following the README or CLI init path will believe role routing and tool permissions are configured when they are mostly not.
+
+### High: `write_file` and `edit_file` are advertised/guarded but not implemented as native tools
+
+The README role example gives implementation agents `edit_file` access (`README.md:57`). `LOCAL_TOOLS` also lists `write_file` and `edit_file` (`bin/smdjad/src/executor.rs:24`). The dispatcher has a path traversal pre-check for these tools (`bin/smdjad/src/executor.rs:118`), but there are no native match arms for either tool; unknown tools fall through to MCP dispatch (`bin/smdjad/src/executor.rs:443`).
+
+This means the daemon does not natively deliver on the README's agent editing flow. Unless an MCP server has registered those tool names, the result is "tool not available", not an edit. The test at `bin/smdjad/src/executor.rs:537` is weak: it passes if the result merely starts with `error:`, which also covers the tool being unavailable rather than proving path traversal protection on an actual write implementation.
+
+### Medium: CLI documentation and implementation disagree
+
+README says `smj session cost` is available (`README.md` Observability section), but the CLI exposes cost as top-level `smj cost --session <id>` (`bin/smj/src/main.rs:39`, `bin/smj/src/main.rs:728`). The daemon RPC is called `session.cost` (`bin/smdjad/src/main.rs:1209`), which may explain the README wording, but the user-facing CLI differs.
+
+README says `smj session rollback <id> <turn>` is on the roadmap (`README.md:104`), but the CLI already exposes `SessionCmd::Rollback` (`bin/smj/src/main.rs:180`) and dispatches it (`bin/smj/src/main.rs:650`). That is not necessarily bad, but the docs need to state whether rollback is usable, partial, or just a placeholder.
+
+### Medium: Formatting and clippy gates are not clean
+
+`cargo fmt --all -- --check` fails across daemon, ingot, RPC, PTY, renderer, and statusbar files. This is mostly mechanical but important in a Rust monorepo.
+
+`cargo clippy --workspace --all-targets -- -D warnings` fails in async tests because a standard `MutexGuard` is held across `.await` in `crates/smedja-adapter/src/claude_cli.rs:303` and `crates/smedja-adapter/src/codex_cli.rs:419`, `:450`, `:476`, and `:508`. These are test-only guards around environment mutation, so the product risk is low, but it blocks a strict quality gate.
+
+### Medium: Path handling has duplication and some misleading safety shape
+
+`execute_tool` repeats near-identical workspace/canonicalization checks for write tools, `read_file`, and `list_files` (`bin/smdjad/src/executor.rs:118`, `bin/smdjad/src/executor.rs:180`, `bin/smdjad/src/executor.rs:208`). This should be a small helper returning an in-workspace resolved path.
+
+Because `write_file` and `edit_file` are not implemented, the write path guard currently gives a false sense of coverage. When native write/edit support is added, it should include tests for existing and non-existing paths, absolute paths, symlinks, `..` components, and parent directories that do not exist.
+
+### Medium: Multi-agent worktree isolation is not substantiated by the current code path reviewed
+
+README says `smdjad` runs multiple agent roles in parallel, each isolated in its own git worktree (`README.md:45`). The code has route selection and task parallel state, but the reviewed `loop.run` path creates tasks in one session and waits for status changes. I did not find concrete git worktree creation/assignment in the main loop path.
+
+This may exist in an unfinished or separate path, but as the primary README promise it is not currently demonstrable from the main implementation.
+
+### Low: `.smedja/agents.toml` tool whitelist is parsed but intentionally not enforced
+
+The parser explicitly says `tools` is "parsed but not yet enforced" (`crates/smedja-assayer/src/config.rs:16`). The README example uses `tools` to communicate role capabilities (`README.md:57`, `README.md:62`, `README.md:67`). Current enforcement is hard-coded mainly around review mode write tools (`bin/smdjad/src/executor.rs:104`), not per-role config.
+
+### Low: Product docs are stronger than the install/getting-started reality
+
+The README fairly states there are no release binaries and build-from-source is required. However, the first-screen promise is broad: local/cloud routing, specialist roles, GPU terminal, OTel, wire protocol, memory, loop, and terminal blocks. Based on this review, the repo is closer to an advanced prototype with many implemented libraries than a fully integrated product delivering all those workflows.
+
+## What Delivers Well
+
+- The workspace builds and tests pass.
+- The crate boundaries are mostly understandable and domain-aligned.
+- Provider adapter coverage is strong: OpenAI/Anthropic/Gemini/Codex/Claude CLI/local parsing and detection are tested.
+- JSON-RPC and daemon route coverage are substantial.
+- Ingot storage, cost/token snapshots, MCP registry, vault storage/search, and cowork gate primitives have direct tests.
+- The TUI has unusually broad state/render smoke coverage.
+- Terminal support crates cover PTY, VT parsing, glyphs, statusbar modules, config migration, and renderer internals.
+
+## Functional Review: Do We Deliver on the README Promise?
+
+Partially.
+
+Delivered or mostly delivered:
+
+- Rust workspace with daemon, CLI, TUI, terminal crates.
+- JSON-RPC socket protocol and daemon/client structure.
+- Provider routing foundations via assayer and provider pool.
+- Cost and token accounting foundations.
+- Vault storage/search foundations.
+- Cowork gate daemon primitives and TUI widget pieces.
+- SmartCrusher and memory budget pieces called out as implemented.
+- Basic terminal/TUI rendering and PTY foundations.
+
+Not yet delivered as promised:
+
+- Full multi-agent orchestration with isolated git worktrees.
+- The OpenSpec loop pipeline with planning, red/green, deterministic verification, review, and bounded retries.
+- Committed `.smedja/agents.toml` defaults matching README.
+- Generated `.smedja/agents.toml` that actually configures runner/tier/model/tools.
+- Native `write_file`/`edit_file` tool execution.
+- Exact README CLI surface for session cost.
+- Fully wired per-role tool whitelists.
+
+## Recommendations
+
+1. Decide whether the README is aspirational or release-facing. If release-facing, downgrade claims around loop, worktrees, role tools, rollback, and config to match current behavior.
+2. Fix `.smedja/agents.toml` first: commit a default file or remove the "committed" claim, and update `AGENTS_TOML_TEMPLATE` to emit `runner`, `tier`, `model`, and `tools`.
+3. Either implement native `write_file`/`edit_file` or remove them from `LOCAL_TOOLS` and README role examples until an MCP tool supplies them.
+4. Wire `smedja-loop::verify::run_verification` into `loop.run`, then add task-state tests that prove failed verification prevents checkbox completion.
+5. Make `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean.
+6. Replace duplicated path resolution with one tested helper.
+7. Add one end-to-end happy-path smoke test for the README flow: start daemon, create session, submit a turn to a mock provider, stream result, and query cost/tokens.
+
+## Bottom Line
+
+smedja has a solid amount of real implementation and tests, but the README currently overstates integration maturity. The codebase is promising and reasonably well structured; the product promise is ahead of the daemon's orchestration and tool execution paths.

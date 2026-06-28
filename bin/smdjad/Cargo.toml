@@ -6,60 +6,6 @@ edition.workspace    = true
 license.workspace    = true
 repository.workspace = true
 
-[[bin]]
-name = "smdjad"
-path = "src/main.rs"
-
-[dependencies]
-anyhow             = { workspace = true }
-async-trait        = { workspace = true }
-axum               = { workspace = true }
-chrono             = { workspace = true }
-futures-util       = { workspace = true }
-opentelemetry          = { workspace = true }
-opentelemetry-otlp     = { workspace = true }
-opentelemetry_sdk      = { workspace = true }
-reqwest            = { workspace = true }
-serde              = { workspace = true }
-serde_json         = { workspace = true }
-sha2               = { workspace = true }
-smedja-adapter       = { path = "../../crates/smedja-adapter" }
-smedja-agent-events  = { path = "../../crates/smedja-agent-events" }
-smedja-assayer       = { path = "../../crates/smedja-assayer" }
-smedja-auth          = { path = "../../crates/smedja-auth" }
-smedja-bellows       = { path = "../../crates/smedja-bellows" }
-smedja-graph         = { path = "../../crates/smedja-graph" }
-smedja-lsp           = { path = "../../crates/smedja-lsp" }
-smedja-ingot       = { path = "../../crates/smedja-ingot" }
-smedja-loop        = { path = "../../crates/smedja-loop" }
-smedja-memory      = { path = "../../crates/smedja-memory" }
-smedja-methodology = { path = "../../crates/smedja-methodology" }
-smedja-rpc         = { path = "../../crates/smedja-rpc" }
-smedja-security    = { path = "../../crates/smedja-security" }
-smedja-sre         = { path = "../../crates/smedja-sre" }
-smedja-telemetry   = { path = "../../crates/smedja-telemetry" }
-smedja-types       = { path = "../../crates/smedja-types" }
-smedja-vault       = { path = "../../crates/smedja-vault" }
-tokio              = { workspace = true }
-toml               = { workspace = true }
-tower              = { workspace = true }
-url                = { workspace = true }
-tower-http         = { workspace = true }
-tracing            = { workspace = true }
-tracing-subscriber = { workspace = true }
-uuid               = { workspace = true }
-which              = { workspace = true }
-
-# Linux-only Landlock LSM bindings for the native sandbox backend. Target-gated
-# so the macOS build never pulls it in.
-[target.'cfg(target_os = "linux")'.dependencies]
-landlock = "0.4"
-
-[dev-dependencies]
-tempfile = "3"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "testing"] }
-tokio = { version = "1", features = ["full", "test-util"] }
-
 # ── Debian package ─────────────────────────────────────────────────────────────
 [package.metadata.deb]
 name             = "smedja"
@@ -78,16 +24,16 @@ section          = "utils"
 priority         = "optional"
 maintainer-scripts = "../../assets/debian/"
 assets = [
-  # Binaries — paths starting with target/ resolve from the workspace root.
-  ["target/release/smdjad",     "usr/bin/smdjad",     "755"],
-  ["target/release/smj",        "usr/bin/smj",        "755"],
-  ["target/release/smedja",     "usr/bin/smedja",     "755"],
-  ["target/release/smedja-tui", "usr/bin/smedja-tui", "755"],
-  # systemd user unit
-  ["../../assets/smdjad.service",     "lib/systemd/user/smdjad.service",                        "644"],
-  # Desktop integration
-  ["../../assets/smedja.desktop",     "usr/share/applications/smedja.desktop",                  "644"],
-  ["../../assets/brand/smedja-256.png","usr/share/icons/hicolor/256x256/apps/smedja.png",        "644"],
+    # Binaries — paths starting with target/ resolve from the workspace root.
+    ["target/release/smdjad",     "usr/bin/smdjad",     "755"],
+    ["target/release/smj",        "usr/bin/smj",        "755"],
+    ["target/release/smedja",     "usr/bin/smedja",     "755"],
+    ["target/release/smedja-tui", "usr/bin/smedja-tui", "755"],
+    # systemd user unit
+    ["../../assets/smdjad.service",     "lib/systemd/user/smdjad.service",                        "644"],
+    # Desktop integration
+    ["../../assets/smedja.desktop",     "usr/share/applications/smedja.desktop",                  "644"],
+    ["../../assets/brand/smedja-256.png","usr/share/icons/hicolor/256x256/apps/smedja.png",        "644"],
 ]
 
 # ── Fedora / RPM package ────────────────────────────────────────────────────────
@@ -112,11 +58,65 @@ echo "  Then launch the terminal: smedja"
 echo ""
 """
 assets = [
-  { source = "target/release/smdjad",      dest = "/usr/bin/smdjad",                                          mode = "755" },
-  { source = "target/release/smj",         dest = "/usr/bin/smj",                                             mode = "755" },
-  { source = "target/release/smedja",      dest = "/usr/bin/smedja",                                          mode = "755" },
-  { source = "target/release/smedja-tui",  dest = "/usr/bin/smedja-tui",                                      mode = "755" },
-  { source = "assets/smdjad.service",            dest = "/usr/lib/systemd/user/smdjad.service",               mode = "644" },
-  { source = "assets/smedja.desktop",            dest = "/usr/share/applications/smedja.desktop",             mode = "644" },
-  { source = "assets/brand/smedja-256.png",      dest = "/usr/share/icons/hicolor/256x256/apps/smedja.png",  mode = "644" },
+    { source = "target/release/smdjad",      dest = "/usr/bin/smdjad",                                          mode = "755" },
+    { source = "target/release/smj",         dest = "/usr/bin/smj",                                             mode = "755" },
+    { source = "target/release/smedja",      dest = "/usr/bin/smedja",                                          mode = "755" },
+    { source = "target/release/smedja-tui",  dest = "/usr/bin/smedja-tui",                                      mode = "755" },
+    { source = "assets/smdjad.service",            dest = "/usr/lib/systemd/user/smdjad.service",               mode = "644" },
+    { source = "assets/smedja.desktop",            dest = "/usr/share/applications/smedja.desktop",             mode = "644" },
+    { source = "assets/brand/smedja-256.png",      dest = "/usr/share/icons/hicolor/256x256/apps/smedja.png",  mode = "644" },
 ]
+
+[[bin]]
+name = "smdjad"
+path = "src/main.rs"
+
+[dependencies]
+anyhow             = { workspace = true }
+async-trait        = { workspace = true }
+axum               = { workspace = true }
+chrono             = { workspace = true }
+futures-util       = { workspace = true }
+opentelemetry          = { workspace = true }
+opentelemetry-otlp     = { workspace = true }
+opentelemetry_sdk      = { workspace = true }
+reqwest            = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+sha2               = { workspace = true }
+smedja-adapter       = { path = "../../crates/smedja-adapter" }
+smedja-agent-events  = { path = "../../crates/smedja-agent-events" }
+smedja-assayer       = { path = "../../crates/smedja-assayer" }
+smedja-auth          = { path = "../../crates/smedja-auth" }
+smedja-bellows       = { path = "../../crates/smedja-bellows" }
+smedja-graph         = { path = "../../crates/smedja-graph" }
+smedja-ingot       = { path = "../../crates/smedja-ingot" }
+smedja-loop        = { path = "../../crates/smedja-loop" }
+smedja-lsp           = { path = "../../crates/smedja-lsp" }
+smedja-memory      = { path = "../../crates/smedja-memory" }
+smedja-methodology = { path = "../../crates/smedja-methodology" }
+smedja-rpc         = { path = "../../crates/smedja-rpc" }
+smedja-security    = { path = "../../crates/smedja-security" }
+smedja-sre         = { path = "../../crates/smedja-sre" }
+smedja-telemetry   = { path = "../../crates/smedja-telemetry" }
+smedja-types       = { path = "../../crates/smedja-types" }
+smedja-vault       = { path = "../../crates/smedja-vault" }
+tokio              = { workspace = true }
+toml               = { workspace = true }
+tower              = { workspace = true }
+tower-http         = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+url                = { workspace = true }
+uuid               = { workspace = true }
+which              = { workspace = true }
+
+# Linux-only Landlock LSM bindings for the native sandbox backend. Target-gated
+# so the macOS build never pulls it in.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+
+[dev-dependencies]
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "testing"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }

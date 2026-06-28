@@ -237,6 +237,7 @@ pub enum MouseMode {
 
 /// Current SGR (Select Graphic Rendition) attribute state.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 struct SgrState {
     fg: Color,
     bg: Color,
@@ -383,6 +384,7 @@ pub fn parse_osc7_uri(uri: &str) -> Option<String> {
 // ── CellGrid ──────────────────────────────────────────────────────────────────
 
 /// The full terminal cell grid, including scrollback.
+#[allow(clippy::struct_excessive_bools)]
 pub struct CellGrid {
     /// Number of columns in the active area.
     pub cols: u16,
@@ -572,11 +574,11 @@ impl CellGrid {
     pub fn scroll_by(&mut self, delta: i32) -> bool {
         let max = self.max_scroll_offset();
         let next = (self.scroll_offset + delta).clamp(0, max);
-        if next != self.scroll_offset {
+        if next == self.scroll_offset {
+            false
+        } else {
             self.scroll_offset = next;
             true
-        } else {
-            false
         }
     }
 
@@ -712,8 +714,7 @@ impl CellGrid {
                 // If history grew without evicting a line and we're scrolled
                 // back, bump the offset so the viewport stays anchored.
                 if !evicted && self.scroll_offset > 0 {
-                    self.scroll_offset =
-                        (self.scroll_offset + 1).min(self.max_scroll_offset());
+                    self.scroll_offset = (self.scroll_offset + 1).min(self.max_scroll_offset());
                 }
             }
             let blank = blank_row(self.cols, bot as u16);
@@ -2946,7 +2947,10 @@ mod tests {
         // Scrolling within the alt screen must NOT pollute the primary
         // scrollback (alt screens have no scrollback).
         grid.scroll_up(2);
-        assert!(grid.scrollback.is_empty(), "alt-screen scroll feeds no scrollback");
+        assert!(
+            grid.scrollback.is_empty(),
+            "alt-screen scroll feeds no scrollback"
+        );
     }
 
     #[test]
@@ -2964,6 +2968,9 @@ mod tests {
         let a = render_vt_snapshot(10, 2, b"hello");
         let b = render_vt_snapshot(10, 2, b"hello");
         assert_eq!(snapshot_hash(&a), snapshot_hash(&b));
-        assert_ne!(snapshot_hash(&a), snapshot_hash(&render_vt_snapshot(10, 2, b"world")));
+        assert_ne!(
+            snapshot_hash(&a),
+            snapshot_hash(&render_vt_snapshot(10, 2, b"world"))
+        );
     }
 }

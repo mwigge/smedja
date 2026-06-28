@@ -1,9 +1,9 @@
 //! Context rail widget — sidebar showing working memory slot usage.
 
+use crate::theme::palette;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use crate::theme::palette;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget};
 

@@ -358,9 +358,8 @@ fn spawn_worker(
     tokio::spawn(async move {
         let mut set = tokio::task::JoinSet::new();
         loop {
-            let (session_id, turn_id) = match work_rx.recv().await {
-                Some(pair) => pair,
-                None => break, // all senders dropped — daemon shutting down
+            let Some((session_id, turn_id)) = work_rx.recv().await else {
+                break; // all senders dropped — daemon shutting down
             };
             let ig = ingot.clone();
             let dp = Arc::clone(&dispatcher);
@@ -552,7 +551,12 @@ fn build_router(
         state,
         handlers::session::set_runner
     );
-    route!(router, "session.set_tier", state, handlers::session::set_tier);
+    route!(
+        router,
+        "session.set_tier",
+        state,
+        handlers::session::set_tier
+    );
     route!(
         router,
         "session.set_mode",
@@ -601,7 +605,12 @@ fn build_router(
     route!(router, "savings.summary", state, handlers::savings::summary);
     route!(router, "cowork.set", state, handlers::audit::set);
     route!(router, "cowork.set_mode", state, handlers::audit::set_mode);
-    route!(router, "cowork.gate_tool", state, handlers::audit::gate_tool);
+    route!(
+        router,
+        "cowork.gate_tool",
+        state,
+        handlers::audit::gate_tool
+    );
     route!(router, "cowork.approve", state, handlers::audit::approve);
     route!(router, "cowork.deny", state, handlers::audit::deny);
     route!(router, "cowork.modify", state, handlers::audit::modify);
@@ -1013,7 +1022,7 @@ async fn main() -> anyhow::Result<()> {
         let ps = Arc::clone(&provider_sessions);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                tokio::time::sleep(std::time::Duration::from_mins(5)).await;
                 let mut map = ps.lock().await;
                 let n = map.len();
                 if n > 10_000 {
@@ -1097,7 +1106,7 @@ async fn main() -> anyhow::Result<()> {
         let ingot_for_vacuum = ingot.clone();
         tokio::spawn(async move {
             // First run after 1 hour so startup I/O is not affected.
-            tokio::time::sleep(std::time::Duration::from_secs(3_600)).await;
+            tokio::time::sleep(std::time::Duration::from_hours(1)).await;
             loop {
                 match ingot_for_vacuum.prune_old_sessions(30).await {
                     Ok(n) if n > 0 => info!(pruned = n, "pruned old terminated sessions"),
@@ -1107,7 +1116,7 @@ async fn main() -> anyhow::Result<()> {
                 if let Err(e) = ingot_for_vacuum.vacuum().await {
                     warn!(error = %e, "database vacuum failed");
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(86_400)).await;
+                tokio::time::sleep(std::time::Duration::from_hours(24)).await;
             }
         });
     }

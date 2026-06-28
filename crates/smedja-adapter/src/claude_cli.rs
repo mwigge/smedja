@@ -44,7 +44,7 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Installs smedja's PreToolUse approval hook on a `claude` command so each of
+/// Installs smedja's `PreToolUse` approval hook on a `claude` command so each of
 /// claude's own tool calls is gated through the daemon's permission policy
 /// (`smj tool-gate` → `cowork.gate_tool`, which blocks on the user when the
 /// policy says "ask"). The smedja session id is passed via `SMEDJA_SESSION_ID`

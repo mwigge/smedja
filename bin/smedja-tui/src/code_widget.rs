@@ -19,9 +19,9 @@ use ratatui::{
     widgets::Widget,
 };
 
-use ratatui::style::Color;
 use crate::main_panel::{apply_syntect, LineStyle, StyledLine};
 use crate::theme::palette;
+use ratatui::style::Color;
 
 /// A ratatui widget that renders a syntax-highlighted code block with
 /// independent scroll state.

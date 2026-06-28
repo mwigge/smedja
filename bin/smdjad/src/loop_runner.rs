@@ -481,7 +481,7 @@ mod tests {
             ) -> anyhow::Result<()> {
                 self.slices_seen
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(slice.to_owned());
                 Ok(())
             }

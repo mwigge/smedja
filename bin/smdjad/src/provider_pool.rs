@@ -304,7 +304,11 @@ impl ProviderPool {
             .entries
             .iter()
             .map(|((_, tier), entry)| {
-                (entry.runner_name, tier_str(tier), entry.default_model.as_str())
+                (
+                    entry.runner_name,
+                    tier_str(tier),
+                    entry.default_model.as_str(),
+                )
             })
             .collect();
         out.sort_by_key(|&(runner, tier, _)| (runner, tier));
@@ -438,13 +442,7 @@ pub async fn build_provider_pool() -> ProviderPool {
     // 2. Codex CLI
     if SubprocessProvider::available("codex") {
         let p_fast = CodexCliProvider::detect(None).expect("codex binary just checked");
-        add!(
-            Runner::Codex,
-            Tier::Fast,
-            p_fast,
-            "codex-cli",
-            "gpt-5.5"
-        );
+        add!(Runner::Codex, Tier::Fast, p_fast, "codex-cli", "gpt-5.5");
         info!(runner = "codex-cli", "provider ready");
     } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         let p = OpenAiProvider::new("https://api.openai.com", key);

@@ -10,9 +10,9 @@ members = [
     "crates/smedja-bellows",
     "crates/smedja-eval",
     "crates/smedja-graph",
-    "crates/smedja-lsp",
     "crates/smedja-ingot",
     "crates/smedja-loop",
+    "crates/smedja-lsp",
     "crates/smedja-memory",
     "crates/smedja-methodology",
     "crates/smedja-plugins",
@@ -43,11 +43,11 @@ rust-version = "1.82"
 
 [workspace.dependencies]
 
-# async trait methods (dyn-dispatched ports)
-async-trait  = "0.1"
-
 # error handling
 anyhow       = "1"
+
+# async trait methods (dyn-dispatched ports)
+async-trait  = "0.1"
 
 # http
 axum         = { version = "0.8", features = ["ws"] }
@@ -62,6 +62,9 @@ cosmic-text  = "0.12"
 
 # terminal (client + term emulator)
 crossterm    = "0.28"
+
+# GPU rendering (smedja terminal)
+etagere      = "0.2"
 futures-core = "0.3"
 futures-util = "0.3"
 opentelemetry          = "0.27"
@@ -122,9 +125,6 @@ url          = "2"
 uuid         = { version = "1", features = ["v4", "serde"] }
 vte          = "0.13"
 walkdir            = "2"
-
-# GPU rendering (smedja terminal)
-etagere      = "0.2"
 wgpu         = "22"
 
 # binary detection

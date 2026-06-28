@@ -607,11 +607,19 @@ mod tests {
         std::fs::write(roles.join("plan.md"), b"a plan rule").unwrap();
 
         let review = super::load_role_skills(tmp.path(), "review").unwrap();
-        assert_eq!(review, vec!["top review rule".to_owned(), "extra A".to_owned()]);
+        assert_eq!(
+            review,
+            vec!["top review rule".to_owned(), "extra A".to_owned()]
+        );
 
         // A role with no pack yields nothing; an unrelated role isn't mixed in.
-        assert!(super::load_role_skills(tmp.path(), "research").unwrap().is_empty());
-        assert_eq!(super::load_role_skills(tmp.path(), "plan").unwrap(), vec!["a plan rule".to_owned()]);
+        assert!(super::load_role_skills(tmp.path(), "research")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            super::load_role_skills(tmp.path(), "plan").unwrap(),
+            vec!["a plan rule".to_owned()]
+        );
     }
 
     #[test]

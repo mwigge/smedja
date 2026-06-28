@@ -946,10 +946,8 @@ impl TurnOrchestrator {
                     // The gate is created on demand so gating works without an
                     // explicit `/cowork on`.
                     let cowork_denied = if role.is_read_only()
-                        && crate::cowork::evaluate(
-                            crate::cowork::PermissionMode::Plan,
-                            &tool_name,
-                        ) == crate::cowork::PermissionDecision::Deny
+                        && crate::cowork::evaluate(crate::cowork::PermissionMode::Plan, &tool_name)
+                            == crate::cowork::PermissionDecision::Deny
                     {
                         // Read-only roles (plan/research/review/ask/orchestrator)
                         // can never mutate, regardless of the permission mode.
@@ -965,8 +963,8 @@ impl TurnOrchestrator {
                                     .or_insert_with(|| Arc::new(CoworkGate::default())),
                             )
                         };
-                        let args_scrubbed = serde_json::from_str(&tool_input)
-                            .unwrap_or(serde_json::Value::Null);
+                        let args_scrubbed =
+                            serde_json::from_str(&tool_input).unwrap_or(serde_json::Value::Null);
                         // High-risk roles (IaC) always confirm a mutation — never
                         // auto-approved even in Auto/AcceptEdits — because the ops
                         // (apply/destroy) are dangerous and hard to reverse.
