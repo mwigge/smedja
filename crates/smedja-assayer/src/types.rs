@@ -29,6 +29,8 @@ pub enum AgentRole {
     Iac,
     /// Coordinates and orchestrates multi-agent workflows.
     Orchestrator,
+    /// Reads and searches the codebase; never mutates. Allow-list: read, glob, grep, list.
+    Search,
 }
 
 impl AgentRole {
@@ -44,6 +46,7 @@ impl AgentRole {
                 | AgentRole::Review
                 | AgentRole::Ask
                 | AgentRole::Orchestrator
+                | AgentRole::Search
         )
     }
 
@@ -84,6 +87,7 @@ impl AgentRole {
             AgentRole::Data => "data",
             AgentRole::Iac => "iac",
             AgentRole::Orchestrator => "orchestrator",
+            AgentRole::Search => "search",
         }
     }
 }

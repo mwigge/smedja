@@ -81,6 +81,7 @@ pub(crate) fn parse_session_mode_to_role(mode: &str) -> Option<AgentRole> {
         "data" | "sql" => Some(AgentRole::Data),
         "iac" | "infra" => Some(AgentRole::Iac),
         "orchestrator" => Some(AgentRole::Orchestrator),
+        "search" => Some(AgentRole::Search),
         _ => None,
     }
 }

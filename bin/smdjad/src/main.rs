@@ -1586,6 +1586,27 @@ mod tests {
     }
 
     #[test]
+    fn search_mode_parses_to_read_only_role() {
+        use smedja_assayer::AgentRole;
+        let role = crate::common::parse_session_mode_to_role("search");
+        assert_eq!(role, Some(AgentRole::Search));
+        assert!(AgentRole::Search.is_read_only());
+        assert_eq!(AgentRole::Search.label(), "search");
+    }
+
+    #[test]
+    fn search_role_blocks_write_tools() {
+        use crate::cowork::{evaluate, PermissionDecision, PermissionMode};
+        use smedja_assayer::AgentRole;
+        let write_tools = ["edit_file", "bash", "write_file", "run_command"];
+        for tool in &write_tools {
+            let denied = AgentRole::Search.is_read_only()
+                && evaluate(PermissionMode::Plan, tool) == PermissionDecision::Deny;
+            assert!(denied, "tool {tool} should be blocked for search role");
+        }
+    }
+
+    #[test]
     fn loop_retire_state_is_terminal() {
         // Verify the terminal-status strings used in loop.retire enforcement.
         // "retired" must not be "complete" or "failed" — so the retire guard
