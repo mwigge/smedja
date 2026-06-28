@@ -1045,7 +1045,7 @@ fn status_hint_line(no_color: bool) -> Line<'static> {
         Style::default().fg(p.text_dim).bg(p.panel)
     };
     Line::from(Span::styled(
-        "/help · ^W sessions · ^O obs · ^L lsp ".to_owned(),
+        "/help · ^W/^⇧W sessions · ^O obs · ^L lsp ".to_owned(),
         style,
     ))
 }
@@ -2359,8 +2359,10 @@ async fn handle_key(
             }
         }
 
-        // Ctrl-W: toggle session browser left-rail.
-        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        // Ctrl-W / Ctrl-Shift-W: toggle session browser left-rail.
+        // Ctrl-W is consumed by many Linux WMs/terminals (e.g. WezTerm on CachyOS),
+        // so Ctrl-Shift-W (crossterm: Char('W') + CONTROL) is the Linux fallback.
+        KeyCode::Char('w' | 'W') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.panels.session_rail = !state.panels.session_rail;
             state.session_rail_cursor = 0;
             // Trigger an immediate poll on next tick by clearing the timestamp.
@@ -3172,7 +3174,23 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         let show_value = state.panels.value;
 
         // Build constraint list dynamically so Layout never gets zero-length.
-        let mut constraints: Vec<Constraint> = vec![Length(1)]; // context row
+        let mut constraints: Vec<Constraint> = vec![];
+        // Metrics panel sits at the very top of the rail when visible.
+        let show_metrics = state.panels.metrics;
+        if show_metrics {
+            let metrics_lines = metrics_view::MetricsView::with_savings(
+                state.metrics_snapshot.clone(),
+                state.savings_snapshot.clone(),
+            )
+            .lines()
+            .len();
+            // +2 for Block top and bottom border.
+            let h = u16::try_from(metrics_lines + 2)
+                .unwrap_or(11)
+                .min(rail_rect.height / 2);
+            constraints.push(Length(h));
+        }
+        constraints.push(Length(1)); // context row
         if show_cockpit {
             constraints.push(Length(6));
         }
@@ -3188,11 +3206,23 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
             constraints.push(Length(10));
         }
         if show_value {
-            constraints.push(Length(8));
+            constraints.push(Length(6));
         }
 
         let rail_chunks = Layout::vertical(constraints).split(rail_rect);
         let mut ci = 0usize;
+
+        // ── Metrics / runner panel ────────────────────────────────────────
+        if show_metrics && ci < rail_chunks.len() {
+            frame.render_widget(
+                metrics_view::MetricsView::with_savings(
+                    state.metrics_snapshot.clone(),
+                    state.savings_snapshot.clone(),
+                ),
+                rail_chunks[ci],
+            );
+            ci += 1;
+        }
 
         // ── Context slot ──────────────────────────────────────────────────
         // Clamp to usize::MAX — well within range on 64-bit targets.
@@ -3234,31 +3264,6 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         // ── Value / ROI panel ─────────────────────────────────────────────
         if show_value && ci < rail_chunks.len() {
             value_panel::ValuePanel::new(&state.value_snapshot).render(rail_chunks[ci], frame);
-        }
-    }
-
-    // -- Metrics view ---------------------------------------------------------
-    // Read-only snapshot panel, toggled via Ctrl-T. Rendered as a top-anchored
-    // overlay on the right of the body so it does not disturb the main/rail
-    // split; it draws from the cached snapshot, never fetching on the hot path.
-    if state.panels.metrics {
-        let width = metrics_view::MetricsView::WIDTH.min(body_area.width);
-        let view = metrics_view::MetricsView::with_savings(
-            state.metrics_snapshot.clone(),
-            state.savings_snapshot.clone(),
-        );
-        let height = u16::try_from(view.lines().len())
-            .unwrap_or(u16::MAX)
-            .min(body_area.height);
-        if width > 0 && height > 0 {
-            let metrics_rect = ratatui::layout::Rect::new(
-                body_area.x + body_area.width.saturating_sub(width),
-                body_area.y,
-                width,
-                height,
-            );
-            frame.render_widget(ratatui::widgets::Clear, metrics_rect);
-            frame.render_widget(view, metrics_rect);
         }
     }
 
@@ -4488,8 +4493,15 @@ async fn main() -> Result<()> {
                         Some((id, label))
                     })
                     .collect();
-                // Clamp cursor to new list length.
-                if !state.session_rail_items.is_empty() {
+                // On first load (cursor still at 0) point at the current session.
+                // On subsequent polls clamp to the new list length.
+                let current_idx = state
+                    .session_rail_items
+                    .iter()
+                    .position(|(id, _)| id == &state.session_id);
+                if let Some(idx) = current_idx {
+                    state.session_rail_cursor = idx;
+                } else if !state.session_rail_items.is_empty() {
                     state.session_rail_cursor = state
                         .session_rail_cursor
                         .min(state.session_rail_items.len().saturating_sub(1));
@@ -7111,8 +7123,13 @@ mod tests {
                 errors: 0,
             },
         ];
-        let buf = render_frame(&mut state);
-        let content: String = buf
+        // MetricsView lives inside the context rail; rail needs width >= 100.
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
             .content()
             .iter()
             .map(ratatui::buffer::Cell::symbol)
