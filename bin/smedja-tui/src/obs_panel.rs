@@ -6,9 +6,9 @@
 
 use std::collections::VecDeque;
 
+use crate::theme::palette;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use crate::theme::palette;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -82,7 +82,9 @@ fn fmt_tok(n: u64) -> String {
 }
 
 /// Eighth-block glyphs for the latency sparkline, low → high.
-const SPARK_BLOCKS: [char; 8] = ['\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+const SPARK_BLOCKS: [char; 8] = [
+    '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}',
+];
 
 /// Renders the most recent `width` latency samples as an inline block
 /// sparkline, scaled to the window's own min/max. Returns an empty string for
@@ -139,9 +141,15 @@ fn labeled_gauge(prefix: &str, suffix: &str, value: u64, max: u64, width: usize)
     let reserved = prefix.chars().count() + suffix.chars().count();
     let bar_w = width.saturating_sub(reserved).max(1);
     let bar = fill_bar(value, max, bar_w, budget_color(pct));
-    let mut spans = vec![Span::styled(prefix.to_owned(), Style::default().fg(p.text_dim))];
+    let mut spans = vec![Span::styled(
+        prefix.to_owned(),
+        Style::default().fg(p.text_dim),
+    )];
     spans.extend(bar.spans);
-    spans.push(Span::styled(suffix.to_owned(), Style::default().fg(p.text_dim)));
+    spans.push(Span::styled(
+        suffix.to_owned(),
+        Style::default().fg(p.text_dim),
+    ));
     Line::from(spans)
 }
 

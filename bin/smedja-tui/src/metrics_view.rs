@@ -7,10 +7,10 @@
 //! window; this widget never fetches or mutates — it only renders what the app
 //! already holds, keeping it off the render hot path.
 
+use crate::theme::palette;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use crate::theme::palette;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget};
 

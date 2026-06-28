@@ -12,8 +12,8 @@ chrono     = { workspace = true }
 regex      = { workspace = true }
 rusqlite   = { workspace = true }
 serde      = { workspace = true }
-smedja-types = { path = "../smedja-types" }
 serde_json = { workspace = true }
+smedja-types = { path = "../smedja-types" }
 thiserror  = { workspace = true }
 # Narrowed from the workspace ["full"] default: this crate only needs the
 # runtime (for spawn_blocking) and the test macros.

@@ -99,8 +99,14 @@ pub(crate) fn format_memory(history: &Value, context: Option<&Value>, sid: &str)
     if let Some(ctx) = context {
         let used = ctx.get("used_tok").and_then(Value::as_u64).unwrap_or(0);
         let window = ctx.get("window_tok").and_then(Value::as_u64).unwrap_or(0);
-        let warm = ctx.get("vault_warm_count").and_then(Value::as_u64).unwrap_or(0);
-        let cold = ctx.get("vault_cold_count").and_then(Value::as_u64).unwrap_or(0);
+        let warm = ctx
+            .get("vault_warm_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cold = ctx
+            .get("vault_cold_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         let pct = used.saturating_mul(100).checked_div(window).unwrap_or(0);
         lines.push(format!(
             "  short-term · context {used}/{window} tok ({pct}%)"
@@ -113,7 +119,10 @@ pub(crate) fn format_memory(history: &Value, context: Option<&Value>, sid: &str)
     let turns = history.get("turns").and_then(Value::as_array);
     match turns {
         Some(turns) if !turns.is_empty() => {
-            lines.push(format!("{} stored turn(s) — long-term memory:", turns.len()));
+            lines.push(format!(
+                "{} stored turn(s) — long-term memory:",
+                turns.len()
+            ));
             for t in turns {
                 let n = t.get("turn_n").and_then(Value::as_u64).unwrap_or(0);
                 let msgs = t.get("messages").and_then(Value::as_array);
@@ -122,7 +131,8 @@ pub(crate) fn format_memory(history: &Value, context: Option<&Value>, sid: &str)
                     for m in msgs {
                         let role = m.get("role").and_then(Value::as_str).unwrap_or("");
                         let content = m.get("content").and_then(Value::as_str).unwrap_or("");
-                        let preview: String = content.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let preview: String =
+                            content.split_whitespace().collect::<Vec<_>>().join(" ");
                         let preview: String = preview.chars().take(72).collect();
                         if role == "user" && user.is_empty() {
                             user = preview;
@@ -142,7 +152,10 @@ pub(crate) fn format_memory(history: &Value, context: Option<&Value>, sid: &str)
 
     if let Some(audit) = history.get("audit").and_then(Value::as_array) {
         if !audit.is_empty() {
-            lines.push(format!("{} audit event(s) in the tool/turn trail", audit.len()));
+            lines.push(format!(
+                "{} audit event(s) in the tool/turn trail",
+                audit.len()
+            ));
         }
     }
     lines.push("tip: /memory <session_id> views another session's memory".to_owned());
@@ -1059,15 +1072,27 @@ pub(crate) async fn dispatch_slash(
                     "available runners:".to_owned(),
                     format!(
                         "  claude   [{}]  — Claude.ai subscription (OAuth, no API key needed)",
-                        if claude_found { "installed" } else { "not found" }
+                        if claude_found {
+                            "installed"
+                        } else {
+                            "not found"
+                        }
                     ),
                     format!(
                         "  codex    [{}]  — OpenAI Codex CLI",
-                        if codex_found { "installed" } else { "not found" }
+                        if codex_found {
+                            "installed"
+                        } else {
+                            "not found"
+                        }
                     ),
                     format!(
                         "  local    [{}]  — local model via rs-llmctl",
-                        if llmctl_found { "installed" } else { "not found" }
+                        if llmctl_found {
+                            "installed"
+                        } else {
+                            "not found"
+                        }
                     ),
                     "  copilot              — GitHub Copilot".to_owned(),
                     "  minimax              — Minimax (set MINIMAX_API_KEY)".to_owned(),
@@ -1327,12 +1352,9 @@ pub(crate) async fn dispatch_slash(
                 state,
                 format!("checking for updates (current: v{VERSION})\u{2026}"),
             );
-            let latest = match fetch_latest_version().await {
-                Some(t) => t,
-                None => {
-                    push_system_message(state, "upgrade failed: could not reach GitHub releases");
-                    return Ok(true);
-                }
+            let Some(latest) = fetch_latest_version().await else {
+                push_system_message(state, "upgrade failed: could not reach GitHub releases");
+                return Ok(true);
             };
             if !is_newer(&latest, VERSION) {
                 push_system_message(state, format!("already at {latest}, nothing to upgrade"));

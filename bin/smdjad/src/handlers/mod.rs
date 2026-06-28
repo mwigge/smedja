@@ -78,5 +78,4 @@ pub(crate) struct HandlerState {
 
 /// Maps an in-flight `turn_id` to the [`tokio::task::AbortHandle`] of its
 /// `run_turn` task (see [`HandlerState::turn_registry`]).
-pub(crate) type TurnRegistry =
-    Arc<std::sync::Mutex<HashMap<String, tokio::task::AbortHandle>>>;
+pub(crate) type TurnRegistry = Arc<std::sync::Mutex<HashMap<String, tokio::task::AbortHandle>>>;

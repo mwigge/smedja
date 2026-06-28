@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use statusbar::ModuleCtx;
 
+use crate::theme::{palette, runner_color, runner_label};
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::event::{
@@ -43,7 +44,6 @@ use crossterm::{event, execute};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use crate::theme::{palette, runner_color, runner_label};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Terminal;
@@ -697,10 +697,7 @@ pub(crate) async fn submit(input: &str, state: &mut AppState, client: &mut Clien
             // per-turn handle and is shown short, after.
             let sid = &state.session_id[..state.session_id.len().min(12)];
             let short_task = &task_id[..task_id.len().min(8)];
-            push_action_log(
-                state,
-                format!("queued · session {sid} · task {short_task}"),
-            );
+            push_action_log(state, format!("queued · session {sid} · task {short_task}"));
             None
         }
         Err(ref e) => Some(format!("error: {e}")),
@@ -724,7 +721,12 @@ fn push_action_log(state: &mut AppState, action: impl Into<String>) {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let ts = format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+    let ts = format!(
+        "{:02}:{:02}:{:02}",
+        (secs / 3600) % 24,
+        (secs / 60) % 60,
+        secs % 60
+    );
     state.action_log.push(action_log::AuditEntry {
         timestamp: ts,
         action: action.into(),
@@ -754,9 +756,19 @@ fn filtered_completions(input: &str) -> Vec<String> {
 fn classify_turn_error(msg: &str) -> (&'static str, &'static str) {
     let lower = msg.to_lowercase();
     if lower.contains("rate limit") || lower.contains("rate_limit") {
-        ("RATE LIMITED", "Wait a moment and press Ctrl-Enter to retry")
-    } else if lower.contains("api key") || lower.contains("auth") || lower.contains("401") || lower.contains("403") {
-        ("AUTH ERROR", "Check ANTHROPIC_API_KEY or provider credentials")
+        (
+            "RATE LIMITED",
+            "Wait a moment and press Ctrl-Enter to retry",
+        )
+    } else if lower.contains("api key")
+        || lower.contains("auth")
+        || lower.contains("401")
+        || lower.contains("403")
+    {
+        (
+            "AUTH ERROR",
+            "Check ANTHROPIC_API_KEY or provider credentials",
+        )
     } else if lower.contains("quota") || lower.contains("429") {
         ("QUOTA EXCEEDED", "Daily quota reached; check smj cost")
     } else if lower.contains("timeout") || lower.contains("timed out") {
@@ -764,8 +776,12 @@ fn classify_turn_error(msg: &str) -> (&'static str, &'static str) {
             "TIMEOUT",
             "Turn hit the wall-clock cap (default 900s; raise with SMEDJA_TURN_TIMEOUT_S)",
         )
-    } else if lower.contains("network") || lower.contains("connection") || lower.contains("connect") {
-        ("NETWORK ERROR", "Check network connectivity and provider endpoint")
+    } else if lower.contains("network") || lower.contains("connection") || lower.contains("connect")
+    {
+        (
+            "NETWORK ERROR",
+            "Check network connectivity and provider endpoint",
+        )
     } else {
         ("ERROR", "")
     }
@@ -840,7 +856,7 @@ fn tool_call_card(name: &str, input: &str, no_color: bool, status: char) -> Line
     } else {
         let p = palette();
         let st = match status {
-            '\u{2713}' => Style::default().fg(p.code_added),   // ✓
+            '\u{2713}' => Style::default().fg(p.code_added), // ✓
             '\u{2717}' => Style::default().fg(p.code_removed), // ✗
             _ => Style::default().fg(p.text_dim),
         };
@@ -866,7 +882,9 @@ fn tool_call_card(name: &str, input: &str, no_color: bool, status: char) -> Line
 /// never contains the secret value.
 fn save_secret(var: &str, value: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
-    let dir = std::path::PathBuf::from(home).join(".config").join("smedja");
+    let dir = std::path::PathBuf::from(home)
+        .join(".config")
+        .join("smedja");
     let path = dir.join("secrets.env");
     if std::fs::create_dir_all(&dir).is_err() {
         return "login: cannot create ~/.config/smedja".to_owned();
@@ -1076,23 +1094,29 @@ pub(crate) fn format_resume_rows(list: &serde_json::Value) -> Vec<String> {
                 .get("mode")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("?");
-            let updated = if let Some(s_val) = s.get("updated_at").and_then(serde_json::Value::as_str) {
-                s_val.to_owned()
-            } else if let Some(n) = s.get("updated_at").and_then(serde_json::Value::as_f64) {
-                // epoch microseconds → relative display
-                let secs = (n / 1_000_000.0) as i64;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                let ago = now - secs;
-                if ago < 60 { format!("{ago}s ago") }
-                else if ago < 3600 { format!("{}m ago", ago / 60) }
-                else if ago < 86400 { format!("{}h ago", ago / 3600) }
-                else { format!("{}d ago", ago / 86400) }
-            } else {
-                "-".to_owned()
-            };
+            let updated =
+                if let Some(s_val) = s.get("updated_at").and_then(serde_json::Value::as_str) {
+                    s_val.to_owned()
+                } else if let Some(n) = s.get("updated_at").and_then(serde_json::Value::as_f64) {
+                    // epoch microseconds → relative display
+                    let secs = (n / 1_000_000.0) as i64;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let ago = now - secs;
+                    if ago < 60 {
+                        format!("{ago}s ago")
+                    } else if ago < 3600 {
+                        format!("{}m ago", ago / 60)
+                    } else if ago < 86400 {
+                        format!("{}h ago", ago / 3600)
+                    } else {
+                        format!("{}d ago", ago / 86400)
+                    }
+                } else {
+                    "-".to_owned()
+                };
             format!("{short}  {title}  {mode}  {updated}")
         })
         .collect()
@@ -1164,7 +1188,10 @@ pub(crate) fn parse_review_scope(args: &str) -> serde_json::Value {
 ///
 /// `counts` is the `audit.run` response's `counts` object; `report_path` is the
 /// written path when present, otherwise the report was returned inline.
-pub(crate) fn render_findings_summary(counts: &serde_json::Value, report_path: Option<&str>) -> String {
+pub(crate) fn render_findings_summary(
+    counts: &serde_json::Value,
+    report_path: Option<&str>,
+) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::from("audit complete — findings:");
@@ -1322,23 +1349,20 @@ fn yank_to_clipboard(lines: &[String]) -> Result<&'static str, String> {
             .args(*args)
             .stdin(std::process::Stdio::piped())
             .spawn();
-        match result {
-            Ok(mut child) => {
-                let write_ok = child
-                    .stdin
-                    .take()
-                    .is_none_or(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
-                if write_ok {
-                    // Reap the child in a background thread so we don't block
-                    // the TUI event loop (clipboard tools like wl-copy stay
-                    // alive serving paste requests until another owner takes over).
-                    std::thread::spawn(move || {
-                        let _ = child.wait();
-                    });
-                    return Ok(bin);
-                }
+        if let Ok(mut child) = result {
+            let write_ok = child
+                .stdin
+                .take()
+                .is_none_or(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+            if write_ok {
+                // Reap the child in a background thread so we don't block
+                // the TUI event loop (clipboard tools like wl-copy stay
+                // alive serving paste requests until another owner takes over).
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Ok(bin);
             }
-            Err(_) => continue,
         }
     }
 
@@ -1538,12 +1562,11 @@ pub(crate) async fn run_upgrade(latest_tag: &str) -> String {
 
     // Resolve the directory that contains the currently running smedja-tui
     // binary; new binaries will be placed alongside it.
-    let install_dir = match std::env::current_exe()
+    let Some(install_dir) = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-    {
-        Some(d) => d,
-        None => return "upgrade failed: could not determine install directory".into(),
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+    else {
+        return "upgrade failed: could not determine install directory".into();
     };
 
     let tmp = std::env::temp_dir().join("smedja-upgrade");
@@ -1804,8 +1827,7 @@ async fn handle_key(
 ) -> Result<()> {
     // Any key other than Ctrl-C disarms the quit confirmation so the two presses
     // must be consecutive.
-    let is_ctrl_c =
-        key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+    let is_ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
     if !is_ctrl_c {
         state.quit_armed = false;
     }
@@ -1948,7 +1970,7 @@ async fn handle_key(
             .await
         {
             if let Some(m) = v.get("mode").and_then(Value::as_str) {
-                state.permission_mode = m.to_owned();
+                m.clone_into(&mut state.permission_mode);
                 push_system_message(state, format!("permission mode \u{2192} {m}"));
             }
         }
@@ -2170,8 +2192,8 @@ async fn handle_key(
                 if state.selection_mode {
                     // Keyboard selection is whole-line: extend by a line, snapping
                     // the end column to that line's length.
-                    let next = (state.selection_end.0 + 1)
-                        .min(state.main_panel.len().saturating_sub(1));
+                    let next =
+                        (state.selection_end.0 + 1).min(state.main_panel.len().saturating_sub(1));
                     state.selection_end = (next, state.main_panel.line_char_len(next));
                 } else {
                     state.main_panel.scroll_down();
@@ -2475,9 +2497,9 @@ async fn handle_key(
         // mirroring claude-cli / opencode. Requires the kitty keyboard protocol
         // (pushed at startup) so the host terminal disambiguates the modifier.
         KeyCode::Enter
-            if key.modifiers.intersects(
-                KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
-            ) =>
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL) =>
         {
             if !state.scroll_focus {
                 state.input.insert(state.input_cursor, '\n');
@@ -2786,10 +2808,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
 
     // Flood-fill the entire frame with the forge background so no terminal
     // default colour bleeds through panel gaps or empty areas.
-    frame.render_widget(
-        Block::default().style(Style::default().bg(p.bg)),
-        area,
-    );
+    frame.render_widget(Block::default().style(Style::default().bg(p.bg)), area);
 
     // Build the input echo (prefix + visible cursor) and compute how many
     // visual rows it needs, so the input field grows and wraps instead of
@@ -2908,9 +2927,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
                 if i == cursor {
                     Line::from(Span::styled(
                         format!("▶ {label}"),
-                        Style::default()
-                            .fg(p.accent)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
                     ))
                 } else {
                     Line::from(Span::raw(format!("  {label}")))
@@ -2955,9 +2972,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         let spinner_style = if state.no_color {
             Style::default()
         } else {
-            Style::default()
-                .fg(p.accent)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
         };
         let dim_style = if state.no_color {
             Style::default()
@@ -3026,21 +3041,19 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     // -- Input area (auto-growing + wrapped; display/height computed above) ----
     // Prompt feedback: right-aligned char + estimated token count. Shown only
     // when the input is a single row, so it can never overlap wrapped text.
-    let counter_text = if !state.input.is_empty() {
+    let counter_text = if state.input.is_empty() {
+        String::new()
+    } else {
         let chars = state.input.chars().count();
         #[allow(clippy::integer_division)]
         let est_tok = chars / 4;
         format!("{chars}c ≈{est_tok}tok")
-    } else {
-        String::new()
     };
     let counter_len = counter_text.chars().count() as u16;
     let counter_style = if state.no_color {
         Style::default()
     } else {
-        Style::default()
-            .fg(p.text_dim)
-            .add_modifier(Modifier::DIM)
+        Style::default().fg(p.text_dim).add_modifier(Modifier::DIM)
     };
     let input_para = Paragraph::new(input_display)
         .wrap(ratatui::widgets::Wrap { trim: false })
@@ -3071,11 +3084,8 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
             "(reverse-i-search) `{}`: {}",
             state.history_search_query, matched
         );
-        let search_widget = Paragraph::new(search_text).style(
-            Style::default()
-                .fg(p.text)
-                .add_modifier(Modifier::DIM),
-        );
+        let search_widget = Paragraph::new(search_text)
+            .style(Style::default().fg(p.text).add_modifier(Modifier::DIM));
         frame.render_widget(search_widget, search_area);
     }
 
@@ -3200,9 +3210,11 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
             .map(|l| Line::raw(l.clone()))
             .collect();
 
-        let diff_widget =
-            Paragraph::new(visible)
-                .block(Block::default().borders(Borders::ALL).title(" tool detail "));
+        let diff_widget = Paragraph::new(visible).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" tool detail "),
+        );
         frame.render_widget(diff_widget, overlay_rect);
     }
 
@@ -3460,8 +3472,10 @@ fn init_tracing() {
     // The fmt layer clones the file handle per write via this closure; on the
     // (essentially OOM-only) clone failure we discard the line rather than panic.
     let make_writer = move || -> Box<dyn std::io::Write> {
-        file.try_clone()
-            .map_or_else(|_| Box::new(std::io::sink()) as Box<dyn std::io::Write>, |f| Box::new(f))
+        file.try_clone().map_or_else(
+            |_| Box::new(std::io::sink()) as Box<dyn std::io::Write>,
+            |f| Box::new(f),
+        )
     };
     match std::env::var("SMEDJA_LOG_FORMAT").as_deref() {
         Ok("json") => tracing_subscriber::fmt()
@@ -3682,8 +3696,13 @@ async fn main() -> Result<()> {
 
     let _guard = TerminalGuard; // instantiate immediately so Drop restores terminal on any panic
     enable_raw_mode().context("enable raw mode")?;
-    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)
-        .context("enter alternate screen")?;
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )
+    .context("enter alternate screen")?;
     // Negotiate the kitty keyboard protocol so the host terminal emits CSI-u
     // sequences: this is what lets us distinguish Shift+Enter from Enter and see
     // Ctrl-modified keys reliably. Best-effort — terminals that don't support it
@@ -3793,26 +3812,26 @@ async fn main() -> Result<()> {
                         // was dragged — a bare click just places the anchor and is
                         // dismissed without clobbering the clipboard).
                         MouseEventKind::Up(crossterm::event::MouseButton::Left)
-                            if state.selection_mode => {
-                                if state.selection_anchor == state.selection_end {
-                                    state.selection_mode = false;
-                                } else {
-                                    let text = state.main_panel.selection_text(
-                                        state.selection_anchor,
-                                        state.selection_end,
-                                    );
-                                    let count = text.lines().count().max(1);
-                                    let msg = match yank_to_clipboard(std::slice::from_ref(&text)) {
-                                        Ok(_) => {
-                                            format!("\u{2713} {count} lines copied to clipboard")
-                                        }
-                                        Err(e) => e,
-                                    };
-                                    state.clipboard = Some(text);
-                                    state.selection_mode = false;
-                                    push_system_message(&mut state, msg);
-                                }
+                            if state.selection_mode =>
+                        {
+                            if state.selection_anchor == state.selection_end {
+                                state.selection_mode = false;
+                            } else {
+                                let text = state
+                                    .main_panel
+                                    .selection_text(state.selection_anchor, state.selection_end);
+                                let count = text.lines().count().max(1);
+                                let msg = match yank_to_clipboard(std::slice::from_ref(&text)) {
+                                    Ok(_) => {
+                                        format!("\u{2713} {count} lines copied to clipboard")
+                                    }
+                                    Err(e) => e,
+                                };
+                                state.clipboard = Some(text);
+                                state.selection_mode = false;
+                                push_system_message(&mut state, msg);
                             }
+                        }
                         _ => {}
                     },
                     Event::Paste(text) => {
@@ -3877,7 +3896,12 @@ async fn main() -> Result<()> {
                             if !state.assistant_open {
                                 let color = theme::runner_color(&state.runner);
                                 let label = theme::runner_label(&state.runner).to_lowercase();
-                                push_author_chip(&mut state.main_panel, &label, color, state.no_color);
+                                push_author_chip(
+                                    &mut state.main_panel,
+                                    &label,
+                                    color,
+                                    state.no_color,
+                                );
                                 state.main_panel.push_line(String::new());
                                 state.assistant_open = true;
                             }
@@ -3887,8 +3911,7 @@ async fn main() -> Result<()> {
                                 if let Some((idx, name, inp)) = state.pending_tool.take() {
                                     let ok = !text.contains("error");
                                     let glyph = if ok { '\u{2713}' } else { '\u{2717}' };
-                                    let card =
-                                        tool_call_card(&name, &inp, state.no_color, glyph);
+                                    let card = tool_call_card(&name, &inp, state.no_color, glyph);
                                     state.main_panel.replace_styled_line(idx, card);
                                 }
                             }
@@ -3943,11 +3966,9 @@ async fn main() -> Result<()> {
                         // Record the card's line + full args for right-click
                         // expansion and the /tools inspector.
                         let line_idx = state.main_panel.len().saturating_sub(1);
-                        state.tool_details.push((
-                            line_idx,
-                            name.to_owned(),
-                            full.to_owned(),
-                        ));
+                        state
+                            .tool_details
+                            .push((line_idx, name.to_owned(), full.to_owned()));
                         state.pending_tool = Some((line_idx, name.to_owned(), input.to_owned()));
                         if let Some(ref mut block) = state.current_block {
                             block.push_text(&format!("▶ {name}: {input}"));
@@ -4160,10 +4181,11 @@ async fn main() -> Result<()> {
                         // Exponential backoff on non-terminal returns: 100 ms → 200 ms → … → 1 s.
                         let shift = state.poll_retry_count.saturating_sub(1).min(10);
                         let backoff_ms = (100u64 << shift).min(1_000);
-                        state.last_poll = Some(
-                            std::time::Instant::now() - std::time::Duration::from_millis(50)
-                                + std::time::Duration::from_millis(backoff_ms),
-                        );
+                        #[allow(clippy::unchecked_time_subtraction)]
+                        let poll_base =
+                            std::time::Instant::now() - std::time::Duration::from_millis(50);
+                        state.last_poll =
+                            Some(poll_base + std::time::Duration::from_millis(backoff_ms));
                         if state.poll_retry_count % 5 == 1 {
                             state.main_panel.push_line(format!(
                                 "waiting for turn… (poll attempt {})",
@@ -4196,7 +4218,9 @@ async fn main() -> Result<()> {
                             match try_reconnect(&sock).await {
                                 Some(new_client) => {
                                     client = new_client;
-                                    state.main_panel.push_line("reconnected to daemon".to_owned());
+                                    state
+                                        .main_panel
+                                        .push_line("reconnected to daemon".to_owned());
                                 }
                                 None => {
                                     state.main_panel.push_line(
@@ -4282,7 +4306,10 @@ async fn main() -> Result<()> {
                     .map(|p| p.display().to_string())
             });
             if let Some(ws) = ws {
-                if let Ok(v) = client.call("graph.status", json!({ "workspace": ws })).await {
+                if let Ok(v) = client
+                    .call("graph.status", json!({ "workspace": ws }))
+                    .await
+                {
                     if v.get("exists").and_then(Value::as_bool).unwrap_or(false) {
                         if let Some(n) = v.get("indexed").and_then(Value::as_u64) {
                             state.graph_symbols = usize::try_from(n).ok();
@@ -4729,6 +4756,7 @@ pub(crate) fn gov_create(workspace: &std::path::Path, rest: &str) -> String {
         return format!("gov create: could not create {}: {e}", dir.display());
     }
 
+    #[allow(clippy::maybe_infinite_iter)]
     let next_n = (1u32..)
         .find(|n| !dir.join(format!("{prefix}-{n:03}.toml")).exists())
         .unwrap_or(1);
@@ -4789,9 +4817,8 @@ pub(crate) fn gov_transition(workspace: &std::path::Path, rest: &str) -> String 
         }
     });
 
-    let path = match path {
-        Some(p) => p,
-        None => return format!("gov transition: artifact '{id}' not found"),
+    let Some(path) = path else {
+        return format!("gov transition: artifact '{id}' not found");
     };
 
     let raw = match std::fs::read_to_string(&path) {
@@ -4965,7 +4992,7 @@ mod tests {
         assert!(text.contains("bash"), "{text}");
         assert!(text.contains("find . -type f"), "{text}");
         assert!(text.contains('\u{2713}'), "{text}"); // status glyph present
-        // No raw JSON braces leak into the card.
+                                                      // No raw JSON braces leak into the card.
         assert!(!text.contains('{'), "{text}");
     }
 
@@ -5815,8 +5842,8 @@ mod tests {
             input: String::new(),
             quit: false,
             quit_armed: false,
-        permission_mode: "ask".to_owned(),
-        graph_workspace: None,
+            permission_mode: "ask".to_owned(),
+            graph_workspace: None,
             graph_symbols: None,
             tool_details: Vec::new(),
             pending_tool: None,
@@ -5871,7 +5898,7 @@ mod tests {
             cowork_modify_mode: false,
             cowork_modify_input: String::new(),
             last_cowork_poll: None,
-        last_graph_poll: None,
+            last_graph_poll: None,
             stream_rx: None,
             current_thinking: String::new(),
             thinking_expanded: false,

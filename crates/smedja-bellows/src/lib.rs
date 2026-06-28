@@ -274,6 +274,10 @@ mod tests {
         let batch = super::drain_ready(&mut rx);
         // The receiver is lagged: it may return 0 or some events depending on internal state.
         // The important invariant: no panic, and len ≤ 4.
-        assert!(batch.len() <= 4, "batch must be bounded; got {}", batch.len());
+        assert!(
+            batch.len() <= 4,
+            "batch must be bounded; got {}",
+            batch.len()
+        );
     }
 }

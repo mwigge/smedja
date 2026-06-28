@@ -77,10 +77,7 @@ pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, 
 
 /// Core of `task.create`, parameterised on the ingot handle so it is testable
 /// without constructing a full [`HandlerState`].
-async fn create_with(
-    ig: &smedja_ingot::IngotHandle,
-    params: &Value,
-) -> Result<Value, RpcError> {
+async fn create_with(ig: &smedja_ingot::IngotHandle, params: &Value) -> Result<Value, RpcError> {
     let title = params
         .get("title")
         .and_then(Value::as_str)

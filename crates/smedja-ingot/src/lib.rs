@@ -460,18 +460,15 @@ impl Ingot {
             let ddl_result = self.conn.execute_batch(sql);
             match ddl_result {
                 Ok(()) => {
-                    self.conn
-                        .execute_batch(&format!("RELEASE \"{sp_name}\""))?;
+                    self.conn.execute_batch(&format!("RELEASE \"{sp_name}\""))?;
                 }
                 Err(ref e) if is_idempotent_ddl_error(e) => {
-                    self.conn
-                        .execute_batch(&format!("RELEASE \"{sp_name}\""))?;
+                    self.conn.execute_batch(&format!("RELEASE \"{sp_name}\""))?;
                 }
                 Err(e) => {
                     self.conn
                         .execute_batch(&format!("ROLLBACK TO \"{sp_name}\""))?;
-                    self.conn
-                        .execute_batch(&format!("RELEASE \"{sp_name}\""))?;
+                    self.conn.execute_batch(&format!("RELEASE \"{sp_name}\""))?;
                     return Err(IngotError::Db(e));
                 }
             }
@@ -668,6 +665,10 @@ impl Ingot {
     /// whose `updated_at` timestamp is older than `older_than_days` days, then
     /// removes orphaned dependent rows from `checkpoints`, `cost_ledger`,
     /// `audit_events`, and `tasks`. Returns the number of sessions deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError`] on database failure.
     pub fn prune_old_sessions(&self, older_than_days: u64) -> Result<usize, IngotError> {
         let micros_per_day: i64 = 86_400 * 1_000_000;
         let cutoff = smedja_types::Timestamp::now().as_micros()
@@ -681,7 +682,9 @@ impl Ingot {
             )?;
             for table in &["checkpoints", "cost_ledger", "audit_events"] {
                 tx.execute(
-                    &format!("DELETE FROM {table} WHERE session_id NOT IN (SELECT id FROM sessions)"),
+                    &format!(
+                        "DELETE FROM {table} WHERE session_id NOT IN (SELECT id FROM sessions)"
+                    ),
                     [],
                 )?;
             }
@@ -697,6 +700,10 @@ impl Ingot {
     }
 
     /// Checkpoints the WAL and rebuilds the database file to reclaim space.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError`] on database failure.
     pub fn vacuum(&self) -> Result<(), IngotError> {
         self.conn
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;

@@ -371,7 +371,14 @@ mod tests {
     fn all_eight_keys_present() {
         let theme = agent_theme();
         for key in &[
-            "local", "fast", "deep", "error", "success", "warn", "border", "highlight",
+            "local",
+            "fast",
+            "deep",
+            "error",
+            "success",
+            "warn",
+            "border",
+            "highlight",
         ] {
             assert!(theme.contains_key(key), "missing key: {key}");
         }
@@ -397,7 +404,11 @@ mod tests {
     fn agent_color_is_deterministic_and_in_palette() {
         // Same name → same colour every time (stable identity).
         assert_eq!(agent_color("reviewer"), agent_color("reviewer"));
-        assert_eq!(agent_color("Reviewer"), agent_color("reviewer"), "case-insensitive");
+        assert_eq!(
+            agent_color("Reviewer"),
+            agent_color("reviewer"),
+            "case-insensitive"
+        );
         // Result is always one of the curated palette entries.
         assert!(AGENT_PALETTE.contains(&agent_color("planner")));
         assert!(AGENT_PALETTE.contains(&agent_color("implementer")));
@@ -405,7 +416,11 @@ mod tests {
 
     #[test]
     fn contrast_fg_picks_dark_on_light_and_bright_on_dark() {
-        assert_eq!(contrast_fg(Color::Rgb(240, 240, 240)), FORGE_BG, "dark text on light bg");
+        assert_eq!(
+            contrast_fg(Color::Rgb(240, 240, 240)),
+            FORGE_BG,
+            "dark text on light bg"
+        );
         assert_eq!(
             contrast_fg(Color::Rgb(20, 20, 20)),
             FORGE_TEXT_BRIGHT,
@@ -465,8 +480,16 @@ mod tests {
         };
         let mut p = Palette::default();
         // Apply manually (mirrors init_palette logic without touching OnceLock).
-        if let Some(ref s) = cfg.bg { if let Some(c) = parse_hex(s) { p.bg = c; } }
-        if let Some(ref s) = cfg.border { if let Some(c) = parse_hex(s) { p.border = c; } }
+        if let Some(ref s) = cfg.bg {
+            if let Some(c) = parse_hex(s) {
+                p.bg = c;
+            }
+        }
+        if let Some(ref s) = cfg.border {
+            if let Some(c) = parse_hex(s) {
+                p.border = c;
+            }
+        }
         assert_eq!(p.bg, Color::Rgb(255, 0, 0));
         assert_eq!(p.border, Color::Rgb(0, 255, 0));
         assert_eq!(p.text, FORGE_TEXT, "unset slots keep the default");
