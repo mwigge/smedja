@@ -6,6 +6,14 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.20.8] — 2026-06-28
+
+### Changed
+
+- **Default panel visibility** — quality gate panel and role cockpit panel now open by default alongside obs, lsp, and value panels.
+
+---
+
 ## [0.20.7] — 2026-06-28
 
 ### Fixed
