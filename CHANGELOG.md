@@ -6,6 +6,14 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.20.9] — 2026-06-28
+
+### Changed
+
+- **All panels visible by default** — metrics, session rail, and all right-rail panels now open on startup for full-visibility testing.
+
+---
+
 ## [0.20.8] — 2026-06-28
 
 ### Changed

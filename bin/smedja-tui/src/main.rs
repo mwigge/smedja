@@ -3691,8 +3691,8 @@ async fn main() -> Result<()> {
         staging_queue: staging::StagingQueue::new(),
         panels: PanelVisibility {
             context_rail: true,
-            metrics: false,
-            session_rail: false,
+            metrics: true,
+            session_rail: true,
             lsp: true,
             obs: true,
             role_cockpit: true,
