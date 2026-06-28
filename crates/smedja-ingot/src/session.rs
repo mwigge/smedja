@@ -219,6 +219,23 @@ pub(crate) fn update_cowork_mode(
     Ok(())
 }
 
+/// Sets the `title` field for the session identified by `id`.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the UPDATE fails.
+pub(crate) fn update_title(
+    conn: &rusqlite::Connection,
+    id: &str,
+    title: &str,
+) -> Result<(), IngotError> {
+    conn.execute(
+        "UPDATE sessions SET title = ?1 WHERE id = ?2",
+        rusqlite::params![title, id],
+    )?;
+    Ok(())
+}
+
 /// Sets the `mode` field for the session identified by `id`.
 ///
 /// # Errors
@@ -473,5 +490,23 @@ mod tests {
 
         let fetched = ingot.get_session(&s.id.to_string()).unwrap().unwrap();
         assert!(fetched.runner_override.is_none());
+    }
+
+    #[test]
+    fn update_title_round_trip() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let s = sample_session();
+        ingot.create_session(&s).unwrap();
+
+        update_title(&ingot.conn, &s.id.to_string(), "my new title").unwrap();
+
+        let fetched = ingot.get_session(&s.id.to_string()).unwrap().unwrap();
+        assert_eq!(fetched.title, "my new title");
+    }
+
+    #[test]
+    fn update_title_unknown_id_is_noop() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        update_title(&ingot.conn, "no-such-id", "ignored").unwrap();
     }
 }

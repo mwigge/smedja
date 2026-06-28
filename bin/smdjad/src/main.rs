@@ -572,6 +572,12 @@ fn build_router(
         state,
         handlers::session::set_mode
     );
+    route!(
+        router,
+        "session.set_title",
+        state,
+        handlers::session::set_title
+    );
     route!(router, "session.context", state, handlers::session::context);
     route!(
         router,
