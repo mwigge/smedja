@@ -6,6 +6,14 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.20.4] — 2026-06-28
+
+### Fixed
+
+- **Stream stall false positive** — raised `STREAM_TIMEOUT_SECS` from 90 s to 600 s in `stream_server.rs`; eliminates the `[ERROR] stream stalled: no events for 90s` error that fired mid-response when using slow providers (codex-cli + claude-haiku).
+
+---
+
 ## [0.16.3] — 2026-06-26
 
 ### Added
