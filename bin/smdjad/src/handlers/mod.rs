@@ -67,6 +67,8 @@ pub(crate) struct HandlerState {
     /// Shared LSP manager — holds language server processes started at daemon
     /// startup and serves their diagnostic snapshots to `lsp.*` handlers.
     pub(crate) lsp_manager: Arc<smedja_lsp::LspManager>,
+    /// Active openspec change name detected at startup from `openspec/changes/`.
+    pub(crate) active_change: Option<Arc<str>>,
     /// Direct channel to the turn worker — bypasses the broadcast so `Started`
     /// events are never dropped even under high diagnostic/delta burst.
     pub(crate) work_tx: tokio::sync::mpsc::Sender<(String, String)>,

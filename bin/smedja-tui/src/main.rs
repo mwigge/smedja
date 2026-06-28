@@ -12,6 +12,7 @@ pub(crate) mod slash;
 mod staging;
 mod statusbar;
 pub mod theme;
+mod value_panel;
 
 // Re-export slash module items so that `use super::*` in the test module
 // continues to find them without change.  The `#[allow(unused_imports)]` is
@@ -203,6 +204,7 @@ slash commands:
   /pptx <slug>       — generate PowerPoint
   /quit              — exit smedja-tui
   /quality           — trigger Tier-2 LLM quality review (Ctrl-Q hold for 500ms also fires this)
+  /value             — print ROI report for the active openspec change
   /quota             — show usage quota
   /resume [id [turn]] — resume a session (omit id for interactive picker; turn rewinds)
   /review            — send git diff for review
@@ -245,6 +247,7 @@ keybindings (scroll/normal mode):
   Ctrl-L             — toggle LSP diagnostic panel
   Ctrl-O             — toggle observability panel
   Ctrl-Q             — toggle quality gate panel
+  Ctrl-V             — toggle value / ROI panel (Ctrl-V in input mode pastes)
   Ctrl-W             — toggle session browser (left rail)
   [ / ]              — move cursor up / down in session rail
   mouse drag         — mark lines in the messages panel; release copies them
@@ -278,6 +281,8 @@ struct PanelVisibility {
     role_cockpit: bool,
     /// Quality gate panel (right rail, Ctrl-Q).
     quality: bool,
+    /// Value / ROI panel (right rail, Ctrl-V).
+    value: bool,
 }
 
 #[allow(clippy::struct_excessive_bools)] // AppState is a TUI dispatch table; enum-splitting would add indirection without clarity
@@ -466,6 +471,8 @@ pub(crate) struct AppState {
     quality_snapshot: quality_panel::QualitySnapshot,
     /// Consecutive turns with quality score < 60 (resets on score ≥ 60).
     consecutive_low_quality: u8,
+    /// Value / ROI snapshot — updated on the obs poll cadence.
+    value_snapshot: value_panel::ValueSnapshot,
     /// Whether a Tier-2 LLM quality review is in flight.
     quality_review_in_progress: bool,
     /// When Ctrl-Q was first pressed; used to detect hold ≥ 500ms.
@@ -2179,19 +2186,19 @@ async fn handle_key(
     }
 
     // ------------------------------------------------------------------
-    // Ctrl-V: paste from system clipboard into the input buffer.
+    // Ctrl-V: toggle value panel when in scroll/rail mode; paste in input mode.
     // ------------------------------------------------------------------
     if key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if !state.scroll_focus {
-            if let Some(text) = paste_from_clipboard() {
-                let text = text.replace('\r', "");
-                let before = &state.input[..state.input_cursor];
-                let after = &state.input[state.input_cursor..];
-                let new_input = format!("{before}{text}{after}");
-                let advance = text.len();
-                state.input = new_input;
-                state.input_cursor += advance;
-            }
+        if state.scroll_focus {
+            state.panels.value = !state.panels.value;
+        } else if let Some(text) = paste_from_clipboard() {
+            let text = text.replace('\r', "");
+            let before = &state.input[..state.input_cursor];
+            let after = &state.input[state.input_cursor..];
+            let new_input = format!("{before}{text}{after}");
+            let advance = text.len();
+            state.input = new_input;
+            state.input_cursor += advance;
         }
         return Ok(());
     }
@@ -3149,9 +3156,9 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         frame.render_widget(search_widget, search_area);
     }
 
-    // -- Right rail: context | role cockpit | LSP panel | obs panel | quality panel ----------
-    // The rail is split vertically into 1–5 sections. Context (1 row) is always
-    // present; role cockpit, LSP, obs, and quality panels are individually toggled.
+    // -- Right rail: context | role cockpit | LSP panel | obs panel | quality panel | value panel
+    // The rail is split vertically into 1–6 sections. Context (1 row) is always
+    // present; role cockpit, LSP, obs, quality, and value panels are individually toggled.
     if let Some(rail_rect) = rail_area {
         use Constraint::{Fill, Length};
 
@@ -3159,14 +3166,15 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         let show_lsp = state.panels.lsp;
         let show_obs = state.panels.obs;
         let show_quality = state.panels.quality;
+        let show_value = state.panels.value;
 
         // Build constraint list dynamically so Layout never gets zero-length.
         let mut constraints: Vec<Constraint> = vec![Length(1)]; // context row
         if show_cockpit {
             constraints.push(Length(6));
         }
-        // LSP gets flexible space; obs and quality get fixed heights below it.
-        let has_fixed = show_obs || show_quality;
+        // LSP gets flexible space; fixed-height panels slot below it.
+        let has_fixed = show_obs || show_quality || show_value;
         if show_lsp || has_fixed {
             constraints.push(Fill(1));
         }
@@ -3175,6 +3183,9 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         }
         if show_quality {
             constraints.push(Length(10));
+        }
+        if show_value {
+            constraints.push(Length(8));
         }
 
         let rail_chunks = Layout::vertical(constraints).split(rail_rect);
@@ -3214,6 +3225,12 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         if show_quality && ci < rail_chunks.len() {
             quality_panel::QualityPanel::new(&state.quality_snapshot)
                 .render(rail_chunks[ci], frame);
+            ci += 1;
+        }
+
+        // ── Value / ROI panel ─────────────────────────────────────────────
+        if show_value && ci < rail_chunks.len() {
+            value_panel::ValuePanel::new(&state.value_snapshot).render(rail_chunks[ci], frame);
         }
     }
 
@@ -3680,6 +3697,7 @@ async fn main() -> Result<()> {
             obs: true,
             role_cockpit: false,
             quality: false,
+            value: false,
         },
         metrics_snapshot: Vec::new(),
         savings_snapshot: metrics_view::SavingsSnapshot::default(),
@@ -3740,6 +3758,7 @@ async fn main() -> Result<()> {
         consecutive_low_quality: 0,
         quality_review_in_progress: false,
         ctrl_q_pressed_at: None,
+        value_snapshot: value_panel::ValueSnapshot::default(),
         latency_samples: VecDeque::new(),
         session_tokens_in: 0,
         session_tokens_out: 0,
@@ -4552,6 +4571,14 @@ async fn main() -> Result<()> {
             // Fetch daily token limit from daemon (reads SMEDJA_DAILY_TOKEN_LIMIT).
             if let Ok(quota_resp) = client.call("quota.limit", serde_json::Value::Null).await {
                 state.obs_snapshot.daily_tokens_limit = quota_resp["daily_tokens"].as_u64();
+            }
+            // Refresh value panel with active-change token cost.
+            if let Ok(vc) = client
+                .call("cost.active_change", serde_json::Value::Null)
+                .await
+            {
+                state.value_snapshot.change_name = vc["change_name"].as_str().map(str::to_owned);
+                state.value_snapshot.token_cost = vc["token_cost"].as_u64().unwrap_or(0);
             }
         }
 
@@ -5997,6 +6024,7 @@ mod tests {
                 obs: true,
                 role_cockpit: false,
                 quality: false,
+                value: false,
             },
             metrics_snapshot: Vec::new(),
             savings_snapshot: metrics_view::SavingsSnapshot::default(),
@@ -6056,6 +6084,7 @@ mod tests {
             consecutive_low_quality: 0,
             quality_review_in_progress: false,
             ctrl_q_pressed_at: None,
+            value_snapshot: value_panel::ValueSnapshot::default(),
             latency_samples: VecDeque::new(),
             session_tokens_in: 0,
             session_tokens_out: 0,

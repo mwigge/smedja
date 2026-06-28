@@ -112,6 +112,7 @@ pub(crate) struct TurnOrchestrator {
     embedder: Arc<dyn crate::embedder_port::Embedder>,
     provider_sessions: ProviderSessions,
     cache_aligners: CacheAligners,
+    active_change: Option<String>,
 }
 
 impl TurnOrchestrator {
@@ -127,6 +128,7 @@ impl TurnOrchestrator {
         embedder: Arc<dyn crate::embedder_port::Embedder>,
         provider_sessions: ProviderSessions,
         cache_aligners: CacheAligners,
+        active_change: Option<String>,
     ) -> Self {
         Self {
             ingot,
@@ -139,6 +141,7 @@ impl TurnOrchestrator {
             embedder,
             provider_sessions,
             cache_aligners,
+            active_change,
         }
     }
 
@@ -1352,6 +1355,7 @@ impl TurnOrchestrator {
                 agent_name: Some(agent_name_val),
                 operation_name: Some(tel::OPERATION_INVOKE_AGENT.to_owned()),
                 status: Some("ok".to_owned()),
+                change_name: self.active_change.clone(),
                 ..smedja_ingot::AuditEvent::default()
             };
             if let Err(e) = ingot.record_timeline_event(audit_ev).await {
@@ -1569,6 +1573,7 @@ mod tests {
             Arc::new(crate::embedder_port::FnvEmbedder::new()),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
+            None,
         )
     }
 
@@ -1866,6 +1871,7 @@ mod tests {
             Arc::new(crate::embedder_port::FnvEmbedder::new()),
             provider_sessions,
             cache_aligners,
+            None,
         );
 
         let session_id = "sess-does-not-exist".to_owned();

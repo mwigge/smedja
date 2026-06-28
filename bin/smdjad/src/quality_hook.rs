@@ -49,6 +49,32 @@ fn dirs_home() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }
 
+/// Returns the alphabetically-first entry in `<workspace_root>/openspec/changes/`
+/// that is not named `archive` and is a directory.
+///
+/// Returns `None` when the directory is absent or empty.
+#[must_use]
+pub fn detect_active_change(workspace_root: &Path) -> Option<String> {
+    let changes_dir = workspace_root.join("openspec").join("changes");
+    let mut entries: Vec<String> = std::fs::read_dir(&changes_dir)
+        .ok()?
+        .filter_map(|e| {
+            let e = e.ok()?;
+            if !e.file_type().ok()?.is_dir() {
+                return None;
+            }
+            let name = e.file_name().into_string().ok()?;
+            if name == "archive" {
+                None
+            } else {
+                Some(name)
+            }
+        })
+        .collect();
+    entries.sort_unstable();
+    entries.into_iter().next()
+}
+
 /// Reads the file-size threshold from `.smedja/quality.toml`, falling back to
 /// 600 on any error.
 #[must_use]
@@ -247,5 +273,34 @@ mod tests {
         assert!(skills.contains(&"/rust".to_string()));
         assert!(skills.contains(&"/tdd-workflow".to_string()));
         assert!(!skills.contains(&"/ignore".to_string()));
+    }
+
+    #[test]
+    fn detect_active_change_returns_alphabetically_first_non_archived() {
+        let dir = tempfile::tempdir().unwrap();
+        let changes_dir = dir.path().join("openspec").join("changes");
+        std::fs::create_dir_all(changes_dir.join("archive")).unwrap();
+        std::fs::create_dir_all(changes_dir.join("smedja-value-panel")).unwrap();
+        std::fs::create_dir_all(changes_dir.join("add-auth")).unwrap();
+
+        let result = detect_active_change(dir.path());
+        assert_eq!(result.as_deref(), Some("add-auth"));
+    }
+
+    #[test]
+    fn detect_active_change_skips_archive_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let changes_dir = dir.path().join("openspec").join("changes");
+        std::fs::create_dir_all(changes_dir.join("archive")).unwrap();
+
+        let result = detect_active_change(dir.path());
+        assert!(result.is_none(), "archive-only dir should return None");
+    }
+
+    #[test]
+    fn detect_active_change_returns_none_when_no_changes_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = detect_active_change(dir.path());
+        assert!(result.is_none());
     }
 }

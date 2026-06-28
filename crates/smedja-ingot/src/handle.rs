@@ -622,6 +622,19 @@ impl IngotHandle {
             .await
     }
 
+    /// Returns the total token count (input + output) attributed to `change_name`
+    /// across all audit events. Returns `Ok(0)` when no matching rows exist.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn cost_for_change(&self, change_name: &str) -> Result<u64, IngotError> {
+        let change_name = change_name.to_owned();
+        self.run_blocking(move |ig| ig.cost_for_change(&change_name))
+            .await
+    }
+
     /// Returns the model name from the most recent cost entry for `session_id`.
     ///
     /// # Errors

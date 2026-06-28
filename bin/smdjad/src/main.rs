@@ -294,6 +294,7 @@ async fn run_turn(
     provider_sessions: orchestrator::ProviderSessions,
     cache_aligners: orchestrator::CacheAligners,
     turn_registry: handlers::TurnRegistry,
+    active_change: Option<Arc<str>>,
 ) {
     // Deregister-on-drop: removes this turn's abort handle from the registry
     // whether the turn completes normally *or* is aborted by `turn.cancel`
@@ -327,6 +328,7 @@ async fn run_turn(
         embedder,
         provider_sessions,
         cache_aligners,
+        active_change.as_deref().map(str::to_owned),
     )
     .run(session_id, turn_id)
     .await;
@@ -356,6 +358,7 @@ fn spawn_worker(
     cache_aligners: orchestrator::CacheAligners,
     mut work_rx: tokio::sync::mpsc::Receiver<(String, String)>,
     turn_registry: handlers::TurnRegistry,
+    active_change: Option<Arc<str>>,
 ) -> tokio::task::JoinHandle<tokio::task::JoinSet<()>> {
     tokio::spawn(async move {
         let mut set = tokio::task::JoinSet::new();
@@ -374,6 +377,7 @@ fn spawn_worker(
             let ps = Arc::clone(&provider_sessions);
             let ca = Arc::clone(&cache_aligners);
             let reg = Arc::clone(&turn_registry);
+            let ac = active_change.clone();
             let handle = set.spawn(run_turn(
                 ig,
                 dp,
@@ -388,6 +392,7 @@ fn spawn_worker(
                 ps,
                 ca,
                 Arc::clone(&turn_registry),
+                ac,
             ));
             // Register the abort handle so `turn.cancel` can interrupt this turn.
             if let Ok(mut map) = reg.lock() {
@@ -501,6 +506,7 @@ fn build_router(
     lsp_manager: &Arc<smedja_lsp::LspManager>,
     work_tx: tokio::sync::mpsc::Sender<(String, String)>,
     turn_registry: handlers::TurnRegistry,
+    active_change: Option<Arc<str>>,
 ) -> Router {
     let mut router = Router::new();
 
@@ -524,6 +530,7 @@ fn build_router(
         startup_runner: Arc::clone(startup_runner),
         startup_model: Arc::clone(startup_model),
         lsp_manager: Arc::clone(lsp_manager),
+        active_change,
         work_tx,
         turn_registry,
     };
@@ -592,6 +599,12 @@ fn build_router(
         handlers::checkpoint::compact
     );
     route!(router, "session.cost", state, handlers::cost::cost);
+    route!(
+        router,
+        "cost.active_change",
+        state,
+        handlers::cost::active_change
+    );
     route!(router, "runner.list", state, handlers::session::runner_list);
     route!(router, "turn.submit", state, handlers::turn::submit);
     route!(router, "turn.cancel", state, handlers::turn::cancel);
@@ -964,6 +977,8 @@ async fn main() -> anyhow::Result<()> {
     // Default to the absolute current directory (deterministic) rather than the
     // relative "." whose meaning depends on the launcher's cwd under a supervisor.
     let workspace_root = resolve_workspace_root();
+    let active_change: Option<Arc<str>> =
+        quality_hook::detect_active_change(&workspace_root).map(|s| Arc::from(s.as_str()));
     let mut assayer = Assayer::default_rules();
     match smedja_assayer::load_rules(&workspace_root) {
         Ok(rules) if !rules.is_empty() => {
@@ -1087,6 +1102,7 @@ async fn main() -> anyhow::Result<()> {
         &lsp_manager,
         work_tx,
         Arc::clone(&turn_registry),
+        active_change.clone(),
     );
 
     let worker_handle = spawn_worker(
@@ -1102,6 +1118,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&cache_aligners),
         work_rx,
         Arc::clone(&turn_registry),
+        active_change,
     );
 
     // Background daily maintenance: prune old sessions and VACUUM both databases.
