@@ -49,6 +49,7 @@ esac
 
 # detect WSL2
 IS_WSL=false
+SYSTEMD_MANAGED=false
 if [ "$OS" = "linux" ] && [ -f /proc/version ]; then
   case "$(cat /proc/version)" in
     *[Mm]icrosoft*) IS_WSL=true ;;
@@ -259,9 +260,21 @@ EOF
     mkdir -p "$SYSTEMD_USER_DIR"
     install -m644 "$SERVICE_SRC" "$SYSTEMD_USER_DIR/smdjad.service"
     if command -v systemctl >/dev/null 2>&1 && systemctl --user daemon-reload 2>/dev/null; then
-      systemctl --user enable --now smdjad 2>/dev/null && \
-        echo "  smdjad systemd unit → enabled" || \
+      if systemctl --user enable smdjad 2>/dev/null; then
+        # Restart if already running (upgrade), otherwise start fresh.
+        if systemctl --user is-active --quiet smdjad 2>/dev/null; then
+          systemctl --user restart smdjad 2>/dev/null && \
+            echo "  smdjad systemd unit → restarted (upgraded)" || \
+            echo "  smdjad systemd unit → enabled (restart manually: systemctl --user restart smdjad)"
+        else
+          systemctl --user start smdjad 2>/dev/null && \
+            echo "  smdjad systemd unit → enabled" || \
+            echo "  smdjad systemd unit → enabled (not yet started)"
+        fi
+        SYSTEMD_MANAGED=true
+      else
         echo "  smdjad systemd unit installed (enable manually: systemctl --user enable --now smdjad)"
+      fi
     else
       if [ "$IS_WSL" = "true" ]; then
         echo ""
@@ -302,9 +315,11 @@ echo ""
 if [ "$OS" = "darwin" ]; then
   echo "quickstart: smedja  (smdjad starts automatically via LaunchAgent)"
 elif [ "$IS_WSL" = "true" ]; then
-  echo "quickstart: smdjad & && smedja"
+  echo "quickstart: smdjad & smedja"
   echo ""
   echo "note: smedja renders via WSLg. Ensure WSLg is enabled in your Windows setup."
+elif [ "$SYSTEMD_MANAGED" = "true" ]; then
+  echo "quickstart: smedja  (smdjad starts automatically via systemd --user)"
 else
-  echo "quickstart: smdjad & && smedja"
+  echo "quickstart: smdjad & smedja"
 fi
