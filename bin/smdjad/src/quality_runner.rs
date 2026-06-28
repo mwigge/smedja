@@ -151,6 +151,7 @@ pub async fn review_turn(diff: &str, tier1_score: u8, reviewer_model: &str) -> Q
         permission_mode: None,
         stable_prefix_len: None,
         cache_strategy: smedja_adapter::CacheStrategy::None,
+        workspace: None,
     };
 
     let (text, input_tokens, output_tokens) = if reviewer_model.starts_with("claude-") {

@@ -368,6 +368,7 @@ mod tests {
             permission_mode: None,
             stable_prefix_len: None,
             cache_strategy: crate::types::CacheStrategy::None,
+            workspace: None,
         };
         let contents = build_contents(&[], &opts);
         assert_eq!(contents.len(), 1);
@@ -389,6 +390,7 @@ mod tests {
             permission_mode: None,
             stable_prefix_len: None,
             cache_strategy: crate::types::CacheStrategy::None,
+            workspace: None,
         };
         let messages = vec![Message {
             role: Role::Assistant,
@@ -410,6 +412,7 @@ mod tests {
             permission_mode: None,
             stable_prefix_len: Some(2),
             cache_strategy: strategy,
+            workspace: None,
         }
     }
 

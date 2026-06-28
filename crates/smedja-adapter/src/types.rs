@@ -118,6 +118,10 @@ pub struct CallOptions {
     /// Gemini consult it to emit `prompt_cache_key` / `cachedContent` respectively.
     #[serde(default)]
     pub cache_strategy: CacheStrategy,
+    /// Workspace root directory. CLI adapters (codex, claude) use this as
+    /// `current_dir` so the subprocess runs inside a trusted git repository.
+    #[serde(default)]
+    pub workspace: Option<std::path::PathBuf>,
 }
 
 /// Provider-neutral instruction for how an adapter should realise a cache hint.
@@ -196,6 +200,7 @@ mod tests {
             permission_mode: None,
             stable_prefix_len: None,
             cache_strategy: CacheStrategy::None,
+            workspace: None,
         }
     }
 
