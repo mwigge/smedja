@@ -2814,7 +2814,17 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     // visual rows it needs, so the input field grows and wraps instead of
     // running off the right edge ("typing blind"). The cursor's row drives an
     // internal scroll once the field hits its row cap.
-    let input_w = area.width.max(1) as usize;
+    // Wrap at the main-content column width, not the full terminal width.
+    // When rails are visible they take columns from the right/left of body_area;
+    // subtracting their widths here keeps the height calculation and the visual
+    // rendering in sync, so the input grows a row at the same point the text
+    // visually wraps instead of running under the rail.
+    let right_rail_w = if state.panels.context_rail && area.width >= 100 {
+        context_rail::ContextRail::WIDTH
+    } else {
+        0
+    };
+    let input_w = area.width.saturating_sub(right_rail_w).max(1) as usize;
     let (input_display, input_cursor_row) = if let Some(ref var) = state.secret_var {
         // Masked secret entry — never echo the value (e.g. an API key).
         let dots = "\u{2022}".repeat(state.input.chars().count());
@@ -3058,15 +3068,28 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     let input_para = Paragraph::new(input_display)
         .wrap(ratatui::widgets::Wrap { trim: false })
         .scroll((input_scroll, 0));
-    if input_rows == 1 && counter_len > 0 && counter_len + 4 < input_area.width {
-        let input_sub_w = input_area.width - counter_len;
-        let input_sub =
-            ratatui::layout::Rect::new(input_area.x, input_area.y, input_sub_w, input_area.height);
+    // Narrow the render rect to match input_w so the Paragraph wrap point
+    // agrees with the height calculation above.
+    let effective_input_w = u16::try_from(input_w).unwrap_or(input_area.width);
+    let effective_input_area = ratatui::layout::Rect::new(
+        input_area.x,
+        input_area.y,
+        effective_input_w.min(input_area.width),
+        input_area.height,
+    );
+    if input_rows == 1 && counter_len > 0 && counter_len + 4 < effective_input_w {
+        let input_sub_w = effective_input_w - counter_len;
+        let input_sub = ratatui::layout::Rect::new(
+            effective_input_area.x,
+            effective_input_area.y,
+            input_sub_w,
+            effective_input_area.height,
+        );
         let counter_rect = ratatui::layout::Rect::new(
-            input_area.x + input_sub_w,
-            input_area.y,
+            effective_input_area.x + input_sub_w,
+            effective_input_area.y,
             counter_len,
-            input_area.height,
+            effective_input_area.height,
         );
         frame.render_widget(input_para, input_sub);
         frame.render_widget(
@@ -3074,7 +3097,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
             counter_rect,
         );
     } else {
-        frame.render_widget(input_para, input_area);
+        frame.render_widget(input_para, effective_input_area);
     }
 
     if let Some(search_area) = search_bar_area {
