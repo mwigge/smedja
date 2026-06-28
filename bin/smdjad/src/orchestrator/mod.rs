@@ -165,6 +165,33 @@ pub(crate) fn format_lsp_diagnostics(snapshot: &smedja_lsp::LspSnapshot) -> Opti
     ))
 }
 
+/// Returns `true` when context fill exceeds the 80% auto-summarisation threshold.
+pub(crate) fn context_pressure_exceeds_threshold(input_tokens: u32, context_window: usize) -> bool {
+    if context_window == 0 {
+        return false;
+    }
+    f64::from(input_tokens) / context_window as f64 >= 0.80
+}
+
+/// Builds the prompt sent to the LLM to produce a conversation summary.
+///
+/// At most 20 turns are included; older turns are dropped from the head.
+pub(crate) fn build_summariser_prompt(history: &[(String, String)]) -> String {
+    const MAX_TURNS: usize = 20;
+    let turns: Vec<_> = history.iter().rev().take(MAX_TURNS).collect();
+    let turns_text: String = turns
+        .into_iter()
+        .rev()
+        .map(|(role, content)| format!("{role}: {content}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Produce a concise summary of the conversation so far. \
+Preserve all decisions, file names, and open questions. \
+Keep it under 400 words.\n\n{turns_text}"
+    )
+}
+
 /// Owns all the shared resources needed to execute a single agent turn.
 pub(crate) struct TurnOrchestrator {
     ingot: IngotHandle,
@@ -777,6 +804,7 @@ impl TurnOrchestrator {
         // advances to the next entry (bounded by MAX_PROVIDER_ROTATIONS),
         // re-deriving CallOptions for the new provider while preserving the same
         // WorkingMemory prompt and accumulated tool history.
+        let mut turn_context_window: usize = 128_000;
         'ring: for entry in &ring {
             let entry_runner_name = entry.runner_name.to_owned();
             let runner_enum = entry.runner;
@@ -804,6 +832,7 @@ impl TurnOrchestrator {
                 .and_then(|s| s.model_override.clone())
                 .unwrap_or(entry_model);
             let context_window = model_context_window(&entry_model);
+            turn_context_window = context_window;
 
             turn_span.set_attribute(KeyValue::new(tel::GEN_AI_SYSTEM, entry_runner_name.clone()));
             turn_span.set_attribute(KeyValue::new(tel::REQUEST_MODEL, entry_model.clone()));
@@ -1403,6 +1432,96 @@ impl TurnOrchestrator {
             };
             if let Err(e) = ingot.save_token_snapshot(snap).await {
                 warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to save token snapshot");
+            }
+        }
+
+        // 9b. Auto-summarise when context pressure exceeds 80%.
+        if context_pressure_exceeds_threshold(total_input_tokens, turn_context_window) {
+            let history: Vec<(String, String)> = mem
+                .messages()
+                .iter()
+                .map(|m| {
+                    let role = match m.role {
+                        AdapterRole::User => "user",
+                        AdapterRole::Assistant => "assistant",
+                        _ => "system",
+                    };
+                    (role.to_owned(), m.content.clone())
+                })
+                .collect();
+            let prompt = build_summariser_prompt(&history);
+            let pool_entry = self
+                .pool
+                .get(smedja_assayer::Runner::Claude, smedja_assayer::Tier::Fast)
+                .or_else(|| {
+                    self.pool
+                        .get(smedja_assayer::Runner::Codex, smedja_assayer::Tier::Fast)
+                })
+                .or_else(|| self.pool.get_default());
+            if let Some(entry) = pool_entry {
+                let sum_opts = smedja_adapter::CallOptions {
+                    model: std::env::var("SMEDJA_SUMMARISER_MODEL")
+                        .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_owned()),
+                    max_tokens: Some(512),
+                    temperature: Some(0.3),
+                    system: Some("You are a summarisation assistant.".to_owned()),
+                    tools: None,
+                    provider_session_id: None,
+                    smedja_session_id: None,
+                    permission_mode: None,
+                    stable_prefix_len: None,
+                    cache_strategy: smedja_adapter::CacheStrategy::None,
+                    workspace: None,
+                };
+                let stream = entry
+                    .provider
+                    .stream_chat(&[AdapterMessage::user(prompt)], &sum_opts);
+                let sum_dispatcher = smedja_bellows::Dispatcher::new(1);
+                match crate::common::drain_stream(
+                    stream,
+                    &sum_dispatcher,
+                    None,
+                    &CorrelationCtx::default(),
+                )
+                .await
+                {
+                    Ok((summary, _, _, _, _)) if !summary.is_empty() => {
+                        let embedding = self.embedder.embed_query(&summary).await;
+                        let model_id = self.embedder.model_id().to_owned();
+                        let dim = self.embedder.dim();
+                        let compact_sid = session_id.clone();
+                        let vault = Arc::clone(&self.vault);
+                        tokio::task::spawn_blocking(move || {
+                            use smedja_vault::VaultEntry;
+                            let entry = VaultEntry {
+                                id: format!("compact:{compact_sid}:{turn_n}"),
+                                embedding,
+                                payload: serde_json::json!({
+                                    "session_id": compact_sid,
+                                    "turn_n": turn_n,
+                                }),
+                                namespace: "compact".to_owned(),
+                                content: summary,
+                                source_file: None,
+                                added_by: Some("auto-summarise".to_owned()),
+                                chunk_index: None,
+                                parent_id: None,
+                                created_at: 0.0,
+                                embedder_model_id: model_id,
+                                dim,
+                            };
+                            let mut guard = vault.blocking_lock();
+                            if let Err(e) = guard.upsert(&entry) {
+                                tracing::warn!(error = %e, "auto-summarise: vault upsert failed");
+                            }
+                        });
+                        tracing::debug!(session_id = %session_id, turn_n, "auto-summarise: context compacted");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::debug!(error = %e, "auto-summarise: summariser call failed; continuing");
+                    }
+                }
             }
         }
 
@@ -2188,5 +2307,55 @@ mod tests {
         let lines: Vec<&str> = block.lines().collect();
         // header + up to 20 diag lines + footer + optional truncation line
         assert!(lines.len() <= 23, "too many lines: {}", lines.len());
+    }
+
+    // --- build_summariser_prompt tests ---
+
+    #[test]
+    fn build_summariser_prompt_includes_history() {
+        let history = vec![
+            ("user".to_owned(), "fix the auth bug".to_owned()),
+            (
+                "assistant".to_owned(),
+                "I found the issue in auth.rs".to_owned(),
+            ),
+        ];
+        let prompt = super::build_summariser_prompt(&history);
+        assert!(prompt.contains("fix the auth bug"));
+        assert!(prompt.contains("I found the issue in auth.rs"));
+    }
+
+    #[test]
+    fn build_summariser_prompt_has_instruction() {
+        let prompt = super::build_summariser_prompt(&[]);
+        assert!(prompt.contains("summarise") || prompt.contains("summary"));
+    }
+
+    #[test]
+    fn build_summariser_prompt_caps_turns() {
+        let history: Vec<(String, String)> = (0..30)
+            .map(|i| ("user".to_owned(), format!("turn {i}")))
+            .collect();
+        let prompt = super::build_summariser_prompt(&history);
+        // Should not include all 30 turns verbatim — cap enforced
+        let turn_count = prompt.matches("turn ").count();
+        assert!(turn_count <= 20, "too many turns: {turn_count}");
+    }
+
+    // --- context_pressure_exceeds_threshold tests ---
+
+    #[test]
+    fn pressure_below_threshold_is_not_exceeded() {
+        assert!(!super::context_pressure_exceeds_threshold(79_999, 100_000));
+    }
+
+    #[test]
+    fn pressure_at_threshold_is_exceeded() {
+        assert!(super::context_pressure_exceeds_threshold(80_000, 100_000));
+    }
+
+    #[test]
+    fn pressure_with_zero_window_is_never_exceeded() {
+        assert!(!super::context_pressure_exceeds_threshold(1_000, 0));
     }
 }
