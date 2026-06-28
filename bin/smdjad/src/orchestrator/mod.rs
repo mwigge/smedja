@@ -376,6 +376,19 @@ impl TurnOrchestrator {
                     with_skills
                 }
             };
+            // Project-specific context files from `.smedja/context/*.md` are
+            // injected here so they ride the stable (cacheable) system block.
+            let with_skills = match smedja_memory::load_context_files(&workspace_root) {
+                Ok(files) if !files.is_empty() => {
+                    let joined = files.join("\n\n");
+                    format!("{with_skills}\n\n<project_context>\n{joined}\n</project_context>")
+                }
+                Ok(_) => with_skills,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to load context files; continuing without");
+                    with_skills
+                }
+            };
             // Always-on, steer-first foundational discipline: the directive is
             // folded into the same cacheable system block as workspace skills so
             // it is sealed into the stable prefix before `seal_prefix()` and the

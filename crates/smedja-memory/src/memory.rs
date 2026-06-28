@@ -384,6 +384,33 @@ pub fn load_workspace_skills(dir: &std::path::Path) -> Result<Vec<String>, std::
     Ok(skills)
 }
 
+/// Reads project-specific context files from `.smedja/context/*.md` in `dir`.
+///
+/// Returns an empty `Vec` when the directory does not exist. Files are sorted
+/// alphabetically so injection order is deterministic across runs.
+///
+/// # Errors
+///
+/// Returns an `io::Error` if the directory exists but cannot be read, or if any
+/// `.md` file cannot be read.
+pub fn load_context_files(dir: &std::path::Path) -> Result<Vec<String>, std::io::Error> {
+    let ctx_dir = dir.join(".smedja").join("context");
+    if !ctx_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&ctx_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            let content = std::fs::read_to_string(&path)?;
+            files.push(content);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
 /// Injects workspace skills into `WorkingMemory` as a single system message
 /// before `seal_prefix` is called.
 ///
@@ -915,5 +942,35 @@ mod tests {
         let _ = mem.cold_context("q").await;
         let call = store.last_call.lock().expect("lock not poisoned").clone();
         assert_eq!(call, Some(("q".to_owned(), "notes".to_owned(), 5)));
+    }
+
+    #[test]
+    fn load_context_files_empty_when_dir_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = super::load_context_files(tmp.path()).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn load_context_files_reads_md_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx_dir = tmp.path().join(".smedja").join("context");
+        std::fs::create_dir_all(&ctx_dir).unwrap();
+        std::fs::write(ctx_dir.join("a.md"), "context A").unwrap();
+        std::fs::write(ctx_dir.join("b.md"), "context B").unwrap();
+        let mut result = super::load_context_files(tmp.path()).unwrap();
+        result.sort();
+        assert_eq!(result, vec!["context A", "context B"]);
+    }
+
+    #[test]
+    fn load_context_files_ignores_non_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx_dir = tmp.path().join(".smedja").join("context");
+        std::fs::create_dir_all(&ctx_dir).unwrap();
+        std::fs::write(ctx_dir.join("notes.md"), "md").unwrap();
+        std::fs::write(ctx_dir.join("raw.txt"), "txt").unwrap();
+        let result = super::load_context_files(tmp.path()).unwrap();
+        assert_eq!(result, vec!["md"]);
     }
 }
