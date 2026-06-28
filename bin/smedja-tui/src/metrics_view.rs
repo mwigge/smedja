@@ -12,7 +12,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 /// One per-runner aggregate row for the latest rollup window.
 #[derive(Debug, Clone, PartialEq)]
@@ -89,9 +89,6 @@ pub struct MetricsView {
 }
 
 impl MetricsView {
-    /// Width of the panel when shown as a right-hand sidebar.
-    pub const WIDTH: u16 = 38;
-
     /// Wraps `rows` and a savings `snapshot` for rendering.
     #[must_use]
     pub fn with_savings(rows: Vec<MetricsRow>, savings: SavingsSnapshot) -> Self {
@@ -100,20 +97,21 @@ impl MetricsView {
 
     /// Renders the panel content as text lines (header + one row per runner, or
     /// a placeholder when there is no data, followed by the savings section).
+    /// Column widths are sized for 25 chars (rail width 27 minus 2 for Block borders).
     /// Exposed for unit testing the layout without a `Buffer`.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
         let mut out = vec![format!(
-            "{:<10} {:>8} {:>9} {:>5}",
-            "RUNNER", "TOKENS", "COST", "ERR"
+            "{:<7} {:>4} {:>8} {:>3}",
+            "RUNNER", "TOK", "COST", "ERR"
         )];
         if self.rows.is_empty() {
             out.push("(no metrics)".to_owned());
         } else {
             for row in &self.rows {
-                let runner = &row.runner[..row.runner.len().min(10)];
+                let runner = &row.runner[..row.runner.len().min(7)];
                 out.push(format!(
-                    "{:<10} {:>8} {:>9} {:>5}",
+                    "{:<7} {:>4} {:>8} {:>3}",
                     runner,
                     row.tokens,
                     format!("${:.4}", row.cost_usd),
@@ -133,8 +131,8 @@ impl MetricsView {
         let mut out = vec![
             String::new(),
             format!("SAVINGS  eff {:.0}%", s.efficiency_ratio * 100.0),
-            format!("  compression {:>10} tok", s.compression_saved),
-            format!("  cache       {:>10} tok", s.cache_saved),
+            format!("  compression {:>5}", s.compression_saved),
+            format!("  cache       {:>5}", s.cache_saved),
         ];
         if s.rows.is_empty() {
             out.push("  (no savings)".to_owned());
@@ -142,7 +140,7 @@ impl MetricsView {
         }
         for row in &s.rows {
             let source = &row.source[..row.source.len().min(12)];
-            out.push(format!("  {:<12} {:>10}", source, row.tokens_saved));
+            out.push(format!("  {:<12} {:>7}", source, row.tokens_saved));
         }
         out
     }
@@ -150,6 +148,15 @@ impl MetricsView {
 
 impl Widget for MetricsView {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let p = palette();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(p.border))
+            .title(" runner ");
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let rows = &self.rows;
         let lines: Vec<Line<'_>> = self
             .lines()
             .into_iter()
@@ -162,9 +169,9 @@ impl Widget for MetricsView {
                     ))
                 } else {
                     // Highlight any runner with errors in red.
-                    let has_error = self.rows.get(idx - 1).is_some_and(|row| row.errors > 0);
+                    let has_error = rows.get(idx - 1).is_some_and(|row| row.errors > 0);
                     let style = if has_error {
-                        Style::default().fg(palette().error)
+                        Style::default().fg(p.error)
                     } else {
                         Style::default()
                     };
@@ -172,7 +179,7 @@ impl Widget for MetricsView {
                 }
             })
             .collect();
-        Paragraph::new(Text::from(lines)).render(area, buf);
+        Paragraph::new(Text::from(lines)).render(inner, buf);
     }
 }
 
@@ -292,7 +299,7 @@ mod tests {
             }],
             SavingsSnapshot::default(),
         );
-        let area = Rect::new(0, 0, MetricsView::WIDTH, 5);
+        let area = Rect::new(0, 0, 27, 9);
         let mut buf = Buffer::empty(area);
         view.render(area, &mut buf);
         // The header label must appear somewhere in the rendered buffer.
