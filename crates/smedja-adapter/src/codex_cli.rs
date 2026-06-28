@@ -47,6 +47,7 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
     let resume_id = opts.provider_session_id.clone();
     let model = opts.model.clone();
     let perm_mode = opts.permission_mode.clone();
+    let workspace = opts.workspace.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::spawn(async move {
@@ -74,7 +75,7 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
         // other mode contains it to the workspace. (Read-only/workspace-write
         // run non-interactively, so codex never hangs waiting for an approval
         // smedja can't answer here.)
-        command.arg("--json");
+        command.arg("--json").arg("--skip-git-repo-check");
         match perm_mode.as_deref() {
             Some("auto") => {
                 command.arg("--dangerously-bypass-approvals-and-sandbox");
@@ -95,9 +96,10 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
             .arg(&prompt)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // So an interrupted turn (turn.cancel aborts the run task) kills the
-            // child instead of leaking a runaway `codex` process.
             .kill_on_drop(true);
+        if let Some(ref dir) = workspace {
+            command.current_dir(dir);
+        }
 
         let mut child = match command.spawn() {
             Ok(c) => c,
@@ -431,6 +433,7 @@ mod tests {
             permission_mode: None,
             stable_prefix_len: None,
             cache_strategy: crate::types::CacheStrategy::None,
+            workspace: None,
         }
     }
 

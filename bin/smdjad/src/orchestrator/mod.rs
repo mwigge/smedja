@@ -791,6 +791,7 @@ impl TurnOrchestrator {
                 permission_mode: Some(perm_mode),
                 stable_prefix_len,
                 cache_strategy,
+                workspace: Some(workspace_root.clone()),
             };
 
             runner = entry_runner_name.clone();

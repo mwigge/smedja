@@ -327,6 +327,7 @@ mod tests {
             permission_mode: None,
             stable_prefix_len: None,
             cache_strategy: CacheStrategy::None,
+            workspace: None,
         }
     }
 

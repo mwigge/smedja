@@ -146,6 +146,7 @@ pub(crate) async fn compact(state: HandlerState, params: Value) -> Result<Value,
         permission_mode: None,
         stable_prefix_len: None,
         cache_strategy: smedja_adapter::CacheStrategy::None,
+        workspace: None,
     };
     let stream = provider.stream_chat(
         &[AdapterMessage {
