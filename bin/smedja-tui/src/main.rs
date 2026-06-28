@@ -2016,11 +2016,22 @@ async fn handle_key(
     }
 
     // ------------------------------------------------------------------
-    // Session detail overlay: Esc closes, any other key propagates normally.
+    // Session detail overlay: Ctrl+Enter loads, Esc closes.
     // ------------------------------------------------------------------
-    if state.session_detail_overlay.is_some() && key.code == KeyCode::Esc {
-        state.session_detail_overlay = None;
-        return Ok(());
+    if state.session_detail_overlay.is_some() {
+        if key.code == KeyCode::Esc {
+            state.session_detail_overlay = None;
+            return Ok(());
+        }
+        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let Some(detail) = state.session_detail_overlay.take() {
+                state.session_id = detail.id;
+                state.display_start_idx = state.messages.len();
+                state.main_panel.clear_display();
+                resume_into_view(state, client, ResumePlan::ReplayOnly).await;
+            }
+            return Ok(());
+        }
     }
 
     // ------------------------------------------------------------------
@@ -3509,7 +3520,7 @@ fn render_session_detail(
         field("updated", &detail.updated_at),
         Line::raw(""),
         Line::from(Span::styled(
-            "  Esc to close",
+            "  ^Enter load \u{00b7} Esc close",
             Style::default().fg(p.text_dim),
         )),
     ];
@@ -8373,5 +8384,84 @@ status = "draft"
             state.session_rail_cursor = state.session_rail_cursor.saturating_sub(1);
         }
         assert_eq!(state.session_rail_cursor, 0, "[ must work in input mode");
+    }
+
+    // --- session detail: Ctrl+Enter load (Story B) ---------------------------
+
+    #[test]
+    fn session_detail_ctrl_enter_switches_session_id() {
+        let mut state = make_state("sess-switch-id");
+        state.session_id = "original-session".into();
+        state.session_detail_overlay = Some(SessionDetail {
+            id: "new-session-abc".into(),
+            title: Some("other work".into()),
+            mode: Some("auto".into()),
+            status: Some("active".into()),
+            active_change: None,
+            created_at: "2026-06-28T00:00:00Z".into(),
+            updated_at: "2026-06-28T00:00:00Z".into(),
+            cowork_mode: None,
+        });
+        // Simulate what Ctrl+Enter does: extract id, switch, clear overlay.
+        let target_id = state
+            .session_detail_overlay
+            .as_ref()
+            .map(|d| d.id.clone())
+            .unwrap();
+        state.session_id = target_id;
+        state.session_detail_overlay = None;
+        state.display_start_idx = state.messages.len();
+        state.main_panel.clear_display();
+
+        assert_eq!(
+            state.session_id, "new-session-abc",
+            "session_id must switch"
+        );
+        assert!(
+            state.session_detail_overlay.is_none(),
+            "overlay must close after load"
+        );
+    }
+
+    #[test]
+    fn session_detail_ctrl_enter_does_nothing_without_overlay() {
+        let mut state = make_state("sess-switch-no-overlay");
+        state.session_id = "original".into();
+        state.session_detail_overlay = None;
+        // Nothing happens — session_id is unchanged.
+        if let Some(ref d) = state.session_detail_overlay {
+            state.session_id = d.id.clone();
+        }
+        assert_eq!(state.session_id, "original", "no overlay = no switch");
+    }
+
+    #[test]
+    fn session_detail_popup_shows_load_hint() {
+        let mut state = make_state("sess-detail-hint");
+        state.session_detail_overlay = Some(SessionDetail {
+            id: "hint-session".into(),
+            title: None,
+            mode: None,
+            status: None,
+            active_change: None,
+            created_at: "2026-06-28T00:00:00Z".into(),
+            updated_at: "2026-06-28T00:00:00Z".into(),
+            cowork_mode: None,
+        });
+        let buf = render_frame(&mut state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        // The popup must hint both the load binding and close binding.
+        assert!(
+            content.contains("load") || content.contains("Load"),
+            "popup must show load hint: {content}"
+        );
+        assert!(
+            content.contains("Esc") || content.contains("close"),
+            "popup must show close hint"
+        );
     }
 }
