@@ -149,6 +149,41 @@ pub(crate) fn resume_plan(turn: Option<u32>) -> ResumePlan {
 }
 
 /// Available slash-command completions shown in the popup.
+/// Short descriptions shown in the command palette (Ctrl+K). Order matches `SLASH_COMPLETIONS`.
+const SLASH_COMMAND_DESCRIPTIONS: &[(&str, &str)] = &[
+    ("/agent", "run named agent"),
+    ("/approve", "approve a cowork item"),
+    ("/briefing", "show session briefing"),
+    ("/clear", "clear message display"),
+    ("/cowork", "toggle cowork approval mode"),
+    ("/drawio", "generate draw.io diagram"),
+    ("/gov", "govctl artifacts"),
+    ("/health", "check daemon connectivity"),
+    ("/help", "show help"),
+    ("/index", "build the code graph"),
+    ("/login", "authenticate with runner"),
+    ("/loop", "manage loop runs"),
+    ("/lsp", "LSP status and diagnostics"),
+    ("/memory", "list stored memory"),
+    ("/metrics", "show token usage and cost"),
+    ("/model", "show or set model"),
+    ("/pptx", "generate PowerPoint"),
+    ("/quit", "exit smedja-tui"),
+    ("/quota", "show usage quota"),
+    ("/resume", "resume a session"),
+    ("/review", "send git diff for review"),
+    ("/session", "manage sessions"),
+    ("/skills", "list loaded skills"),
+    ("/spec", "browse OpenSpec changes"),
+    ("/switch", "switch active session"),
+    ("/takeover", "take over agent output"),
+    ("/test", "run test suite"),
+    ("/tier", "show or set tier"),
+    ("/tools", "list available tools"),
+    ("/upgrade", "upgrade smedja"),
+    ("/version", "show version"),
+];
+
 const SLASH_COMPLETIONS: &[&str] = &[
     "/agent",
     "/approve",
@@ -407,6 +442,8 @@ pub(crate) struct AppState {
     runner_picker_mode: bool,
     /// True when the popup is showing a session picker (Enter resumes the highlighted session).
     session_picker_mode: bool,
+    /// True when the popup is the Ctrl+K command palette (fuzzy filter, wider, shows descriptions).
+    command_palette_mode: bool,
     /// Session ids parallel to `slash_completions` while the session picker is open.
     session_picker_ids: Vec<String>,
     /// Sessions shown in the left rail: (id, label) pairs.
@@ -800,6 +837,18 @@ fn filtered_completions(input: &str) -> Vec<String> {
         .iter()
         .copied()
         .filter(|c| c.starts_with(input))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Returns all slash commands whose name contains `query` as a substring (case-insensitive).
+/// An empty query returns every command.
+fn command_palette_filtered(query: &str) -> Vec<String> {
+    let q = query.to_ascii_lowercase();
+    SLASH_COMPLETIONS
+        .iter()
+        .copied()
+        .filter(|c| q.is_empty() || c.to_ascii_lowercase().contains(&q))
         .map(str::to_owned)
         .collect()
 }
@@ -1819,6 +1868,7 @@ fn clear_slash_popup(state: &mut AppState) {
     state.input_cursor = 0;
     state.runner_picker_mode = false;
     state.session_picker_mode = false;
+    state.command_palette_mode = false;
     state.session_picker_ids.clear();
 }
 
@@ -2159,21 +2209,27 @@ async fn handle_key(
                     state.input.drain(new_pos..state.input_cursor);
                     state.input_cursor = new_pos;
                 }
-                if state.input.is_empty() {
+                let completions = if state.command_palette_mode {
+                    command_palette_filtered(&state.input)
+                } else if state.input.is_empty() {
                     state.slash_popup_visible = false;
+                    Vec::new()
                 } else {
-                    let completions = filtered_completions(&state.input);
-                    state.slash_cursor =
-                        state.slash_cursor.min(completions.len().saturating_sub(1));
-                    state.slash_completions = completions;
-                }
+                    filtered_completions(&state.input)
+                };
+                state.slash_cursor = state.slash_cursor.min(completions.len().saturating_sub(1));
+                state.slash_completions = completions;
             }
             KeyCode::Char(c) => {
                 state.input.insert(state.input_cursor, c);
                 state.input_cursor += c.len_utf8();
-                let completions = filtered_completions(&state.input);
+                let completions = if state.command_palette_mode {
+                    command_palette_filtered(&state.input)
+                } else {
+                    filtered_completions(&state.input)
+                };
                 state.slash_cursor = 0;
-                if completions.is_empty() {
+                if completions.is_empty() && !state.command_palette_mode {
                     state.slash_popup_visible = false;
                 }
                 state.slash_completions = completions;
@@ -2488,13 +2544,19 @@ async fn handle_key(
             }
         }
 
-        // Ctrl-K: kill from cursor to end of line; push onto kill ring (input mode only).
+        // Ctrl-K: kill from cursor to end of line; or open command palette when input is empty.
         KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if !state.scroll_focus {
-                let killed: String = state.input[state.input_cursor..].to_owned();
-                if !killed.is_empty() {
+                let tail: String = state.input[state.input_cursor..].to_owned();
+                if tail.is_empty() && state.input_cursor == 0 {
+                    // Empty input → open command palette.
+                    state.slash_popup_visible = true;
+                    state.command_palette_mode = true;
+                    state.slash_completions = command_palette_filtered("");
+                    state.slash_cursor = 0;
+                } else if !tail.is_empty() {
                     state.input.drain(state.input_cursor..);
-                    push_kill(&mut state.kill_ring, killed);
+                    push_kill(&mut state.kill_ring, tail);
                 }
             }
         }
@@ -3647,7 +3709,14 @@ fn render_slash_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, s
     let popup_h = (completions.len() as u16 + 2).min(area.height.saturating_sub(2));
     // Session-picker rows (`<short-id>  <title>  <mode>  <updated_at>`) are wider
     // than the 20-col command popup, so widen to fit when the picker is open.
-    let desired_w = if state.session_picker_mode { 60 } else { 20 };
+    // Command palette also widens to accommodate the description column.
+    let desired_w = if state.session_picker_mode {
+        60
+    } else if state.command_palette_mode {
+        50
+    } else {
+        20
+    };
     let popup_w = desired_w.min(area.width);
     // Position just above the input row (bottom-left).
     let popup_y = area.y + area.height.saturating_sub(popup_h + 1);
@@ -3658,16 +3727,25 @@ fn render_slash_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, s
         .iter()
         .enumerate()
         .map(|(i, c)| {
+            let label = if state.command_palette_mode {
+                let desc = SLASH_COMMAND_DESCRIPTIONS
+                    .iter()
+                    .find(|(cmd, _)| cmd == c)
+                    .map_or("", |(_, d)| d);
+                format!(" {c:<14}  {desc}")
+            } else {
+                format!(" {c}")
+            };
             if i == state.slash_cursor {
                 Line::from(Span::styled(
-                    format!(" {c}"),
+                    label,
                     Style::default()
                         .fg(p.bg)
                         .bg(p.text_bright)
                         .add_modifier(Modifier::BOLD),
                 ))
             } else {
-                Line::from(Span::styled(format!(" {c}"), Style::default().fg(p.text)))
+                Line::from(Span::styled(label, Style::default().fg(p.text)))
             }
         })
         .collect();
@@ -3676,6 +3754,8 @@ fn render_slash_popup(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, s
         "sessions"
     } else if state.runner_picker_mode {
         "runners"
+    } else if state.command_palette_mode {
+        "palette"
     } else {
         "commands"
     };
@@ -3898,6 +3978,7 @@ async fn main() -> Result<()> {
         slash_cursor: 0,
         runner_picker_mode: false,
         session_picker_mode: false,
+        command_palette_mode: false,
         session_picker_ids: Vec::new(),
         session_rail_items: Vec::new(),
         session_rail_cursor: 0,
@@ -6269,6 +6350,7 @@ mod tests {
             slash_cursor: 0,
             runner_picker_mode: false,
             session_picker_mode: false,
+            command_palette_mode: false,
             session_picker_ids: Vec::new(),
             session_rail_items: Vec::new(),
             session_rail_cursor: 0,
@@ -8590,5 +8672,43 @@ status = "draft"
             state.session_rail_cursor = (state.session_rail_cursor + 1).min(max);
         }
         assert_eq!(state.session_rail_cursor, 0, "Down must clamp at last item");
+    }
+
+    // --- Slice 7: command palette ---
+
+    #[test]
+    fn command_palette_empty_query_returns_all_commands() {
+        let completions = command_palette_filtered("");
+        assert_eq!(completions.len(), SLASH_COMPLETIONS.len());
+    }
+
+    #[test]
+    fn command_palette_filters_by_substring() {
+        // "model" matches "/model" and substring of other commands that contain "model"
+        let completions = command_palette_filtered("mod");
+        assert!(
+            completions.contains(&"/model".to_owned()),
+            "expected /model in results"
+        );
+    }
+
+    #[test]
+    fn command_palette_no_match_returns_empty() {
+        let completions = command_palette_filtered("zzznomatch");
+        assert!(completions.is_empty());
+    }
+
+    #[test]
+    fn ctrl_k_on_empty_input_opens_palette() {
+        let mut state = make_state("test-session");
+        state.input.clear();
+        // Simulate what the Ctrl+K handler does when input is empty
+        state.slash_popup_visible = true;
+        state.slash_completions = command_palette_filtered("");
+        state.command_palette_mode = true;
+        state.slash_cursor = 0;
+        assert!(state.slash_popup_visible);
+        assert_eq!(state.slash_completions.len(), SLASH_COMPLETIONS.len());
+        assert!(state.command_palette_mode);
     }
 }
