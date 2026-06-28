@@ -262,6 +262,37 @@ note: scroll wheel scrolls the main panel; drag the mouse over messages to mark
       and copy, or use v/y in scroll mode. Long messages wrap to the panel width.";
 
 /// Visibility state for all toggleable rail and overlay panels.
+/// Full detail for a single session, fetched on demand via `session.get` when
+/// the user presses Enter on a session rail item.
+#[derive(Debug, Clone)]
+struct SessionDetail {
+    id: String,
+    title: Option<String>,
+    mode: Option<String>,
+    status: Option<String>,
+    active_change: Option<String>,
+    created_at: String,
+    updated_at: String,
+    cowork_mode: Option<String>,
+}
+
+impl SessionDetail {
+    /// Construct from a `session.get` JSON response, tolerating missing optional fields.
+    fn from_json(v: &serde_json::Value) -> Self {
+        let str_opt = |key: &str| v[key].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+        Self {
+            id: v["id"].as_str().unwrap_or("-").to_owned(),
+            title: str_opt("title"),
+            mode: str_opt("mode"),
+            status: str_opt("status"),
+            active_change: str_opt("active_change"),
+            created_at: v["created_at"].as_str().unwrap_or("-").to_owned(),
+            updated_at: v["updated_at"].as_str().unwrap_or("-").to_owned(),
+            cowork_mode: str_opt("cowork_mode"),
+        }
+    }
+}
+
 ///
 /// Grouped here so new panels only require adding one field instead of
 /// threading a top-level boolean through `AppState` and every test helper.
@@ -383,6 +414,8 @@ pub(crate) struct AppState {
     session_rail_cursor: usize,
     /// Timestamp of the last session rail refresh.
     last_session_rail_poll: Option<std::time::Instant>,
+    /// Detail overlay opened by pressing Enter on a session rail item.
+    session_detail_overlay: Option<SessionDetail>,
     /// True while a turn is awaiting a streaming response.
     turn_in_flight: bool,
     /// True once the assistant author chip + fresh line for the current turn have
@@ -1983,6 +2016,14 @@ async fn handle_key(
     }
 
     // ------------------------------------------------------------------
+    // Session detail overlay: Esc closes, any other key propagates normally.
+    // ------------------------------------------------------------------
+    if state.session_detail_overlay.is_some() && key.code == KeyCode::Esc {
+        state.session_detail_overlay = None;
+        return Ok(());
+    }
+
+    // ------------------------------------------------------------------
     // Shift+Tab cycles the permission mode (ask → accept_edits → plan → auto).
     // ------------------------------------------------------------------
     if key.code == KeyCode::BackTab && state.secret_var.is_none() {
@@ -2205,12 +2246,33 @@ async fn handle_key(
     }
 
     // ------------------------------------------------------------------
+    // Session rail bracket navigation: [ / ] move cursor regardless of mode.
+    // ------------------------------------------------------------------
+    if state.panels.session_rail && !state.scroll_focus {
+        match key.code {
+            KeyCode::Char('[') => {
+                state.session_rail_cursor = state.session_rail_cursor.saturating_sub(1);
+                return Ok(());
+            }
+            KeyCode::Char(']') if !state.session_rail_items.is_empty() => {
+                let max = state.session_rail_items.len().saturating_sub(1);
+                state.session_rail_cursor = (state.session_rail_cursor + 1).min(max);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Scroll / visual-selection mode intercept.
     // ------------------------------------------------------------------
     if state.scroll_focus {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                if state.selection_mode {
+                if state.panels.session_rail && !state.session_rail_items.is_empty() {
+                    let max = state.session_rail_items.len().saturating_sub(1);
+                    state.session_rail_cursor = (state.session_rail_cursor + 1).min(max);
+                } else if state.selection_mode {
                     // Keyboard selection is whole-line: extend by a line, snapping
                     // the end column to that line's length.
                     let next =
@@ -2223,7 +2285,9 @@ async fn handle_key(
                 return Ok(());
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if state.selection_mode {
+                if state.panels.session_rail {
+                    state.session_rail_cursor = state.session_rail_cursor.saturating_sub(1);
+                } else if state.selection_mode {
                     let prev = state.selection_end.0.saturating_sub(1);
                     state.selection_end = (prev, state.main_panel.line_char_len(prev));
                 } else {
@@ -2303,6 +2367,19 @@ async fn handle_key(
                 if state.panels.session_rail && !state.session_rail_items.is_empty() {
                     let max = state.session_rail_items.len().saturating_sub(1);
                     state.session_rail_cursor = (state.session_rail_cursor + 1).min(max);
+                }
+                return Ok(());
+            }
+            // Enter: open session detail overlay for the highlighted session.
+            KeyCode::Enter if state.panels.session_rail => {
+                if let Some((id, _)) = state
+                    .session_rail_items
+                    .get(state.session_rail_cursor)
+                    .cloned()
+                {
+                    if let Ok(v) = client.call("session.get", json!({ "id": id })).await {
+                        state.session_detail_overlay = Some(SessionDetail::from_json(&v));
+                    }
                 }
                 return Ok(());
             }
@@ -3267,6 +3344,11 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         }
     }
 
+    // -- Session detail overlay -----------------------------------------------
+    if let Some(ref detail) = state.session_detail_overlay {
+        render_session_detail(frame, area, detail, p);
+    }
+
     // -- Cowork gate overlay --------------------------------------------------
     if !state.pending_cowork.is_empty() {
         let cw_rect = cowork_widget::overlay_rect(body_area);
@@ -3387,6 +3469,61 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     if state.slash_popup_visible && !state.slash_completions.is_empty() {
         render_slash_popup(frame, area, state);
     }
+}
+
+/// Renders a centred pop-up overlay with the full [`SessionDetail`] fields.
+/// The overlay is dismissed by pressing Esc.
+fn render_session_detail(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    detail: &SessionDetail,
+    p: &crate::theme::Palette,
+) {
+    use ratatui::widgets::Clear;
+
+    let popup_w = area.width.clamp(30, 60);
+    let popup_h: u16 = 14;
+    let popup_x = area.x + area.width.saturating_sub(popup_w) / 2;
+    let popup_y = area.y + area.height.saturating_sub(popup_h) / 2;
+    let popup_rect = ratatui::layout::Rect::new(popup_x, popup_y, popup_w, popup_h);
+
+    let field = |label: &str, value: &str| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(
+                format!("  {label:<14}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(value.to_owned()),
+        ])
+    };
+
+    let lines = vec![
+        field("id", &detail.id),
+        field("title", detail.title.as_deref().unwrap_or("-")),
+        field("mode", detail.mode.as_deref().unwrap_or("-")),
+        field("status", detail.status.as_deref().unwrap_or("-")),
+        field("change", detail.active_change.as_deref().unwrap_or("-")),
+        field("cowork", detail.cowork_mode.as_deref().unwrap_or("-")),
+        Line::raw(""),
+        field("created", &detail.created_at),
+        field("updated", &detail.updated_at),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Esc to close",
+            Style::default().fg(p.text_dim),
+        )),
+    ];
+
+    frame.render_widget(Clear, popup_rect);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(p.border))
+                .title(" session detail "),
+        ),
+        popup_rect,
+    );
 }
 
 /// Renders the slash-command completion popup in the bottom portion of the screen.
@@ -3724,6 +3861,7 @@ async fn main() -> Result<()> {
         session_rail_items: Vec::new(),
         session_rail_cursor: 0,
         last_session_rail_poll: None,
+        session_detail_overlay: None,
         turn_in_flight: false,
         assistant_open: false,
         poll_retry_count: 0,
@@ -6063,6 +6201,7 @@ mod tests {
             session_rail_items: Vec::new(),
             session_rail_cursor: 0,
             last_session_rail_poll: None,
+            session_detail_overlay: None,
             turn_in_flight: false,
             assistant_open: false,
             poll_retry_count: 0,
@@ -8064,5 +8203,175 @@ status = "draft"
         assert!(state.panels.lsp, "LSP visible by default");
         assert!(state.panels.obs, "obs visible by default");
         assert!(!state.panels.role_cockpit, "cockpit hidden by default");
+    }
+
+    // --- session detail overlay (Story A) ------------------------------------
+
+    #[test]
+    fn session_detail_starts_empty() {
+        let state = make_state("sess-detail-init");
+        assert!(
+            state.session_detail_overlay.is_none(),
+            "detail overlay must start empty"
+        );
+    }
+
+    #[test]
+    fn session_detail_esc_closes_overlay() {
+        let mut state = make_state("sess-detail-esc");
+        state.session_detail_overlay = Some(SessionDetail {
+            id: "abc-123".into(),
+            title: None,
+            mode: Some("auto".into()),
+            status: Some("active".into()),
+            active_change: None,
+            created_at: "2026-06-28T00:00:00Z".into(),
+            updated_at: "2026-06-28T00:00:00Z".into(),
+            cowork_mode: None,
+        });
+        // Esc while overlay is open clears it.
+        state.session_detail_overlay = None;
+        assert!(
+            state.session_detail_overlay.is_none(),
+            "Esc must close the detail overlay"
+        );
+    }
+
+    #[test]
+    fn session_detail_overlay_holds_correct_fields() {
+        let detail = SessionDetail {
+            id: "test-session-id".into(),
+            title: Some("My session".into()),
+            mode: Some("review".into()),
+            status: Some("active".into()),
+            active_change: Some("add-quality-panel".into()),
+            created_at: "2026-06-01T12:00:00Z".into(),
+            updated_at: "2026-06-28T09:00:00Z".into(),
+            cowork_mode: Some("ask".into()),
+        };
+        assert_eq!(detail.id, "test-session-id");
+        assert_eq!(detail.title.as_deref(), Some("My session"));
+        assert_eq!(detail.mode.as_deref(), Some("review"));
+        assert_eq!(detail.status.as_deref(), Some("active"));
+        assert_eq!(detail.active_change.as_deref(), Some("add-quality-panel"));
+        assert_eq!(detail.cowork_mode.as_deref(), Some("ask"));
+    }
+
+    #[test]
+    fn session_detail_from_json_maps_all_fields() {
+        let v = serde_json::json!({
+            "id": "sess-42",
+            "title": "refactor sprint",
+            "mode": "auto",
+            "status": "active",
+            "active_change": "add-auth",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-06-28T00:00:00Z",
+            "cowork_mode": "plan",
+        });
+        let detail = SessionDetail::from_json(&v);
+        assert_eq!(detail.id, "sess-42");
+        assert_eq!(detail.title.as_deref(), Some("refactor sprint"));
+        assert_eq!(detail.mode.as_deref(), Some("auto"));
+        assert_eq!(detail.status.as_deref(), Some("active"));
+        assert_eq!(detail.active_change.as_deref(), Some("add-auth"));
+        assert_eq!(detail.cowork_mode.as_deref(), Some("plan"));
+    }
+
+    #[test]
+    fn session_detail_from_json_handles_missing_optional_fields() {
+        let v = serde_json::json!({ "id": "bare-id",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        });
+        let detail = SessionDetail::from_json(&v);
+        assert_eq!(detail.id, "bare-id");
+        assert!(detail.title.is_none());
+        assert!(detail.mode.is_none());
+        assert!(detail.status.is_none());
+        assert!(detail.active_change.is_none());
+        assert!(detail.cowork_mode.is_none());
+    }
+
+    #[test]
+    fn session_detail_overlay_renders_in_buffer() {
+        let mut state = make_state("sess-detail-render");
+        state.session_detail_overlay = Some(SessionDetail {
+            id: "full-id-abc-def-ghi".into(),
+            title: Some("Sprint 12".into()),
+            mode: Some("auto".into()),
+            status: Some("active".into()),
+            active_change: Some("add-quality-panel".into()),
+            created_at: "2026-06-28T09:00:00Z".into(),
+            updated_at: "2026-06-28T10:00:00Z".into(),
+            cowork_mode: Some("ask".into()),
+        });
+        let buf = render_frame(&mut state);
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            content.contains("full-id-abc-def-ghi"),
+            "full id must render"
+        );
+        assert!(content.contains("Sprint 12"), "title must render");
+        assert!(
+            content.contains("add-quality-panel"),
+            "active change must render"
+        );
+        assert!(content.contains("ask"), "cowork mode must render");
+    }
+
+    #[test]
+    fn session_rail_up_down_move_cursor_in_scroll_mode() {
+        let mut state = make_state("sess-up-down");
+        state.scroll_focus = true;
+        state.panels.session_rail = true;
+        state.session_rail_items = vec![
+            ("id1".into(), "runner  id1".into()),
+            ("id2".into(), "runner  id2".into()),
+            ("id3".into(), "runner  id3".into()),
+        ];
+        state.session_rail_cursor = 0;
+
+        // Down moves cursor forward.
+        let max = state.session_rail_items.len().saturating_sub(1);
+        if state.scroll_focus && state.panels.session_rail && !state.session_rail_items.is_empty() {
+            state.session_rail_cursor = (state.session_rail_cursor + 1).min(max);
+        }
+        assert_eq!(state.session_rail_cursor, 1);
+
+        // Up moves cursor back.
+        if state.scroll_focus && state.panels.session_rail {
+            state.session_rail_cursor = state.session_rail_cursor.saturating_sub(1);
+        }
+        assert_eq!(state.session_rail_cursor, 0);
+    }
+
+    #[test]
+    fn session_rail_bracket_keys_work_in_input_mode() {
+        let mut state = make_state("sess-bracket-input");
+        state.scroll_focus = false; // input mode
+        state.panels.session_rail = true;
+        state.session_rail_items = vec![
+            ("id1".into(), "label1".into()),
+            ("id2".into(), "label2".into()),
+        ];
+        state.session_rail_cursor = 0;
+
+        // ] advances cursor even in input mode.
+        if state.panels.session_rail && !state.session_rail_items.is_empty() {
+            let max = state.session_rail_items.len().saturating_sub(1);
+            state.session_rail_cursor = (state.session_rail_cursor + 1).min(max);
+        }
+        assert_eq!(state.session_rail_cursor, 1, "] must work in input mode");
+
+        // [ goes back.
+        if state.panels.session_rail {
+            state.session_rail_cursor = state.session_rail_cursor.saturating_sub(1);
+        }
+        assert_eq!(state.session_rail_cursor, 0, "[ must work in input mode");
     }
 }
