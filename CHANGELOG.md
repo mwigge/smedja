@@ -6,6 +6,14 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.20.5] — 2026-06-28
+
+### Fixed
+
+- **install.sh quickstart message** — Linux installs with systemd now show `quickstart: smedja  (smdjad starts automatically via systemd --user)` instead of the misleading `smdjad & smedja`; on upgrade, the running daemon is restarted automatically via `systemctl --user restart`.
+
+---
+
 ## [0.20.4] — 2026-06-28
 
 ### Fixed
