@@ -3697,7 +3697,7 @@ async fn main() -> Result<()> {
             obs: true,
             role_cockpit: false,
             quality: false,
-            value: false,
+            value: true,
         },
         metrics_snapshot: Vec::new(),
         savings_snapshot: metrics_view::SavingsSnapshot::default(),
