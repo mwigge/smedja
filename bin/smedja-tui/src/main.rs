@@ -701,7 +701,11 @@ async fn resolve_session(client: &mut Client, start: SessionStart) -> Result<Res
                 .map_err(|_| anyhow::anyhow!("session not found: {id}"))?;
             Ok(ResolvedSession {
                 session_id: resp["id"].as_str().unwrap_or(&id).to_owned(),
-                runner: "unknown".to_owned(),
+                runner: resp
+                    .get("runner")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_owned(),
                 model: None,
                 tier: None,
                 mode: resp.get("mode").and_then(|v| v.as_str()).map(str::to_owned),
