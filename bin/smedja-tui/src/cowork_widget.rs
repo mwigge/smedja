@@ -67,6 +67,8 @@ impl Widget for CoworkWidget<'_> {
                     format!("{}_", self.modify_input),
                     Style::default().fg(p.accent),
                 ),
+                Span::raw("  "),
+                Span::styled("[Esc] cancel", Style::default().fg(p.text_dim)),
             ])
         } else {
             Line::from(vec![

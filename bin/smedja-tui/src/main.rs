@@ -498,6 +498,8 @@ pub(crate) struct AppState {
     last_graph_poll: Option<std::time::Instant>,
     /// NDJSON stream receiver for the current in-flight turn.
     stream_rx: Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>,
+    /// Oneshot receiver for a background /upgrade operation.
+    upgrade_rx: Option<tokio::sync::oneshot::Receiver<String>>,
     /// Accumulated thinking-token text for the current in-flight turn.
     ///
     /// Reset to empty at the start of each new turn. Rendered as a dim
@@ -4188,6 +4190,7 @@ async fn main() -> Result<()> {
         last_cowork_poll: None,
         last_graph_poll: None,
         stream_rx: None,
+        upgrade_rx: None,
         current_thinking: String::new(),
         thinking_expanded: false,
         kill_ring: VecDeque::new(),
@@ -4886,6 +4889,17 @@ async fn main() -> Result<()> {
         // stream_rx borrow has ended.
         if let Some((output_type, content)) = pending_output_save {
             save_generator_output(&output_type, &content, &mut state);
+        }
+
+        // Poll background upgrade result.
+        let upgrade_done: Option<String> = if let Some(ref mut rx) = state.upgrade_rx {
+            rx.try_recv().ok()
+        } else {
+            None
+        };
+        if let Some(msg) = upgrade_done {
+            push_system_message(&mut state, msg);
+            state.upgrade_rx = None;
         }
 
         // Poll cowork.pending every 200 ms when a turn is in flight to surface
@@ -6592,6 +6606,7 @@ mod tests {
             last_cowork_poll: None,
             last_graph_poll: None,
             stream_rx: None,
+            upgrade_rx: None,
             current_thinking: String::new(),
             thinking_expanded: false,
             kill_ring: VecDeque::new(),

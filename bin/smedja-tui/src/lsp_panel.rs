@@ -50,15 +50,11 @@ impl<'a> LspPanel<'a> {
         // ── Empty state ──────────────────────────────────────────────────────
         if snap.servers.is_empty() {
             lines.push(Line::from(Span::styled(
-                "no servers found",
+                "no LSP servers detected",
                 Style::default().fg(p.text_dim),
             )));
             lines.push(Line::from(Span::styled(
-                "install rust-analyzer,",
-                Style::default().fg(p.text_dim),
-            )));
-            lines.push(Line::from(Span::styled(
-                "gopls, or pyright",
+                "install a language server for your project",
                 Style::default().fg(p.text_dim),
             )));
         }
