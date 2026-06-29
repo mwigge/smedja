@@ -70,13 +70,17 @@ pub(crate) type CacheAligners = Arc<Mutex<HashMap<AlignerKey, smedja_memory::Cac
 /// secondary. Each discipline's clause is present only when its config flag is
 /// `true`; when both are disabled the directive is omitted entirely (`None`).
 #[must_use]
-pub(crate) fn methodology_directive(
+/// Language-aware variant: when `is_rust` is false, Rust-specific idioms are
+/// replaced with generic equivalents so the directive is not actively misleading
+/// in Python, TypeScript, or other workspaces.
+pub(crate) fn methodology_directive_for(
     config: smedja_methodology::MethodologyConfig,
+    is_rust: bool,
 ) -> Option<String> {
     if !config.tdd && !config.clean {
         return None;
     }
-    let mut clauses: Vec<&str> = Vec::new();
+    let mut clauses: Vec<&'static str> = Vec::new();
     if config.tdd {
         clauses.push(
             "Write a failing test before the implementation it covers (Red, then Green, \
@@ -85,10 +89,17 @@ pub(crate) fn methodology_directive(
         );
     }
     if config.clean {
-        clauses.push(
-            "Do not use `unwrap`, `expect`, or `println!` in library code — return errors \
-             with `?` and log through the structured logger.",
-        );
+        if is_rust {
+            clauses.push(
+                "Do not use `unwrap`, `expect`, or `println!` in library code — return errors \
+                 with `?` and log through the structured logger.",
+            );
+        } else {
+            clauses.push(
+                "Do not swallow errors silently — propagate or log them explicitly. \
+                 Avoid bare print statements in library code; use the structured logger.",
+            );
+        }
     }
     let body = clauses
         .iter()
@@ -186,9 +197,13 @@ pub(crate) fn build_summariser_prompt(history: &[(String, String)]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Produce a concise summary of the conversation so far. \
-Preserve all decisions, file names, and open questions. \
-Keep it under 400 words.\n\n{turns_text}"
+        "Produce a structured summary of the conversation so far. \
+Format it as three clearly labelled sections using bullet points:\n\
+- **Decisions**: key choices made and their rationale\n\
+- **Changed files**: files created, edited, or deleted (with brief reason)\n\
+- **Open questions**: unresolved issues or follow-up items\n\
+Omit sections that have no content. Keep total length under 400 words.\n\n\
+{turns_text}"
     )
 }
 
@@ -490,7 +505,8 @@ impl TurnOrchestrator {
             // Config-gated per discipline; omitted entirely when both are off.
             let methodology_config =
                 crate::methodology_config::load_methodology_config(&workspace_root);
-            match methodology_directive(methodology_config) {
+            let is_rust_workspace = workspace_root.join("Cargo.toml").exists();
+            match methodology_directive_for(methodology_config, is_rust_workspace) {
                 Some(directive) => format!("{with_skills}\n\n{directive}"),
                 None => with_skills,
             }
@@ -545,25 +561,31 @@ impl TurnOrchestrator {
         let mut builtin_tools: Vec<serde_json::Value> = vec![
             serde_json::json!({
                 "name": "smedja_vault_search",
-                "description": "Search the smedja vault for semantically similar entries.",
+                "description": "Search the smedja vault for semantically similar entries. \
+                    namespace: optional — defaults to 'default'; use 'compact' for session \
+                    summaries, or the role label (e.g. 'review', 'sre') for role-scoped knowledge. \
+                    k: number of results to return, default 3.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string" },
-                        "namespace": { "type": "string" },
-                        "k": { "type": "integer" }
+                        "namespace": { "type": "string", "description": "defaults to 'default'; known values: compact, default, review, sre, researcher" },
+                        "k": { "type": "integer", "description": "number of results, default 3" }
                     },
                     "required": ["query"]
                 }
             }),
             serde_json::json!({
                 "name": "smedja_vault_store",
-                "description": "Store an entry in the smedja vault for future retrieval.",
+                "description": "Store an entry in the smedja vault for future retrieval. \
+                    namespace: optional — defaults to 'default'; use 'compact' for session \
+                    summaries, or the role label (e.g. 'review', 'sre') for role-scoped knowledge. \
+                    Omitting namespace stores in 'default', which is always included in proactive recall.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
                         "content": { "type": "string" },
-                        "namespace": { "type": "string" },
+                        "namespace": { "type": "string", "description": "defaults to 'default'; known values: compact, default, review, sre, researcher" },
                         "id": { "type": "string" },
                         "payload": { "type": "object" },
                         "source_file": { "type": "string" },
@@ -1690,7 +1712,7 @@ mod tests {
     fn directive_present_under_default_config() {
         // On a code-writing turn with default config the sealed system prefix
         // carries the TDD/clean discipline directive (both clauses present).
-        let directive = super::methodology_directive(MethodologyConfig::default())
+        let directive = super::methodology_directive_for(MethodologyConfig::default(), true)
             .expect("default config must yield a directive");
         assert!(directive.contains("<methodology_discipline>"));
         assert!(directive.contains("failing test"));
@@ -1703,8 +1725,8 @@ mod tests {
             tdd: false,
             clean: true,
         };
-        let directive =
-            super::methodology_directive(cfg).expect("clean clause must still be present");
+        let directive = super::methodology_directive_for(cfg, true)
+            .expect("clean clause must still be present");
         assert!(!directive.contains("failing test"));
         assert!(directive.contains("`unwrap`"));
     }
@@ -1716,7 +1738,7 @@ mod tests {
             clean: false,
         };
         let directive =
-            super::methodology_directive(cfg).expect("tdd clause must still be present");
+            super::methodology_directive_for(cfg, true).expect("tdd clause must still be present");
         assert!(directive.contains("failing test"));
         assert!(!directive.contains("`unwrap`"));
     }
@@ -1727,7 +1749,7 @@ mod tests {
             tdd: false,
             clean: false,
         };
-        assert!(super::methodology_directive(cfg).is_none());
+        assert!(super::methodology_directive_for(cfg, true).is_none());
     }
 
     /// A provider that yields a single classified error then nothing — used to
