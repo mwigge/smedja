@@ -1760,6 +1760,23 @@ async fn handle_key(
                                     .unwrap_or(&runner_name)
                                     .to_owned();
                                 state.runner.clone_from(&canonical);
+                                // Update displayed model to new runner's default.
+                                if let Ok(list) = client.call("runner.list", json!({})).await {
+                                    if let Some(runners) =
+                                        list.get("runners").and_then(|r| r.as_array())
+                                    {
+                                        if let Some(m) = runners
+                                            .iter()
+                                            .find(|r| {
+                                                r.get("runner").and_then(|n| n.as_str())
+                                                    == Some(&canonical)
+                                            })
+                                            .and_then(|r| r.get("model").and_then(|m| m.as_str()))
+                                        {
+                                            state.model = Some(m.to_owned());
+                                        }
+                                    }
+                                }
                                 push_system_message(
                                     state,
                                     format!("runner switched to {canonical}"),
