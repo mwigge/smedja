@@ -4,6 +4,7 @@ mod clipboard;
 pub mod code_widget;
 mod context_rail;
 mod cowork_widget;
+mod diff_viewer;
 mod editor;
 mod governance;
 mod lsp_panel;
@@ -438,6 +439,8 @@ pub(crate) struct AppState {
     diff_overlay: Option<(usize, Vec<String>)>,
     /// Scroll offset within the diff overlay.
     diff_scroll: usize,
+    /// When true, the diff overlay renders in side-by-side split mode.
+    diff_split_view: bool,
     /// Staging queue for batched tool dispatch.
     staging_queue: staging::StagingQueue,
     /// Visibility state for all toggleable rail and overlay panels.
@@ -2083,7 +2086,9 @@ async fn handle_key(
     if state.scroll_focus {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                if state.panels.session_rail && !state.session_rail_items.is_empty() {
+                if state.diff_overlay.is_some() {
+                    state.diff_scroll = state.diff_scroll.saturating_add(1);
+                } else if state.panels.session_rail && !state.session_rail_items.is_empty() {
                     let max = state.session_rail_items.len().saturating_sub(1);
                     state.session_rail_cursor = (state.session_rail_cursor + 1).min(max);
                 } else if state.selection_mode {
@@ -2099,7 +2104,9 @@ async fn handle_key(
                 return Ok(());
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if state.panels.session_rail {
+                if state.diff_overlay.is_some() {
+                    state.diff_scroll = state.diff_scroll.saturating_sub(1);
+                } else if state.panels.session_rail {
                     state.session_rail_cursor = state.session_rail_cursor.saturating_sub(1);
                 } else if state.selection_mode {
                     let prev = state.selection_end.0.saturating_sub(1);
@@ -2167,6 +2174,13 @@ async fn handle_key(
             KeyCode::Char('T') => {
                 if !state.current_thinking.is_empty() {
                     state.thinking_expanded = !state.thinking_expanded;
+                }
+                return Ok(());
+            }
+            // S: toggle diff overlay between unified and split view.
+            KeyCode::Char('S') => {
+                if state.diff_overlay.is_some() {
+                    state.diff_split_view = !state.diff_split_view;
                 }
                 return Ok(());
             }
@@ -2373,6 +2387,7 @@ async fn handle_key(
                 state.panel_search_query.clear();
             } else if state.diff_overlay.is_some() {
                 state.diff_overlay = None;
+                state.diff_split_view = false;
             } else if state.selection_mode {
                 state.selection_mode = false;
             } else if state.scroll_focus {
@@ -3137,8 +3152,6 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     // -- Diff overlay ---------------------------------------------------------
     if let Some((_idx, ref lines)) = state.diff_overlay {
         // Centre 80% of the main area.
-        // Truncation is intentional: pixel-aligned terminal dimensions are
-        // always well within u16 range; f32 precision is fine for rounding.
         #[allow(
             clippy::cast_lossless,
             clippy::cast_possible_truncation,
@@ -3155,19 +3168,23 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         let oy = area.y + (area.height.saturating_sub(oh)) / 2;
         let overlay_rect = ratatui::layout::Rect::new(ox, oy, ow, oh);
 
-        let visible: Vec<Line<'_>> = lines
-            .iter()
-            .skip(state.diff_scroll)
-            .take(oh as usize)
-            .map(|l| Line::raw(l.clone()))
-            .collect();
-
-        let diff_widget = Paragraph::new(visible).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" tool detail "),
-        );
-        frame.render_widget(diff_widget, overlay_rect);
+        if state.diff_split_view && diff_viewer::is_diff_content(lines) {
+            diff_viewer::render_split(
+                lines,
+                state.diff_scroll,
+                overlay_rect,
+                state.no_color,
+                frame,
+            );
+        } else {
+            diff_viewer::render_unified(
+                lines,
+                state.diff_scroll,
+                overlay_rect,
+                state.no_color,
+                frame,
+            );
+        }
     }
 
     // -- Block browser overlay ------------------------------------------------
@@ -3649,6 +3666,7 @@ async fn main() -> Result<()> {
         clipboard: None,
         diff_overlay: None,
         diff_scroll: 0,
+        diff_split_view: false,
         staging_queue: staging::StagingQueue::new(),
         panels: PanelVisibility {
             context_rail: true,
@@ -5794,6 +5812,7 @@ mod tests {
             clipboard: None,
             diff_overlay: None,
             diff_scroll: 0,
+            diff_split_view: false,
             staging_queue: staging::StagingQueue::new(),
             panels: PanelVisibility {
                 context_rail: true,
