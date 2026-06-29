@@ -244,6 +244,7 @@ async fn list_with(ig: &smedja_ingot::IngotHandle) -> Result<Value, RpcError> {
                 "id": s.id,
                 "title": s.title,
                 "mode": s.mode,
+                "runner": s.runner_override,
                 "created_at": s.created_at,
                 "updated_at": s.updated_at,
             })
@@ -274,6 +275,7 @@ pub(crate) async fn get(state: HandlerState, params: Value) -> Result<Value, Rpc
         "id": session.id,
         "title": session.title,
         "mode": session.mode,
+        "runner": session.runner_override,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
         "status": session.status,
