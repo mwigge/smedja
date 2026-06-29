@@ -17,6 +17,7 @@ mod staging;
 mod statusbar;
 mod terminal_guard;
 pub mod theme;
+mod tool_call;
 mod upgrade;
 mod value_panel;
 
@@ -45,6 +46,8 @@ pub(crate) use governance::{
 };
 #[allow(unused_imports)]
 pub(crate) use terminal_guard::TerminalGuard;
+#[allow(unused_imports)]
+pub(crate) use tool_call::{tool_call_card, tool_glyph_label};
 #[allow(unused_imports)]
 pub(crate) use upgrade::{
     fetch_latest_version, format_openspec_list, format_openspec_status, is_newer, run_openspec,
@@ -1037,64 +1040,6 @@ pub(crate) fn push_system_message(state: &mut AppState, text: impl Into<String>)
     }
     state.main_panel.push_line(msg.text.clone());
     state.messages.push(msg);
-}
-
-/// Maps a tool name to a compact `(glyph, short-label)` pair so cards stay tidy
-/// — e.g. the verbose `ToolSearch` becomes "⌕ search". Unknown tools fall back
-/// to a lowercased, length-capped name.
-fn tool_glyph_label(name: &str) -> (&'static str, String) {
-    match name {
-        "Bash" | "bash" | "shell" => ("⌘", "bash".to_owned()),
-        "Read" | "read" => ("◇", "read".to_owned()),
-        "Write" | "write" => ("✎", "write".to_owned()),
-        "Edit" | "edit" | "MultiEdit" | "Update" => ("✎", "edit".to_owned()),
-        "Grep" | "grep" | "search_files" => ("⌕", "grep".to_owned()),
-        "Glob" | "glob" | "find" => ("⌕", "glob".to_owned()),
-        "ToolSearch" => ("⌕", "search".to_owned()),
-        "WebFetch" | "fetch" => ("⬇", "fetch".to_owned()),
-        "WebSearch" => ("⌕", "web".to_owned()),
-        "Task" | "Agent" => ("◈", "agent".to_owned()),
-        "TodoWrite" => ("☑", "todo".to_owned()),
-        "NotebookEdit" => ("✎", "notebook".to_owned()),
-        other => {
-            let s: String = other.to_lowercase().chars().take(14).collect();
-            ("▶", s)
-        }
-    }
-}
-
-/// Builds a one-line tool-call card — `<status> <glyph> <label>  <summary>`.
-/// `status` is the progress glyph: a spinner frame while running, `✓` on success,
-/// `✗` on error. glyph+label are accented/bold and the summary dimmed.
-fn tool_call_card(name: &str, input: &str, no_color: bool, status: char) -> Line<'static> {
-    let (glyph, label) = tool_glyph_label(name);
-    let (status_style, head_style, arg_style) = if no_color {
-        (
-            Style::default(),
-            Style::default().add_modifier(Modifier::BOLD),
-            Style::default(),
-        )
-    } else {
-        let p = palette();
-        let st = match status {
-            '\u{2713}' => Style::default().fg(p.code_added), // ✓
-            '\u{2717}' => Style::default().fg(p.code_removed), // ✗
-            _ => Style::default().fg(p.text_dim),
-        };
-        (
-            st,
-            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-            Style::default().fg(p.text_dim),
-        )
-    };
-    let mut spans = vec![
-        Span::styled(format!("{status} "), status_style),
-        Span::styled(format!("{glyph} {label}"), head_style),
-    ];
-    if !input.is_empty() {
-        spans.push(Span::styled(format!("  {input}"), arg_style));
-    }
-    Line::from(spans)
 }
 
 /// Saves a secret (e.g. an API key pasted during login) to
