@@ -1229,6 +1229,20 @@ pub(crate) async fn dispatch_slash(
                         .unwrap_or(args)
                         .to_owned();
                     state.runner.clone_from(&canonical);
+                    // Update the displayed model to the new runner's default.
+                    if let Ok(list) = client.call("runner.list", json!({})).await {
+                        if let Some(runners) = list.get("runners").and_then(|r| r.as_array()) {
+                            if let Some(m) = runners
+                                .iter()
+                                .find(|r| {
+                                    r.get("runner").and_then(|n| n.as_str()) == Some(&canonical)
+                                })
+                                .and_then(|r| r.get("model").and_then(|m| m.as_str()))
+                            {
+                                state.model = Some(m.to_owned());
+                            }
+                        }
+                    }
                     push_system_message(state, format!("runner switched to {canonical}"));
                     // Show the existing session memory the new runner picks up.
                     if let Ok(hist) = client

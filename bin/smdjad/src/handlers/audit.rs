@@ -115,7 +115,6 @@ pub(crate) async fn gate_tool(state: HandlerState, params: Value) -> Result<Valu
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let tool_input = params.get("tool_input").cloned().unwrap_or(Value::Null);
 
     let gate = {
         let mut g = state.gates.lock().await;
@@ -124,11 +123,21 @@ pub(crate) async fn gate_tool(state: HandlerState, params: Value) -> Result<Valu
                 .or_insert_with(|| Arc::new(CoworkGate::default())),
         )
     };
-    let (decision, reason) = match gate.gate_tool(0, &tool_name, tool_input, "", None).await {
-        crate::cowork::Decision::Approve => ("allow", String::new()),
-        crate::cowork::Decision::Deny(r) => ("deny", r),
-        // External CLIs can't apply a "modify"; treat as approve.
-        crate::cowork::Decision::Modify(_) => ("allow", "approved".to_owned()),
+    // Evaluate the policy synchronously — the hook cannot block waiting for
+    // a TUI approval dialog (no push path). Ask → fail-open: the CLI's own
+    // sandbox (codex --sandbox, claude's permissions model) provides the
+    // outer guard. Plan remains a hard deny so the user can restrict a session
+    // to read-only analysis even from external CLIs.
+    let mode = gate.mode().await;
+    let (decision, reason) = match crate::cowork::evaluate(mode, &tool_name) {
+        crate::cowork::PermissionDecision::Deny => {
+            ("deny", format!("blocked by {} mode", mode.as_str()))
+        }
+        // Allow and Ask both resolve to allow: the external CLI's own sandbox
+        // provides the outer guard; we cannot block on a TUI approval dialog.
+        crate::cowork::PermissionDecision::Allow | crate::cowork::PermissionDecision::Ask => {
+            ("allow", String::new())
+        }
     };
     Ok(json!({ "decision": decision, "reason": reason }))
 }
