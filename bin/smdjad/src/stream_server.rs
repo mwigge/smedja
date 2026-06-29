@@ -26,7 +26,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 
-use smedja_bellows::{Dispatcher, TurnEvent};
+use smedja_bellows::{Dispatcher, StreamEvent, TurnEvent};
 
 /// Maximum NDJSON lines buffered per turn before the oldest are discarded.
 const MAX_BUFFER_PER_TURN: usize = 8192;
@@ -385,17 +385,22 @@ fn turn_event_to_ndjson(
     event: &TurnEvent,
     expected_turn_id: &str,
 ) -> (Option<String>, String, bool) {
+    let ser = |ev: &StreamEvent| serde_json::to_string(ev).unwrap_or_default();
     match event {
         TurnEvent::AssistantDelta {
             content, turn_id, ..
         } => {
-            let line = json!({"type": "delta", "text": content}).to_string();
+            let line = ser(&StreamEvent::Delta {
+                text: content.clone(),
+            });
             (turn_id.clone(), line, false)
         }
         TurnEvent::ThinkingDelta {
             content, turn_id, ..
         } => {
-            let line = json!({"type": "thinking", "text": content}).to_string();
+            let line = ser(&StreamEvent::Thinking {
+                text: content.clone(),
+            });
             (turn_id.clone(), line, false)
         }
         TurnEvent::ToolCalled {
@@ -405,8 +410,11 @@ fn turn_event_to_ndjson(
             turn_id,
             ..
         } => {
-            let line = json!({"type": "tool_call", "name": tool_name, "input": input_summary, "full": full_input})
-                .to_string();
+            let line = ser(&StreamEvent::ToolCall {
+                name: tool_name.clone(),
+                input: input_summary.clone(),
+                full: full_input.clone(),
+            });
             (turn_id.clone(), line, false)
         }
         TurnEvent::Completed {
@@ -419,16 +427,11 @@ fn turn_event_to_ndjson(
             if turn_id != expected_turn_id {
                 return (Some(turn_id.clone()), String::new(), false);
             }
-            let mut obj = serde_json::Map::new();
-            obj.insert("type".into(), json!("done"));
-            obj.insert("output_tok".into(), json!(output_tokens));
-            if let Some(n) = input_tokens {
-                obj.insert("input_tok".into(), json!(n));
-            }
-            if let Some(tp) = traceparent {
-                obj.insert("traceparent".into(), json!(tp));
-            }
-            let line = serde_json::Value::Object(obj).to_string();
+            let line = ser(&StreamEvent::Done {
+                output_tok: *output_tokens,
+                input_tok: *input_tokens,
+                traceparent: traceparent.clone(),
+            });
             (Some(turn_id.clone()), line, true)
         }
         TurnEvent::Failed {
@@ -437,7 +440,9 @@ fn turn_event_to_ndjson(
             if turn_id != expected_turn_id {
                 return (Some(turn_id.clone()), String::new(), false);
             }
-            let line = json!({"type": "error", "message": reason}).to_string();
+            let line = ser(&StreamEvent::Error {
+                message: reason.clone(),
+            });
             (Some(turn_id.clone()), line, true)
         }
         TurnEvent::Started {
@@ -446,7 +451,9 @@ fn turn_event_to_ndjson(
             ..
         } => {
             if let Some(ref name) = correlation.agent_name {
-                let line = json!({"type": "started", "agent_name": name}).to_string();
+                let line = ser(&StreamEvent::Started {
+                    agent_name: Some(name.clone()),
+                });
                 (Some(turn_id.clone()), line, false)
             } else {
                 (None, String::new(), false)
@@ -462,16 +469,15 @@ fn turn_event_to_ndjson(
             turn_id,
             ..
         } => {
-            let line = json!({
-                "type": "quality",
-                "score": score,
-                "tdd_pass": tdd_pass,
-                "clean_pass": clean_pass,
-                "file_advisories": file_advisories,
-                "skill_advisories": skill_advisories,
-                "llm_reviewed": llm_reviewed,
-            })
-            .to_string();
+            let line = ser(&StreamEvent::Quality {
+                score: *score,
+                tdd_pass: *tdd_pass,
+                clean_pass: *clean_pass,
+                file_advisories: file_advisories.clone(),
+                skill_advisories: skill_advisories.clone(),
+                llm_reviewed: *llm_reviewed,
+                suggested_command: None,
+            });
             (turn_id.clone(), line, false)
         }
     }

@@ -50,6 +50,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Terminal;
 use serde_json::{json, Value};
+use smedja_bellows::StreamEvent;
 use smedja_rpc::client::Client;
 
 // ---------------------------------------------------------------------------
@@ -497,7 +498,7 @@ pub(crate) struct AppState {
     /// Timestamp of the last `graph.status` poll (refreshes the right-bar count).
     last_graph_poll: Option<std::time::Instant>,
     /// NDJSON stream receiver for the current in-flight turn.
-    stream_rx: Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>,
+    stream_rx: Option<tokio::sync::mpsc::UnboundedReceiver<StreamEvent>>,
     /// Oneshot receiver for a background /upgrade operation.
     upgrade_rx: Option<tokio::sync::oneshot::Receiver<String>>,
     /// Accumulated thinking-token text for the current in-flight turn.
@@ -593,7 +594,7 @@ fn stream_socket_path(rpc_path: &std::path::Path) -> PathBuf {
 async fn start_stream_reader(
     sock_path: PathBuf,
     task_id: String,
-    tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
@@ -602,9 +603,9 @@ async fn start_stream_reader(
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "stream socket connect failed");
-            let _ = tx.send(
-                serde_json::json!({"type":"error","message":format!("stream unavailable: {e}")}),
-            );
+            let _ = tx.send(StreamEvent::Error {
+                message: format!("stream unavailable: {e}"),
+            });
             return;
         }
     };
@@ -613,7 +614,9 @@ async fn start_stream_reader(
 
     let req = format!("{{\"task_id\":\"{task_id}\"}}\n");
     if writer.write_all(req.as_bytes()).await.is_err() {
-        let _ = tx.send(serde_json::json!({"type":"error","message":"stream handshake failed"}));
+        let _ = tx.send(StreamEvent::Error {
+            message: "stream handshake failed".to_owned(),
+        });
         return;
     }
 
@@ -627,10 +630,10 @@ async fn start_stream_reader(
                 if trimmed.is_empty() {
                     continue;
                 }
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                    let is_terminal = matches!(v["type"].as_str(), Some("done" | "error"));
-                    let _ = tx.send(v);
-                    if is_terminal {
+                if let Ok(ev) = serde_json::from_str::<StreamEvent>(trimmed) {
+                    let terminal = ev.is_terminal();
+                    let _ = tx.send(ev);
+                    if terminal {
                         break;
                     }
                 }
@@ -4454,96 +4457,89 @@ async fn main() -> Result<()> {
                         break;
                     }
                 };
-                match event["type"].as_str() {
-                    Some("delta") => {
-                        if let Some(text) = event["text"].as_str() {
-                            // First delta of the turn: emit the assistant author
-                            // chip on its own line so the response never merges
-                            // into the preceding line (which broke ```fences →
-                            // syntax highlighting), and start a fresh body line.
-                            if !state.assistant_open {
-                                let color = theme::runner_color(&state.runner);
-                                let label = theme::runner_label(&state.runner).to_lowercase();
-                                push_author_chip(
-                                    &mut state.main_panel,
-                                    &label,
-                                    color,
-                                    state.no_color,
-                                );
+                match event {
+                    StreamEvent::Delta { text } => {
+                        // First delta of the turn: emit the assistant author
+                        // chip on its own line so the response never merges
+                        // into the preceding line (which broke ```fences →
+                        // syntax highlighting), and start a fresh body line.
+                        if !state.assistant_open {
+                            let color = theme::runner_color(&state.runner);
+                            let label = theme::runner_label(&state.runner).to_lowercase();
+                            push_author_chip(&mut state.main_panel, &label, color, state.no_color);
+                            state.main_panel.push_line(String::new());
+                            state.assistant_open = true;
+                        }
+                        // A tool-result marker (↳) resolves the running tool
+                        // card to ✓ (ok) or ✗ (error).
+                        if text.contains('\u{21b3}') {
+                            if let Some((idx, name, inp)) = state.pending_tool.take() {
+                                let ok = !text.contains("error");
+                                let glyph = if ok { '\u{2713}' } else { '\u{2717}' };
+                                let card = tool_call_card(&name, &inp, state.no_color, glyph);
+                                state.main_panel.replace_styled_line(idx, card);
+                            }
+                        }
+                        // Split on newlines so each line is a separate panel entry.
+                        let mut remaining = text.as_str();
+                        loop {
+                            if let Some(pos) = remaining.find('\n') {
+                                let chunk = &remaining[..pos];
+                                if !chunk.is_empty() {
+                                    state.main_panel.push_delta(chunk);
+                                }
+                                // The line is now complete — classify it
+                                // (syntax-highlight code, colour diffs) then
+                                // open a fresh tail line for the next chunk.
+                                state.main_panel.finalize_last_line();
                                 state.main_panel.push_line(String::new());
-                                state.assistant_open = true;
-                            }
-                            // A tool-result marker (↳) resolves the running tool
-                            // card to ✓ (ok) or ✗ (error).
-                            if text.contains('\u{21b3}') {
-                                if let Some((idx, name, inp)) = state.pending_tool.take() {
-                                    let ok = !text.contains("error");
-                                    let glyph = if ok { '\u{2713}' } else { '\u{2717}' };
-                                    let card = tool_call_card(&name, &inp, state.no_color, glyph);
-                                    state.main_panel.replace_styled_line(idx, card);
+                                remaining = &remaining[pos + 1..];
+                                if let Some(ref mut block) = state.current_block {
+                                    block.push_text(chunk);
+                                    block.push_text("\n");
                                 }
-                            }
-                            // Split on newlines so each line is a separate panel entry.
-                            let mut remaining = text;
-                            loop {
-                                if let Some(pos) = remaining.find('\n') {
-                                    let chunk = &remaining[..pos];
-                                    if !chunk.is_empty() {
-                                        state.main_panel.push_delta(chunk);
-                                    }
-                                    // The line is now complete — classify it
-                                    // (syntax-highlight code, colour diffs) then
-                                    // open a fresh tail line for the next chunk.
-                                    state.main_panel.finalize_last_line();
-                                    state.main_panel.push_line(String::new());
-                                    remaining = &remaining[pos + 1..];
+                            } else {
+                                if !remaining.is_empty() {
+                                    state.main_panel.push_delta(remaining);
                                     if let Some(ref mut block) = state.current_block {
-                                        block.push_text(chunk);
-                                        block.push_text("\n");
+                                        block.push_text(remaining);
                                     }
-                                } else {
-                                    if !remaining.is_empty() {
-                                        state.main_panel.push_delta(remaining);
-                                        if let Some(ref mut block) = state.current_block {
-                                            block.push_text(remaining);
-                                        }
-                                    }
-                                    break;
                                 }
+                                break;
                             }
                         }
                     }
-                    Some("started") => {
-                        if let Some(name) = event["agent_name"].as_str() {
-                            state.active_agent_name = Some(name.to_owned());
+                    StreamEvent::Started { agent_name } => {
+                        if let Some(name) = agent_name {
+                            state.active_agent_name = Some(name);
                         }
                     }
-                    Some("thinking") => {
-                        if let Some(text) = event["text"].as_str() {
-                            state.current_thinking.push_str(text);
-                        }
+                    StreamEvent::Thinking { text } => {
+                        state.current_thinking.push_str(&text);
                     }
-                    Some("tool_call") => {
-                        let name = event["name"].as_str().unwrap_or("?");
-                        let input = event["input"].as_str().unwrap_or("");
-                        let full = event["full"].as_str().unwrap_or(input);
+                    StreamEvent::ToolCall { name, input, full } => {
+                        let full_str = full.as_deref().unwrap_or(&input);
                         // Card starts "running" (◷); resolved to ✓/✗ when its
                         // result arrives.
-                        let card = tool_call_card(name, input, state.no_color, '\u{25f7}');
+                        let card = tool_call_card(&name, &input, state.no_color, '\u{25f7}');
                         state.main_panel.push_styled_line(card);
                         // Record the card's line + full args for right-click
                         // expansion and the /tools inspector.
                         let line_idx = state.main_panel.len().saturating_sub(1);
                         state
                             .tool_details
-                            .push((line_idx, name.to_owned(), full.to_owned()));
-                        state.pending_tool = Some((line_idx, name.to_owned(), input.to_owned()));
+                            .push((line_idx, name.clone(), full_str.to_owned()));
+                        state.pending_tool = Some((line_idx, name.clone(), input.clone()));
                         if let Some(ref mut block) = state.current_block {
                             block.push_text(&format!("▶ {name}: {input}"));
                             block.push_text("\n");
                         }
                     }
-                    Some("done") => {
+                    StreamEvent::Done {
+                        output_tok,
+                        input_tok,
+                        traceparent,
+                    } => {
                         // Classify the final streamed line (responses needn't end
                         // with a newline) and close the assistant block.
                         state.main_panel.finalize_last_line();
@@ -4553,9 +4549,9 @@ async fn main() -> Result<()> {
                             let card = tool_call_card(&name, &inp, state.no_color, '\u{2713}');
                             state.main_panel.replace_styled_line(idx, card);
                         }
-                        let output_tok = event["output_tok"].as_u64().unwrap_or(0);
-                        let input_tok = event["input_tok"].as_u64().unwrap_or(0);
-                        let tp = event["traceparent"].as_str().map(str::to_owned);
+                        let output_tok = u64::from(output_tok);
+                        let input_tok = u64::from(input_tok.unwrap_or(0));
+                        let tp = traceparent;
                         let elapsed_ms = state.turn_submitted_at.map_or(0, |t| {
                             u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
                         });
@@ -4615,13 +4611,12 @@ async fn main() -> Result<()> {
 
                         turn_done = true;
                     }
-                    Some("error") => {
-                        let msg_text = event["message"].as_str().unwrap_or("unknown error");
-                        let (label, hint) = classify_turn_error(msg_text);
+                    StreamEvent::Error { message } => {
+                        let (label, hint) = classify_turn_error(&message);
                         let display = if hint.is_empty() {
-                            format!("[{label}] {msg_text}")
+                            format!("[{label}] {message}")
                         } else {
-                            format!("[{label}] {msg_text}\n  \u{2192} {hint}")
+                            format!("[{label}] {message}\n  \u{2192} {hint}")
                         };
                         // push_system_message cannot be called here because `state.stream_rx`
                         // is mutably borrowed via `ref mut rx` for the entire enclosing block.
@@ -4635,35 +4630,24 @@ async fn main() -> Result<()> {
                         }
                         turn_done = true;
                     }
-                    Some("quality") => {
+                    StreamEvent::Quality {
+                        score,
+                        tdd_pass,
+                        clean_pass,
+                        file_advisories,
+                        skill_advisories,
+                        llm_reviewed,
+                        suggested_command,
+                    } => {
                         // Update quality panel snapshot from the post-turn gate evaluation.
-                        #[allow(clippy::cast_possible_truncation)]
-                        let score = event["score"].as_u64().unwrap_or(0) as u8;
-                        let llm_reviewed = event["llm_reviewed"].as_bool().unwrap_or(false);
                         state.quality_snapshot = quality_panel::QualitySnapshot {
                             score,
-                            tdd_pass: event["tdd_pass"].as_bool().unwrap_or(true),
-                            clean_pass: event["clean_pass"].as_bool().unwrap_or(true),
+                            tdd_pass,
+                            clean_pass,
                             llm_reviewed,
-                            file_advisories: event["file_advisories"]
-                                .as_array()
-                                .map(|a| {
-                                    a.iter()
-                                        .filter_map(|v| v.as_str().map(str::to_owned))
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                            skill_advisories: event["skill_advisories"]
-                                .as_array()
-                                .map(|a| {
-                                    a.iter()
-                                        .filter_map(|v| v.as_str().map(str::to_owned))
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                            suggested_command: event["suggested_command"]
-                                .as_str()
-                                .map(str::to_owned),
+                            file_advisories,
+                            skill_advisories,
+                            suggested_command,
                         };
                         if llm_reviewed {
                             state.quality_review_in_progress = false;
@@ -4687,14 +4671,13 @@ async fn main() -> Result<()> {
                             state.consecutive_low_quality = 0;
                         }
                     }
-                    Some("buffer_overflow") => {
-                        let lost = event["lost"].as_u64().unwrap_or(1);
+                    StreamEvent::BufferOverflow { lost } => {
                         let s = if lost == 1 { "" } else { "s" };
                         state.main_panel.push_line(format!(
                             "[stream] {lost} event{s} dropped — output may be incomplete"
                         ));
                     }
-                    _ => {}
+                    StreamEvent::Unknown => {}
                 }
             }
 

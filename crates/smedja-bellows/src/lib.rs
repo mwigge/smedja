@@ -7,10 +7,12 @@
 pub mod dispatcher;
 pub mod event;
 pub mod handle;
+pub mod stream_event;
 
 pub use dispatcher::Dispatcher;
 pub use event::TurnEvent;
 pub use handle::TurnHandle;
+pub use stream_event::StreamEvent;
 
 /// Drains all immediately-available events from `rx` without blocking.
 ///
