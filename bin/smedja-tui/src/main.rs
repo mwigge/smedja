@@ -983,7 +983,7 @@ fn command_palette_filtered(query: &str) -> Vec<String> {
 ///
 /// Returns `(label, hint)` where `hint` is empty when there is nothing useful
 /// to suggest.  The label is used to prefix the displayed error line.
-use formatting::classify_turn_error;
+use formatting::{classify_turn_error, format_turn_error};
 
 pub(crate) fn push_system_message(state: &mut AppState, text: impl Into<String>) {
     let msg = Message {
@@ -4233,10 +4233,11 @@ async fn main() -> Result<()> {
                     }
                     StreamEvent::Error { message } => {
                         let (label, hint) = classify_turn_error(&message);
+                        let header = format_turn_error(&state.runner, label, &message);
                         let display = if hint.is_empty() {
-                            format!("[{label}] {message}")
+                            header
                         } else {
-                            format!("[{label}] {message}\n  \u{2192} {hint}")
+                            format!("{header}\n  \u{2192} {hint}")
                         };
                         // push_system_message cannot be called here because `state.stream_rx`
                         // is mutably borrowed via `ref mut rx` for the entire enclosing block.
@@ -4371,10 +4372,11 @@ async fn main() -> Result<()> {
                     Ok(v) if v["done"].as_bool() == Some(true) => {
                         if let Some(error) = v["error"].as_str() {
                             let (label, hint) = classify_turn_error(error);
+                            let header = format_turn_error(&state.runner, label, error);
                             let display = if hint.is_empty() {
-                                format!("[{label}] {error}")
+                                header
                             } else {
-                                format!("[{label}] {error}\n  \u{2192} {hint}")
+                                format!("{header}\n  \u{2192} {hint}")
                             };
                             state.main_panel.push_line(display.clone());
                             push_system_message(&mut state, display);

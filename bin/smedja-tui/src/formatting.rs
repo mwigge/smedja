@@ -81,6 +81,17 @@ pub(crate) fn history_search<'a>(history: &'a [String], query: &str) -> Option<(
 
 /// Maps a turn-error message to `(short_label, hint)` for user-facing display.
 #[must_use]
+/// Formats a stream error for display, prefixing the runner name when known.
+///
+/// Output: `[runner · LABEL] message` or `[LABEL] message` when runner is empty.
+pub(crate) fn format_turn_error(runner: &str, label: &str, message: &str) -> String {
+    if runner.is_empty() {
+        format!("[{label}] {message}")
+    } else {
+        format!("[{runner} \u{00b7} {label}] {message}")
+    }
+}
+
 pub(crate) fn classify_turn_error(msg: &str) -> (&'static str, &'static str) {
     let lower = msg.to_lowercase();
     if lower.contains("rate limit") || lower.contains("rate_limit") {
@@ -191,6 +202,21 @@ mod tests {
     fn history_search_empty_query_returns_none() {
         let history: Vec<String> = vec!["foo".into()];
         assert!(history_search(&history, "").is_none());
+    }
+
+    #[test]
+    fn format_turn_error_includes_runner_and_label() {
+        let s = format_turn_error("anthropic", "RATE LIMITED", "rate limit exceeded");
+        assert!(s.contains("anthropic"), "{s}");
+        assert!(s.contains("RATE LIMITED"), "{s}");
+        assert!(s.contains("rate limit exceeded"), "{s}");
+    }
+
+    #[test]
+    fn format_turn_error_falls_back_to_label_when_runner_is_unknown() {
+        let s = format_turn_error("", "ERROR", "boom");
+        assert!(s.contains("ERROR"), "{s}");
+        assert!(s.contains("boom"), "{s}");
     }
 
     #[test]
