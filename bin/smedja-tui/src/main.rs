@@ -6,6 +6,7 @@ mod context_rail;
 mod cowork_widget;
 mod diff_viewer;
 mod editor;
+mod formatting;
 mod governance;
 mod lsp_panel;
 pub mod main_panel;
@@ -13,6 +14,7 @@ mod metrics_view;
 mod obs_panel;
 mod plan_panel;
 mod quality_panel;
+mod secrets;
 pub(crate) mod slash;
 mod staging;
 mod statusbar;
@@ -968,52 +970,7 @@ fn command_palette_filtered(query: &str) -> Vec<String> {
 ///
 /// Returns `(label, hint)` where `hint` is empty when there is nothing useful
 /// to suggest.  The label is used to prefix the displayed error line.
-fn classify_turn_error(msg: &str) -> (&'static str, &'static str) {
-    let lower = msg.to_lowercase();
-    if lower.contains("rate limit") || lower.contains("rate_limit") {
-        (
-            "RATE LIMITED",
-            "Use ↑ to recall your last message, then Enter to retry",
-        )
-    } else if lower.contains("api key")
-        || lower.contains("auth")
-        || lower.contains("401")
-        || lower.contains("403")
-    {
-        (
-            "AUTH ERROR",
-            "Check ANTHROPIC_API_KEY or provider credentials",
-        )
-    } else if lower.contains("quota") || lower.contains("429") {
-        ("QUOTA EXCEEDED", "Daily quota reached; check smj cost")
-    } else if lower.contains("timeout") || lower.contains("timed out") {
-        (
-            "TIMEOUT",
-            "Turn hit the wall-clock cap (default 900s; raise with SMEDJA_TURN_TIMEOUT_S)",
-        )
-    } else if lower.contains("network") || lower.contains("connection") || lower.contains("connect")
-    {
-        (
-            "NETWORK ERROR",
-            "Check network connectivity and provider endpoint",
-        )
-    } else if lower.contains("overload") {
-        (
-            "OVERLOADED",
-            "Provider overloaded — use ↑ and retry in a moment",
-        )
-    } else if lower.contains("context length") || lower.contains("maximum context") {
-        (
-            "CONTEXT FULL",
-            "Context window full — use /rollback to trim history",
-        )
-    } else {
-        (
-            "ERROR",
-            "Check /obs for details or run smj session rollback",
-        )
-    }
-}
+use formatting::classify_turn_error;
 
 pub(crate) fn push_system_message(state: &mut AppState, text: impl Into<String>) {
     let msg = Message {
@@ -1044,41 +1001,6 @@ pub(crate) fn push_system_message(state: &mut AppState, text: impl Into<String>)
     }
     state.main_panel.push_line(msg.text.clone());
     state.messages.push(msg);
-}
-
-/// Saves a secret (e.g. an API key pasted during login) to
-/// `~/.config/smedja/secrets.env` under `var`, replacing any existing line for
-/// that variable, and chmods the file to 0600. Returns a status string that
-/// never contains the secret value.
-fn save_secret(var: &str, value: &str) -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
-    let dir = std::path::PathBuf::from(home)
-        .join(".config")
-        .join("smedja");
-    let path = dir.join("secrets.env");
-    if std::fs::create_dir_all(&dir).is_err() {
-        return "login: cannot create ~/.config/smedja".to_owned();
-    }
-    let prefix = format!("{var}=");
-    let mut lines: Vec<String> = std::fs::read_to_string(&path)
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.starts_with(&prefix))
-        .map(str::to_owned)
-        .collect();
-    lines.push(format!("{var}={value}"));
-    let body = format!("{}\n", lines.join("\n"));
-    if std::fs::write(&path, body).is_err() {
-        return format!("login: failed to write {}", path.display());
-    }
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    format!(
-        "\u{2713} saved {var} to {} (0600). Activate: add\n  EnvironmentFile=%h/.config/smedja/secrets.env\nto the smdjad unit, then: systemctl --user restart smdjad",
-        path.display()
-    )
 }
 
 /// Formats a tool call's full arguments into overlay lines, pretty-printing the
@@ -1401,15 +1323,7 @@ pub(crate) fn render_findings_summary(
 /// Extract the first fenced code block of the given `lang` from `text`.
 ///
 /// Returns the content inside the delimiters (without the fence lines).
-fn extract_code_block<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
-    let fence_open = format!("```{lang}");
-    let start = text.find(fence_open.as_str())?;
-    let after_open = start + fence_open.len();
-    let newline = text[after_open..].find('\n')?;
-    let content_start = after_open + newline + 1;
-    let end = text[content_start..].find("```")?;
-    Some(text[content_start..content_start + end].trim())
-}
+use formatting::extract_code_block;
 
 /// Save the output of a generator command (`/drawio`, `/pptx`) to a file.
 ///
@@ -1464,68 +1378,7 @@ fn save_generator_output(output_type: &OutputType, content: &str, state: &mut Ap
 /// Maximum visual rows the input field grows to before it scrolls internally.
 const INPUT_MAX_ROWS: u16 = 6;
 
-/// Character-wraps `text` (honouring embedded `'\n'`) to `width` columns and
-/// returns the visual rows. A plain column wrap — no word boundaries — matching
-/// the fixed-width input echo, so the field's height and the cursor's row can be
-/// computed the same way ratatui will render it. `width` is clamped to ≥1.
-fn wrap_input_rows(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut rows = Vec::new();
-    for logical in text.split('\n') {
-        let mut cur = String::new();
-        let mut cur_w = 0usize;
-        for ch in logical.chars() {
-            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            if cur_w + cw > width && !cur.is_empty() {
-                rows.push(std::mem::take(&mut cur));
-                cur_w = 0;
-            }
-            cur.push(ch);
-            cur_w += cw;
-        }
-        rows.push(cur);
-    }
-    if rows.is_empty() {
-        rows.push(String::new());
-    }
-    rows
-}
-
-fn prev_char_boundary(s: &str, pos: usize) -> usize {
-    let mut p = pos;
-    while p > 0 && !s.is_char_boundary(p) {
-        p -= 1;
-    }
-    p.saturating_sub(s[..p].chars().next_back().map_or(0, char::len_utf8))
-}
-
-fn next_char_boundary(s: &str, pos: usize) -> usize {
-    let mut p = pos;
-    while p < s.len() && !s.is_char_boundary(p) {
-        p += 1;
-    }
-    if p < s.len() {
-        p + s[p..].chars().next().map_or(0, char::len_utf8)
-    } else {
-        p
-    }
-}
-
-/// Searches `history` backwards for the most recent entry containing `query`.
-///
-/// Returns `(index, matched_text)` on success.  An empty `query` always returns `None`.
-#[must_use]
-fn history_search<'a>(history: &'a [String], query: &str) -> Option<(usize, &'a str)> {
-    if query.is_empty() {
-        return None;
-    }
-    history
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, s)| s.contains(query))
-        .map(|(i, s)| (i, s.as_str()))
-}
+use formatting::{history_search, next_char_boundary, prev_char_boundary, wrap_input_rows};
 
 fn accept_slash_completion(state: &mut AppState, append_space: bool) -> bool {
     let Some(completion) = state.slash_completions.get(state.slash_cursor).cloned() else {
@@ -2479,7 +2332,7 @@ async fn handle_key(
                 let msg = if key.trim().is_empty() {
                     "login: empty key — cancelled".to_owned()
                 } else {
-                    save_secret(&var, key.trim())
+                    secrets::save_secret(&var, key.trim())
                 };
                 push_system_message(state, msg);
                 return Ok(());
