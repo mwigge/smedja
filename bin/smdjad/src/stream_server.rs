@@ -52,15 +52,25 @@ pub type DeltaStore = Arc<Mutex<HashMap<String, VecDeque<String>>>>;
 /// marker exists at the front, one is inserted (consuming another slot so
 /// the total never exceeds `MAX_BUFFER_PER_TURN`).
 fn evict_and_push(buf: &mut std::collections::VecDeque<String>, line: String) {
-    if buf.len() >= MAX_BUFFER_PER_TURN {
-        buf.pop_front();
-        let needs_overflow = buf.front().is_none_or(|l| !l.contains("buffer_overflow"));
-        if needs_overflow {
-            // Pop one more to make room for the overflow marker so total stays ≤ cap.
-            buf.pop_front();
-            let overflow = serde_json::json!({"type":"buffer_overflow","lost":1}).to_string();
-            buf.push_front(overflow);
+    if buf.len() < MAX_BUFFER_PER_TURN {
+        buf.push_back(line);
+        return;
+    }
+    buf.pop_front();
+    if let Some(marker) = buf
+        .front_mut()
+        .filter(|l| l.contains("\"buffer_overflow\""))
+    {
+        // Increment the existing lost counter so repeated overflow is accurately tracked.
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(marker) {
+            let lost = v["lost"].as_u64().unwrap_or(1) + 1;
+            v["lost"] = serde_json::json!(lost);
+            *marker = v.to_string();
         }
+    } else {
+        // No marker yet — pop one more slot so total stays ≤ cap, then insert.
+        buf.pop_front();
+        buf.push_front(serde_json::json!({"type":"buffer_overflow","lost":1}).to_string());
     }
     buf.push_back(line);
 }
