@@ -790,6 +790,21 @@ pub(crate) async fn submit(input: &str, state: &mut AppState, client: &mut Clien
             let tid = task_id.clone();
             tokio::spawn(start_stream_reader(sock, tid, tx));
 
+            // Dim provider hint — visible immediately while the turn is in flight,
+            // before the first token arrives.
+            {
+                let p = palette();
+                let label = theme::runner_label(&state.runner).to_lowercase();
+                let model_part = state
+                    .model
+                    .as_deref()
+                    .map_or_else(String::new, |m| format!(" · {m}"));
+                state.main_panel.push_styled_line(Line::from(Span::styled(
+                    format!("↪ {label}{model_part}"),
+                    Style::default().fg(p.text_dim),
+                )));
+            }
+
             // "queued" is operational noise — route it to the actions log, not
             // the message box (keeps the conversation clean). Lead with the
             // session id (same 12-char form as the session rail) so the queued
