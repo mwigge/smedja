@@ -114,6 +114,7 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
         };
 
         let stderr = child.stderr.take();
+        let mut had_output = false;
         if let Some(stdout) = child.stdout.take() {
             use tokio::io::AsyncBufReadExt as _;
             let mut lines = tokio::io::BufReader::new(stdout).lines();
@@ -121,6 +122,7 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
                         if let Some(delta) = parse_codex_line(&line) {
+                            had_output = true;
                             if tx.send(Ok(delta)).await.is_err() {
                                 break;
                             }
@@ -136,7 +138,20 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
         }
 
         match child.wait().await {
-            Ok(status) if status.success() => {}
+            Ok(status) if status.success() => {
+                // codex exited cleanly but produced no output — surface stderr
+                // so the user knows something went wrong (auth failure, unsupported
+                // model, network error, etc.) rather than seeing a silent idle.
+                if !had_output {
+                    let stderr_text = read_stderr(stderr).await;
+                    let detail = if stderr_text.trim().is_empty() {
+                        "codex returned no output (check auth and model name)".to_owned()
+                    } else {
+                        format!("codex returned no output: {}", stderr_text.trim())
+                    };
+                    let _ = tx.send(Err(AdapterError::Request(detail))).await;
+                }
+            }
             Ok(status) => {
                 let stderr_text = read_stderr(stderr).await;
                 let detail = if stderr_text.trim().is_empty() {
@@ -556,6 +571,36 @@ mod tests {
         assert!(
             output.contains("-m") && output.contains("o3-mini"),
             "expected '-m o3-mini' in args; got: {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn empty_output_surfaces_error_not_silent_idle() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("smedja-codex-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Exits 0 but produces no stdout — simulates auth failure / unsupported model.
+        make_mock_codex(&tmp, "#!/bin/sh\nexit 0\n");
+
+        let old = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old}", tmp.display()));
+
+        let provider = CodexCliProvider::Cli;
+        let mut stream = provider.stream_chat(&[user_msg("hi")], &base_opts(None));
+        let mut got_error = false;
+        while let Some(item) = stream.next().await {
+            if item.is_err() {
+                got_error = true;
+            }
+        }
+
+        std::env::set_var("PATH", old);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            got_error,
+            "expected an error delta when codex exits 0 with no output"
         );
     }
 }
