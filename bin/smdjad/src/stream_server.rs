@@ -430,10 +430,14 @@ fn turn_event_to_ndjson(
             let line = json!({"type": "error", "message": reason}).to_string();
             (Some(turn_id.clone()), line, true)
         }
-        TurnEvent::Started { correlation, .. } => {
+        TurnEvent::Started {
+            turn_id,
+            correlation,
+            ..
+        } => {
             if let Some(ref name) = correlation.agent_name {
                 let line = json!({"type": "started", "agent_name": name}).to_string();
-                (None, line, false)
+                (Some(turn_id.clone()), line, false)
             } else {
                 (None, String::new(), false)
             }
