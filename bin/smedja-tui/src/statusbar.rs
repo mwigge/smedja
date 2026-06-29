@@ -9,6 +9,8 @@ pub struct ModuleCtx<'a> {
     pub pending: bool,
     /// True when the input bar is active (not in scroll/normal mode).
     pub input_mode: bool,
+    /// Context window fill percentage (0–100), shown as a gauge chip when present.
+    pub ctx_pct: Option<u8>,
 }
 
 /// A single status bar segment.
@@ -155,6 +157,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: false,
+            ctx_pct: None,
         };
         let bar = render_status_bar(&ctx);
         assert!(bar.contains("[deep]"));
@@ -170,6 +173,7 @@ mod tests {
             runner: None,
             pending: true,
             input_mode: false,
+            ctx_pct: None,
         };
         assert!(render_status_bar(&ctx).contains('\u{27f3}'));
     }
@@ -183,6 +187,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: false,
+            ctx_pct: None,
         };
         assert!(!render_status_bar(&ctx).contains('\u{27f3}'));
     }
@@ -199,6 +204,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: false,
+            ctx_pct: None,
         };
         let _ = render_status_bar_with_timeout(&ctx, 0);
     }
@@ -213,6 +219,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: false,
+            ctx_pct: None,
         };
         let config = StatusBarConfig {
             format: Some("{tier} {mode}".into()),
@@ -235,6 +242,7 @@ mod tests {
             runner: Some("claude-sonnet"),
             pending: false,
             input_mode: false,
+            ctx_pct: None,
         };
         let bar = render_status_bar(&ctx);
         assert!(
@@ -252,6 +260,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: false,
+            ctx_pct: None,
         };
         let bar = render_status_bar(&ctx);
         assert!(
@@ -269,6 +278,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: false,
+            ctx_pct: None,
         };
         // Request session before tier.
         let config = StatusBarConfig {
@@ -292,6 +302,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: true,
+            ctx_pct: None,
         };
         let ctx_n = ModuleCtx {
             session_id: "x",
@@ -300,6 +311,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: false,
+            ctx_pct: None,
         };
         assert_eq!(segment_input_mode(&ctx_i), "[I]");
         assert_eq!(segment_input_mode(&ctx_n), "[N]");
@@ -314,6 +326,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: true,
+            ctx_pct: None,
         };
         let bar = render_status_bar(&ctx);
         assert!(
