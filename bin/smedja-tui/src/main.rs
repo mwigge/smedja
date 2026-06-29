@@ -1091,7 +1091,8 @@ fn status_bar_line(ctx: &ModuleCtx<'_>, no_color: bool) -> Line<'static> {
     }
     if let Some(mode) = ctx.mode {
         spans.push(sep());
-        spans.push(chip(mode.to_owned(), p.text, false));
+        let mc = crate::theme::agent_color(mode);
+        spans.push(chip(mode.to_owned(), mc, false));
     }
     spans.push(sep());
     spans.push(chip(
@@ -3231,6 +3232,14 @@ fn render_role_cockpit(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, 
                     .fg(p.text_bright)
                     .add_modifier(Modifier::BOLD),
             ),
+        ]),
+        Line::from(vec![
+            Span::styled("mode  ", Style::default().fg(p.text_dim)),
+            Span::styled(
+                "\u{25C6} ",
+                Style::default().fg(crate::theme::agent_color(mode)),
+            ),
+            Span::styled(mode.to_owned(), Style::default().fg(p.text_bright)),
         ]),
         Line::from(vec![
             Span::styled("turn  ", Style::default().fg(p.text_dim)),
