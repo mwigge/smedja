@@ -127,6 +127,34 @@ pub fn model_default(runner_name: &str, tier: Tier, builtin: &str) -> String {
         .unwrap_or_else(|| builtin.to_owned())
 }
 
+/// Returns the preferred runner name for Claude given availability.
+/// Native API wins over subprocess binary — API key users get native HTTP
+/// without needing the `claude` CLI binary installed.
+#[cfg(test)]
+pub(crate) fn claude_preferred_runner(has_api_key: bool, has_binary: bool) -> Option<&'static str> {
+    if has_api_key {
+        Some("anthropic")
+    } else if has_binary {
+        Some("claude-cli")
+    } else {
+        None
+    }
+}
+
+/// Returns the preferred runner name for Codex given availability.
+/// Native API wins over subprocess binary — API key users get native HTTP
+/// without needing the `codex` CLI binary installed.
+#[cfg(test)]
+pub(crate) fn codex_preferred_runner(has_api_key: bool, has_binary: bool) -> Option<&'static str> {
+    if has_api_key {
+        Some("openai")
+    } else if has_binary {
+        Some("codex-cli")
+    } else {
+        None
+    }
+}
+
 /// Map from `(Runner, Tier)` to a concrete provider instance.
 ///
 /// Built once at daemon start-up; shared across all concurrent turns via
@@ -390,31 +418,10 @@ pub async fn build_provider_pool() -> ProviderPool {
         }};
     }
 
-    // 1. Claude CLI (subscription — no API key)
+    // 1. Claude — native API preferred; CLI binary is the fallback for
+    //    subscription users without an ANTHROPIC_API_KEY.
     let anthropic_key = std::env::var("ANTHROPIC_API_KEY").ok();
-    if let Some(p) = ClaudeCliProvider::detect(None) {
-        if SubprocessProvider::available("claude") {
-            // Re-detect a second instance for the Deep tier.
-            let p_deep = ClaudeCliProvider::detect(None);
-            add!(
-                Runner::Claude,
-                Tier::Fast,
-                p,
-                "claude-cli",
-                "claude-haiku-4-5-20251001"
-            );
-            if let Some(pd) = p_deep {
-                add!(
-                    Runner::Claude,
-                    Tier::Deep,
-                    pd,
-                    "claude-cli",
-                    "claude-opus-4-8"
-                );
-            }
-            info!(runner = "claude-cli", "provider ready");
-        }
-    } else if let Some(key) = anthropic_key {
+    if let Some(key) = anthropic_key {
         let p_fast = AnthropicProvider::new(key.clone());
         let p_deep = AnthropicProvider::new(key);
         add!(
@@ -432,26 +439,46 @@ pub async fn build_provider_pool() -> ProviderPool {
             "claude-sonnet-4-6"
         );
         info!(runner = "anthropic", "provider ready");
+    } else if SubprocessProvider::available("claude") {
+        let p = ClaudeCliProvider::detect(None).expect("claude binary just confirmed available");
+        let p_deep = ClaudeCliProvider::detect(None);
+        add!(
+            Runner::Claude,
+            Tier::Fast,
+            p,
+            "claude-cli",
+            "claude-haiku-4-5-20251001"
+        );
+        if let Some(pd) = p_deep {
+            add!(
+                Runner::Claude,
+                Tier::Deep,
+                pd,
+                "claude-cli",
+                "claude-opus-4-8"
+            );
+        }
+        info!(runner = "claude-cli", "provider ready");
     } else {
         warn!(
             runner = "claude",
-            "UNAVAILABLE — no claude binary and no ANTHROPIC_API_KEY"
+            "UNAVAILABLE — no ANTHROPIC_API_KEY and no claude binary"
         );
     }
 
-    // 2. Codex CLI
-    if SubprocessProvider::available("codex") {
-        let p_fast = CodexCliProvider::detect(None).expect("codex binary just checked");
-        add!(Runner::Codex, Tier::Fast, p_fast, "codex-cli", "gpt-5.5");
-        info!(runner = "codex-cli", "provider ready");
-    } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+    // 2. Codex/OpenAI — native API preferred; CLI binary is the fallback.
+    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         let p = OpenAiProvider::new("https://api.openai.com", key);
         add!(Runner::Codex, Tier::Fast, p, "openai", "gpt-5.5");
         info!(runner = "openai", "provider ready");
+    } else if SubprocessProvider::available("codex") {
+        let p_fast = CodexCliProvider::detect(None).expect("codex binary just confirmed available");
+        add!(Runner::Codex, Tier::Fast, p_fast, "codex-cli", "gpt-5.5");
+        info!(runner = "codex-cli", "provider ready");
     } else {
         warn!(
             runner = "codex",
-            "UNAVAILABLE — no codex binary and no OPENAI_API_KEY"
+            "UNAVAILABLE — no OPENAI_API_KEY and no codex binary"
         );
     }
 
@@ -853,5 +880,45 @@ mod tests {
         // Routed deep entry only; the fast entry is less capable and excluded.
         // The default (claude-fast) is incompatible so it is not appended.
         assert_eq!(ring.len(), 1, "deep route must exclude the fast entry");
+    }
+
+    #[test]
+    fn native_api_preferred_over_subprocess_for_claude() {
+        assert_eq!(
+            claude_preferred_runner(true, true),
+            Some("anthropic"),
+            "API key wins over binary"
+        );
+        assert_eq!(
+            claude_preferred_runner(false, true),
+            Some("claude-cli"),
+            "binary used when no key"
+        );
+        assert_eq!(
+            claude_preferred_runner(true, false),
+            Some("anthropic"),
+            "key works without binary"
+        );
+        assert_eq!(claude_preferred_runner(false, false), None);
+    }
+
+    #[test]
+    fn native_api_preferred_over_subprocess_for_codex() {
+        assert_eq!(
+            codex_preferred_runner(true, true),
+            Some("openai"),
+            "API key wins over binary"
+        );
+        assert_eq!(
+            codex_preferred_runner(false, true),
+            Some("codex-cli"),
+            "binary used when no key"
+        );
+        assert_eq!(
+            codex_preferred_runner(true, false),
+            Some("openai"),
+            "key works without binary"
+        );
+        assert_eq!(codex_preferred_runner(false, false), None);
     }
 }
