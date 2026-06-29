@@ -186,6 +186,10 @@ const SLASH_COMMAND_DESCRIPTIONS: &[(&str, &str)] = &[
     ("/agent", "run named agent"),
     ("/approve", "approve a cowork item"),
     ("/briefing", "show session briefing"),
+    (
+        "/capabilities",
+        "list provider capabilities (thinking, subprocess, model)",
+    ),
     ("/clear", "clear message display"),
     ("/cowork", "toggle cowork approval mode"),
     ("/drawio", "generate draw.io diagram"),
@@ -220,6 +224,7 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/agent",
     "/approve",
     "/briefing",
+    "/capabilities",
     "/clear",
     "/cowork",
     "/drawio",
@@ -1123,6 +1128,51 @@ fn status_bar_line(ctx: &ModuleCtx<'_>, no_color: bool) -> Line<'static> {
         spans.push(chip("  ⟳".to_owned(), p.accent, true));
     }
     Line::from(spans)
+}
+
+/// Returns `true` when `runner` supports extended thinking tokens.
+fn runner_supports_thinking(runner: &str) -> bool {
+    matches!(runner, "anthropic")
+}
+
+/// Returns `true` when `runner` is a subprocess CLI wrapper rather than a
+/// native HTTP provider.
+fn runner_is_subprocess(runner: &str) -> bool {
+    matches!(runner, "claude-cli" | "codex-cli")
+}
+
+/// Formats a capability table from a `runner.list` response array.
+///
+/// Each row shows runner name, tier, model, and derived capability flags
+/// (thinking support, subprocess mode).
+fn format_capabilities_table(runners: &[serde_json::Value]) -> String {
+    if runners.is_empty() {
+        return "no runners available".to_owned();
+    }
+    let mut lines = vec![format!(
+        "{:<16} {:<8} {:<8} {:<36}",
+        "runner", "tier", "flags", "model"
+    )];
+    lines.push("-".repeat(72));
+    for r in runners {
+        let name = r.get("runner").and_then(|v| v.as_str()).unwrap_or("?");
+        let tier = r.get("tier").and_then(|v| v.as_str()).unwrap_or("-");
+        let model = r.get("model").and_then(|v| v.as_str()).unwrap_or("-");
+        let mut flags: Vec<&str> = Vec::new();
+        if runner_supports_thinking(name) {
+            flags.push("thinking");
+        }
+        if runner_is_subprocess(name) {
+            flags.push("subprocess");
+        }
+        let flag_str = if flags.is_empty() {
+            "-".to_owned()
+        } else {
+            flags.join(",")
+        };
+        lines.push(format!("{name:<16} {tier:<8} {flag_str:<8} {model}"));
+    }
+    lines.join("\n")
 }
 
 /// A dim, right-aligned discoverability hint for the status row — surfaces the
@@ -2554,6 +2604,24 @@ async fn handle_key(
                 let msg = Message {
                     role: Role::System,
                     text: "SRE mode activated (tier: deep)".into(),
+                };
+                state.main_panel.push_line(msg.text.clone());
+                state.messages.push(msg);
+            } else if input.trim() == "/capabilities" {
+                let text = match client.call("runner.list", json!({})).await {
+                    Ok(v) => {
+                        let runners = v
+                            .get("runners")
+                            .and_then(|r| r.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        format_capabilities_table(&runners)
+                    }
+                    Err(e) => format!("capabilities: error — {e}"),
+                };
+                let msg = Message {
+                    role: Role::System,
+                    text,
                 };
                 state.main_panel.push_line(msg.text.clone());
                 state.messages.push(msg);
@@ -4965,6 +5033,28 @@ mod tests {
             }
         }
         assert_eq!(history.len(), PROMPT_HISTORY_CAP);
+    }
+
+    #[test]
+    fn runner_capability_flags_for_known_runners() {
+        assert!(runner_supports_thinking("anthropic"));
+        assert!(!runner_supports_thinking("claude-cli"));
+        assert!(!runner_supports_thinking("openai"));
+        assert!(runner_is_subprocess("claude-cli"));
+        assert!(runner_is_subprocess("codex-cli"));
+        assert!(!runner_is_subprocess("anthropic"));
+    }
+
+    #[test]
+    fn format_capabilities_table_lists_runners() {
+        let runners = vec![
+            serde_json::json!({ "runner": "anthropic", "tier": "fast", "model": "claude-haiku-4-5-20251001" }),
+            serde_json::json!({ "runner": "claude-cli", "tier": "fast", "model": "claude-opus" }),
+        ];
+        let table = format_capabilities_table(&runners);
+        assert!(table.contains("anthropic"), "{table}");
+        assert!(table.contains("thinking"), "{table}");
+        assert!(table.contains("subprocess"), "{table}");
     }
 
     #[test]
