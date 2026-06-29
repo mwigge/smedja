@@ -10,6 +10,7 @@ mod lsp_panel;
 pub mod main_panel;
 mod metrics_view;
 mod obs_panel;
+mod plan_panel;
 mod quality_panel;
 pub(crate) mod slash;
 mod staging;
@@ -573,6 +574,9 @@ pub(crate) struct AppState {
     obs_snapshot: obs_panel::ObsSnapshot,
     /// Quality gate snapshot — updated on each `TurnEvent::QualitySnapshot`.
     quality_snapshot: quality_panel::QualitySnapshot,
+    /// Plan steps extracted from the current turn's streaming response.
+    /// Reset at the start of each new turn.
+    plan_steps: Vec<String>,
     /// Consecutive turns with quality score < 60 (resets on score ≥ 60).
     consecutive_low_quality: u8,
     /// Value / ROI snapshot — updated on the obs poll cadence.
@@ -820,6 +824,7 @@ pub(crate) async fn submit(input: &str, state: &mut AppState, client: &mut Clien
             state.current_thinking.clear();
             state.thinking_expanded = false;
             state.active_agent_name = None;
+            state.plan_steps.clear();
 
             // Start streaming reader; events arrive via unbounded channel.
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -3134,6 +3139,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         let show_obs = state.panels.obs;
         let show_quality = state.panels.quality;
         let show_value = state.panels.value;
+        let show_plan = state.plan_steps.len() >= 2;
 
         // Build constraint list dynamically so Layout never gets zero-length.
         let mut constraints: Vec<Constraint> = vec![];
@@ -3162,6 +3168,9 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         }
         if show_obs {
             constraints.push(Length(6));
+        }
+        if show_plan {
+            constraints.push(Length(plan_panel::panel_height(state.plan_steps.len())));
         }
         if show_quality {
             constraints.push(Length(8));
@@ -3212,6 +3221,12 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         // ── Observability panel ───────────────────────────────────────────
         if show_obs && ci < rail_chunks.len() {
             obs_panel::ObsPanel::new(&state.obs_snapshot).render(rail_chunks[ci], frame);
+            ci += 1;
+        }
+
+        // ── Plan step tracker ─────────────────────────────────────────────
+        if show_plan && ci < rail_chunks.len() {
+            plan_panel::PlanPanel::new(&state.plan_steps).render(rail_chunks[ci], frame);
             ci += 1;
         }
 
@@ -3834,6 +3849,7 @@ async fn main() -> Result<()> {
         lsp_snapshot: smedja_lsp::LspSnapshot::default(),
         obs_snapshot: obs_panel::ObsSnapshot::default(),
         quality_snapshot: quality_panel::QualitySnapshot::default(),
+        plan_steps: Vec::new(),
         consecutive_low_quality: 0,
         quality_review_in_progress: false,
         ctrl_q_pressed_at: None,
@@ -4123,6 +4139,14 @@ async fn main() -> Result<()> {
                                 }
                                 break;
                             }
+                        }
+                        // Scan accumulated turn text for new numbered plan steps.
+                        if let Some(ref block) = state.current_block {
+                            let new = plan_panel::extract_new_steps(
+                                &block.content,
+                                state.plan_steps.len(),
+                            );
+                            state.plan_steps.extend(new);
                         }
                     }
                     StreamEvent::Started { agent_name } => {
@@ -5965,6 +5989,7 @@ mod tests {
             lsp_snapshot: smedja_lsp::LspSnapshot::default(),
             obs_snapshot: obs_panel::ObsSnapshot::default(),
             quality_snapshot: quality_panel::QualitySnapshot::default(),
+            plan_steps: Vec::new(),
             consecutive_low_quality: 0,
             quality_review_in_progress: false,
             ctrl_q_pressed_at: None,
