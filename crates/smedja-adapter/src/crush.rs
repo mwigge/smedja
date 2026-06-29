@@ -3,7 +3,7 @@
 //! This module provides three compressors that shrink context content before
 //! it is serialised into an outbound LLM request:
 //!
-//! - [`compress_tool_result`] — strips JSON null fields recursively.
+//! - [`compress_tool_result`] — strips JSON null and empty-array fields recursively.
 //! - [`compress_command_output`] — removes known-noisy lines per command type.
 //! - [`trim_code_block`] — truncates long code blocks to first 20 lines.
 //!
@@ -24,7 +24,7 @@ fn bypass_enabled() -> bool {
 
 // ── Task 51 — SmartCrusher ───────────────────────────────────────────────────
 
-/// Strips JSON null fields recursively from a serialised JSON string.
+/// Strips JSON null and empty-array fields recursively from a serialised JSON string.
 ///
 /// Non-JSON input is returned unchanged.  Honouring `SMEDJA_NO_TOOL_COMPRESS=1`
 /// bypasses all processing and returns the content as-is.
@@ -38,23 +38,25 @@ pub fn compress_tool_result(content: &str) -> String {
         return content.to_owned();
     };
 
-    let stripped = strip_nulls(value);
+    let stripped = strip_nulls_and_empty_arrays(value);
     serde_json::to_string(&stripped).unwrap_or_else(|_| content.to_owned())
 }
 
-/// Recursively removes all JSON null fields from an object or array.
-fn strip_nulls(value: serde_json::Value) -> serde_json::Value {
+/// Recursively removes all JSON null and empty-array fields from an object or array.
+fn strip_nulls_and_empty_arrays(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
             let filtered = map
                 .into_iter()
-                .filter(|(_, v)| !v.is_null())
-                .map(|(k, v)| (k, strip_nulls(v)))
+                .filter(|(_, v)| {
+                    !v.is_null() && !matches!(v, serde_json::Value::Array(arr) if arr.is_empty())
+                })
+                .map(|(k, v)| (k, strip_nulls_and_empty_arrays(v)))
                 .collect();
             serde_json::Value::Object(filtered)
         }
         serde_json::Value::Array(arr) => {
-            let filtered = arr.into_iter().map(strip_nulls).collect();
+            let filtered = arr.into_iter().map(strip_nulls_and_empty_arrays).collect();
             serde_json::Value::Array(filtered)
         }
         other => other,
@@ -636,6 +638,18 @@ mod tests {
         assert_eq!(v["outer"]["y"], 42);
         assert!(v["arr"][0].get("z").is_none());
         assert_eq!(v["arr"][0]["w"], 1);
+    }
+
+    #[test]
+    fn strips_empty_array_fields() {
+        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        let input = r#"{"keep":1,"drop":[],"nested":{"also_drop":[],"keep":"value"}}"#;
+        let output = compress_tool_result(input);
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(v.get("drop").is_none(), "empty array field must be removed");
+        assert!(v["nested"].get("also_drop").is_none());
+        assert_eq!(v["keep"], 1);
+        assert_eq!(v["nested"]["keep"], "value");
     }
 
     #[test]

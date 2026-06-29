@@ -1,0 +1,37 @@
+# Workspace-local routing overrides for smedja agent roles.
+#
+# The assayer reads this file as TOML from `.smedja/agents.toml`.
+# Supported role names:
+#   impl, code, plan, research, debug, ask, test, review, sre,
+#   data, sql, iac, infra, orchestrator
+#
+# Supported runners in this file:
+#   claude, local, codex, copilot
+#
+# Supported tiers:
+#   local, fast, deep
+#
+# Each role may set:
+#   runner = "<runner>"
+#   tier   = "<tier>"
+#   model  = "<optional model override>"
+#   tools  = ["<tool name>", ...]  # empty or omitted means all tools are allowed
+
+# Example: route implementation work to a local model.
+#[roles.impl]
+#runner = "local"
+#tier = "local"
+#model = "replace-with-local-model-name"
+#tools = ["read_file", "edit_file", "bash"]
+
+# Example: keep reviews on a stronger read-oriented runner.
+#[roles.review]
+#runner = "claude"
+#tier = "deep"
+#tools = ["read_file", "graph_query"]
+
+# Example: route observability work to a cloud runner with monitoring tools.
+#[roles.sre]
+#runner = "claude"
+#tier = "deep"
+#tools = ["read_file", "otel_query", "metric_query", "log_tail"]
