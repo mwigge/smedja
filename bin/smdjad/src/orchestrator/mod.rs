@@ -22,7 +22,7 @@ use smedja_bellows::{Dispatcher, TurnEvent};
 use smedja_ingot::{Checkpoint, CostEntry, IngotHandle, TokenSnapshot, TokensSavedEntry};
 use smedja_memory::{estimate_messages_tokens, estimate_tokens, inject_conciseness, WorkingMemory};
 use smedja_types::{Microdollars, Timestamp};
-use smedja_vault::Vault;
+use smedja_vault::{Vault, VaultEntry};
 use tokio::sync::Mutex;
 use tracing::warn;
 use uuid::Uuid;
@@ -701,6 +701,29 @@ impl TurnOrchestrator {
                 let _ = write!(content, "\n\n{diag_block}");
             }
             content
+        };
+
+        // Proactive vault recall: search the "default" namespace for entries
+        // semantically similar to the user's query and prepend them to the user
+        // turn, so the model sees relevant notes without needing a tool call.
+        let first_user_content = {
+            let q = embedder.embed_query(&task.title).await;
+            let mid = embedder.model_id().to_owned();
+            let d = embedder.dim();
+            let v = Arc::clone(vault);
+            let t = task.title.clone();
+            let entries = tokio::task::spawn_blocking(move || {
+                v.blocking_lock()
+                    .search(&q, &t, "default", 3, &mid, d)
+                    .unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default();
+            tracing::debug!(smedja.turn.vault_recalled = entries.len(), "vault recall");
+            match format_vault_recalled(&entries) {
+                Some(block) => format!("{block}\n\n{first_user_content}"),
+                None => first_user_content,
+            }
         };
 
         // 4a. Cold recall: pull semantically-relevant context from beyond the
@@ -1609,6 +1632,20 @@ impl TurnOrchestrator {
     }
 }
 
+/// Formats vault recall results as a `<recalled_context>` XML block for injection
+/// into the user turn. Returns `None` when `entries` is empty.
+fn format_vault_recalled(entries: &[VaultEntry]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let body = entries
+        .iter()
+        .map(|e| e.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+    Some(format!("<recalled_context>\n{body}\n</recalled_context>"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2363,5 +2400,47 @@ mod tests {
     #[test]
     fn pressure_with_zero_window_is_never_exceeded() {
         assert!(!super::context_pressure_exceeds_threshold(1_000, 0));
+    }
+
+    // --- format_vault_recalled tests ---
+
+    fn make_vault_entry(content: &str) -> smedja_vault::VaultEntry {
+        smedja_vault::VaultEntry {
+            id: "test-id".into(),
+            embedding: vec![0.1; 128],
+            payload: serde_json::Value::Null,
+            namespace: "default".into(),
+            content: content.into(),
+            source_file: None,
+            added_by: None,
+            chunk_index: None,
+            parent_id: None,
+            created_at: 0.0,
+            embedder_model_id: "fnv-bow-128".into(),
+            dim: 128,
+        }
+    }
+
+    #[test]
+    fn format_vault_recalled_empty_returns_none() {
+        assert!(super::format_vault_recalled(&[]).is_none());
+    }
+
+    #[test]
+    fn format_vault_recalled_single_entry_wraps_in_xml() {
+        let entries = vec![make_vault_entry("the auth token expires after 24 hours")];
+        let result = super::format_vault_recalled(&entries).unwrap();
+        assert!(result.starts_with("<recalled_context>"));
+        assert!(result.contains("auth token expires after 24 hours"));
+        assert!(result.ends_with("</recalled_context>"));
+    }
+
+    #[test]
+    fn format_vault_recalled_multiple_entries_joined_with_separator() {
+        let entries = vec![make_vault_entry("note one"), make_vault_entry("note two")];
+        let result = super::format_vault_recalled(&entries).unwrap();
+        assert!(result.contains("note one"));
+        assert!(result.contains("note two"));
+        assert!(result.contains("---"));
     }
 }
