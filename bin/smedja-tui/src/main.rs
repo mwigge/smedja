@@ -1,8 +1,11 @@
 pub mod action_log;
 mod blocks;
+mod clipboard;
 pub mod code_widget;
 mod context_rail;
 mod cowork_widget;
+mod editor;
+mod governance;
 mod lsp_panel;
 pub mod main_panel;
 mod metrics_view;
@@ -11,7 +14,9 @@ mod quality_panel;
 pub(crate) mod slash;
 mod staging;
 mod statusbar;
+mod terminal_guard;
 pub mod theme;
+mod upgrade;
 mod value_panel;
 
 // Re-export slash module items so that `use super::*` in the test module
@@ -22,6 +27,27 @@ mod value_panel;
 pub(crate) use slash::{
     apply_agent, apply_tier, dispatch_slash, format_agents_table, format_approvals_list,
     format_local_model_list, format_metrics, format_model_list,
+};
+
+// Re-export extracted module items so callers (slash.rs, tests) see them
+// at the crate root unchanged.
+#[allow(unused_imports)]
+pub(crate) use clipboard::{
+    emit_osc9, osc9_turn_complete_bytes, paste_from_clipboard, push_kill, yank_to_clipboard,
+};
+#[allow(unused_imports)]
+pub(crate) use editor::{open_in_editor, resolve_editor};
+#[allow(unused_imports)]
+pub(crate) use governance::{
+    detect_project_types, format_gov_list, gov_create, gov_transition, scan_gov_artifacts,
+    GovArtifact,
+};
+#[allow(unused_imports)]
+pub(crate) use terminal_guard::TerminalGuard;
+#[allow(unused_imports)]
+pub(crate) use upgrade::{
+    fetch_latest_version, format_openspec_list, format_openspec_status, is_newer, run_openspec,
+    run_upgrade, VERSION,
 };
 
 use std::collections::VecDeque;
@@ -35,13 +61,10 @@ use crate::theme::{palette, runner_color, runner_label};
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, MouseEventKind, PushKeyboardEnhancementFlags,
 };
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
 use crossterm::{event, execute};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -1534,389 +1557,6 @@ fn next_char_boundary(s: &str, pos: usize) -> usize {
     } else {
         p
     }
-}
-
-/// Writes `lines` to the system clipboard.
-///
-/// Tries clipboard tools in order: `pbcopy` (macOS), `wl-copy` (Wayland),
-/// `xclip` (X11), `xsel` (X11 fallback). Returns the tool name on success,
-/// or an error string describing what was tried so the caller can surface it.
-fn yank_to_clipboard(lines: &[String]) -> Result<&'static str, String> {
-    use std::io::Write as _;
-    let text = lines.join("\n");
-
-    let candidates: &[(&str, &[&str])] = &[
-        #[cfg(target_os = "macos")]
-        ("pbcopy", &[]),
-        #[cfg(not(target_os = "macos"))]
-        ("wl-copy", &[]),
-        #[cfg(not(target_os = "macos"))]
-        ("xclip", &["-selection", "clipboard"]),
-        #[cfg(not(target_os = "macos"))]
-        ("xsel", &["--clipboard", "--input"]),
-    ];
-
-    for (bin, args) in candidates {
-        let result = std::process::Command::new(bin)
-            .args(*args)
-            .stdin(std::process::Stdio::piped())
-            .spawn();
-        if let Ok(mut child) = result {
-            let write_ok = child
-                .stdin
-                .take()
-                .is_none_or(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
-            if write_ok {
-                // Reap the child in a background thread so we don't block
-                // the TUI event loop (clipboard tools like wl-copy stay
-                // alive serving paste requests until another owner takes over).
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
-                return Ok(bin);
-            }
-        }
-    }
-
-    let tried: Vec<&str> = candidates.iter().map(|(b, _)| *b).collect();
-    Err(format!(
-        "clipboard unavailable — install one of: {}",
-        tried.join(", ")
-    ))
-}
-
-/// Reads text from the system clipboard using wl-paste (Wayland) or xclip/xsel (X11).
-fn paste_from_clipboard() -> Option<String> {
-    use std::process::Command;
-
-    #[cfg(target_os = "macos")]
-    {
-        let out = Command::new("pbpaste").output().ok()?;
-        if out.status.success() {
-            return Some(String::from_utf8_lossy(&out.stdout).into_owned());
-        }
-        return None;
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        if std::env::var("WAYLAND_DISPLAY").is_ok() {
-            let out = Command::new("wl-paste").arg("--no-newline").output().ok()?;
-            if out.status.success() {
-                return Some(String::from_utf8_lossy(&out.stdout).into_owned());
-            }
-        }
-        // X11 fallbacks
-        if let Ok(out) = Command::new("xclip")
-            .args(["-selection", "clipboard", "-o"])
-            .output()
-        {
-            if out.status.success() {
-                return Some(String::from_utf8_lossy(&out.stdout).into_owned());
-            }
-        }
-        if let Ok(out) = Command::new("xsel")
-            .args(["--clipboard", "--output"])
-            .output()
-        {
-            if out.status.success() {
-                return Some(String::from_utf8_lossy(&out.stdout).into_owned());
-            }
-        }
-        None
-    }
-}
-
-/// Returns the OSC-9 turn-complete notification byte sequence.
-///
-/// Supported by Windows Terminal, iTerm2, and any OSC-9-capable terminal.
-/// Silently ignored by terminals that do not implement OSC 9.
-fn osc9_turn_complete_bytes() -> &'static [u8] {
-    b"\x1b]9;turn complete\x07"
-}
-
-/// Writes the OSC-9 turn-complete notification to `w`.
-fn emit_osc9(w: &mut impl std::io::Write) -> std::io::Result<()> {
-    w.write_all(osc9_turn_complete_bytes())
-}
-
-/// Pushes `text` onto the kill ring, evicting the oldest entry when the ring
-/// is at capacity (16 entries).
-fn push_kill(ring: &mut VecDeque<String>, text: String) {
-    if ring.len() >= 16 {
-        ring.pop_front();
-    }
-    ring.push_back(text);
-}
-
-/// Resolves the editor binary to use for Ctrl-G composition.
-///
-/// Priority: `$VISUAL` → `$EDITOR` → `vi`.
-fn resolve_editor() -> String {
-    std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".to_owned())
-}
-
-/// Opens the system `$EDITOR` with `initial_text` pre-filled.
-///
-/// Suspends the TUI (disables raw mode + leaves the alternate screen), runs
-/// the editor, then restores the terminal.  Returns the trimmed file contents
-/// on success, or `None` if the editor exited with a non-zero status or an
-/// I/O error occurred.
-fn open_in_editor(initial_text: &str) -> Option<String> {
-    use std::{fs, io::Write as _, process::Command};
-
-    let editor = resolve_editor();
-
-    // Temp file keyed by PID; no external crate needed.
-    let path = std::env::temp_dir().join(format!("smedja-edit-{}.md", std::process::id()));
-
-    // Write the current input into the temp file.
-    {
-        let mut f = fs::File::create(&path).ok()?;
-        f.write_all(initial_text.as_bytes()).ok()?;
-    }
-
-    // Suspend the TUI so the editor can own the terminal. Pop our kitty
-    // keyboard flags first so the editor sees a clean legacy terminal.
-    let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
-    let _ = disable_raw_mode();
-    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
-
-    let status = Command::new(&editor).arg(&path).status();
-
-    // Restore the TUI regardless of editor outcome.
-    let _ = execute!(std::io::stdout(), EnterAlternateScreen);
-    let _ = enable_raw_mode();
-    let _ = execute!(
-        std::io::stdout(),
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-        )
-    );
-
-    let ok = status.is_ok_and(|s| s.success());
-    if !ok {
-        let _ = fs::remove_file(&path);
-        return None;
-    }
-
-    let text = fs::read_to_string(&path).ok();
-    let _ = fs::remove_file(&path);
-    text.map(|s| s.trim_end_matches('\n').to_owned())
-}
-
-/// Runs `openspec bin args` as a subprocess and returns stdout on success, stderr on error.
-/// Current binary version, baked in at compile time.
-pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Fetches the latest release tag from the GitHub API.
-///
-/// Returns `Some("v0.15.1")` on success, `None` on any network or parse
-/// failure.  Uses `curl` as an external subprocess so we don't need a full
-/// HTTP client dependency.
-pub(crate) async fn fetch_latest_version() -> Option<String> {
-    let out = tokio::process::Command::new("curl")
-        .args([
-            "-sf",
-            "--max-time",
-            "10",
-            "-H",
-            "Accept: application/vnd.github.v3+json",
-            "-H",
-            &format!("User-Agent: smedja-tui/{VERSION}"),
-            "https://api.github.com/repos/mwigge/smedja/releases/latest",
-        ])
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let body: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    body.get("tag_name")?.as_str().map(str::to_owned)
-}
-
-/// Returns `true` when `latest` (e.g. `"v0.16.0"`) is strictly greater than
-/// `current` (e.g. `"0.15.0"`).  Leading `v` is stripped before comparison.
-pub(crate) fn is_newer(latest: &str, current: &str) -> bool {
-    let parse = |v: &str| -> Option<(u64, u64, u64)> {
-        let v = v.trim_start_matches('v');
-        let p: Vec<u64> = v.split('.').filter_map(|s| s.parse().ok()).collect();
-        if p.len() == 3 {
-            Some((p[0], p[1], p[2]))
-        } else {
-            None
-        }
-    };
-    match (parse(latest), parse(current)) {
-        (Some(l), Some(c)) => l > c,
-        _ => false,
-    }
-}
-
-/// Downloads the latest release tarball and installs the binaries alongside
-/// the currently-running executable.
-///
-/// Returns a human-readable outcome string (success or error details) so the
-/// caller can push it straight into the panel.
-pub(crate) async fn run_upgrade(latest_tag: &str) -> String {
-    let arch = if cfg!(target_arch = "x86_64") {
-        "x86_64"
-    } else {
-        "aarch64"
-    };
-    let url = format!(
-        "https://github.com/mwigge/smedja/releases/download/{latest_tag}/smedja-linux-{arch}.tar.gz"
-    );
-
-    // Resolve the directory that contains the currently running smedja-tui
-    // binary; new binaries will be placed alongside it.
-    let Some(install_dir) = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-    else {
-        return "upgrade failed: could not determine install directory".into();
-    };
-
-    let tmp = std::env::temp_dir().join("smedja-upgrade");
-    let _ = std::fs::remove_dir_all(&tmp);
-    if std::fs::create_dir_all(&tmp).is_err() {
-        return "upgrade failed: could not create temp directory".into();
-    }
-    let tarball = tmp.join("release.tar.gz");
-
-    // Download
-    let dl = tokio::process::Command::new("curl")
-        .args(["-sfL", "--max-time", "120", &url, "-o"])
-        .arg(&tarball)
-        .status()
-        .await;
-    if !matches!(dl, Ok(s) if s.success()) {
-        let _ = std::fs::remove_dir_all(&tmp);
-        return format!("upgrade failed: could not download {url}");
-    }
-
-    // Extract
-    let ex = tokio::process::Command::new("tar")
-        .args(["-xzf"])
-        .arg(&tarball)
-        .arg("-C")
-        .arg(&tmp)
-        .status()
-        .await;
-    if !matches!(ex, Ok(s) if s.success()) {
-        let _ = std::fs::remove_dir_all(&tmp);
-        return "upgrade failed: extraction error".into();
-    }
-
-    // Install each binary with mv (atomic) falling back to copy.
-    let src_dir = tmp.join(format!("smedja-linux-{arch}"));
-    let bins = ["smedja", "smedja-tui", "smdjad", "smj"];
-    let mut installed = Vec::new();
-    let mut failed: Vec<String> = Vec::new();
-
-    for bin in bins {
-        let src = src_dir.join(bin);
-        let dst = install_dir.join(bin);
-        if !src.exists() {
-            continue;
-        }
-        // mv is atomic on the same filesystem; fall back to copy for cross-fs
-        let ok = std::fs::rename(&src, &dst)
-            .or_else(|_| std::fs::copy(&src, &dst).map(|_| ()))
-            .is_ok();
-        if ok {
-            installed.push(bin);
-        } else {
-            failed.push(bin.into());
-        }
-    }
-    let _ = std::fs::remove_dir_all(&tmp);
-
-    // Restart smdjad if systemctl is available.
-    let smdjad_status = tokio::process::Command::new("systemctl")
-        .args(["--user", "restart", "smdjad"])
-        .status()
-        .await
-        .is_ok_and(|s| s.success());
-
-    let mut msg = if failed.is_empty() {
-        format!(
-            "upgraded to {latest_tag} ({})\nrestart smedja to use the new binary",
-            installed.join(", ")
-        )
-    } else {
-        format!(
-            "partial upgrade to {latest_tag}\n  ok: {}\n  failed: {}",
-            installed.join(", "),
-            failed.join(", ")
-        )
-    };
-    if smdjad_status {
-        msg.push_str("\nsmdjad restarted via systemctl");
-    }
-    msg
-}
-
-pub(crate) async fn run_openspec(bin: &std::path::Path, args: &[&str]) -> Result<String, String> {
-    let output = tokio::process::Command::new(bin)
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| format!("openspec exec error: {e}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).into_owned())
-    }
-}
-
-/// Renders `openspec list --json` output into a human-readable string.
-#[must_use]
-pub(crate) fn format_openspec_list(json: &str) -> String {
-    let v: serde_json::Value = match serde_json::from_str(json) {
-        Ok(v) => v,
-        Err(e) => return format!("openspec list parse error: {e}"),
-    };
-    let changes = match v.get("changes").and_then(|c| c.as_array()) {
-        Some(arr) if !arr.is_empty() => arr,
-        _ => return "no active changes".to_owned(),
-    };
-    let mut lines = vec!["active changes:".to_owned()];
-    for c in changes {
-        let name = c.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-        let status = c.get("status").and_then(|s| s.as_str()).unwrap_or("?");
-        lines.push(format!("  {name:<30} {status}"));
-    }
-    lines.join("\n")
-}
-
-/// Renders `openspec status --json` output as `key: value` lines.
-#[must_use]
-pub(crate) fn format_openspec_status(json: &str) -> String {
-    let v: serde_json::Value = match serde_json::from_str(json) {
-        Ok(v) => v,
-        Err(e) => return format!("openspec status parse error: {e}"),
-    };
-    let Some(obj) = v.as_object() else {
-        return "openspec status: unexpected response format".to_owned();
-    };
-    if obj.is_empty() {
-        return "openspec status: no data".to_owned();
-    }
-    obj.iter()
-        .map(|(k, v)| {
-            let val = match v {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            format!("{k}: {val}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Searches `history` backwards for the most recent entry containing `query`.
@@ -3962,27 +3602,6 @@ fn render_file_picker(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, s
 }
 
 // ---------------------------------------------------------------------------
-// Cleanup guard — always restores terminal even on panic
-// ---------------------------------------------------------------------------
-
-struct TerminalGuard;
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        // Pop the kitty keyboard flags we pushed at startup before tearing down
-        // raw mode / alt screen, so the host terminal is left in legacy state.
-        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            stdout(),
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -5275,247 +4894,6 @@ fn toggle_metrics_view(state: &mut AppState) {
     if state.panels.metrics {
         state.last_metrics_poll = None;
     }
-}
-
-/// Returns the manifest file names present in `workspace`, in detection order:
-/// Cargo.toml, package.json, go.mod, pyproject.toml.
-pub(crate) fn detect_project_types(workspace: &std::path::Path) -> Vec<&'static str> {
-    [
-        workspace
-            .join("Cargo.toml")
-            .exists()
-            .then_some("Cargo.toml"),
-        workspace
-            .join("package.json")
-            .exists()
-            .then_some("package.json"),
-        workspace.join("go.mod").exists().then_some("go.mod"),
-        workspace
-            .join("pyproject.toml")
-            .exists()
-            .then_some("pyproject.toml"),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
-}
-
-// ---------------------------------------------------------------------------
-// govctl-style work-item harness
-// ---------------------------------------------------------------------------
-
-/// A single govctl artifact read from a `gov/` TOML file.
-#[derive(Debug, Clone)]
-pub(crate) struct GovArtifact {
-    /// E.g. "WI-001", "RFC-001", "ADR-001"
-    pub(crate) id: String,
-    /// Artifact kind: "work-item", "rfc", or "adr"
-    pub(crate) kind: String,
-    pub(crate) title: String,
-    /// `"planned"` | `"in_progress"` | `"done"` | `"cancelled"` | `"draft"` | `"accepted"` | `"superseded"`
-    pub(crate) status: String,
-}
-
-/// Scans `<workspace>/gov/` for TOML files and parses them as govctl artifacts.
-///
-/// Expected TOML fields: `id`, `title`, `status` (required), `type`/`kind` (optional).
-/// Files that fail to parse are silently skipped.
-pub(crate) fn scan_gov_artifacts(workspace: &std::path::Path) -> Vec<GovArtifact> {
-    let gov_dir = workspace.join("gov");
-    if !gov_dir.is_dir() {
-        return Vec::new();
-    }
-    let mut artifacts = Vec::new();
-    let subdirs = ["work-items", "rfc", "adr", ""];
-    for sub in &subdirs {
-        let dir = if sub.is_empty() {
-            gov_dir.clone()
-        } else {
-            gov_dir.join(sub)
-        };
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-                continue;
-            }
-            let Ok(raw) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(val) = toml::from_str::<toml::Value>(&raw) else {
-                continue;
-            };
-            let Some(id) = val.get("id").and_then(toml::Value::as_str) else {
-                continue;
-            };
-            let title = val
-                .get("title")
-                .and_then(toml::Value::as_str)
-                .unwrap_or("")
-                .to_owned();
-            let status = val
-                .get("status")
-                .and_then(toml::Value::as_str)
-                .unwrap_or("unknown")
-                .to_owned();
-            let kind = if sub.is_empty() {
-                val.get("kind")
-                    .or_else(|| val.get("type"))
-                    .and_then(toml::Value::as_str)
-                    .unwrap_or("artifact")
-                    .to_owned()
-            } else {
-                (*sub).to_owned()
-            };
-            artifacts.push(GovArtifact {
-                id: id.to_owned(),
-                kind,
-                title,
-                status,
-            });
-        }
-    }
-    artifacts.sort_by(|a, b| a.id.cmp(&b.id));
-    artifacts
-}
-
-/// Creates a new govctl artifact TOML file in the appropriate subdirectory.
-///
-/// `rest` is the tail of `/gov create <rest>`, e.g. `work-item My title here`.
-/// Auto-increments the numeric suffix (WI-NNN, RFC-NNN, ADR-NNN) by scanning
-/// existing files.  Returns a human-readable outcome string.
-pub(crate) fn gov_create(workspace: &std::path::Path, rest: &str) -> String {
-    let (kind, prefix, subdir, default_status) = if let Some(title) = rest
-        .strip_prefix("work-item ")
-        .or_else(|| rest.strip_prefix("work-items "))
-    {
-        (title.trim(), "WI", "work-items", "planned")
-    } else if let Some(title) = rest.strip_prefix("rfc ") {
-        (title.trim(), "RFC", "rfc", "draft")
-    } else if let Some(title) = rest.strip_prefix("adr ") {
-        (title.trim(), "ADR", "adr", "draft")
-    } else {
-        return "gov create: unknown kind — try: work-item | rfc | adr".to_owned();
-    };
-
-    if kind.is_empty() {
-        return "gov create: title is required".to_owned();
-    }
-
-    let dir = workspace.join("gov").join(subdir);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        return format!("gov create: could not create {}: {e}", dir.display());
-    }
-
-    #[allow(clippy::maybe_infinite_iter)]
-    let next_n = (1u32..)
-        .find(|n| !dir.join(format!("{prefix}-{n:03}.toml")).exists())
-        .unwrap_or(1);
-    let id = format!("{prefix}-{next_n:03}");
-    let path = dir.join(format!("{id}.toml"));
-
-    let content =
-        format!("id     = \"{id}\"\ntitle  = \"{kind}\"\nstatus = \"{default_status}\"\n");
-    match std::fs::write(&path, content) {
-        Ok(()) => format!("gov: created {id} — {kind}"),
-        Err(e) => format!("gov create: write failed: {e}"),
-    }
-}
-
-/// Transitions a govctl artifact to a new status.
-///
-/// `rest` is `<id> <new-status>`.  Reads the existing TOML file, replaces the
-/// `status` line, and writes it back.  Returns a human-readable outcome string.
-pub(crate) fn gov_transition(workspace: &std::path::Path, rest: &str) -> String {
-    let valid_wi = ["planned", "in_progress", "done", "cancelled"];
-    let valid_rfc_adr = ["draft", "accepted", "rejected", "superseded"];
-
-    let mut parts = rest.splitn(2, ' ');
-    let id = match parts.next() {
-        Some(s) if !s.is_empty() => s,
-        _ => return "gov transition: usage: /gov transition <id> <status>".to_owned(),
-    };
-    let new_status = match parts.next() {
-        Some(s) if !s.is_empty() => s.trim(),
-        _ => return "gov transition: status is required".to_owned(),
-    };
-
-    let prefix = id.split('-').next().unwrap_or("");
-    let valid = if prefix == "WI" {
-        &valid_wi[..]
-    } else {
-        &valid_rfc_adr[..]
-    };
-    if !valid.contains(&new_status) {
-        return format!(
-            "gov transition: invalid status '{new_status}' for {prefix} — valid: {}",
-            valid.join(", ")
-        );
-    }
-
-    let subdirs = ["work-items", "rfc", "adr", ""];
-    let path = subdirs.iter().find_map(|sub| {
-        let dir = if sub.is_empty() {
-            workspace.join("gov")
-        } else {
-            workspace.join("gov").join(sub)
-        };
-        let p = dir.join(format!("{id}.toml"));
-        if p.exists() {
-            Some(p)
-        } else {
-            None
-        }
-    });
-
-    let Some(path) = path else {
-        return format!("gov transition: artifact '{id}' not found");
-    };
-
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => return format!("gov transition: read failed: {e}"),
-    };
-
-    let updated: String = raw
-        .lines()
-        .map(|line| {
-            if line.trim_start().starts_with("status") && line.contains('=') {
-                format!("status = \"{new_status}\"")
-            } else {
-                line.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let updated = if raw.ends_with('\n') {
-        format!("{updated}\n")
-    } else {
-        updated
-    };
-
-    match std::fs::write(&path, updated) {
-        Ok(()) => format!("gov: {id} → {new_status}"),
-        Err(e) => format!("gov transition: write failed: {e}"),
-    }
-}
-
-/// Formats a list of govctl artifacts for display in the main panel.
-pub(crate) fn format_gov_list(artifacts: &[GovArtifact]) -> String {
-    if artifacts.is_empty() {
-        return "gov: no artifacts found in ./gov/ — create gov/work-items/WI-001.toml to start"
-            .to_owned();
-    }
-    let mut lines = vec![format!("{} govctl artifact(s):", artifacts.len())];
-    for a in artifacts {
-        lines.push(format!(
-            "  [{:12}] {:10} [{:12}] {}",
-            a.id, a.kind, a.status, a.title
-        ));
-    }
-    lines.join("\n")
 }
 
 // ---------------------------------------------------------------------------
