@@ -403,6 +403,7 @@ async fn handle_stream_connection(
 ///
 /// Returns `(None, _, _)` for events where the `turn_id` is unknown or not
 /// relevant to the caller's filter (e.g. daemon-level events).
+#[allow(clippy::too_many_lines)]
 fn turn_event_to_ndjson(
     event: &TurnEvent,
     expected_turn_id: &str,

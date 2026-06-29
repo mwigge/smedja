@@ -181,7 +181,9 @@ pub(crate) fn context_pressure_exceeds_threshold(input_tokens: u32, context_wind
     if context_window == 0 {
         return false;
     }
-    f64::from(input_tokens) / context_window as f64 >= 0.80
+    #[allow(clippy::cast_precision_loss)]
+    let ratio = f64::from(input_tokens) / context_window as f64;
+    ratio >= 0.80
 }
 
 /// Builds the prompt sent to the LLM to produce a conversation summary.

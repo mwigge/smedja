@@ -149,43 +149,47 @@ pub fn render_step_overlay(
         )
     };
 
-    let lines: Vec<Line<'_>> = steps
-        .iter()
-        .map(|step| {
-            let ts = format!("[+{:.1}s] ", step.elapsed_s());
-            match step {
-                ThinkingStep::Reasoning { text, .. } => {
-                    let preview: String = text
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .chars()
-                        .take(inner.width.saturating_sub(12) as usize)
-                        .collect();
-                    Line::from(vec![
-                        Span::styled(ts, dim),
-                        Span::styled("\u{1f4ad} ", dim),
-                        Span::styled(preview, dim),
-                    ])
+    let lines: Vec<Line<'_>> =
+        steps
+            .iter()
+            .map(|step| {
+                let ts = format!("[+{:.1}s] ", step.elapsed_s());
+                match step {
+                    ThinkingStep::Reasoning { text, .. } => {
+                        let preview: String = text
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(inner.width.saturating_sub(12) as usize)
+                            .collect();
+                        Line::from(vec![
+                            Span::styled(ts, dim),
+                            Span::styled("\u{1f4ad} ", dim),
+                            Span::styled(preview, dim),
+                        ])
+                    }
+                    ThinkingStep::Tool { name, preview, .. } => {
+                        let arg: String =
+                            preview
+                                .chars()
+                                .take(inner.width.saturating_sub(
+                                    u16::try_from(14 + name.len()).unwrap_or(u16::MAX),
+                                ) as usize)
+                                .collect();
+                        Line::from(vec![
+                            Span::styled(ts, accent),
+                            Span::styled("\u{2318} ", accent),
+                            Span::styled(format!("{name}: {arg}"), accent),
+                        ])
+                    }
+                    ThinkingStep::Answer { .. } => Line::from(vec![
+                        Span::styled(ts, bright),
+                        Span::styled("\u{25ce} answer", bright),
+                    ]),
                 }
-                ThinkingStep::Tool { name, preview, .. } => {
-                    let arg: String = preview
-                        .chars()
-                        .take(inner.width.saturating_sub((14 + name.len()) as u16) as usize)
-                        .collect();
-                    Line::from(vec![
-                        Span::styled(ts, accent),
-                        Span::styled("\u{2318} ", accent),
-                        Span::styled(format!("{name}: {arg}"), accent),
-                    ])
-                }
-                ThinkingStep::Answer { .. } => Line::from(vec![
-                    Span::styled(ts, bright),
-                    Span::styled("\u{25ce} answer", bright),
-                ]),
-            }
-        })
-        .collect();
+            })
+            .collect();
 
     frame.render_widget(block, overlay_rect);
     frame.render_widget(
