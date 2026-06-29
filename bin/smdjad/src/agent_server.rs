@@ -180,8 +180,8 @@ fn turn_event_to_agent_event(event: &TurnEvent) -> Option<AgentEvent> {
             tokens_saved: None,
             efficiency_ratio: None,
         }),
-        // Quality snapshots are internal signals — not surfaced to agent event consumers.
-        TurnEvent::QualitySnapshot { .. } => None,
+        // Quality snapshots and cowork requests are internal signals — not surfaced to agent consumers.
+        TurnEvent::QualitySnapshot { .. } | TurnEvent::CoworkRequest { .. } => None,
     }
 }
 

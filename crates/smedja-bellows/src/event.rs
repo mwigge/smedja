@@ -179,6 +179,32 @@ pub enum TurnEvent {
         #[serde(flatten)]
         correlation: CorrelationCtx,
     },
+
+    /// A tool call is awaiting human approval at the cowork gate.
+    ///
+    /// Published by `CoworkGate::intercept` immediately after registering the
+    /// pending approval, before suspending.  The TUI receives this via the
+    /// NDJSON stream and presents the approval overlay without needing to poll
+    /// `cowork.pending`.
+    CoworkRequest {
+        /// UUID assigned to this approval request; pass to `cowork.approve` /
+        /// `cowork.deny` / `cowork.modify`.
+        approval_id: String,
+        /// Name of the tool awaiting approval.
+        tool: String,
+        /// Step index within the current turn.
+        step_n: u32,
+        /// Human-readable serialisation of the scrubbed tool arguments.
+        args_display: String,
+        /// Agent's reasoning for invoking this tool.
+        reasoning: String,
+        /// Turn identifier; used to route the event into the correct stream buffer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        /// Correlation context (trace, conversation, agent, status).
+        #[serde(flatten)]
+        correlation: CorrelationCtx,
+    },
 }
 
 // ── Constructors ──────────────────────────────────────────────────────────────

@@ -124,7 +124,7 @@ pub(crate) async fn gate_tool(state: HandlerState, params: Value) -> Result<Valu
                 .or_insert_with(|| Arc::new(CoworkGate::default())),
         )
     };
-    let (decision, reason) = match gate.gate_tool(0, &tool_name, tool_input, "").await {
+    let (decision, reason) = match gate.gate_tool(0, &tool_name, tool_input, "", None).await {
         crate::cowork::Decision::Approve => ("allow", String::new()),
         crate::cowork::Decision::Deny(r) => ("deny", r),
         // External CLIs can't apply a "modify"; treat as approve.

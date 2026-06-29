@@ -417,7 +417,10 @@ async fn resolve_shell(
             reasoning: "inline @shell fragment".to_owned(),
             plan_summary: String::new(),
         };
-        match gate.intercept(prompt, SHELL_APPROVAL_TIMEOUT_SECS).await {
+        match gate
+            .intercept(prompt, SHELL_APPROVAL_TIMEOUT_SECS, None)
+            .await
+        {
             Decision::Approve => {}
             // A denial or a modify request both mean "do not run this command as
             // submitted"; an inline fragment has no place to apply a modification.

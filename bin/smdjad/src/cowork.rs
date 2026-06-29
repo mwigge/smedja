@@ -3,6 +3,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
+use smedja_bellows::{CorrelationCtx, Dispatcher, TurnEvent};
 use tokio::sync::{oneshot, Mutex};
 
 /// Describes a pending tool call awaiting human approval.
@@ -198,8 +199,17 @@ impl CoworkGate {
     /// Submits a tool call for approval. Suspends until a decision arrives
     /// or the optional `timeout_secs` (0 = infinite) elapses.
     ///
+    /// If `push` is `Some((dispatcher, turn_id))`, a [`TurnEvent::CoworkRequest`]
+    /// is published immediately after registering the pending approval so the TUI
+    /// receives the request via the NDJSON stream instead of polling.
+    ///
     /// Returns [`Decision::Deny`] on timeout or channel close (fail-closed).
-    pub async fn intercept(&self, prompt: ApprovalPrompt, timeout_secs: u64) -> Decision {
+    pub async fn intercept(
+        &self,
+        prompt: ApprovalPrompt,
+        timeout_secs: u64,
+        push: Option<(&Dispatcher, Option<&str>)>,
+    ) -> Decision {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         {
@@ -211,6 +221,17 @@ impl CoworkGate {
                     tx,
                 },
             );
+        }
+        if let Some((dispatcher, turn_id)) = push {
+            dispatcher.publish(TurnEvent::CoworkRequest {
+                approval_id: id.clone(),
+                tool: prompt.tool.clone(),
+                step_n: prompt.step_n,
+                args_display: prompt.args_scrubbed.to_string(),
+                reasoning: prompt.reasoning.clone(),
+                turn_id: turn_id.map(str::to_owned),
+                correlation: CorrelationCtx::default(),
+            });
         }
         tracing::info!(
             approval_id = %id,
@@ -277,12 +298,16 @@ impl CoworkGate {
     /// Gates a single tool call under the gate's current [`PermissionMode`]:
     /// allow/deny outright per [`evaluate`], or — for `Ask` — suspend on the
     /// gate (≤30 min) until the user decides. Returns the resolved [`Decision`].
+    ///
+    /// Pass `push` to have a [`TurnEvent::CoworkRequest`] pushed via the NDJSON
+    /// stream so the TUI receives it without polling.
     pub async fn gate_tool(
         &self,
         step_n: u32,
         tool: &str,
         args_scrubbed: serde_json::Value,
         reasoning: &str,
+        push: Option<(&Dispatcher, Option<&str>)>,
     ) -> Decision {
         let mode = self.mode().await;
         match evaluate(mode, tool) {
@@ -300,6 +325,7 @@ impl CoworkGate {
                         plan_summary: String::new(),
                     },
                     30 * 60,
+                    push,
                 )
                 .await
             }
@@ -315,6 +341,7 @@ impl CoworkGate {
         tool: &str,
         args_scrubbed: serde_json::Value,
         reasoning: &str,
+        push: Option<(&Dispatcher, Option<&str>)>,
     ) -> Decision {
         self.intercept(
             ApprovalPrompt {
@@ -325,6 +352,7 @@ impl CoworkGate {
                 plan_summary: String::new(),
             },
             30 * 60,
+            push,
         )
         .await
     }
@@ -461,7 +489,7 @@ mod tests {
         let gate = CoworkGate::default(); // Ask mode by default.
                                           // Read-only: allowed, no pending entry.
         assert!(matches!(
-            gate.gate_tool(1, "read_file", json!({}), "").await,
+            gate.gate_tool(1, "read_file", json!({}), "", None).await,
             Decision::Approve
         ));
         assert!(gate.list_pending().await.is_empty());
@@ -469,7 +497,7 @@ mod tests {
         // Plan mode denies a write outright.
         gate.set_mode(PermissionMode::Plan).await;
         assert!(matches!(
-            gate.gate_tool(1, "write_file", json!({}), "").await,
+            gate.gate_tool(1, "write_file", json!({}), "", None).await,
             Decision::Deny(_)
         ));
 
@@ -477,7 +505,7 @@ mod tests {
         let gate = Arc::new(CoworkGate::default());
         let g2 = Arc::clone(&gate);
         let h = tokio::spawn(async move {
-            g2.gate_tool(1, "write_file", json!({ "path": "x" }), "edit")
+            g2.gate_tool(1, "write_file", json!({ "path": "x" }), "edit", None)
                 .await
         });
         let id = {
@@ -500,7 +528,7 @@ mod tests {
         let gate = Arc::new(CoworkGate::default());
         let gate2 = Arc::clone(&gate);
 
-        let handle = tokio::spawn(async move { gate2.intercept(prompt(), 0).await });
+        let handle = tokio::spawn(async move { gate2.intercept(prompt(), 0, None).await });
 
         // Give the intercept task time to register itself.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -519,7 +547,7 @@ mod tests {
         let gate = Arc::new(CoworkGate::default());
         let gate2 = Arc::clone(&gate);
 
-        let handle = tokio::spawn(async move { gate2.intercept(prompt(), 0).await });
+        let handle = tokio::spawn(async move { gate2.intercept(prompt(), 0, None).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
@@ -534,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_denies() {
         let gate = CoworkGate::default();
-        let decision = gate.intercept(prompt(), 1).await;
+        let decision = gate.intercept(prompt(), 1, None).await;
         assert!(matches!(decision, Decision::Deny(r) if r == "timeout"));
     }
 
@@ -557,7 +585,7 @@ mod tests {
         let gate = Arc::new(CoworkGate::default());
         let gate2 = Arc::clone(&gate);
 
-        let handle = tokio::spawn(async move { gate2.intercept(prompt(), 0).await });
+        let handle = tokio::spawn(async move { gate2.intercept(prompt(), 0, None).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let pending = gate.list_pending().await;
@@ -576,7 +604,8 @@ mod tests {
         let gate_ref = Arc::clone(&gate);
 
         // Spawn a task that intercepts a tool call.
-        let intercept_handle = tokio::spawn(async move { gate_ref.intercept(prompt(), 5).await });
+        let intercept_handle =
+            tokio::spawn(async move { gate_ref.intercept(prompt(), 5, None).await });
 
         // Give intercept time to register the pending entry.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -603,7 +632,7 @@ mod tests {
         let gate = Arc::new(CoworkGate::default());
         let gate2 = Arc::clone(&gate);
 
-        let handle = tokio::spawn(async move { gate2.intercept(prompt(), 0).await });
+        let handle = tokio::spawn(async move { gate2.intercept(prompt(), 0, None).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
@@ -618,6 +647,42 @@ mod tests {
         // Clean up: approve so the spawned task can finish.
         let id = pending[0].0.clone();
         gate.approve(&id).await;
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn intercept_push_publishes_cowork_request_event() {
+        use smedja_bellows::Dispatcher;
+
+        let gate = Arc::new(CoworkGate::default());
+        let gate2 = Arc::clone(&gate);
+        let dispatcher = Arc::new(Dispatcher::new(16));
+        let mut rx = dispatcher.subscribe();
+        let disp_ref = Arc::clone(&dispatcher);
+
+        let handle = tokio::spawn(async move {
+            gate2
+                .intercept(prompt(), 0, Some((disp_ref.as_ref(), Some("t-99"))))
+                .await
+        });
+
+        // The CoworkRequest event must arrive before the gate suspends.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let event = rx.try_recv().expect("CoworkRequest must be published");
+        let smedja_bellows::TurnEvent::CoworkRequest {
+            ref tool,
+            ref turn_id,
+            ..
+        } = event
+        else {
+            panic!("expected CoworkRequest, got {event:?}");
+        };
+        assert_eq!(tool, "bash");
+        assert_eq!(turn_id.as_deref(), Some("t-99"));
+
+        // Clean up.
+        let pending = gate.list_pending().await;
+        gate.approve(&pending[0].0).await;
         handle.await.unwrap();
     }
 }
