@@ -599,7 +599,10 @@ async fn start_stream_reader(
     let stream = match UnixStream::connect(&sock_path).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(error = %e, "stream socket connect failed; falling back to polling");
+            tracing::warn!(error = %e, "stream socket connect failed");
+            let _ = tx.send(
+                serde_json::json!({"type":"error","message":format!("stream unavailable: {e}")}),
+            );
             return;
         }
     };
@@ -608,6 +611,7 @@ async fn start_stream_reader(
 
     let req = format!("{{\"task_id\":\"{task_id}\"}}\n");
     if writer.write_all(req.as_bytes()).await.is_err() {
+        let _ = tx.send(serde_json::json!({"type":"error","message":"stream handshake failed"}));
         return;
     }
 
@@ -4414,7 +4418,18 @@ async fn main() -> Result<()> {
         let mut pending_output_save: Option<(OutputType, String)> = None;
         if let Some(ref mut rx) = state.stream_rx {
             let mut turn_done = false;
-            while let Ok(event) = rx.try_recv() {
+            let mut stream_disconnected = false;
+            loop {
+                let event = match rx.try_recv() {
+                    Ok(ev) => ev,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        if !turn_done {
+                            stream_disconnected = true;
+                        }
+                        break;
+                    }
+                };
                 match event["type"].as_str() {
                     Some("delta") => {
                         if let Some(text) = event["text"].as_str() {
@@ -4650,6 +4665,19 @@ async fn main() -> Result<()> {
                     }
                     _ => {}
                 }
+            }
+
+            if stream_disconnected {
+                // Sender dropped without a terminal event — daemon socket closed
+                // unexpectedly. Surface a recoverable error rather than spinning forever.
+                state.main_panel.push_line(
+                    "[STREAM] daemon closed unexpectedly — ↑ to recall and retry".to_owned(),
+                );
+                if let Some(mut block) = state.current_block.take() {
+                    block.fail();
+                    state.block_store.push(block);
+                }
+                turn_done = true;
             }
 
             if turn_done {
