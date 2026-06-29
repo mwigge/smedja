@@ -427,7 +427,13 @@ impl TurnOrchestrator {
         // (cacheable) system block. `base_system` is kept unsteered so verbosity
         // steering can be re-applied per tool-loop iteration without compounding.
         let base_system = {
-            let base = format!("You are smedja, an AI coding assistant.{task_prefix}");
+            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let base = format!(
+                "You are smedja, an AI coding assistant.\
+                \nWorkspace: {workspace_root}\
+                \nDate: {today}{task_prefix}",
+                workspace_root = workspace_root.display(),
+            );
             let with_skills = match smedja_memory::load_workspace_skills(&workspace_root) {
                 Ok(skills) if !skills.is_empty() => {
                     let joined = skills.join("\n\n");
