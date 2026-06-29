@@ -538,6 +538,8 @@ pub(crate) struct AppState {
     /// collapsible block while the turn is in flight; summarised as a
     /// single-line badge once the turn completes.
     current_thinking: String,
+    /// Ordered steps accumulated during the current turn for the timeline overlay.
+    thinking_steps: Vec<thoughts_panel::ThinkingStep>,
     /// Whether the completed thinking block is expanded in the panel.
     thinking_expanded: bool,
     /// Kill ring for Ctrl-K / Ctrl-U / Ctrl-Y input editing (max 16 entries).
@@ -831,6 +833,7 @@ pub(crate) async fn submit(input: &str, state: &mut AppState, client: &mut Clien
             state.turn_in_flight = true;
             state.last_poll = Some(std::time::Instant::now());
             state.current_thinking.clear();
+            state.thinking_steps.clear();
             state.thinking_expanded = false;
             state.active_agent_name = None;
             state.plan_steps.clear();
@@ -2041,9 +2044,9 @@ async fn handle_key(
                 }
                 return Ok(());
             }
-            // T (uppercase): toggle thinking block expansion.
+            // T (uppercase): toggle thinking step timeline expansion.
             KeyCode::Char('T') => {
-                if !state.current_thinking.is_empty() {
+                if !state.thinking_steps.is_empty() {
                     state.thinking_expanded = !state.thinking_expanded;
                 }
                 return Ok(());
@@ -2810,10 +2813,10 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         state.no_color,
         frame,
     );
-    thoughts_panel::render_overlay(
+    thoughts_panel::render_step_overlay(
         main_area,
         state.thinking_expanded,
-        &state.current_thinking,
+        &state.thinking_steps,
         state.no_color,
         frame,
     );
@@ -3596,6 +3599,7 @@ async fn main() -> Result<()> {
         stream_rx: None,
         upgrade_rx: None,
         current_thinking: String::new(),
+        thinking_steps: Vec::new(),
         thinking_expanded: false,
         kill_ring: VecDeque::new(),
         active_agent_name: None,
@@ -3926,9 +3930,37 @@ async fn main() -> Result<()> {
                     }
                     StreamEvent::Thinking { text } => {
                         state.current_thinking.push_str(&text);
+                        let elapsed_s = state
+                            .turn_submitted_at
+                            .map_or(0.0, |t| t.elapsed().as_secs_f32());
+                        // Merge consecutive reasoning into the last step.
+                        if let Some(thoughts_panel::ThinkingStep::Reasoning {
+                            text: ref mut t,
+                            ..
+                        }) = state.thinking_steps.last_mut()
+                        {
+                            t.push_str(&text);
+                        } else {
+                            state
+                                .thinking_steps
+                                .push(thoughts_panel::ThinkingStep::Reasoning {
+                                    text: text.clone(),
+                                    elapsed_s,
+                                });
+                        }
                     }
                     StreamEvent::ToolCall { name, input, full } => {
                         let full_str = full.as_deref().unwrap_or(&input);
+                        let elapsed_s = state
+                            .turn_submitted_at
+                            .map_or(0.0, |t| t.elapsed().as_secs_f32());
+                        state
+                            .thinking_steps
+                            .push(thoughts_panel::ThinkingStep::Tool {
+                                name: name.clone(),
+                                preview: input.chars().take(60).collect(),
+                                elapsed_s,
+                            });
                         // Card starts "running" (◷); resolved to ✓/✗ when its
                         // result arrives.
                         let card = tool_call_card(&name, &input, state.no_color, '\u{25f7}');
@@ -3954,6 +3986,12 @@ async fn main() -> Result<()> {
                         // with a newline) and close the assistant block.
                         state.main_panel.finalize_last_line();
                         state.assistant_open = false;
+                        let elapsed_s = state
+                            .turn_submitted_at
+                            .map_or(0.0, |t| t.elapsed().as_secs_f32());
+                        state
+                            .thinking_steps
+                            .push(thoughts_panel::ThinkingStep::Answer { elapsed_s });
                         // Any tool still marked "running" at turn end is settled.
                         if let Some((idx, name, inp)) = state.pending_tool.take() {
                             let card = tool_call_card(&name, &inp, state.no_color, '\u{2713}');
@@ -4005,12 +4043,20 @@ async fn main() -> Result<()> {
                         };
                         state.main_panel.push_line(footer);
 
-                        // Emit a collapsible thinking badge if the model produced thinking tokens.
-                        if !state.current_thinking.is_empty() {
-                            let chars = state.current_thinking.chars().count();
-                            state
-                                .main_panel
-                                .push_line(format!("╌ thinking ({chars} chars) [T to expand] ╌"));
+                        // Emit a collapsible trace badge when thinking steps or tool
+                        // calls were recorded — meaningful for all providers.
+                        let n_steps = state.thinking_steps.len();
+                        if n_steps > 1 {
+                            let label = if state.thinking_steps.iter().any(|s| {
+                                matches!(s, thoughts_panel::ThinkingStep::Reasoning { .. })
+                            }) {
+                                "thinking"
+                            } else {
+                                "trace"
+                            };
+                            state.main_panel.push_line(format!(
+                                "\u{254c} {label} ({n_steps} steps) [T to expand] \u{254c}"
+                            ));
                         }
 
                         if let Some(output_type) = state.pending_output_type.take() {
@@ -5738,6 +5784,7 @@ mod tests {
             stream_rx: None,
             upgrade_rx: None,
             current_thinking: String::new(),
+            thinking_steps: Vec::new(),
             thinking_expanded: false,
             kill_ring: VecDeque::new(),
             active_agent_name: None,
@@ -7333,29 +7380,54 @@ mod tests {
     fn thinking_expanded_toggles_only_when_content_present() {
         let mut state = make_state("sess-think-toggle");
         state.scroll_focus = true;
-        // No content: T key must be a no-op.
-        assert!(state.current_thinking.is_empty());
-        if !state.current_thinking.is_empty() {
+        // No steps: T key must be a no-op.
+        assert!(state.thinking_steps.is_empty());
+        if !state.thinking_steps.is_empty() {
             state.thinking_expanded = !state.thinking_expanded;
         }
         assert!(
             !state.thinking_expanded,
-            "T must not toggle when no thinking content"
+            "T must not toggle when no thinking steps"
         );
 
-        // With content: T key must toggle.
-        state.current_thinking = "I considered option A vs B".to_owned();
-        if !state.current_thinking.is_empty() {
+        // With steps: T key must toggle.
+        state
+            .thinking_steps
+            .push(thoughts_panel::ThinkingStep::Answer { elapsed_s: 1.0 });
+        if !state.thinking_steps.is_empty() {
             state.thinking_expanded = !state.thinking_expanded;
         }
         assert!(
             state.thinking_expanded,
-            "T must expand when thinking content is present"
+            "T must expand when thinking steps are present"
         );
-        if !state.current_thinking.is_empty() {
+        if !state.thinking_steps.is_empty() {
             state.thinking_expanded = !state.thinking_expanded;
         }
         assert!(!state.thinking_expanded, "second T must collapse");
+    }
+
+    // --- thinking step timeline ----------------------------------------------
+
+    #[test]
+    fn thinking_steps_cleared_at_turn_start() {
+        let mut state = make_state("sess-steps-clear");
+        state
+            .thinking_steps
+            .push(thoughts_panel::ThinkingStep::Answer { elapsed_s: 1.0 });
+        assert_eq!(state.thinking_steps.len(), 1);
+        state.thinking_steps.clear();
+        assert!(state.thinking_steps.is_empty());
+    }
+
+    #[test]
+    fn thinking_step_tool_has_correct_fields() {
+        let step = thoughts_panel::ThinkingStep::Tool {
+            name: "bash".into(),
+            preview: "ls /src".into(),
+            elapsed_s: 0.5,
+        };
+        assert!(matches!(step.elapsed_s(), 0.4..=0.6));
     }
 
     // --- govctl work-item harness --------------------------------------------
