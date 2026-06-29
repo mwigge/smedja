@@ -79,6 +79,19 @@ fn workspace_has_marker(workspace: &std::path::Path, spec: &ServerSpec) -> bool 
     spec.markers.iter().any(|m| workspace.join(m).exists())
 }
 
+/// Resolves `name` to an executable path, checking `$PATH` first, then
+/// `~/.cargo/bin` — which Rustup populates but which may be absent from the
+/// daemon's `$PATH` when smdjad is launched as a service or outside a login shell.
+fn resolve_binary(name: &str) -> Option<PathBuf> {
+    if let Ok(p) = which(name) {
+        return Some(p);
+    }
+    let cargo_bin = std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".cargo").join("bin").join(name))?;
+    cargo_bin.is_file().then_some(cargo_bin)
+}
+
 /// Internal event sent from a per-server task to the aggregator.
 enum ServerEvent {
     Starting {
@@ -192,23 +205,25 @@ impl LspManager {
 }
 
 async fn run_all(workspace: PathBuf, watch_tx: watch::Sender<LspSnapshot>) {
-    // Start a server only when its binary exists AND the workspace actually uses
-    // that language (a project marker is present) — so e.g. clangd does not run
-    // on a Rust repo just because clangd is installed.
-    let available: Vec<&ServerSpec> = SERVERS
+    // Start a server only when its binary is locatable AND the workspace actually
+    // uses that language (a project marker is present). resolve_binary checks
+    // $PATH first, then ~/.cargo/bin, so rust-analyzer works even when the daemon
+    // runs outside a login shell where ~/.cargo/bin is not on $PATH.
+    let available: Vec<(&ServerSpec, PathBuf)> = SERVERS
         .iter()
-        .filter(|s| which(s.binary).is_ok() && workspace_has_marker(&workspace, s))
+        .filter(|s| workspace_has_marker(&workspace, s))
+        .filter_map(|s| resolve_binary(s.binary).map(|p| (s, p)))
         .collect();
 
     if available.is_empty() {
-        tracing::debug!("no LSP servers found on PATH");
+        tracing::debug!("no LSP servers found on PATH or in ~/.cargo/bin");
         return;
     }
 
     // Seed watch with "Starting" state for each server.
     let initial_servers = available
         .iter()
-        .map(|s| ServerStatus {
+        .map(|(s, _)| ServerStatus {
             name: s.name.to_owned(),
             state: ServerState::Starting,
         })
@@ -221,9 +236,9 @@ async fn run_all(workspace: PathBuf, watch_tx: watch::Sender<LspSnapshot>) {
     let (event_tx, event_rx) = mpsc::channel::<ServerEvent>(EVENT_CHANNEL_CAP);
 
     // Spawn one task per server; each task restarts up to MAX_RESTART_ATTEMPTS times.
-    for spec in &available {
+    for (spec, binary_path) in &available {
         let name = spec.name.to_owned();
-        let binary = spec.binary.to_owned();
+        let binary = binary_path.to_string_lossy().into_owned();
         let args: Vec<String> = spec.args.iter().map(ToString::to_string).collect();
         let ws = workspace.clone();
         let etx = event_tx.clone();
@@ -411,7 +426,28 @@ fn build_snapshot(
 
 #[cfg(test)]
 mod marker_tests {
-    use super::{workspace_has_marker, SERVERS};
+    use super::{resolve_binary, workspace_has_marker, SERVERS};
+
+    #[test]
+    fn resolve_binary_finds_shell_on_path() {
+        // `sh` is always on $PATH — resolve_binary must find it.
+        assert!(resolve_binary("sh").is_some());
+    }
+
+    #[test]
+    fn resolve_binary_returns_none_for_nonexistent() {
+        assert!(resolve_binary("__smedja_nonexistent_binary_xyz__").is_none());
+    }
+
+    #[test]
+    fn resolve_binary_path_is_file() {
+        let p = resolve_binary("sh").expect("sh must resolve");
+        assert!(
+            p.is_file(),
+            "resolved path must be a real file: {}",
+            p.display()
+        );
+    }
 
     #[test]
     fn marker_gating_starts_only_relevant_servers() {
