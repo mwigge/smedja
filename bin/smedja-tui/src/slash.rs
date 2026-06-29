@@ -1359,21 +1359,27 @@ pub(crate) async fn dispatch_slash(
             Ok(true)
         }
         "upgrade" => {
-            push_system_message(
-                state,
-                format!("checking for updates (current: v{VERSION})\u{2026}"),
-            );
-            let Some(latest) = fetch_latest_version().await else {
-                push_system_message(state, "upgrade failed: could not reach GitHub releases");
-                return Ok(true);
-            };
-            if !is_newer(&latest, VERSION) {
-                push_system_message(state, format!("already at {latest}, nothing to upgrade"));
+            if state.upgrade_rx.is_some() {
+                push_system_message(state, "upgrade already in progress");
                 return Ok(true);
             }
-            push_system_message(state, format!("downloading {latest}\u{2026}"));
-            let result = run_upgrade(&latest).await;
-            push_system_message(state, result);
+            let current = VERSION.to_owned();
+            push_system_message(
+                state,
+                format!("checking for updates (current: v{current})\u{2026}"),
+            );
+            let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+            state.upgrade_rx = Some(rx);
+            tokio::spawn(async move {
+                let msg = match fetch_latest_version().await {
+                    None => "upgrade failed: could not reach GitHub releases".into(),
+                    Some(latest) if !is_newer(&latest, &current) => {
+                        format!("already at {latest}, nothing to upgrade")
+                    }
+                    Some(latest) => run_upgrade(&latest).await,
+                };
+                let _ = tx.send(msg);
+            });
             Ok(true)
         }
         _ => Ok(false),

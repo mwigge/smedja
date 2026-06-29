@@ -327,7 +327,11 @@ impl TurnOrchestrator {
             .and_then(crate::common::parse_session_mode_to_role)
             .unwrap_or(AgentRole::Orchestrator);
         let route = {
-            let complexity = Complexity::Coding;
+            let complexity = match role {
+                AgentRole::Ask | AgentRole::Search => Complexity::Simple,
+                AgentRole::Impl | AgentRole::Test | AgentRole::Debug => Complexity::Coding,
+                _ => Complexity::Complex,
+            };
             let decision = assayer.route_decision(role, complexity);
             tracing::debug!(
                 turn_id = %turn_id,
@@ -728,10 +732,16 @@ impl TurnOrchestrator {
                 smedja.turn.graph_symbols_injected = injected_count,
                 "graph symbol injection"
             );
-            // Append current LSP diagnostics (errors + warnings only) so the
-            // model sees live compiler feedback alongside the user's question.
-            if let Some(diag_block) = format_lsp_diagnostics(&self.lsp_manager.snapshot()) {
-                let _ = write!(content, "\n\n{diag_block}");
+            // Append LSP diagnostics only when the turn is code-focused: coder
+            // roles or queries that mention fix/build/compile/error keywords.
+            let wants_diag = matches!(role, AgentRole::Impl | AgentRole::Debug | AgentRole::Test)
+                || ["fix", "build", "compile", "error", "warn"]
+                    .iter()
+                    .any(|kw| task.title.to_lowercase().contains(kw));
+            if wants_diag {
+                if let Some(diag_block) = format_lsp_diagnostics(&self.lsp_manager.snapshot()) {
+                    let _ = write!(content, "\n\n{diag_block}");
+                }
             }
             content
         };
