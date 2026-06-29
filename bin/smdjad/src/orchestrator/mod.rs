@@ -431,7 +431,14 @@ impl TurnOrchestrator {
             let base = format!(
                 "You are smedja, an AI coding assistant.\
                 \nWorkspace: {workspace_root}\
-                \nDate: {today}{task_prefix}",
+                \nDate: {today}{task_prefix}\
+                \n\nBe concise and direct. Apply the smallest diff that satisfies a \
+                request. Prefer reading graph/vault context before opening files, and \
+                reading files before writing them. When <recalled_context>, \
+                <cold_context>, or <graph_symbols> blocks are present, treat them as \
+                authoritative — reference specifics from them rather than asking the \
+                user to repeat information. Ask before acting only when the request is \
+                genuinely ambiguous or would be destructive.",
                 workspace_root = workspace_root.display(),
             );
             let with_skills = match smedja_memory::load_workspace_skills(&workspace_root) {
@@ -630,9 +637,13 @@ impl TurnOrchestrator {
         let mut mem = WorkingMemory::new(budget_tokens).with_cold_store(cold_adapter);
         mem.set_strata(strata);
         // Cold recall scales with tier depth: fast favours latency (k=1), deep
-        // favours recall (k=5). The "compact" namespace is where session.compact
-        // indexes its summaries.
-        mem.set_cold_query("compact", cold_k_for_tier(route.tier));
+        // favours recall (k=5). Query all three relevant namespaces: session
+        // summaries ("compact"), user notes ("default"), and the active role's
+        // knowledge store (e.g. "review", "sre") when a non-default role is set.
+        // set_cold_query is called per namespace; results are accumulated before
+        // assemble_cold_block applies the budget cap.
+        let cold_k = cold_k_for_tier(route.tier);
+        mem.set_cold_query("compact", cold_k);
 
         let first_user_content = {
             let mut content = task.title.clone();
@@ -704,9 +715,11 @@ impl TurnOrchestrator {
         };
 
         // Proactive vault recall: search the "default" namespace for entries
-        // semantically similar to the user's query and prepend them to the user
-        // turn, so the model sees relevant notes without needing a tool call.
-        let first_user_content = {
+        // semantically similar to the user's query. The block is emitted as a
+        // system-role message (alongside cold_context) rather than inside the
+        // user message, so provider attention weighting treats it as context
+        // rather than user utterance, and the user message stays clean.
+        let vault_recall_block: Option<String> = {
             let q = embedder.embed_query(&task.title).await;
             let mid = embedder.model_id().to_owned();
             let d = embedder.dim();
@@ -720,10 +733,7 @@ impl TurnOrchestrator {
             .await
             .unwrap_or_default();
             tracing::debug!(smedja.turn.vault_recalled = entries.len(), "vault recall");
-            match format_vault_recalled(&entries) {
-                Some(block) => format!("{block}\n\n{first_user_content}"),
-                None => first_user_content,
-            }
+            format_vault_recalled(&entries)
         };
 
         // 4a. Cold recall: pull semantically-relevant context from beyond the
@@ -732,7 +742,14 @@ impl TurnOrchestrator {
         //     is capped at a fraction of the tier budget; lowest-scored entries
         //     are dropped until it fits, so cold context never displaces hot
         //     turns.
-        let cold_results = mem.cold_context(&task.title).await;
+        let mut cold_results = mem.cold_context(&task.title).await;
+        // Also recall from user-stored notes and the active role's namespace.
+        mem.set_cold_query("default", cold_k.min(3));
+        cold_results.extend(mem.cold_context(&task.title).await);
+        if role != AgentRole::Orchestrator {
+            mem.set_cold_query(role.label(), cold_k.min(3));
+            cold_results.extend(mem.cold_context(&task.title).await);
+        }
         let cold_budget = budget_tokens / COLD_BUDGET_DIVISOR;
         let cold_injected = match cold::assemble_cold_block(&cold_results, cold_budget) {
             Some((block, count)) => {
@@ -741,6 +758,10 @@ impl TurnOrchestrator {
             }
             None => 0,
         };
+        // Push proactive vault recall as a system message alongside cold_context.
+        if let Some(block) = vault_recall_block {
+            mem.push(AdapterMessage::system(block));
+        }
         tracing::debug!(
             smedja.turn.cold_results_injected = cold_injected,
             "cold context injection"
