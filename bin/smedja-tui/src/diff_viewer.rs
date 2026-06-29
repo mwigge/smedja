@@ -1,5 +1,6 @@
 //! Diff viewer — unified and side-by-side rendering for diff overlays.
 
+use crate::main_panel::apply_syntect;
 use crate::theme::palette;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -28,11 +29,20 @@ pub fn render_unified(
     frame: &mut Frame,
 ) {
     let visible_h = rect.height.saturating_sub(2) as usize;
-    let rendered: Vec<Line<'_>> = lines
+    let lang = detect_diff_lang(lines).unwrap_or("");
+    let rendered: Vec<Line<'static>> = lines
         .iter()
         .skip(scroll)
         .take(visible_h)
-        .map(|l| line_to_styled(l, no_color))
+        .map(|l| {
+            if !l.starts_with("+++") && l.starts_with('+') {
+                highlighted_diff_line(l, true, lang, no_color)
+            } else if !l.starts_with("---") && l.starts_with('-') {
+                highlighted_diff_line(l, false, lang, no_color)
+            } else {
+                Line::from(vec![Span::raw(l.clone())])
+            }
+        })
         .collect();
     let widget = Paragraph::new(rendered).block(
         Block::default()
@@ -60,19 +70,21 @@ pub fn render_split(
     let right_rect = chunks[1];
 
     // Build parallel left/right line lists from the unified diff.
-    let mut left: Vec<Line<'_>> = Vec::new();
-    let mut right: Vec<Line<'_>> = Vec::new();
+    let lang = detect_diff_lang(lines).unwrap_or("");
+    let mut left: Vec<Line<'static>> = Vec::new();
+    let mut right: Vec<Line<'static>> = Vec::new();
     for l in lines.iter().skip(scroll).take(visible_h * 2) {
-        if l.starts_with('-') {
-            left.push(line_to_styled(l, no_color));
+        if !l.starts_with("---") && l.starts_with('-') {
+            left.push(highlighted_diff_line(l, false, lang, no_color));
             right.push(Line::raw(String::new()));
-        } else if l.starts_with('+') {
+        } else if !l.starts_with("+++") && l.starts_with('+') {
             left.push(Line::raw(String::new()));
-            right.push(line_to_styled(l, no_color));
+            right.push(highlighted_diff_line(l, true, lang, no_color));
         } else {
             // Context or hunk header — appears on both sides.
-            left.push(line_to_styled(l, no_color));
-            right.push(line_to_styled(l, no_color));
+            let styled = Line::from(vec![Span::raw(l.clone())]);
+            left.push(styled.clone());
+            right.push(styled);
         }
     }
 
@@ -88,22 +100,79 @@ pub fn render_split(
     frame.render_widget(right_widget, right_rect);
 }
 
-/// Colours a single diff line by its sigil (`+`, `-`, `@@`, context).
-fn line_to_styled(l: &str, no_color: bool) -> Line<'_> {
-    if no_color {
-        return Line::raw(l);
+/// Extracts a file extension hint from unified diff header lines (`--- a/...`
+/// / `+++ b/...`).  Returns `None` when no recognisable header is found.
+pub fn detect_diff_lang(lines: &[String]) -> Option<&'static str> {
+    for l in lines {
+        let path = if let Some(rest) = l.strip_prefix("--- a/").or_else(|| l.strip_prefix("--- ")) {
+            rest
+        } else if let Some(rest) = l.strip_prefix("+++ b/").or_else(|| l.strip_prefix("+++ ")) {
+            rest
+        } else {
+            continue;
+        };
+        if let Some(ext) = path.rsplit('.').next() {
+            // Map common extensions to syntect-recognised tokens.
+            let token: &'static str = match ext {
+                "rs" => "rs",
+                "py" => "py",
+                "js" | "mjs" | "cjs" => "js",
+                "ts" | "tsx" => "ts",
+                "json" => "json",
+                "toml" => "toml",
+                "yaml" | "yml" => "yaml",
+                "sh" | "bash" => "sh",
+                "go" => "go",
+                "c" | "h" => "c",
+                "cpp" | "cc" | "cxx" | "hpp" => "cpp",
+                "md" => "md",
+                _ => continue,
+            };
+            return Some(token);
+        }
     }
+    None
+}
+
+/// Returns a styled [`Line`] for a single `+` or `-` diff line.
+///
+/// When `no_color` is false and `lang` is non-empty, the content portion is
+/// syntax-highlighted via syntect.  The leading sigil keeps the standard
+/// add/remove colour so the diff structure remains visually clear.
+pub fn highlighted_diff_line(
+    raw: &str,
+    is_added: bool,
+    lang: &str,
+    no_color: bool,
+) -> Line<'static> {
     let p = palette();
-    let style = if l.starts_with('+') && !l.starts_with("+++") {
-        Style::default().fg(p.code_added)
-    } else if l.starts_with('-') && !l.starts_with("---") {
-        Style::default().fg(p.code_removed)
-    } else if l.starts_with("@@") {
-        Style::default().fg(p.accent)
+    let (sigil, sigil_style) = if is_added {
+        ("+", Style::default().fg(p.code_added))
     } else {
-        Style::default()
+        ("-", Style::default().fg(p.code_removed))
     };
-    Line::from(Span::styled(l.to_owned(), style))
+
+    // Strip the leading sigil character.
+    let content = raw.get(1..).unwrap_or("");
+
+    if no_color || lang.is_empty() {
+        let text = format!("{sigil}{content}");
+        return Line::from(vec![Span::styled(text, sigil_style)]);
+    }
+
+    // Highlight via syntect — takes the first (and only) output line.
+    let highlighted = apply_syntect(lang, content);
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(sigil, sigil_style)];
+    if let Some(styled_line) = highlighted.into_iter().next() {
+        if let Some(line) = styled_line.spans {
+            spans.extend(line.spans);
+        } else {
+            spans.push(Span::raw(styled_line.text));
+        }
+    } else {
+        spans.push(Span::raw(content.to_owned()));
+    }
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -159,5 +228,32 @@ mod tests {
         let area = Rect::new(0, 0, 80, 20);
         t.draw(|f| render_unified(&sample_diff(), 3, area, true, f))
             .unwrap();
+    }
+
+    #[test]
+    fn detect_diff_lang_from_rust_header() {
+        let lines: Vec<String> = vec!["--- a/src/main.rs".into(), "+++ b/src/main.rs".into()];
+        assert_eq!(detect_diff_lang(&lines), Some("rs"));
+    }
+
+    #[test]
+    fn detect_diff_lang_returns_none_for_unknown() {
+        let lines: Vec<String> = vec!["@@ -1 +1 @@".into()];
+        assert_eq!(detect_diff_lang(&lines), None);
+    }
+
+    #[test]
+    fn highlighted_diff_line_produces_multi_span_for_added() {
+        let line = "+let x = 1;";
+        let result = highlighted_diff_line(line, true, "rs", false);
+        // Must not panic and must produce spans (content highlighted)
+        assert!(!result.spans.is_empty());
+    }
+
+    #[test]
+    fn highlighted_diff_line_falls_back_to_mono_when_no_color() {
+        let line = "+let x = 1;";
+        let result = highlighted_diff_line(line, true, "rs", true);
+        assert!(!result.spans.is_empty());
     }
 }
