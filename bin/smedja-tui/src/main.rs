@@ -430,7 +430,7 @@ pub(crate) struct AppState {
     last_poll: Option<std::time::Instant>,
     /// Monotonically increasing turn counter.
     turn_n: u32,
-    /// Timestamp when the current turn was submitted (used to compute `elapsed_ms`).
+    /// Timestamp when the current turn was submitted (used to compute `turn_ms`).
     turn_submitted_at: Option<std::time::Instant>,
     /// The turn block being assembled for the current in-flight turn.
     current_block: Option<blocks::TurnBlock>,
@@ -487,9 +487,9 @@ pub(crate) struct AppState {
     file_picker_open: bool,
     /// Current directory being browsed in the file picker.
     file_picker_dir: std::path::PathBuf,
-    /// Entries in the current directory: (display-name, is_dir).
+    /// Entries in the current directory: (display-name, `is_dir`).
     file_picker_entries: Vec<(String, bool)>,
-    /// Cursor index within file_picker_entries.
+    /// Cursor index within `file_picker_entries`.
     file_picker_cursor: usize,
     /// Session ids parallel to `slash_completions` while the session picker is open.
     session_picker_ids: Vec<String>,
@@ -2802,11 +2802,9 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     };
 
     // -- Status bar -----------------------------------------------------------
-    let ctx_pct = if state.context_window > 0 {
-        Some(((state.context_used as f64 / state.context_window as f64) * 100.0).round() as u8)
-    } else {
-        None
-    };
+    let ctx_pct = (state.context_used * 100)
+        .checked_div(state.context_window)
+        .map(|p| u8::try_from(p.min(100)).unwrap_or(100));
     let ctx = ModuleCtx {
         session_id: &state.session_id,
         mode: state.mode.as_deref(),
@@ -3322,18 +3320,19 @@ fn render_session_peek(
             Span::raw(value.to_owned()),
         ])
     };
-    let ctx_str = if state.context_window > 0 {
-        let pct =
-            ((state.context_used as f64 / state.context_window as f64) * 100.0).round() as u64;
-        format!(
-            "{}k / {}k  ({}%)",
-            state.context_used / 1000,
-            state.context_window / 1000,
-            pct
-        )
-    } else {
-        "-".to_owned()
-    };
+    let ctx_str = (state.context_used * 100)
+        .checked_div(state.context_window)
+        .map_or_else(
+            || "-".to_owned(),
+            |pct| {
+                format!(
+                    "{}k / {}k  ({}%)",
+                    state.context_used / 1000,
+                    state.context_window / 1000,
+                    pct.min(100)
+                )
+            },
+        );
     let lines = vec![
         field("mode", state.mode.as_deref().unwrap_or("impl")),
         field("tier", state.tier.as_deref().unwrap_or("fast")),
@@ -4152,7 +4151,7 @@ async fn main() -> Result<()> {
                         state.assistant_open = false;
                         let elapsed_s = state
                             .turn_submitted_at
-                            .map_or(0.0, |t| t.elapsed().as_secs_f32());
+                            .map_or(0.0, |start| start.elapsed().as_secs_f32());
                         state
                             .thinking_steps
                             .push(thoughts_panel::ThinkingStep::Answer { elapsed_s });
@@ -4163,19 +4162,18 @@ async fn main() -> Result<()> {
                         }
                         let output_tok = u64::from(output_tok);
                         let input_tok = u64::from(input_tok.unwrap_or(0));
-                        let tp = traceparent;
-                        let elapsed_ms = state.turn_submitted_at.map_or(0, |t| {
-                            u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+                        let turn_ms = state.turn_submitted_at.map_or(0, |inst| {
+                            u64::try_from(inst.elapsed().as_millis()).unwrap_or(u64::MAX)
                         });
                         state.turn_submitted_at = None;
-                        state.last_traceparent.clone_from(&tp);
+                        state.last_traceparent.clone_from(&traceparent);
 
                         // Track latency samples for p95/p99 in the obs panel.
-                        if elapsed_ms > 0 {
+                        if turn_ms > 0 {
                             if state.latency_samples.len() >= LATENCY_SAMPLE_CAP {
                                 state.latency_samples.pop_front();
                             }
-                            state.latency_samples.push_back(elapsed_ms);
+                            state.latency_samples.push_back(turn_ms);
                             state.obs_snapshot.latency_samples = state.latency_samples.clone();
                         }
                         // Accumulate session token totals.
@@ -4186,7 +4184,7 @@ async fn main() -> Result<()> {
                         state.obs_snapshot.tokens_output = state.session_tokens_out;
 
                         let block_content = if let Some(mut block) = state.current_block.take() {
-                            block.complete(elapsed_ms);
+                            block.complete(turn_ms);
                             let content = block.content.clone();
                             state.block_store.push(block);
                             content
@@ -4194,7 +4192,7 @@ async fn main() -> Result<()> {
                             String::new()
                         };
 
-                        let footer = if let Some(ref tp_str) = tp {
+                        let footer = if let Some(ref tp_str) = traceparent {
                             if state.otlp_configured {
                                 format!("↳ {input_tok}↑ {output_tok}↓ · trace: {tp_str}")
                             } else {
@@ -4203,7 +4201,7 @@ async fn main() -> Result<()> {
                                 )
                             }
                         } else {
-                            format!("↳ {input_tok}↑ {output_tok}↓ tokens · {elapsed_ms}ms")
+                            format!("↳ {input_tok}↑ {output_tok}↓ tokens · {turn_ms}ms")
                         };
                         state.main_panel.push_line(footer);
 
@@ -4388,14 +4386,14 @@ async fn main() -> Result<()> {
                             let response = v["response"].as_str().unwrap_or("").to_owned();
                             let input_tok = v["input_tok"].as_i64().unwrap_or(0);
                             let output_tok = v["output_tok"].as_i64().unwrap_or(0);
-                            let elapsed_ms = state.turn_submitted_at.map_or(0, |t| {
+                            let turn_ms = state.turn_submitted_at.map_or(0, |t| {
                                 u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
                             });
                             state.turn_submitted_at = None;
 
                             if let Some(mut block) = state.current_block.take() {
                                 block.push_text(&response);
-                                block.complete(elapsed_ms);
+                                block.complete(turn_ms);
                                 for line in block.render_lines(80) {
                                     state.main_panel.push_line(line.clone());
                                     state.messages.push(Message {
@@ -4415,7 +4413,7 @@ async fn main() -> Result<()> {
                             }
 
                             let footer =
-                                format!("↳ {input_tok}↑ {output_tok}↓ tokens · {elapsed_ms}ms");
+                                format!("↳ {input_tok}↑ {output_tok}↓ tokens · {turn_ms}ms");
                             state.main_panel.push_line(footer);
                             state.last_traceparent = None;
                         }
@@ -6696,7 +6694,7 @@ mod tests {
     fn build_turn_footer(
         input_tok: u64,
         output_tok: u64,
-        elapsed_ms: u64,
+        turn_ms: u64,
         traceparent: Option<&str>,
         otlp_configured: bool,
     ) -> String {
@@ -6709,7 +6707,7 @@ mod tests {
                 )
             }
         } else {
-            format!("↳ {input_tok}↑ {output_tok}↓ tokens · {elapsed_ms}ms")
+            format!("↳ {input_tok}↑ {output_tok}↓ tokens · {turn_ms}ms")
         }
     }
 

@@ -40,6 +40,7 @@ impl Provider for CodexCliProvider {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
     let prompt = messages
         .last()
