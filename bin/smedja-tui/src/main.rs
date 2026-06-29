@@ -4663,6 +4663,13 @@ async fn main() -> Result<()> {
                             state.consecutive_low_quality = 0;
                         }
                     }
+                    Some("buffer_overflow") => {
+                        let lost = event["lost"].as_u64().unwrap_or(1);
+                        let s = if lost == 1 { "" } else { "s" };
+                        state.main_panel.push_line(format!(
+                            "[stream] {lost} event{s} dropped — output may be incomplete"
+                        ));
+                    }
                     _ => {}
                 }
             }
