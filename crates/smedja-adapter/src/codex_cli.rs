@@ -59,11 +59,12 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
         let mut command = tokio::process::Command::new("codex");
 
         // Route to `codex exec resume` when a prior session exists.
-        if let Some(id) = resume_id.as_deref().filter(|s| !s.is_empty()) {
+        let is_resume = resume_id.as_deref().is_some_and(|s| !s.is_empty());
+        if is_resume {
             command.arg("exec").arg("resume");
-            if id == "last" {
+            if resume_id.as_deref() == Some("last") {
                 command.arg("--last");
-            } else {
+            } else if let Some(id) = resume_id.as_deref() {
                 command.arg(id);
             }
         } else {
@@ -73,20 +74,23 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
         // `codex exec` runs autonomously — it has no per-tool approval hook like
         // claude, so smedja's permission mode maps to codex's sandbox level
         // instead. Auto keeps the full bypass; Plan makes codex read-only; every
-        // other mode contains it to the workspace. (Read-only/workspace-write
-        // run non-interactively, so codex never hangs waiting for an approval
-        // smedja can't answer here.)
+        // other mode contains it to the workspace.
+        //
+        // `codex exec resume` does not accept `--sandbox`; only the bypass flag
+        // is shared between the two sub-commands.
         command.arg("--json").arg("--skip-git-repo-check");
         match perm_mode.as_deref() {
             Some("auto") => {
                 command.arg("--dangerously-bypass-approvals-and-sandbox");
             }
-            Some("plan") => {
-                command.arg("--sandbox").arg("read-only");
+            _ if !is_resume => {
+                // `--sandbox` is only valid for `codex exec`, not `codex exec resume`.
+                match perm_mode.as_deref() {
+                    Some("plan") => { command.arg("--sandbox").arg("read-only"); }
+                    _ => { command.arg("--sandbox").arg("workspace-write"); }
+                }
             }
-            _ => {
-                command.arg("--sandbox").arg("workspace-write");
-            }
+            _ => {} // resume + non-auto: use codex's default sandbox
         }
 
         if !model.is_empty() {
@@ -187,6 +191,7 @@ async fn read_stderr(stderr: Option<tokio::process::ChildStderr>) -> String {
 /// Tries multiple known `OpenAI` Responses-API event shapes before falling back
 /// to treating a non-empty, non-JSON line as plain text. Returns `None` for
 /// blank lines and unrecognised JSON objects.
+#[allow(clippy::too_many_lines)]
 fn parse_codex_line(line: &str) -> Option<Delta> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -294,6 +299,73 @@ fn parse_codex_line(line: &str) -> Option<Delta> {
                 #[allow(clippy::cast_possible_truncation)]
                 cache_read_tokens: cache as u32,
             });
+        }
+    }
+
+    // Pattern 6: codex exec --json new wire format (≥0.139).
+    //
+    // {"type":"item.started","item":{"type":"command_execution","command":"...","...}}
+    // → ToolCall delta so the TUI can display the pending tool.
+    //
+    // {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+    // → Text delta (the assistant reply).
+    //
+    // {"type":"item.completed","item":{"type":"command_execution","aggregated_output":"..."}}
+    // → ToolResult delta.
+    //
+    // {"type":"turn.completed","usage":{"input_tokens":N,"output_tokens":M,"cached_input_tokens":K}}
+    // → Usage delta.
+    if let Some(ev_type) = v.get("type").and_then(serde_json::Value::as_str) {
+        match ev_type {
+            "item.started" => {
+                let item = v.get("item")?;
+                if item.get("type").and_then(serde_json::Value::as_str) == Some("command_execution") {
+                    let cmd = item.get("command").and_then(serde_json::Value::as_str).unwrap_or("");
+                    if !cmd.is_empty() {
+                        return Some(Delta::ToolCall {
+                            name: "shell".to_owned(),
+                            input: serde_json::json!({ "command": cmd }),
+                        });
+                    }
+                }
+            }
+            "item.completed" => {
+                let item = v.get("item")?;
+                match item.get("type").and_then(serde_json::Value::as_str) {
+                    Some("agent_message") => {
+                        let text = item.get("text").and_then(serde_json::Value::as_str).unwrap_or("");
+                        if !text.is_empty() {
+                            return Some(Delta::Text(text.to_owned()));
+                        }
+                    }
+                    Some("command_execution") => {
+                        let output = item.get("aggregated_output").and_then(serde_json::Value::as_str).unwrap_or("");
+                        let cmd = item.get("command").and_then(serde_json::Value::as_str).unwrap_or("?");
+                        return Some(Delta::ToolResult {
+                            tool_use_id: String::new(),
+                            content: format!("[{cmd}]\n{output}"),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            "turn.completed" => {
+                let usage = v.get("usage")?;
+                let input = usage.get("input_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                let output = usage.get("output_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                let cache = usage.get("cached_input_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                if input > 0 || output > 0 {
+                    return Some(Delta::Usage {
+                        #[allow(clippy::cast_possible_truncation)]
+                        input_tokens: input as u32,
+                        #[allow(clippy::cast_possible_truncation)]
+                        output_tokens: output as u32,
+                        #[allow(clippy::cast_possible_truncation)]
+                        cache_read_tokens: cache as u32,
+                    });
+                }
+            }
+            _ => {}
         }
     }
 
