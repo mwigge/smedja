@@ -17,6 +17,7 @@ mod staging;
 mod statusbar;
 mod terminal_guard;
 pub mod theme;
+mod thoughts_panel;
 mod tool_call;
 mod upgrade;
 mod value_panel;
@@ -2914,95 +2915,22 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         .main_panel
         .render(main_area, frame, selection, search_q, state.no_color);
 
-    // Overlay an animated thinking indicator at the bottom of the main area.
-    // When the model emits thinking tokens, we show a one-line preview of the
-    // accumulated content alongside the spinner.
-    if state.turn_in_flight && main_area.height >= 1 {
-        const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-        let frame_char = SPINNER[state.spinner_tick as usize % SPINNER.len()];
-        state.spinner_tick = state.spinner_tick.wrapping_add(1);
-        let thinking_area = ratatui::layout::Rect::new(
-            main_area.x,
-            main_area.y + main_area.height.saturating_sub(1),
-            main_area.width,
-            1,
-        );
-        let spinner_style = if state.no_color {
-            Style::default()
-        } else {
-            Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
-        };
-        let dim_style = if state.no_color {
-            Style::default()
-        } else {
-            Style::default()
-                .fg(p.text_dim)
-                .add_modifier(Modifier::ITALIC)
-        };
-        // Label adapts to what the model is actually doing right now.
-        let (label, show_thinking_preview) =
-            if let Some((_, ref name, ref inp)) = state.pending_tool {
-                let inp_short: String = inp.chars().take(40).collect();
-                let ellipsis = if inp.chars().count() > 40 {
-                    "\u{2026}"
-                } else {
-                    ""
-                };
-                (format!("{frame_char} {name}: {inp_short}{ellipsis}"), false)
-            } else if !state.current_thinking.is_empty() {
-                (format!("{frame_char} thinking\u{2026}"), true)
-            } else {
-                (format!("{frame_char} working\u{2026}"), false)
-            };
-        let mut spans = vec![Span::styled(label, spinner_style)];
-        if show_thinking_preview {
-            // Show the last ~50 chars of thinking so users see live progress.
-            let preview: String = state
-                .current_thinking
-                .chars()
-                .rev()
-                .take(50)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect();
-            let preview = preview.replace('\n', " ");
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(preview, dim_style));
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)), thinking_area);
-    }
-
-    // When thinking_expanded is set, render the full thinking content in an
-    // overlay above the input area.
-    if state.thinking_expanded && !state.current_thinking.is_empty() && main_area.height >= 4 {
-        let h = main_area.height.min(10);
-        let overlay_rect = ratatui::layout::Rect::new(
-            main_area.x,
-            main_area.y + main_area.height.saturating_sub(h + 1),
-            main_area.width,
-            h,
-        );
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" thinking (T to collapse) ");
-        let inner = block.inner(overlay_rect);
-        let thinking_style = if state.no_color {
-            Style::default()
-        } else {
-            Style::default().fg(p.text_dim)
-        };
-        let lines: Vec<Line<'_>> = state
-            .current_thinking
-            .lines()
-            .map(|l| Line::from(Span::styled(l.to_owned(), thinking_style)))
-            .collect();
-        frame.render_widget(block, overlay_rect);
-        frame.render_widget(
-            Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
-            inner,
-        );
-    }
+    thoughts_panel::render_indicator(
+        main_area,
+        state.turn_in_flight,
+        &mut state.spinner_tick,
+        &state.current_thinking,
+        state.pending_tool.as_ref(),
+        state.no_color,
+        frame,
+    );
+    thoughts_panel::render_overlay(
+        main_area,
+        state.thinking_expanded,
+        &state.current_thinking,
+        state.no_color,
+        frame,
+    );
 
     // -- Action log -----------------------------------------------------------
     // L122: 5-row area using the existing ActionLog widget.
