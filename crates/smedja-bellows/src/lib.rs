@@ -10,7 +10,7 @@ pub mod handle;
 pub mod stream_event;
 
 pub use dispatcher::Dispatcher;
-pub use event::TurnEvent;
+pub use event::{CorrelationCtx, TurnEvent};
 pub use handle::TurnHandle;
 pub use stream_event::StreamEvent;
 

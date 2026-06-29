@@ -516,8 +516,6 @@ pub(crate) struct AppState {
     cowork_modify_mode: bool,
     /// Current content of the modify instruction input.
     cowork_modify_input: String,
-    /// Timestamp of the last `cowork.pending` poll.
-    last_cowork_poll: Option<std::time::Instant>,
     /// Timestamp of the last `graph.status` poll (refreshes the right-bar count).
     last_graph_poll: Option<std::time::Instant>,
     /// NDJSON stream receiver for the current in-flight turn.
@@ -3809,7 +3807,6 @@ async fn main() -> Result<()> {
         pending_cowork: Vec::new(),
         cowork_modify_mode: false,
         cowork_modify_input: String::new(),
-        last_cowork_poll: None,
         last_graph_poll: None,
         stream_rx: None,
         upgrade_rx: None,
@@ -4296,6 +4293,25 @@ async fn main() -> Result<()> {
                             "[stream] {lost} event{s} dropped — output may be incomplete"
                         ));
                     }
+                    StreamEvent::CoworkRequest {
+                        approval_id,
+                        tool,
+                        step_n,
+                        args_display,
+                        reasoning,
+                    } => {
+                        let already_known =
+                            state.pending_cowork.iter().any(|i| i.id == approval_id);
+                        if !already_known {
+                            state.pending_cowork.push(cowork_widget::CoworkItem {
+                                id: approval_id,
+                                tool,
+                                step_n,
+                                args_display,
+                                reasoning,
+                            });
+                        }
+                    }
                     StreamEvent::Unknown => {}
                 }
             }
@@ -4502,47 +4518,6 @@ async fn main() -> Result<()> {
         if let Some(msg) = upgrade_done {
             push_system_message(&mut state, msg);
             state.upgrade_rx = None;
-        }
-
-        // Poll cowork.pending every 200 ms when a turn is in flight to surface
-        // any gate waiting for a human decision.
-        let should_poll_cowork = state
-            .last_cowork_poll
-            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(200));
-        if should_poll_cowork && state.pending_task_id.is_some() {
-            state.last_cowork_poll = Some(std::time::Instant::now());
-            if let Ok(Value::Array(items)) = client
-                .call("cowork.pending", json!({ "session_id": state.session_id }))
-                .await
-            {
-                let mut parsed: Vec<cowork_widget::CoworkItem> = items
-                    .iter()
-                    .filter_map(|v| {
-                        let id = v["id"].as_str()?.to_owned();
-                        let tool = v["tool"].as_str().unwrap_or("?").to_owned();
-                        #[allow(clippy::cast_possible_truncation)]
-                        // step counter is bounded well below u32::MAX
-                        let step_n = v["step_n"].as_u64().unwrap_or(0) as u32;
-                        let args_display = v["args"]
-                            .as_object()
-                            .map_or_else(|| v["args"].to_string(), |_| v["args"].to_string());
-                        let reasoning = v["reasoning"].as_str().unwrap_or("").to_owned();
-                        Some(cowork_widget::CoworkItem {
-                            id,
-                            tool,
-                            step_n,
-                            args_display,
-                            reasoning,
-                        })
-                    })
-                    .collect();
-                // Keep items already confirmed in the widget (user already see
-                // them); only add genuinely new IDs.
-                let existing_ids: std::collections::HashSet<String> =
-                    state.pending_cowork.iter().map(|i| i.id.clone()).collect();
-                parsed.retain(|i| !existing_ids.contains(&i.id));
-                state.pending_cowork.extend(parsed);
-            }
         }
 
         // Graph status poll: reflect the real indexed symbol count for the
@@ -5964,7 +5939,6 @@ mod tests {
             pending_cowork: Vec::new(),
             cowork_modify_mode: false,
             cowork_modify_input: String::new(),
-            last_cowork_poll: None,
             last_graph_poll: None,
             stream_rx: None,
             upgrade_rx: None,

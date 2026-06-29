@@ -59,6 +59,22 @@ pub enum StreamEvent {
     /// Events were evicted from the per-turn buffer before delivery.
     BufferOverflow { lost: u64 },
 
+    /// A tool call is awaiting human approval at the cowork gate.
+    ///
+    /// The TUI renders the approval overlay immediately without polling.
+    CoworkRequest {
+        /// UUID for `cowork.approve` / `cowork.deny` / `cowork.modify`.
+        approval_id: String,
+        /// Tool name.
+        tool: String,
+        /// Step index within the current turn.
+        step_n: u32,
+        /// Human-readable serialised tool arguments.
+        args_display: String,
+        /// Agent's reasoning for invoking this tool.
+        reasoning: String,
+    },
+
     /// Catchall for unknown future event types — never matched by the TUI.
     #[serde(other)]
     Unknown,
@@ -232,6 +248,22 @@ mod tests {
         .is_terminal());
         assert!(!StreamEvent::Delta { text: "y".into() }.is_terminal());
         assert!(!StreamEvent::Started { agent_name: None }.is_terminal());
+    }
+
+    #[test]
+    fn cowork_request_roundtrips() {
+        let ev = StreamEvent::CoworkRequest {
+            approval_id: "uuid-123".into(),
+            tool: "bash".into(),
+            step_n: 3,
+            args_display: r#"{"cmd":"ls"}"#.into(),
+            reasoning: "list workspace files".into(),
+        };
+        assert_eq!(roundtrip(&ev), ev);
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""type":"cowork_request""#));
+        assert!(json.contains("uuid-123"));
+        assert!(json.contains("bash"));
     }
 
     #[test]

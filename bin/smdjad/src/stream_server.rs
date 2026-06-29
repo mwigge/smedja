@@ -214,6 +214,28 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                             buf.push_back(line);
                         }
                     }
+                    TurnEvent::CoworkRequest {
+                        ref approval_id,
+                        ref tool,
+                        step_n,
+                        ref args_display,
+                        ref reasoning,
+                        ref turn_id,
+                        ..
+                    } => {
+                        let Some(tid) = turn_id else { continue };
+                        if let Some(buf) = store.get_mut(tid) {
+                            let line = serde_json::to_string(&StreamEvent::CoworkRequest {
+                                approval_id: approval_id.clone(),
+                                tool: tool.clone(),
+                                step_n,
+                                args_display: args_display.clone(),
+                                reasoning: reasoning.clone(),
+                            })
+                            .unwrap_or_default();
+                            evict_and_push(buf, line);
+                        }
+                    }
                 }
             } // lock released here
               // Schedule buffer eviction after TTL so late-connecting stream
@@ -477,6 +499,24 @@ fn turn_event_to_ndjson(
                 skill_advisories: skill_advisories.clone(),
                 llm_reviewed: *llm_reviewed,
                 suggested_command: None,
+            });
+            (turn_id.clone(), line, false)
+        }
+        TurnEvent::CoworkRequest {
+            approval_id,
+            tool,
+            step_n,
+            args_display,
+            reasoning,
+            turn_id,
+            ..
+        } => {
+            let line = ser(&StreamEvent::CoworkRequest {
+                approval_id: approval_id.clone(),
+                tool: tool.clone(),
+                step_n: *step_n,
+                args_display: args_display.clone(),
+                reasoning: reasoning.clone(),
             });
             (turn_id.clone(), line, false)
         }

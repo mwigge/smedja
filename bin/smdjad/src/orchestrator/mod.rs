@@ -1169,16 +1169,17 @@ impl TurnOrchestrator {
                         // High-risk roles (IaC) always confirm a mutation — never
                         // auto-approved even in Auto/AcceptEdits — because the ops
                         // (apply/destroy) are dangerous and hard to reverse.
+                        let push = Some((dispatcher.as_ref(), Some(turn_id.as_str())));
                         let decision = if role.is_high_risk()
                             && crate::cowork::evaluate(
                                 crate::cowork::PermissionMode::Plan,
                                 &tool_name,
                             ) == crate::cowork::PermissionDecision::Deny
                         {
-                            gate.gate_tool_forced_ask(0, &tool_name, args_scrubbed, "")
+                            gate.gate_tool_forced_ask(0, &tool_name, args_scrubbed, "", push)
                                 .await
                         } else {
-                            gate.gate_tool(0, &tool_name, args_scrubbed, "").await
+                            gate.gate_tool(0, &tool_name, args_scrubbed, "", push).await
                         };
                         match decision {
                             Decision::Approve => None,
