@@ -602,6 +602,8 @@ pub(crate) struct AppState {
     session_tokens_in: u64,
     /// Cumulative output tokens for this session.
     session_tokens_out: u64,
+    /// True while the session config peek overlay is visible (toggled by Ctrl+P in scroll mode).
+    show_session_peek: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +803,9 @@ pub(crate) async fn submit(input: &str, state: &mut AppState, client: &mut Clien
         return Ok(());
     }
     state.prompt_history.push(text.clone());
+    if state.prompt_history.len() > PROMPT_HISTORY_CAP {
+        state.prompt_history.remove(0);
+    }
     state.history_idx = None;
     state.saved_input.clear();
     let user_msg = Message {
@@ -1103,6 +1108,17 @@ fn status_bar_line(ctx: &ModuleCtx<'_>, no_color: bool) -> Line<'static> {
         p.text_dim,
         false,
     ));
+    if let Some(pct) = ctx.ctx_pct {
+        spans.push(sep());
+        let color = if pct >= 80 {
+            p.error
+        } else if pct >= 60 {
+            p.warn
+        } else {
+            p.text_dim
+        };
+        spans.push(chip(format!("▓ {pct}%"), color, false));
+    }
     if ctx.pending {
         spans.push(chip("  ⟳".to_owned(), p.accent, true));
     }
@@ -2099,6 +2115,11 @@ async fn handle_key(
             KeyCode::Esc => {
                 // Fall through to the main Esc handler below.
             }
+            // Ctrl+P in scroll mode: toggle session config peek overlay.
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.show_session_peek = !state.show_session_peek;
+                return Ok(());
+            }
             _ => return Ok(()), // consume unknown keys in scroll mode
         }
     }
@@ -2251,7 +2272,9 @@ async fn handle_key(
         }
 
         KeyCode::Esc => {
-            if state.secret_var.take().is_some() {
+            if state.show_session_peek {
+                state.show_session_peek = false;
+            } else if state.secret_var.take().is_some() {
                 // Cancel masked secret entry; discard whatever was typed.
                 state.input.clear();
                 state.input_cursor = 0;
@@ -2711,6 +2734,11 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     };
 
     // -- Status bar -----------------------------------------------------------
+    let ctx_pct = if state.context_window > 0 {
+        Some(((state.context_used as f64 / state.context_window as f64) * 100.0).round() as u8)
+    } else {
+        None
+    };
     let ctx = ModuleCtx {
         session_id: &state.session_id,
         mode: state.mode.as_deref(),
@@ -2718,6 +2746,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         runner: Some(&state.runner),
         pending: state.pending_task_id.is_some(),
         input_mode: !state.scroll_focus,
+        ctx_pct,
     };
     // Starship-style segmented status line (left), with a dim discoverability
     // hint right-aligned over the same row. Paint the panel background first so
@@ -3010,6 +3039,11 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         render_session_detail(frame, area, detail, p);
     }
 
+    // -- Session config peek overlay (Ctrl+P in scroll mode) -----------------
+    if state.show_session_peek {
+        render_session_peek(frame, area, state, p);
+    }
+
     // -- Cowork gate overlay --------------------------------------------------
     if !state.pending_cowork.is_empty() {
         let cw_rect = cowork_widget::overlay_rect(body_area);
@@ -3189,6 +3223,67 @@ fn render_session_detail(
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(p.border))
                 .title(" session detail "),
+        ),
+        popup_rect,
+    );
+}
+
+/// Renders a compact session config peek overlay (Ctrl+P in scroll mode).
+///
+/// Shows mode, tier, runner, and context window fill so prompt-engineering
+/// context is visible without opening the full context rail.
+fn render_session_peek(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    state: &AppState,
+    p: &crate::theme::Palette,
+) {
+    use ratatui::widgets::Clear;
+    let popup_w = area.width.clamp(30, 52);
+    let popup_h: u16 = 7;
+    let popup_x = area.x + area.width.saturating_sub(popup_w) / 2;
+    let popup_y = area.y + area.height.saturating_sub(popup_h) / 2;
+    let popup_rect = ratatui::layout::Rect::new(popup_x, popup_y, popup_w, popup_h);
+
+    let field = |label: &str, value: &str| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(
+                format!("  {label:<10}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(value.to_owned()),
+        ])
+    };
+    let ctx_str = if state.context_window > 0 {
+        let pct =
+            ((state.context_used as f64 / state.context_window as f64) * 100.0).round() as u64;
+        format!(
+            "{}k / {}k  ({}%)",
+            state.context_used / 1000,
+            state.context_window / 1000,
+            pct
+        )
+    } else {
+        "-".to_owned()
+    };
+    let lines = vec![
+        field("mode", state.mode.as_deref().unwrap_or("impl")),
+        field("tier", state.tier.as_deref().unwrap_or("fast")),
+        field("runner", &state.runner),
+        field("context", &ctx_str),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  ^P / Esc  close",
+            Style::default().fg(p.text_dim),
+        )),
+    ];
+    frame.render_widget(Clear, popup_rect);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(p.border))
+                .title(" session config (^P) "),
         ),
         popup_rect,
     );
@@ -3631,6 +3726,7 @@ async fn main() -> Result<()> {
         latency_samples: VecDeque::new(),
         session_tokens_in: 0,
         session_tokens_out: 0,
+        show_session_peek: false,
     };
 
     // Connect banner — shown on every startup so the user knows what's connected.
@@ -4571,6 +4667,9 @@ async fn try_reconnect(sock: &std::path::Path) -> Option<Client> {
 /// Maximum number of turn latency samples retained for p95/p99 computation.
 const LATENCY_SAMPLE_CAP: usize = 50;
 
+/// Maximum number of entries kept in the prompt history ring.
+pub(crate) const PROMPT_HISTORY_CAP: usize = 500;
+
 const METRICS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Window covered by the metrics fetch: the last 24h, in microseconds.
@@ -4795,6 +4894,7 @@ mod tests {
             runner: Some("claude-cli"),
             pending: false,
             input_mode: true,
+            ctx_pct: None,
         };
         let text: String = status_bar_line(&ctx, true)
             .spans
@@ -4805,6 +4905,66 @@ mod tests {
         assert!(text.contains("CLAUDE"), "{text}"); // runner_label uppercases
         assert!(text.contains("deep"), "{text}");
         assert!(text.contains("abcd1234"), "{text}"); // 8-char session id
+    }
+
+    #[test]
+    fn status_bar_shows_ctx_pct_when_nonzero() {
+        let ctx = ModuleCtx {
+            session_id: "abc",
+            mode: None,
+            tier: None,
+            runner: None,
+            pending: false,
+            input_mode: true,
+            ctx_pct: Some(61),
+        };
+        let text: String = status_bar_line(&ctx, true)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("61%"), "ctx gauge must appear: {text}");
+    }
+
+    #[test]
+    fn status_bar_omits_ctx_gauge_when_none() {
+        let ctx = ModuleCtx {
+            session_id: "abc",
+            mode: None,
+            tier: None,
+            runner: None,
+            pending: false,
+            input_mode: true,
+            ctx_pct: None,
+        };
+        let text: String = status_bar_line(&ctx, true)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(!text.contains('%'), "no gauge when ctx_pct is None: {text}");
+    }
+
+    #[test]
+    fn ctrl_p_in_scroll_mode_toggles_session_peek() {
+        let mut state = make_state("sess-peek");
+        state.scroll_focus = true;
+        assert!(!state.show_session_peek);
+        // Simulate Ctrl+P toggle
+        state.show_session_peek = !state.show_session_peek;
+        assert!(state.show_session_peek);
+    }
+
+    #[test]
+    fn prompt_history_capped_at_max_size() {
+        let mut history: Vec<String> = Vec::new();
+        for i in 0..=PROMPT_HISTORY_CAP {
+            history.push(format!("msg{i}"));
+            if history.len() > PROMPT_HISTORY_CAP {
+                history.remove(0);
+            }
+        }
+        assert_eq!(history.len(), PROMPT_HISTORY_CAP);
     }
 
     #[test]
@@ -5819,6 +5979,7 @@ mod tests {
             file_picker_dir: std::path::PathBuf::new(),
             file_picker_entries: Vec::new(),
             file_picker_cursor: 0,
+            show_session_peek: false,
         }
     }
 
