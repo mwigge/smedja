@@ -755,6 +755,10 @@ pub(crate) async fn submit(input: &str, state: &mut AppState, client: &mut Clien
     if text.is_empty() {
         return Ok(());
     }
+    if state.turn_in_flight {
+        push_system_message(state, "a turn is already in flight — press Esc to cancel");
+        return Ok(());
+    }
     state.prompt_history.push(text.clone());
     state.history_idx = None;
     state.saved_input.clear();
@@ -931,7 +935,7 @@ fn classify_turn_error(msg: &str) -> (&'static str, &'static str) {
     if lower.contains("rate limit") || lower.contains("rate_limit") {
         (
             "RATE LIMITED",
-            "Wait a moment and press Ctrl-Enter to retry",
+            "Use ↑ to recall your last message, then Enter to retry",
         )
     } else if lower.contains("api key")
         || lower.contains("auth")
@@ -955,8 +959,21 @@ fn classify_turn_error(msg: &str) -> (&'static str, &'static str) {
             "NETWORK ERROR",
             "Check network connectivity and provider endpoint",
         )
+    } else if lower.contains("overload") {
+        (
+            "OVERLOADED",
+            "Provider overloaded — use ↑ and retry in a moment",
+        )
+    } else if lower.contains("context length") || lower.contains("maximum context") {
+        (
+            "CONTEXT FULL",
+            "Context window full — use /rollback to trim history",
+        )
     } else {
-        ("ERROR", "")
+        (
+            "ERROR",
+            "Check /obs for details or run smj session rollback",
+        )
     }
 }
 
@@ -4807,10 +4824,11 @@ async fn main() -> Result<()> {
                         state.last_poll =
                             Some(poll_base + std::time::Duration::from_millis(backoff_ms));
                         if state.poll_retry_count % 5 == 1 {
-                            state.main_panel.push_line(format!(
-                                "waiting for turn… (poll attempt {})",
-                                state.poll_retry_count
-                            ));
+                            let attempt = state.poll_retry_count;
+                            push_action_log(
+                                &mut state,
+                                format!("waiting for turn… (poll attempt {attempt})"),
+                            );
                         }
                         if state.poll_retry_count >= 60 {
                             state.main_panel.push_line(
