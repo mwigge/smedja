@@ -86,8 +86,12 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
             _ if !is_resume => {
                 // `--sandbox` is only valid for `codex exec`, not `codex exec resume`.
                 match perm_mode.as_deref() {
-                    Some("plan") => { command.arg("--sandbox").arg("read-only"); }
-                    _ => { command.arg("--sandbox").arg("workspace-write"); }
+                    Some("plan") => {
+                        command.arg("--sandbox").arg("read-only");
+                    }
+                    _ => {
+                        command.arg("--sandbox").arg("workspace-write");
+                    }
                 }
             }
             _ => {} // resume + non-auto: use codex's default sandbox
@@ -319,8 +323,12 @@ fn parse_codex_line(line: &str) -> Option<Delta> {
         match ev_type {
             "item.started" => {
                 let item = v.get("item")?;
-                if item.get("type").and_then(serde_json::Value::as_str) == Some("command_execution") {
-                    let cmd = item.get("command").and_then(serde_json::Value::as_str).unwrap_or("");
+                if item.get("type").and_then(serde_json::Value::as_str) == Some("command_execution")
+                {
+                    let cmd = item
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
                     if !cmd.is_empty() {
                         return Some(Delta::ToolCall {
                             name: "shell".to_owned(),
@@ -333,14 +341,23 @@ fn parse_codex_line(line: &str) -> Option<Delta> {
                 let item = v.get("item")?;
                 match item.get("type").and_then(serde_json::Value::as_str) {
                     Some("agent_message") => {
-                        let text = item.get("text").and_then(serde_json::Value::as_str).unwrap_or("");
+                        let text = item
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
                         if !text.is_empty() {
                             return Some(Delta::Text(text.to_owned()));
                         }
                     }
                     Some("command_execution") => {
-                        let output = item.get("aggregated_output").and_then(serde_json::Value::as_str).unwrap_or("");
-                        let cmd = item.get("command").and_then(serde_json::Value::as_str).unwrap_or("?");
+                        let output = item
+                            .get("aggregated_output")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        let cmd = item
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("?");
                         return Some(Delta::ToolResult {
                             tool_use_id: String::new(),
                             content: format!("[{cmd}]\n{output}"),
@@ -351,9 +368,18 @@ fn parse_codex_line(line: &str) -> Option<Delta> {
             }
             "turn.completed" => {
                 let usage = v.get("usage")?;
-                let input = usage.get("input_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0);
-                let output = usage.get("output_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0);
-                let cache = usage.get("cached_input_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                let input = usage
+                    .get("input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let output = usage
+                    .get("output_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let cache = usage
+                    .get("cached_input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
                 if input > 0 || output > 0 {
                     return Some(Delta::Usage {
                         #[allow(clippy::cast_possible_truncation)]

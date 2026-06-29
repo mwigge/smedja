@@ -1,0 +1,51 @@
+{
+  "_comment": "Starter loop policy. JSON does not support comments, so guidance lives in _comment fields that the current loop config loader ignores.",
+  "version": 1,
+  "limits": {
+    "_comment": "max_attempts is per slice; agent_timeout_s is the per-agent call timeout.",
+    "max_attempts": 3,
+    "agent_timeout_s": 600
+  },
+  "roles": [
+    {
+      "_comment": "The first attempt for each slice. Use a writable generator runner.",
+      "name": "implementer",
+      "runner": "local",
+      "tier": "local",
+      "model": null,
+      "read_only": false,
+      "tools": []
+    },
+    {
+      "_comment": "Reviewer must use a different runner than implementer for evaluator/generator separation.",
+      "name": "reviewer",
+      "runner": "minimax",
+      "tier": "fast",
+      "model": null,
+      "read_only": true,
+      "tools": []
+    },
+    {
+      "_comment": "Retry role used after failed verification or review.",
+      "name": "fix",
+      "runner": "local",
+      "tier": "local",
+      "model": null,
+      "read_only": false,
+      "tools": []
+    }
+  ],
+  "verification": {
+    "_comment": "Replace this with the deterministic command for your repo, for example: cargo test --workspace.",
+    "command": ".smedja/bin/verify.sh"
+  },
+  "review": {
+    "_comment": "per_slice controls whether reviewer runs after each passing verification; required blocks progression on failed review.",
+    "per_slice": true,
+    "required": true
+  },
+  "publication": {
+    "_comment": "Maximum changed lines permitted in a single published slice.",
+    "max_pr_lines": 400
+  }
+}
