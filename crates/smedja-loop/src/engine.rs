@@ -50,6 +50,17 @@ pub struct LoopOutcome {
     pub slices_completed: u64,
 }
 
+/// Checkpoint persisted to `.smedja/loop-state.json` before each slice runs.
+///
+/// Used by `loop.resume` to re-enter the pipeline at the last started slice.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct LoopCheckpoint {
+    pub change_name: String,
+    pub policy_hash: String,
+    pub slice_index: usize,
+    pub slices_completed: u64,
+}
+
 /// Resolves a role by name from the config, falling back to the default table,
 /// then to a deny-all local role.
 fn resolve_role(config: &LoopConfig, name: &str) -> LoopRole {
@@ -130,7 +141,15 @@ async fn run_role_traced<R: RoleRunner>(
 ///    `limits.max_attempts`. When `review.per_slice` is set the reviewer runs
 ///    after a passing gate.
 ///
+/// `start_slice` is the 0-based index of the first slice to process; pass `0`
+/// for a fresh run and the checkpointed index for a `loop.resume` call.
+/// Slices before `start_slice` count toward `slices_completed` immediately.
+///
+/// Before executing each slice the engine writes a checkpoint to
+/// `.smedja/loop-state.json`; `loop.resume` reads it to re-enter here.
+///
 /// Returns the terminal [`LoopOutcome`]; it never panics.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn drive<R: RoleRunner, S: StatusSink>(
     config: &LoopConfig,
     workspace: &Path,
@@ -139,6 +158,7 @@ pub async fn drive<R: RoleRunner, S: StatusSink>(
     slices: &[String],
     runner: &R,
     sink: &S,
+    start_slice: usize,
 ) -> LoopOutcome {
     let started = Instant::now();
 
@@ -175,8 +195,26 @@ pub async fn drive<R: RoleRunner, S: StatusSink>(
     let timeout = verification_timeout();
     let max_attempts = config.limits.max_attempts.max(1);
 
-    let mut completed: u64 = 0;
+    // Slices before start_slice were completed in a prior run; count them now.
+    let mut completed: u64 = start_slice as u64;
+    let checkpoint_path = workspace.join(".smedja").join("loop-state.json");
     for (idx, slice) in slices.iter().enumerate() {
+        if idx < start_slice {
+            continue;
+        }
+
+        // Checkpoint: record this slice before running it so loop.resume can
+        // re-enter here if the process is interrupted mid-slice.
+        let ckpt = LoopCheckpoint {
+            change_name: change_name.to_owned(),
+            policy_hash: config.policy_hash.clone(),
+            slice_index: idx,
+            slices_completed: completed,
+        };
+        if let Ok(json) = serde_json::to_string(&ckpt) {
+            let _ = std::fs::write(&checkpoint_path, json);
+        }
+
         sink.set_status(&LoopState::Slicing).await;
         #[allow(clippy::cast_possible_wrap)] // slice index never exceeds i64::MAX
         sink.set_slice((idx + 1) as i64).await;
@@ -334,6 +372,7 @@ mod tests {
             &["slice one".to_owned()],
             &rec,
             &rec,
+            0,
         )
         .await;
         assert_eq!(out.final_state, LoopState::Complete);
@@ -358,6 +397,7 @@ mod tests {
             &["slice".to_owned()],
             &rec,
             &rec,
+            0,
         )
         .await;
         assert_eq!(out.final_state, LoopState::Failed);
@@ -415,6 +455,7 @@ mod tests {
             &["slice".to_owned()],
             &rec,
             &rec,
+            0,
         )
         .await;
         assert_eq!(out.final_state, LoopState::Failed);
@@ -441,6 +482,7 @@ mod tests {
             &["slice".to_owned()],
             &rec,
             &rec,
+            0,
         )
         .await;
         assert_eq!(out.final_state, LoopState::Failed);
@@ -465,6 +507,7 @@ mod tests {
             &["slice".to_owned()],
             &rec,
             &rec,
+            0,
         )
         .await;
         assert_eq!(out.final_state, LoopState::PolicyTampered);
@@ -531,6 +574,7 @@ mod tests {
             &["slice".to_owned()],
             &rec,
             &rec,
+            0,
         )
         .await;
         assert_eq!(out.final_state, LoopState::Failed);
@@ -567,6 +611,7 @@ mod tests {
             &["slice".to_owned()],
             &rec,
             &rec,
+            0,
         )
         .await;
         assert_eq!(out.final_state, LoopState::Complete);
@@ -574,6 +619,50 @@ mod tests {
         assert!(
             roles.contains(&"reviewer".to_owned()),
             "reviewer must run after a passing gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_written_before_each_slice() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".smedja")).unwrap();
+        let (cfg, path) = config_with(&dir, "true", "[]");
+        let rec = Recorder::default();
+        let slices = vec!["s0".to_owned(), "s1".to_owned()];
+        let _ = drive(&cfg, dir.path(), &path, "mychange", &slices, &rec, &rec, 0).await;
+
+        let ckpt_path = dir.path().join(".smedja").join("loop-state.json");
+        assert!(ckpt_path.exists(), "checkpoint file must be written");
+        let raw = std::fs::read_to_string(&ckpt_path).unwrap();
+        let ckpt: LoopCheckpoint = serde_json::from_str(&raw).unwrap();
+        // After drive completes, checkpoint holds the last slice started.
+        assert_eq!(ckpt.change_name, "mychange");
+        assert_eq!(
+            ckpt.slice_index, 1,
+            "last slice's index must be in checkpoint"
+        );
+        assert_eq!(ckpt.slices_completed, 1);
+    }
+
+    #[tokio::test]
+    async fn resume_from_start_slice_skips_earlier_slices() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".smedja")).unwrap();
+        let (cfg, path) = config_with(&dir, "true", "[]");
+        let rec = Recorder::default();
+        // Three slices, resume from index 1 (slice "s0" was already done).
+        let slices = vec!["s0".to_owned(), "s1".to_owned(), "s2".to_owned()];
+        let out = drive(&cfg, dir.path(), &path, "mychange", &slices, &rec, &rec, 1).await;
+
+        assert_eq!(out.final_state, LoopState::Complete);
+        // slices_completed = start_slice(1) + run_count(2) = 3
+        assert_eq!(out.slices_completed, 3);
+        let roles = rec.roles_run.lock().unwrap();
+        // Only s1 and s2 trigger role runs (s0 is skipped).
+        assert_eq!(
+            roles.len(),
+            2,
+            "only slices from start_slice onward must run"
         );
     }
 }

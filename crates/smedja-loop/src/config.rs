@@ -40,6 +40,11 @@ pub struct Limits {
     pub max_attempts: u32,
     /// Per-agent call timeout in seconds.
     pub agent_timeout_s: u64,
+    /// Maximum number of tool-call turns an agent may take within a single
+    /// `run_role` invocation before the orchestrator cuts it off.
+    /// `None` defers to the daemon default (`SMEDJA_MAX_TOOL_TURNS`, default 10).
+    #[serde(default)]
+    pub max_tool_turns: Option<u32>,
 }
 
 /// Verification gate configuration.
@@ -213,6 +218,36 @@ mod tests {
 
         let cfg = LoopConfig::from_file(&path).unwrap();
         assert!(cfg.verify_policy(&path).is_ok());
+    }
+
+    #[test]
+    fn max_tool_turns_defaults_to_none_when_absent() {
+        let json = minimal_json(1);
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("loop.json");
+        std::fs::write(&path, &json).unwrap();
+        let cfg = LoopConfig::from_file(&path).unwrap();
+        assert_eq!(
+            cfg.limits.max_tool_turns, None,
+            "absent field must default to None"
+        );
+    }
+
+    #[test]
+    fn max_tool_turns_loaded_from_json() {
+        let json = r#"{
+            "version": 1,
+            "limits": {"max_attempts": 3, "agent_timeout_s": 60, "max_tool_turns": 25},
+            "roles": [],
+            "verification": {"command": ".smedja/bin/verify.sh"},
+            "review": {"per_slice": false, "required": false},
+            "publication": {"max_pr_lines": 400}
+        }"#;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("loop.json");
+        std::fs::write(&path, json).unwrap();
+        let cfg = LoopConfig::from_file(&path).unwrap();
+        assert_eq!(cfg.limits.max_tool_turns, Some(25));
     }
 
     #[test]

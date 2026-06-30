@@ -1,4 +1,4 @@
-//! Loop RPC handlers: `loop.create/status/cancel/list/retire/list_by_status/run`.
+//! Loop RPC handlers: `loop.create/status/cancel/list/retire/list_by_status/run/resume`.
 
 use std::sync::Arc;
 
@@ -209,4 +209,64 @@ pub(crate) async fn run(state: HandlerState, params: Value) -> Result<Value, Rpc
     ));
 
     Ok(json!({ "loop_id": loop_id, "status": "slicing" }))
+}
+
+/// Handles `loop.resume`: re-enters the loop engine from the last checkpoint.
+///
+/// # Errors
+///
+/// Returns an error when `loop_id` is missing, the loop does not exist, or the
+/// change name fails the path-traversal guard.
+pub(crate) async fn resume(state: HandlerState, params: Value) -> Result<Value, RpcError> {
+    let ig = state.ingot;
+    let loop_id = params["loop_id"]
+        .as_str()
+        .ok_or_else(|| missing_param("loop_id"))?
+        .to_owned();
+
+    let rec = ig
+        .get_loop(&loop_id)
+        .await
+        .map_err(|e| ingot_err(&e))?
+        .ok_or_else(|| {
+            RpcError::new(codes::INVALID_PARAMS, format!("loop not found: {loop_id}"))
+        })?;
+
+    if rec.status == "retired" {
+        return Err(RpcError::new(
+            codes::INVALID_PARAMS,
+            "loop is retired and cannot be resumed",
+        ));
+    }
+
+    if rec.change_name.contains("..") || rec.change_name.contains('/') {
+        return Err(RpcError::new(codes::INVALID_PARAMS, "invalid change_name"));
+    }
+
+    let workspace_root = crate::common::workspace_root();
+    let change_name = rec.change_name.clone();
+    let bg_loop_id = loop_id.clone();
+
+    state
+        .task_set
+        .lock()
+        .await
+        .spawn(crate::loop_runner::resume(
+            ig,
+            Arc::clone(&state.dispatcher),
+            Arc::clone(&state.gates),
+            Arc::clone(&state.provider_pool),
+            Arc::clone(&state.assayer),
+            Arc::clone(&state.price_table),
+            Arc::clone(&state.vault),
+            Arc::clone(&state.embedder),
+            Arc::clone(&state.provider_sessions),
+            Arc::clone(&state.cache_aligners),
+            Arc::clone(&state.lsp_manager),
+            bg_loop_id,
+            change_name,
+            workspace_root,
+        ));
+
+    Ok(json!({ "loop_id": loop_id, "status": "resuming" }))
 }

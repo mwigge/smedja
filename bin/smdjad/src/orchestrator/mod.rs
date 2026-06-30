@@ -235,6 +235,7 @@ pub(crate) struct TurnOrchestrator {
     cache_aligners: CacheAligners,
     active_change: Option<String>,
     lsp_manager: Arc<smedja_lsp::LspManager>,
+    max_tool_turns: Option<u32>,
 }
 
 impl TurnOrchestrator {
@@ -266,7 +267,14 @@ impl TurnOrchestrator {
             cache_aligners,
             active_change,
             lsp_manager,
+            max_tool_turns: None,
         }
+    }
+
+    /// Overrides the per-turn tool-call cap for loop-runner sessions.
+    pub(crate) fn cap_tool_turns(mut self, n: u32) -> Self {
+        self.max_tool_turns = Some(n);
+        self
     }
 
     /// Execute a single agent turn: load task → route → call LLM → tool loop →
@@ -1013,7 +1021,10 @@ impl TurnOrchestrator {
             // `None` means the attempt completed (success or fatal handled inline).
             let mut rotate: Option<(&'static str, String)> = None;
 
-            'tool_loop: for _iteration in 0..crate::common::effective_max_tool_turns() {
+            let turn_cap = self
+                .max_tool_turns
+                .map_or_else(crate::common::effective_max_tool_turns, |n| n as usize);
+            'tool_loop: for _iteration in 0..turn_cap {
                 // 5a. Stream LLM response with rate-limit retry.
                 let (
                     response_text,
