@@ -391,6 +391,15 @@ struct PanelVisibility {
     value: bool,
 }
 
+/// Prompt input editing mode — Emacs-style (Insert) or Vim Normal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InputMode {
+    /// Normal text editing mode (default); keys type characters.
+    Insert,
+    /// Vim normal mode; motion and editing keys are active.
+    Normal,
+}
+
 #[allow(clippy::struct_excessive_bools)] // AppState is a TUI dispatch table; enum-splitting would add indirection without clarity
 #[derive(Debug)]
 pub(crate) struct AppState {
@@ -614,6 +623,10 @@ pub(crate) struct AppState {
     session_browser_open: bool,
     /// Cursor row within the session browser overlay.
     session_browser_cursor: usize,
+    /// Vim-style prompt editing mode (Insert vs Normal).
+    vim_input_mode: InputMode,
+    /// First key of a two-key vim sequence (e.g. `d` in `dd`, `g` in `gg`).
+    pending_vim_key: Option<char>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2179,6 +2192,124 @@ async fn handle_key(
         }
     }
 
+    // ------------------------------------------------------------------
+    // M10 — Vim Normal mode intercept (only when not in scroll mode)
+    // ------------------------------------------------------------------
+    if !state.scroll_focus && state.vim_input_mode == InputMode::Normal {
+        match key.code {
+            // Enter insert mode.
+            KeyCode::Char('i' | 'a') => {
+                state.vim_input_mode = InputMode::Insert;
+                state.pending_vim_key = None;
+            }
+            // Motion: h → move cursor left.
+            KeyCode::Char('h') => {
+                if state.input_cursor > 0 {
+                    // Step back one UTF-8 character.
+                    let before = &state.input[..state.input_cursor];
+                    if let Some(ch) = before.chars().next_back() {
+                        state.input_cursor -= ch.len_utf8();
+                    }
+                }
+                state.pending_vim_key = None;
+            }
+            // Motion: l → move cursor right.
+            KeyCode::Char('l') => {
+                if state.input_cursor < state.input.len() {
+                    let ch = state.input[state.input_cursor..]
+                        .chars()
+                        .next()
+                        .unwrap_or('\0');
+                    state.input_cursor += ch.len_utf8();
+                }
+                state.pending_vim_key = None;
+            }
+            // Motion: 0 → start of line.
+            KeyCode::Char('0') => {
+                state.input_cursor = 0;
+                state.pending_vim_key = None;
+            }
+            // Motion: $ → end of line.
+            KeyCode::Char('$') => {
+                state.input_cursor = state.input.len();
+                state.pending_vim_key = None;
+            }
+            // Motion: w → forward one word.
+            KeyCode::Char('w') => {
+                let rest = &state.input[state.input_cursor..];
+                let skip = rest
+                    .char_indices()
+                    .skip_while(|(_, c)| !c.is_whitespace())
+                    .skip_while(|(_, c)| c.is_whitespace())
+                    .map(|(i, _)| i)
+                    .next()
+                    .unwrap_or(rest.len());
+                state.input_cursor += skip;
+                state.pending_vim_key = None;
+            }
+            // Motion: b → backward one word.
+            KeyCode::Char('b') => {
+                let before = &state.input[..state.input_cursor];
+                let rev_skip = before
+                    .char_indices()
+                    .rev()
+                    .skip_while(|(_, c)| c.is_whitespace())
+                    .skip_while(|(_, c)| !c.is_whitespace())
+                    .map(|(i, _)| i)
+                    .next()
+                    .unwrap_or(0);
+                state.input_cursor = rev_skip;
+                state.pending_vim_key = None;
+            }
+            // Edit: x → delete char at cursor.
+            KeyCode::Char('x') => {
+                if state.input_cursor < state.input.len() {
+                    let ch = state.input[state.input_cursor..]
+                        .chars()
+                        .next()
+                        .unwrap_or('\0');
+                    state.input.remove(state.input_cursor);
+                    let _ = ch; // char used for len_utf8 implicitly by remove
+                }
+                state.pending_vim_key = None;
+            }
+            // Edit: dd → kill entire line.
+            KeyCode::Char('d') => {
+                if state.pending_vim_key == Some('d') {
+                    state.input.clear();
+                    state.input_cursor = 0;
+                    state.pending_vim_key = None;
+                } else {
+                    state.pending_vim_key = Some('d');
+                }
+            }
+            // Scroll: G → bottom; gg → top.
+            KeyCode::Char('G') => {
+                state.main_panel.scroll_to_bottom();
+                state.pending_vim_key = None;
+            }
+            KeyCode::Char('g') => {
+                if state.pending_vim_key == Some('g') {
+                    state.main_panel.scroll = state.main_panel.display_start;
+                    state.pending_vim_key = None;
+                } else {
+                    state.pending_vim_key = Some('g');
+                }
+            }
+            // Esc: already handled below by the main Esc arm — don't return early.
+            KeyCode::Esc => {}
+            // Ignore all other keys in Normal mode.
+            _ => {
+                state.pending_vim_key = None;
+                return Ok(());
+            }
+        }
+        // Esc in Normal mode falls through to the main Esc handler below.
+        if key.code != KeyCode::Esc {
+            return Ok(());
+        }
+    }
+
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             // Ctrl-C is non-destructive: clear an in-progress input, otherwise
@@ -2354,6 +2485,10 @@ async fn handle_key(
                 state.diff_split_view = false;
             } else if state.selection_mode {
                 state.selection_mode = false;
+            } else if !state.scroll_focus && state.vim_input_mode == InputMode::Insert {
+                // Esc in Insert mode → enter Normal mode.
+                state.vim_input_mode = InputMode::Normal;
+                state.pending_vim_key = None;
             } else if state.scroll_focus {
                 state.scroll_focus = false;
             } else if state.block_browser_open {
@@ -3838,6 +3973,8 @@ async fn main() -> Result<()> {
         show_session_peek: false,
         session_browser_open: false,
         session_browser_cursor: 0,
+        vim_input_mode: InputMode::Insert,
+        pending_vim_key: None,
     };
 
     // Connect banner — shown on every startup so the user knows what's connected.
@@ -6227,6 +6364,8 @@ mod tests {
             show_session_peek: false,
             session_browser_open: false,
             session_browser_cursor: 0,
+            vim_input_mode: InputMode::Insert,
+            pending_vim_key: None,
         }
     }
 
@@ -8597,6 +8736,87 @@ status = "draft"
     // -------------------------------------------------------------------------
     // M5 — History persistence and large-paste protection
     // -------------------------------------------------------------------------
+
+    // -------------------------------------------------------------------------
+    // M10 — Vim normal mode for prompt input
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn esc_enters_normal_mode() {
+        let mut state = make_state("vim-esc");
+        assert_eq!(state.vim_input_mode, InputMode::Insert);
+        // Simulate Esc in Insert mode (not in scroll_focus).
+        state.vim_input_mode = InputMode::Normal;
+        assert_eq!(state.vim_input_mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn i_returns_to_insert_mode() {
+        let mut state = make_state("vim-i");
+        state.vim_input_mode = InputMode::Normal;
+        // Simulate `i` key.
+        state.vim_input_mode = InputMode::Insert;
+        assert_eq!(state.vim_input_mode, InputMode::Insert);
+    }
+
+    #[test]
+    fn vim_h_moves_cursor_left() {
+        let mut state = make_state("vim-h");
+        state.input = "hello".to_owned();
+        state.input_cursor = 3;
+        state.vim_input_mode = InputMode::Normal;
+        // Simulate `h` — move left by one char.
+        let before = &state.input[..state.input_cursor];
+        if let Some(ch) = before.chars().next_back() {
+            state.input_cursor -= ch.len_utf8();
+        }
+        assert_eq!(state.input_cursor, 2);
+    }
+
+    #[test]
+    fn vim_w_skips_word() {
+        let mut state = make_state("vim-w");
+        state.input = "hello world".to_owned();
+        state.input_cursor = 0;
+        state.vim_input_mode = InputMode::Normal;
+        // Simulate `w` — skip past "hello" and the space.
+        let rest = &state.input[state.input_cursor..];
+        let skip = rest
+            .char_indices()
+            .skip_while(|(_, c)| !c.is_whitespace())
+            .skip_while(|(_, c)| c.is_whitespace())
+            .map(|(i, _)| i)
+            .next()
+            .unwrap_or(rest.len());
+        state.input_cursor += skip;
+        assert_eq!(state.input_cursor, 6, "cursor must be at 'world'");
+    }
+
+    #[test]
+    fn vim_dd_clears_input() {
+        let mut state = make_state("vim-dd");
+        state.input = "some text".to_owned();
+        state.vim_input_mode = InputMode::Normal;
+        // Simulate first `d` then second `d`.
+        state.pending_vim_key = Some('d');
+        if state.pending_vim_key == Some('d') {
+            state.input.clear();
+            state.input_cursor = 0;
+            state.pending_vim_key = None;
+        }
+        assert!(state.input.is_empty());
+    }
+
+    #[test]
+    fn vim_dollar_goes_to_end() {
+        let mut state = make_state("vim-dollar");
+        state.input = "hello world".to_owned();
+        state.input_cursor = 0;
+        state.vim_input_mode = InputMode::Normal;
+        // Simulate `$`.
+        state.input_cursor = state.input.len();
+        assert_eq!(state.input_cursor, 11);
+    }
 
     // -------------------------------------------------------------------------
     // M7 — Session browser overlay
