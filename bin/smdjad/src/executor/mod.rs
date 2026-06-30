@@ -144,6 +144,28 @@ fn retrieve_store_order() -> &'static tokio::sync::Mutex<std::collections::VecDe
 /// recovery via the `smedja_retrieve` tool.
 pub(crate) const FILTER_RECOVERY_NAMESPACE: &str = "filter-recovery";
 
+/// Byte length above which a tool response is offloaded to a temp file rather
+/// than injected verbatim into the agent context. Keeps large reads/fetches
+/// from saturating the context window.
+pub(crate) const LARGE_RESPONSE_THRESHOLD: usize = 100_000;
+
+/// Writes a large tool response to a temp file and returns a compact agent
+/// reference. Returns `None` when the write fails; caller falls through to
+/// verbatim return.
+fn offload_large_response(result: &str, cmd: &str) -> Option<String> {
+    let dir = std::env::temp_dir().join("smedja-tool-responses");
+    std::fs::create_dir_all(&dir).ok()?;
+    let hash = content_hash(result);
+    let path = dir.join(&hash);
+    std::fs::write(&path, result.as_bytes()).ok()?;
+    tracing::debug!(cmd, bytes = result.len(), path = %path.display(), "large response offloaded");
+    Some(format!(
+        "[large output: {} bytes — use read_file(\"{}\") to retrieve]\n[smedja_retrieve hash={hash} to expand]",
+        result.len(),
+        path.display(),
+    ))
+}
+
 /// Computes the lowercase hex SHA-256 content hash used to address a teed
 /// full-output recovery entry.
 fn content_hash(content: &str) -> String {
@@ -180,14 +202,24 @@ async fn filter_command_output(
         // Attribute the SmartCrusher saving to its own source so it is not folded
         // into the filter total. The estimate is recorded on this JSON path only.
         record_tokens_saved(cmd, &result, &compressed, "crusher", session, ingot).await;
+        if compressed.len() > LARGE_RESPONSE_THRESHOLD {
+            if let Some(offloaded) = offload_large_response(&compressed, cmd) {
+                return offloaded;
+            }
+        }
         return compressed;
     }
 
     let registry = crate::filters::load_filter_registry(workspace);
     let (compressed, ratio) = smedja_adapter::compress_command_output_with(&registry, cmd, &result);
 
-    // No reduction → return verbatim; nothing to tee, no savings to record.
+    // No reduction → offload if large, otherwise return verbatim.
     if ratio >= 1.0 {
+        if result.len() > LARGE_RESPONSE_THRESHOLD {
+            if let Some(offloaded) = offload_large_response(&result, cmd) {
+                return offloaded;
+            }
+        }
         return result;
     }
 
@@ -3385,5 +3417,67 @@ mod tests {
             "loopback IP must be blocked by SSRF policy: {result}"
         );
         assert!(result.contains("SSRF"), "error must mention SSRF: {result}");
+    }
+
+    // ── large response offload ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn large_text_output_is_offloaded_rather_than_returned_verbatim() {
+        use smedja_ingot::{Ingot, IngotHandle};
+        use smedja_vault::Vault;
+        use tokio::sync::Mutex;
+
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+        let ws = tempfile::tempdir().unwrap();
+
+        // Generate a text result that exceeds the threshold and won't be
+        // compressed by the filter registry (not a known command output pattern).
+        let large = "z".repeat(super::LARGE_RESPONSE_THRESHOLD + 1);
+
+        let out = super::filter_command_output(
+            "unknown_cmd",
+            large.clone(),
+            ws.path(),
+            None,
+            &ingot,
+            &vault,
+        )
+        .await;
+
+        assert!(
+            out.len() < large.len(),
+            "offloaded output must be shorter than original ({} bytes returned)",
+            out.len()
+        );
+        assert!(
+            out.contains("bytes"),
+            "reference must mention byte count: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn small_text_output_below_threshold_is_returned_verbatim() {
+        use smedja_ingot::{Ingot, IngotHandle};
+        use smedja_vault::Vault;
+        use tokio::sync::Mutex;
+
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+        let ws = tempfile::tempdir().unwrap();
+
+        let small = "hello world";
+
+        let out = super::filter_command_output(
+            "unknown_cmd",
+            small.to_owned(),
+            ws.path(),
+            None,
+            &ingot,
+            &vault,
+        )
+        .await;
+
+        assert_eq!(out, small, "small output must pass through unchanged");
     }
 }
