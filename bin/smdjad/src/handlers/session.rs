@@ -1,5 +1,5 @@
 //! Session RPC handlers:
-//! `session.create/list/get/delete/fork/set_model/set_runner/set_mode/set_title/`
+//! `session.create/list/search/get/delete/fork/set_model/set_runner/set_mode/set_title/`
 //! `context/token_usage/takeover` and `runner.list`.
 
 use std::path::PathBuf;
@@ -246,6 +246,37 @@ async fn list_with(ig: &smedja_ingot::IngotHandle) -> Result<Value, RpcError> {
                 "title": s.title,
                 "mode": s.mode,
                 "runner": s.runner_override,
+                "created_at": s.created_at,
+                "updated_at": s.updated_at,
+            })
+        })
+        .collect();
+    Ok(Value::Array(out))
+}
+
+/// Handles `session.search`: returns sessions whose title or workspace_root matches `query`.
+///
+/// # Errors
+///
+/// Returns an error when `query` is missing or the ingot read fails.
+pub(crate) async fn search(state: HandlerState, params: Value) -> Result<Value, RpcError> {
+    let query = params["query"]
+        .as_str()
+        .ok_or_else(|| missing_param("query"))?
+        .to_owned();
+    search_with(&state.ingot, &query).await
+}
+
+async fn search_with(ig: &smedja_ingot::IngotHandle, query: &str) -> Result<Value, RpcError> {
+    let sessions = ig.search_sessions(query).await.map_err(|e| ingot_err(&e))?;
+    let out: Vec<Value> = sessions
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "title": s.title,
+                "mode": s.mode,
+                "workspace_root": s.workspace_root,
                 "created_at": s.created_at,
                 "updated_at": s.updated_at,
             })
@@ -940,6 +971,31 @@ mod tests {
             model_override: None,
             runner_override: None,
         }
+    }
+
+    // ── session.search ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn search_matches_title_substring() {
+        let ig = handle();
+        let id = Uuid::new_v4();
+        ig.create_session(sample_session(id, "rust memory pressure"))
+            .await
+            .unwrap();
+        let resp = search_with(&ig, "memory").await.unwrap();
+        let arr = resp.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"].as_str().unwrap(), id.to_string());
+    }
+
+    #[tokio::test]
+    async fn search_returns_empty_for_no_match() {
+        let ig = handle();
+        ig.create_session(sample_session(Uuid::new_v4(), "alpha"))
+            .await
+            .unwrap();
+        let resp = search_with(&ig, "zzznomatch").await.unwrap();
+        assert_eq!(resp.as_array().unwrap().len(), 0);
     }
 
     // ── session.list ──────────────────────────────────────────────────────────

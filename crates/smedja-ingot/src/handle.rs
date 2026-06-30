@@ -195,6 +195,17 @@ impl IngotHandle {
         self.run_blocking(Ingot::list_sessions).await
     }
 
+    /// Searches sessions by title or workspace_root substring (case-insensitive).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    pub async fn search_sessions(&self, query: &str) -> Result<Vec<Session>, IngotError> {
+        let q = query.to_owned();
+        self.run_blocking(move |ingot| ingot.search_sessions(&q))
+            .await
+    }
+
     /// Deletes the session with the given `id`.
     ///
     /// Returns `true` if a row was deleted, `false` if none existed.

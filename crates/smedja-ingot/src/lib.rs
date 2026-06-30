@@ -673,6 +673,16 @@ impl Ingot {
         session::list(&self.conn)
     }
 
+    /// Searches sessions where `title` or `workspace_root` contains `query` (case-insensitive).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the matched sessions"]
+    pub fn search_sessions(&self, query: &str) -> Result<Vec<Session>, IngotError> {
+        session::search(&self.conn, query)
+    }
+
     /// Deletes the session with the given `id`.
     ///
     /// Returns `true` if a row was deleted, `false` if no session with that `id`
