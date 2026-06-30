@@ -10,9 +10,9 @@ mod registry;
 mod types;
 
 pub use error::PluginsError;
-pub use parse::parse_skill;
+pub use parse::{apply_skill_arguments, parse_skill};
 pub use registry::{SkillRegistry, SyncResult};
-pub use types::{Skill, SkillManifest};
+pub use types::{Skill, SkillArgument, SkillManifest};
 
 /// Wraps a skill body in an XML envelope, escaping `<`, `>`, and `&` in the
 /// body to prevent envelope breakout.
