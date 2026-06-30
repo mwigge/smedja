@@ -84,6 +84,14 @@ pub enum StreamEvent {
     /// for the terminal `ToolCall` event.
     ToolCallChunk { name: String, partial_input: String },
 
+    /// Auto-compaction fired: the active context window was replaced with a
+    /// summary.  Clients should insert a visible seam marker so users know
+    /// where the model's memory restarted.
+    HistoryReplaced {
+        #[serde(default)]
+        summary_tokens: usize,
+    },
+
     /// Catchall for unknown future event types — never matched by the TUI.
     #[serde(other)]
     Unknown,
@@ -298,6 +306,34 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains(r#""type":"tool_call_chunk""#), "{json}");
         assert!(json.contains("bash"), "{json}");
+    }
+
+    #[test]
+    fn history_replaced_roundtrips() {
+        let ev = StreamEvent::HistoryReplaced {
+            summary_tokens: 512,
+        };
+        assert_eq!(roundtrip(&ev), ev);
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""type":"history_replaced""#), "{json}");
+        assert!(json.contains("512"), "{json}");
+    }
+
+    #[test]
+    fn history_replaced_deserializes_from_server_wire_format() {
+        // This is what smdjad actually emits (session_id present, but our
+        // StreamEvent variant skips it — verify it doesn't fail to deserialize).
+        let json = r#"{"type":"history_replaced","session_id":"sess-1","summary_tokens":300}"#;
+        let ev: StreamEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(
+                ev,
+                StreamEvent::HistoryReplaced {
+                    summary_tokens: 300
+                }
+            ),
+            "should deserialize as HistoryReplaced"
+        );
     }
 
     #[test]

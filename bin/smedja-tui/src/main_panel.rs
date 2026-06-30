@@ -382,6 +382,34 @@ impl MainPanel {
         self.follow = true;
     }
 
+    /// Inserts a full-width context-seam divider — a dim horizontal rule that
+    /// signals the model's active context window was replaced with a summary.
+    /// Includes an optional token count for the summary.
+    pub fn push_seam(&mut self, summary_tokens: usize) {
+        let p = palette();
+        let label = if summary_tokens > 0 {
+            format!(" \u{21a9} context summarized ({summary_tokens} tok) ")
+        } else {
+            " \u{21a9} context summarized ".to_owned()
+        };
+        let rule = "\u{2500}".repeat(4);
+        let text = format!("{rule}{label}{rule}");
+        let spans = Line::from(Span::styled(
+            text.clone(),
+            Style::default()
+                .fg(p.text_dim)
+                .add_modifier(Modifier::ITALIC),
+        ));
+        self.lines.push(StyledLine {
+            text,
+            style: LineStyle::Normal,
+            spans: Some(spans),
+        });
+        if self.follow {
+            self.scroll = self.lines.len().saturating_sub(1);
+        }
+    }
+
     /// Pushes a line of text, classifying its style automatically.
     ///
     /// - Lines beginning with `+` → [`LineStyle::Added`]
@@ -1672,5 +1700,29 @@ mod tests {
             "push_line must apply math rendering; got: {:?}",
             panel.lines[0].text
         );
+    }
+
+    #[test]
+    fn push_seam_inserts_divider_with_token_count() {
+        let mut panel = MainPanel::new();
+        panel.push_seam(512);
+        assert_eq!(panel.lines.len(), 1);
+        let line = &panel.lines[0];
+        assert!(line.text.contains('↩'), "seam must contain return arrow");
+        assert!(line.text.contains("512"), "seam must include token count");
+        assert!(line.text.contains("summarized"), "seam must say summarized");
+        // Pre-built styled spans must be present (seam uses spans directly)
+        assert!(line.spans.is_some(), "seam line must have pre-built spans");
+    }
+
+    #[test]
+    fn push_seam_without_tokens_omits_count() {
+        let mut panel = MainPanel::new();
+        panel.push_seam(0);
+        assert!(
+            !panel.lines[0].text.contains("0 tok"),
+            "zero tokens must not show count"
+        );
+        assert!(panel.lines[0].text.contains("summarized"));
     }
 }

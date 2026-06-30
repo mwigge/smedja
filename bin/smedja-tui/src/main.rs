@@ -4317,6 +4317,9 @@ async fn main() -> Result<()> {
                             });
                         }
                     }
+                    StreamEvent::HistoryReplaced { summary_tokens } => {
+                        state.main_panel.push_seam(summary_tokens);
+                    }
                     StreamEvent::Unknown
                     | StreamEvent::Usage { .. }
                     | StreamEvent::ToolCallChunk { .. } => {}
