@@ -316,7 +316,7 @@ pub(crate) async fn fork(state: HandlerState, params: Value) -> Result<Value, Rp
     let turn_n = params
         .get("turn_n")
         .and_then(Value::as_u64)
-        .map(|n| n as u32);
+        .and_then(|n| u32::try_from(n).ok());
     fork_with(&state.ingot, session_id, turn_n).await
 }
 

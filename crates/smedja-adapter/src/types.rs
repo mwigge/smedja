@@ -188,7 +188,7 @@ pub enum Delta {
     /// the full `ToolCall` arrives.  Consumers that only need complete tool calls
     /// can ignore this variant.
     ToolCallChunk {
-        /// Tool name (may be empty for intermediate OpenAI chunks).
+        /// Tool name (may be empty for intermediate `OpenAI` chunks).
         name: String,
         /// Partial argument JSON fragment.
         partial_input: String,

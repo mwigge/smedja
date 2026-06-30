@@ -411,7 +411,7 @@ pub(crate) async fn run(
 ///
 /// Reads `.smedja/loop-state.json`, verifies the policy hash has not changed,
 /// then calls `drive()` starting at the checkpoint's `slice_index`.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn resume(
     ingot: IngotHandle,
     dispatcher: Arc<Dispatcher>,

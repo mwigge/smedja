@@ -208,6 +208,7 @@ pub enum RuleMode {
 
 /// Loads `[[permission.rules]]` from `.smedja/workspace.toml`, returning an
 /// empty list if the file is absent or the section is missing.
+#[must_use]
 pub fn load_permission_rules(workspace: &std::path::Path) -> Vec<PermissionRule> {
     #[derive(Deserialize, Default)]
     struct WorkspaceToml {
