@@ -1,6 +1,6 @@
 id     = "WI-019"
 title  = "bash/run_command: per-call timeout, env map, stdin (complement to WI-012)"
-status = "planned"
+status = "done"
 priority = "P3"
 
 [detail]

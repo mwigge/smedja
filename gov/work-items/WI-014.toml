@@ -1,6 +1,6 @@
 id     = "WI-014"
 title  = "Bash command denylist and auto-mode audit event"
-status = "planned"
+status = "done"
 priority = "P3"
 
 [detail]

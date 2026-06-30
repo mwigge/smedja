@@ -1,6 +1,6 @@
 id     = "WI-016"
 title  = "Auto-compact session when context window reaches 85% capacity"
-status = "planned"
+status = "done"
 priority = "P2"
 
 [detail]
