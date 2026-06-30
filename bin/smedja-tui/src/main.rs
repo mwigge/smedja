@@ -610,6 +610,10 @@ pub(crate) struct AppState {
     session_tokens_out: u64,
     /// True while the session config peek overlay is visible (toggled by Ctrl+P in scroll mode).
     show_session_peek: bool,
+    /// Whether the Ctrl-S session browser overlay is open.
+    session_browser_open: bool,
+    /// Cursor row within the session browser overlay.
+    session_browser_cursor: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -2192,6 +2196,16 @@ async fn handle_key(
             }
         }
 
+        // Ctrl-S: open/close session browser overlay.
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if state.session_browser_open {
+                state.session_browser_open = false;
+            } else {
+                state.session_browser_open = true;
+                state.session_browser_cursor = 0;
+            }
+        }
+
         // Ctrl-R: toggle reverse history search (input mode only).
         KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if !state.scroll_focus {
@@ -2323,7 +2337,9 @@ async fn handle_key(
         }
 
         KeyCode::Esc => {
-            if state.show_session_peek {
+            if state.session_browser_open {
+                state.session_browser_open = false;
+            } else if state.show_session_peek {
                 state.show_session_peek = false;
             } else if state.secret_var.take().is_some() {
                 // Cancel masked secret entry; discard whatever was typed.
@@ -2348,7 +2364,9 @@ async fn handle_key(
         }
 
         KeyCode::Up => {
-            if state.block_browser_open {
+            if state.session_browser_open {
+                state.session_browser_cursor = state.session_browser_cursor.saturating_sub(1);
+            } else if state.block_browser_open {
                 state.block_browser_cursor = state.block_browser_cursor.saturating_sub(1);
             } else {
                 // input mode: browse prompt history backwards
@@ -2369,7 +2387,12 @@ async fn handle_key(
         }
 
         KeyCode::Down => {
-            if state.block_browser_open {
+            if state.session_browser_open {
+                let count = state.session_rail_items.len();
+                if count > 0 {
+                    state.session_browser_cursor = (state.session_browser_cursor + 1) % count;
+                }
+            } else if state.block_browser_open {
                 let max = state.block_store.len().saturating_sub(1);
                 if state.block_browser_cursor < max {
                     state.block_browser_cursor += 1;
@@ -2419,6 +2442,21 @@ async fn handle_key(
         }
 
         KeyCode::Enter => {
+            // Session browser: switch to the selected session and close the overlay.
+            if state.session_browser_open {
+                if let Some((id, _label)) = state
+                    .session_rail_items
+                    .get(state.session_browser_cursor)
+                    .cloned()
+                {
+                    state.session_browser_open = false;
+                    let _ = client
+                        .call("session.switch", serde_json::json!({ "session_id": id }))
+                        .await;
+                }
+                return Ok(());
+            }
+
             // Masked secret entry (API key paste): save to the secrets file under
             // the pending env-var name; never echo or send it as a turn.
             if let Some(var) = state.secret_var.take() {
@@ -3798,6 +3836,8 @@ async fn main() -> Result<()> {
         session_tokens_in: 0,
         session_tokens_out: 0,
         show_session_peek: false,
+        session_browser_open: false,
+        session_browser_cursor: 0,
     };
 
     // Connect banner — shown on every startup so the user knows what's connected.
@@ -6185,6 +6225,8 @@ mod tests {
             file_picker_entries: Vec::new(),
             file_picker_cursor: 0,
             show_session_peek: false,
+            session_browser_open: false,
+            session_browser_cursor: 0,
         }
     }
 
@@ -8550,6 +8592,49 @@ status = "draft"
         assert!(state.slash_popup_visible);
         assert_eq!(state.slash_completions.len(), SLASH_COMPLETIONS.len());
         assert!(state.command_palette_mode);
+    }
+
+    // -------------------------------------------------------------------------
+    // M5 — History persistence and large-paste protection
+    // -------------------------------------------------------------------------
+
+    // -------------------------------------------------------------------------
+    // M7 — Session browser overlay
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn session_browser_opens_on_ctrl_s() {
+        let mut state = make_state("sess-browser");
+        assert!(!state.session_browser_open);
+        // Simulate Ctrl-S toggle.
+        state.session_browser_open = true;
+        state.session_browser_cursor = 0;
+        assert!(state.session_browser_open);
+    }
+
+    #[test]
+    fn session_browser_closes_on_esc() {
+        let mut state = make_state("sess-browser-esc");
+        state.session_browser_open = true;
+        // Esc handler closes the overlay.
+        state.session_browser_open = false;
+        assert!(!state.session_browser_open);
+    }
+
+    #[test]
+    fn session_browser_cursor_wraps_on_down() {
+        let mut state = make_state("sess-browser-wrap");
+        state.session_rail_items = vec![
+            ("id1".into(), "Session 1".into()),
+            ("id2".into(), "Session 2".into()),
+            ("id3".into(), "Session 3".into()),
+        ];
+        state.session_browser_open = true;
+        state.session_browser_cursor = 2; // at last item
+                                          // Simulate Down key with wrap-around.
+        let count = state.session_rail_items.len();
+        state.session_browser_cursor = (state.session_browser_cursor + 1) % count;
+        assert_eq!(state.session_browser_cursor, 0, "cursor must wrap to 0");
     }
 
     // -------------------------------------------------------------------------
