@@ -21,6 +21,7 @@
 //! | [`BergetProvider`] | Berget AI HTTP API |
 
 pub mod anthropic;
+pub mod bedrock;
 pub mod claude_cli;
 pub mod codex_cli;
 pub mod copilot;
@@ -49,6 +50,7 @@ pub(crate) mod sse;
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub use anthropic::AnthropicProvider;
+pub use bedrock::{AwsCredentials, BedrockProvider};
 pub use claude_cli::ClaudeCliProvider;
 pub use codex_cli::CodexCliProvider;
 pub use copilot::CopilotProvider;
