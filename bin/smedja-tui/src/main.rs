@@ -3684,6 +3684,9 @@ async fn main() -> Result<()> {
 
     let otlp_configured = std::env::var("SMEDJA_OTLP_ENDPOINT").is_ok();
     let stream_sock_path = stream_socket_path(&sock);
+    // Load the persisted TUI prompt history from disk.
+    let tui_history_path = dirs_tui_history_path();
+    let loaded_prompt_history = load_history(&tui_history_path);
     let mut state = AppState {
         session_id,
         mode: cli.mode.or(resumed_mode),
@@ -3776,7 +3779,7 @@ async fn main() -> Result<()> {
         panel_search_mode: false,
         panel_search_query: String::new(),
         display_start_idx: 0,
-        prompt_history: Vec::new(),
+        prompt_history: loaded_prompt_history,
         history_idx: None,
         saved_input: String::new(),
         history_search_mode: false,
@@ -3965,13 +3968,21 @@ async fn main() -> Result<()> {
                         _ => {}
                     },
                     Event::Paste(text) => {
+                        // Large pastes are saved to a temp file to avoid
+                        // flooding the input bar; a short token is substituted.
+                        let insert_text = if let Some((token, msg)) = large_paste_token(&text) {
+                            push_system_message(&mut state, msg);
+                            token
+                        } else {
+                            text
+                        };
                         // Insert the whole paste as a single edit at the cursor.
                         // Because we don't process it key-by-key, embedded
                         // newlines stay literal (no accidental submit) — pasting
                         // a multi-line URL/snippet just lands in the input.
                         let cur = state.input_cursor.min(state.input.len());
-                        state.input.insert_str(cur, &text);
-                        state.input_cursor = cur + text.len();
+                        state.input.insert_str(cur, &insert_text);
+                        state.input_cursor = cur + insert_text.len();
                         let completions = filtered_completions(&state.input);
                         state.slash_completions = completions;
                     }
@@ -4707,6 +4718,8 @@ async fn main() -> Result<()> {
 
     // L127: persist history on clean shutdown.
     let _ = editor.save_history(&history_path);
+    // M5a: persist TUI prompt history to ~/.config/smedja/tui-history.jsonl.
+    let _ = save_history(&state.prompt_history, &tui_history_path);
 
     Ok(())
 }
@@ -4763,6 +4776,101 @@ pub(crate) fn format_token_count(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+// ---------------------------------------------------------------------------
+// M5 — Prompt history persistence + large-paste protection
+// ---------------------------------------------------------------------------
+
+/// Returns the canonical path for the TUI-specific prompt-history JSONL file:
+/// `~/.config/smedja/tui-history.jsonl`.
+fn dirs_tui_history_path() -> std::path::PathBuf {
+    let config_dir = if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        std::path::PathBuf::from(xdg)
+    } else {
+        dirs_home().join(".config")
+    };
+    config_dir.join("smedja").join("tui-history.jsonl")
+}
+
+/// Returns the user's home directory from `$HOME`, falling back to `/tmp`.
+fn dirs_home() -> std::path::PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        std::path::PathBuf::from(home)
+    } else {
+        std::path::PathBuf::from("/tmp")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M5a — Prompt history persistence
+// ---------------------------------------------------------------------------
+
+/// Maximum entries kept in the persisted TUI history file.
+const HISTORY_FILE_CAP: usize = 200;
+
+/// Serialises `history` to `path` as JSONL (one JSON string per line).
+///
+/// Only the last [`HISTORY_FILE_CAP`] entries are written so the file stays
+/// bounded.  Best-effort — errors are returned to the caller.
+pub(crate) fn save_history(history: &[String], path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::File::create(path)?;
+    let start = history.len().saturating_sub(HISTORY_FILE_CAP);
+    for entry in &history[start..] {
+        let line = serde_json::to_string(entry)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        writeln!(file, "{line}")?;
+    }
+    Ok(())
+}
+
+/// Loads history from a JSONL file at `path`.
+///
+/// Returns an empty `Vec` when the file does not exist or cannot be parsed;
+/// individual malformed lines are silently skipped.
+#[must_use]
+pub(crate) fn load_history(path: &std::path::Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<String>(line).ok())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// M5b — Large-paste SHA-8 placeholder
+// ---------------------------------------------------------------------------
+
+const LARGE_PASTE_THRESHOLD: usize = 1024;
+
+/// When `text` is larger than [`LARGE_PASTE_THRESHOLD`] bytes, writes it to a
+/// temp file and returns the `@paste:{sha8}` token together with a status
+/// message.  When `text` is small, returns `None` (caller keeps text as-is).
+pub(crate) fn large_paste_token(text: &str) -> Option<(String, String)> {
+    use sha2::Digest as _;
+    if text.len() <= LARGE_PASTE_THRESHOLD {
+        return None;
+    }
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(text.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    });
+    let sha8 = &hex[..8];
+    let path = std::path::PathBuf::from(format!("/tmp/smedja-paste-{sha8}.txt"));
+    // Best-effort write; if it fails the token is still substituted.
+    let _ = std::fs::write(&path, text);
+    let token = format!("@paste:{sha8}");
+    let msg = format!("paste saved \u{2192} {token} ({} bytes)", text.len());
+    Some((token, msg))
 }
 
 fn lsp_snapshot_from_rpc(
@@ -8442,5 +8550,58 @@ status = "draft"
         assert!(state.slash_popup_visible);
         assert_eq!(state.slash_completions.len(), SLASH_COMPLETIONS.len());
         assert!(state.command_palette_mode);
+    }
+
+    // -------------------------------------------------------------------------
+    // M5 — History persistence and large-paste protection
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn save_and_load_history_roundtrips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        let original = vec!["alpha".to_owned(), "beta".to_owned()];
+        save_history(&original, &path).unwrap();
+        let loaded = load_history(&path);
+        assert_eq!(loaded, original);
+    }
+
+    #[test]
+    fn load_history_missing_file_returns_empty() {
+        let path = std::path::Path::new("/tmp/smedja-test-nonexistent-history-xyz.jsonl");
+        let loaded = load_history(path);
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn save_history_caps_at_200() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        let entries: Vec<String> = (0..250).map(|i| format!("entry{i}")).collect();
+        save_history(&entries, &path).unwrap();
+        let loaded = load_history(&path);
+        assert_eq!(loaded.len(), 200);
+        // The last 200 entries should have been kept.
+        assert_eq!(loaded[0], "entry50");
+        assert_eq!(loaded[199], "entry249");
+    }
+
+    #[test]
+    fn large_paste_placeholder_replaces_input() {
+        let big: String = "x".repeat(1025);
+        let result = large_paste_token(&big);
+        assert!(result.is_some(), "large paste must produce a token");
+        let (token, _msg) = result.unwrap();
+        assert!(
+            token.starts_with("@paste:"),
+            "token must start with @paste:"
+        );
+    }
+
+    #[test]
+    fn small_paste_is_kept_verbatim() {
+        let small = "hello world".to_owned();
+        let result = large_paste_token(&small);
+        assert!(result.is_none(), "small paste must return None");
     }
 }
