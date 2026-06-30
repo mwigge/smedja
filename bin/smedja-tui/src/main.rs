@@ -39,7 +39,8 @@ pub(crate) use slash::{
 // at the crate root unchanged.
 #[allow(unused_imports)]
 pub(crate) use clipboard::{
-    emit_osc9, osc9_turn_complete_bytes, paste_from_clipboard, push_kill, yank_to_clipboard,
+    emit_turn_notifications, osc9_turn_complete_bytes, paste_from_clipboard, push_kill,
+    set_terminal_title, yank_to_clipboard,
 };
 #[allow(unused_imports)]
 pub(crate) use editor::{open_in_editor, resolve_editor};
@@ -4006,6 +4007,7 @@ async fn main() -> Result<()> {
         }
         terminal.draw(|f| render(f, &mut state))?;
         let _ = execute!(stdout(), crossterm::terminal::EndSynchronizedUpdate);
+        let _ = set_terminal_title(&mut stdout(), state.turn_in_flight, state.spinner_tick);
 
         // Drain NDJSON stream events from the background reader task.
         // When streaming is active (stream_rx is Some), render deltas in real
@@ -4225,7 +4227,7 @@ async fn main() -> Result<()> {
                             pending_output_save = Some((output_type, block_content));
                         }
 
-                        let _ = emit_osc9(&mut std::io::stdout());
+                        let _ = emit_turn_notifications(&mut std::io::stdout());
 
                         turn_done = true;
                     }
@@ -7868,7 +7870,7 @@ status = "draft"
         assert!(!state.thinking_expanded);
     }
 
-    // --- P3b: OSC-9 helper ---------------------------------------------------
+    // --- M1: notification helpers -------------------------------------------
 
     #[test]
     fn osc9_bytes_is_correct_sequence() {
@@ -7877,10 +7879,13 @@ status = "draft"
     }
 
     #[test]
-    fn emit_osc9_writes_to_vec() {
+    fn emit_turn_notifications_writes_all_three_osc() {
         let mut buf: Vec<u8> = Vec::new();
-        emit_osc9(&mut buf).unwrap();
-        assert_eq!(buf, b"\x1b]9;turn complete\x07");
+        emit_turn_notifications(&mut buf).unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("]9;"), "OSC 9 present");
+        assert!(text.contains("]99;"), "OSC 99 present");
+        assert!(text.contains("]777;"), "OSC 777 present");
     }
 
     // --- P2a: kill ring -------------------------------------------------------
