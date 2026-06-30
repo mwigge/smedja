@@ -1,6 +1,6 @@
 id     = "WI-007"
 title  = "PanelVisibility struct — group panel booleans out of AppState"
-status = "planned"
+status = "done"
 priority = "P4"
 
 [detail]

@@ -5,8 +5,8 @@ use std::sync::Mutex;
 
 use smedja_adapter::{
     AnthropicProvider, BergetProvider, ClaudeCliProvider, CodexCliProvider, CopilotProvider,
-    GpuSnapshot, LocalModel, LocalProvider, MinimaxProvider, OpenAiProvider, PoolsideProvider,
-    Provider, SubprocessProvider,
+    GpuSnapshot, LocalModel, LocalProvider, MinimaxProvider, OpenAiProvider, PoolCliProvider,
+    PoolsideProvider, Provider, SubprocessProvider,
 };
 use smedja_assayer::{Runner, Tier};
 use tracing::{error, info, warn};
@@ -494,7 +494,13 @@ pub async fn build_provider_pool() -> ProviderPool {
         info!(runner = "poolside", "provider ready");
     }
 
-    // 5. Minimax
+    // 5. Pool (Poolside `pool` CLI)
+    if let Some(p) = PoolCliProvider::detect() {
+        add!(Runner::Pool, Tier::Fast, p, "pool", "laguna-m1");
+        info!(runner = "pool", "provider ready");
+    }
+
+    // 6. Minimax
     if let Some(p) = MinimaxProvider::detect() {
         add!(Runner::Local, Tier::Fast, p, "minimax", "MiniMax-M2");
         info!(runner = "minimax", "provider ready");

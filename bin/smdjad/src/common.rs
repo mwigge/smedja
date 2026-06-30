@@ -96,6 +96,7 @@ pub(crate) fn runner_session_key(runner: Runner) -> &'static str {
         Runner::Copilot => "copilot",
         Runner::Minimax => "minimax",
         Runner::Berget => "berget",
+        Runner::Pool => "pool",
     }
 }
 
@@ -111,6 +112,7 @@ pub(crate) fn parse_runner_str(s: &str) -> Option<Runner> {
         "copilot" => Some(Runner::Copilot),
         "minimax" => Some(Runner::Minimax),
         "berget" => Some(Runner::Berget),
+        "pool" | "poolside" => Some(Runner::Pool),
         _ => None,
     }
 }

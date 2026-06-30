@@ -1,6 +1,6 @@
 id     = "WI-005"
 title  = "Math rendering — $...$ LaTeX inline math to Unicode"
-status = "planned"
+status = "done"
 priority = "P3"
 
 [detail]

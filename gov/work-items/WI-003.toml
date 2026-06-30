@@ -1,6 +1,6 @@
 id     = "WI-003"
 title  = "Kill ring + word navigation in input bar"
-status = "planned"
+status = "done"
 priority = "P2"
 
 [detail]
