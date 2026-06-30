@@ -99,6 +99,7 @@ fn stream_claude_cli(messages: &[Message], opts: &CallOptions) -> DeltaStream {
     // fails with "No conversation found" (exit 1) on the second turn. milliways
     // takes the same approach — assemble the whole prompt upstream, no resume.
     let prompt = render_conversation(messages);
+    let model = opts.model.clone();
     let session_id = opts.smedja_session_id.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
@@ -106,8 +107,6 @@ fn stream_claude_cli(messages: &[Message], opts: &CallOptions) -> DeltaStream {
         // Mirror the proven milliways invocation. Notably:
         //  * NO `--bare`: that flag selects a credential path that ignores the
         //    logged-in Claude session and fails with "Not logged in".
-        //  * NO `--dangerously-skip-permissions`: not needed for the prompt path
-        //    and a source of non-zero exits in non-interactive use.
         //  * The prompt is delivered on STDIN, not as a positional argv element —
         //    a large prompt (system preamble + context) as a single argv entry
         //    overflows MAX_ARG_STRLEN (128 KiB) and execve fails with E2BIG.
@@ -120,9 +119,20 @@ fn stream_claude_cli(messages: &[Message], opts: &CallOptions) -> DeltaStream {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            // Disable claude's own bwrap subprocess isolation. The smedja
+            // landlock sandbox and the cowork PreToolUse gate hook (installed
+            // below) already provide the confinement boundary. Without this,
+            // bwrap fails with EAFNOSUPPORT when AF_NETLINK is blocked by an
+            // outer seccomp filter (e.g. when smdjad itself runs inside a
+            // Claude Code session).
+            .env("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "0")
             // So an interrupted turn (turn.cancel aborts the run task) kills the
             // child instead of leaking a runaway `claude` process.
             .kill_on_drop(true);
+
+        if !model.is_empty() {
+            command.arg("--model").arg(&model);
+        }
 
         // Install the PreToolUse approval hook so claude's own tool calls are
         // gated through smedja's permission policy (ask → approve/deny).

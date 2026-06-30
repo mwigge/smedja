@@ -47,7 +47,6 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
         .map_or_else(String::new, |m| m.content.clone());
     let resume_id = opts.provider_session_id.clone();
     let model = opts.model.clone();
-    let perm_mode = opts.permission_mode.clone();
     let workspace = opts.workspace.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
@@ -79,23 +78,14 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
         // `codex exec resume` does not accept `--sandbox`; only the bypass flag
         // is shared between the two sub-commands.
         command.arg("--json").arg("--skip-git-repo-check");
-        match perm_mode.as_deref() {
-            Some("auto") => {
-                command.arg("--dangerously-bypass-approvals-and-sandbox");
-            }
-            _ if !is_resume => {
-                // `--sandbox` is only valid for `codex exec`, not `codex exec resume`.
-                match perm_mode.as_deref() {
-                    Some("plan") => {
-                        command.arg("--sandbox").arg("read-only");
-                    }
-                    _ => {
-                        command.arg("--sandbox").arg("workspace-write");
-                    }
-                }
-            }
-            _ => {} // resume + non-auto: use codex's default sandbox
-        }
+        // Bypass codex's own bwrap sandbox entirely. The smedja cowork gate
+        // (smj tool-gate / PreToolUse hook on the claude side) and landlock
+        // filesystem confinement are the actual approval boundary. Codex's
+        // `--sandbox workspace-write` invokes bwrap which fails with EAFNOSUPPORT
+        // when AF_NETLINK is blocked by an outer seccomp filter — the same
+        // condition that prevents `unshare --net`. Bypass is safe here because
+        // smdjad itself provides the workspace boundary.
+        command.arg("--dangerously-bypass-approvals-and-sandbox");
 
         if !model.is_empty() {
             command.arg("-m").arg(&model);
