@@ -336,24 +336,26 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     }
 }
 
-fn bash_blocked_patterns(workspace: &std::path::Path) -> Vec<String> {
+#[derive(serde::Deserialize, Default)]
+struct BashConfig {
+    blocked_patterns: Option<Vec<String>>,
+    timeout_secs: Option<u64>,
+}
+
+fn bash_config(workspace: &std::path::Path) -> BashConfig {
     #[derive(serde::Deserialize, Default)]
     struct WorkspaceToml {
         tools: Option<ToolsSection>,
     }
     #[derive(serde::Deserialize, Default)]
     struct ToolsSection {
-        bash: Option<BashSection>,
-    }
-    #[derive(serde::Deserialize, Default)]
-    struct BashSection {
-        blocked_patterns: Option<Vec<String>>,
+        bash: Option<BashConfig>,
     }
     let path = workspace.join(".smedja").join("workspace.toml");
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| toml::from_str::<WorkspaceToml>(&s).ok())
-        .and_then(|c| c.tools?.bash?.blocked_patterns)
+        .and_then(|c| c.tools?.bash)
         .unwrap_or_default()
 }
 
@@ -498,8 +500,10 @@ pub(crate) async fn execute_tool(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
 
+            let bash_cfg = bash_config(workspace);
+
             // Blocked patterns — checked before any spawn, all permission modes.
-            for pat in bash_blocked_patterns(workspace) {
+            for pat in bash_cfg.blocked_patterns.unwrap_or_default() {
                 if cmd.contains(&*pat) {
                     return format!("error: command blocked by policy (matched pattern: {pat})");
                 }
@@ -527,7 +531,11 @@ pub(crate) async fn execute_tool(
                     }
                 }
             }
-            let timeout_secs = input.get("timeout_secs").and_then(Value::as_u64);
+            // Per-call timeout overrides workspace default; workspace default overrides compile-time default.
+            let timeout_secs = input
+                .get("timeout_secs")
+                .and_then(Value::as_u64)
+                .or(bash_cfg.timeout_secs);
             let stdin_bytes: Option<Vec<u8>> = input
                 .get("stdin")
                 .and_then(Value::as_str)
@@ -2338,7 +2346,10 @@ mod tests {
     fn bash_blocked_patterns_empty_when_no_workspace_toml() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
-            super::bash_blocked_patterns(dir.path()).is_empty(),
+            super::bash_config(dir.path())
+                .blocked_patterns
+                .unwrap_or_default()
+                .is_empty(),
             "missing workspace.toml must return empty patterns"
         );
     }
@@ -2353,7 +2364,9 @@ mod tests {
             "[tools.bash]\nblocked_patterns = [\"rm -rf /\", \"curl * | sh\"]\n",
         )
         .unwrap();
-        let patterns = super::bash_blocked_patterns(dir.path());
+        let patterns = super::bash_config(dir.path())
+            .blocked_patterns
+            .unwrap_or_default();
         assert_eq!(patterns, vec!["rm -rf /", "curl * | sh"]);
     }
 
@@ -2489,6 +2502,50 @@ mod tests {
         assert!(
             result.contains("timed out"),
             "short timeout must return timeout error, got: {result}"
+        );
+    }
+
+    // ── WI-012: stderr block, partial output on timeout ───────────────────────
+
+    #[tokio::test]
+    async fn bash_stderr_appended_as_block_on_nonzero_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write something to stdout and something to stderr, then exit 1.
+        let result = crate::exec_bash_ext(
+            "echo out; echo err >&2; exit 1",
+            dir.path(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            result.starts_with("error:"),
+            "non-zero exit must start with error: prefix; got: {result}"
+        );
+        assert!(
+            result.contains("[stderr]"),
+            "stderr must appear in a [stderr] block; got: {result}"
+        );
+        assert!(
+            result.contains("err"),
+            "stderr content must be included; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_partial_output_returned_on_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        // Print one line immediately, then sleep to trigger timeout.
+        let result =
+            crate::exec_bash_ext("echo partial; sleep 10", dir.path(), Some(1), None, None).await;
+        assert!(
+            result.contains("partial"),
+            "output emitted before timeout must be returned; got: {result}"
+        );
+        assert!(
+            result.contains("timed out"),
+            "timeout message must be present; got: {result}"
         );
     }
 
