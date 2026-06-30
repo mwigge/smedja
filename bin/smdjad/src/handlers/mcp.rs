@@ -26,14 +26,14 @@ pub(crate) async fn register(state: HandlerState, params: Value) -> Result<Value
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
-    if !is_safe_mcp_url(&url) {
-        return Err(RpcError::new(codes::INVALID_PARAMS, "url not permitted"));
-    }
     let transport = params
         .get("transport")
         .and_then(Value::as_str)
         .unwrap_or("http")
         .to_owned();
+    if transport != "stdio" && !is_safe_mcp_url(&url) {
+        return Err(RpcError::new(codes::INVALID_PARAMS, "url not permitted"));
+    }
     let server = McpServer {
         id: Uuid::new_v4().to_string(),
         name,
