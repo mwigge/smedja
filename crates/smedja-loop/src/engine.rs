@@ -202,10 +202,10 @@ pub async fn drive<R: RoleRunner, S: StatusSink>(
 
     // Bounded concurrency: default min(4, remaining slice count).
     let remaining = slices.len().saturating_sub(start_slice);
-    let max_parallel = config
-        .limits
-        .max_parallel_slices
-        .map_or_else(|| (remaining as u32).min(4), |n| n.max(1)) as usize;
+    let max_parallel = config.limits.max_parallel_slices.map_or_else(
+        || u32::try_from(remaining).unwrap_or(u32::MAX).min(4),
+        |n| n.max(1),
+    ) as usize;
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallel));
 
     // Checkpoint: record the batch start so loop.resume can re-enter here.

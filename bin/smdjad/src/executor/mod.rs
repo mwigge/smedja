@@ -461,7 +461,7 @@ fn is_confirm_edits_enabled(workspace: &std::path::Path) -> bool {
 ///
 /// Supported tools: `bash`, `run_command`, `read_file`, `list_files`, vault tools,
 /// graph tools, SRE tools.  Unknown tools are forwarded to [`dispatch_mcp_tool`].
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::items_after_statements)]
 pub(crate) async fn execute_tool(
     tool_name: &str,
     tool_input: &str,
@@ -681,11 +681,11 @@ pub(crate) async fn execute_tool(
             let start_line = input
                 .get("start_line")
                 .and_then(Value::as_u64)
-                .map(|n| n as usize);
+                .map(|n| n.try_into().unwrap_or(usize::MAX));
             let end_line = input
                 .get("end_line")
                 .and_then(Value::as_u64)
-                .map(|n| n as usize);
+                .map(|n| n.try_into().unwrap_or(usize::MAX));
             let raw = match tokio::fs::read(&full).await {
                 Ok(bytes) => bytes,
                 Err(e) => return format!("error reading {path_str}: {e}"),
@@ -699,7 +699,7 @@ pub(crate) async fn execute_tool(
                 } else {
                     let start = start_line.unwrap_or(1).saturating_sub(1);
                     let lines: Vec<&str> = text.lines().collect();
-                    let end = end_line.map(|e| e.min(lines.len())).unwrap_or(lines.len());
+                    let end = end_line.map_or(lines.len(), |e| e.min(lines.len()));
                     lines[start.min(lines.len())..end].join("\n")
                 }
             }
@@ -710,7 +710,12 @@ pub(crate) async fn execute_tool(
                 Ok(p) => p,
                 Err(err) => return err,
             };
-            let depth = input.get("depth").and_then(Value::as_u64).unwrap_or(1) as usize;
+            let depth: usize = input
+                .get("depth")
+                .and_then(Value::as_u64)
+                .unwrap_or(1)
+                .try_into()
+                .unwrap_or(usize::MAX);
             let pattern = input
                 .get("pattern")
                 .and_then(Value::as_str)
@@ -751,10 +756,12 @@ pub(crate) async fn execute_tool(
                 _ => return "error: pattern field required".into(),
             };
             let sub = input.get("path").and_then(Value::as_str).unwrap_or(".");
-            let max_results = input
+            let max_results: usize = input
                 .get("max_results")
                 .and_then(Value::as_u64)
-                .unwrap_or(50) as usize;
+                .unwrap_or(50)
+                .try_into()
+                .unwrap_or(usize::MAX);
             let root = match assert_within_workspace(workspace, sub) {
                 Ok(p) => p,
                 Err(e) => return e,
@@ -801,10 +808,12 @@ pub(crate) async fn execute_tool(
                 .unwrap_or("*")
                 .to_owned();
             let sub = input.get("path").and_then(Value::as_str).unwrap_or(".");
-            let max_results = input
+            let max_results: usize = input
                 .get("max_results")
                 .and_then(Value::as_u64)
-                .unwrap_or(100) as usize;
+                .unwrap_or(100)
+                .try_into()
+                .unwrap_or(usize::MAX);
             let root = match assert_within_workspace(workspace, sub) {
                 Ok(p) => p,
                 Err(e) => return e,
@@ -1133,10 +1142,12 @@ pub(crate) async fn execute_tool(
                 Some(u) => u.to_owned(),
                 None => return "error: url field required".into(),
             };
-            let max_bytes = input
+            let max_bytes: usize = input
                 .get("max_bytes")
                 .and_then(Value::as_u64)
-                .unwrap_or(256 * 1024) as usize;
+                .unwrap_or(256 * 1024)
+                .try_into()
+                .unwrap_or(usize::MAX);
 
             if !crate::sandbox::NetworkPolicy::from_env().permits_public_egress() {
                 return "error: network access disabled by sandbox policy".into();
@@ -1394,8 +1405,7 @@ fn remove_html_block(s: &str, open_tag: &str, close_tag: &str) -> String {
         let after = start + open_tag.len();
         let end = lower[after..]
             .find(close_tag)
-            .map(|p| after + p + close_tag.len())
-            .unwrap_or(result.len());
+            .map_or(result.len(), |p| after + p + close_tag.len());
         result.drain(start..end);
     }
     result

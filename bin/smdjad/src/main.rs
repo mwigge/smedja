@@ -173,6 +173,7 @@ pub(crate) async fn exec_bash(cmd: &str, workspace: &std::path::Path) -> String 
 /// On timeout the child is killed and any partial stdout already read is
 /// returned with a timeout suffix. Stderr is appended as a `[stderr]` block
 /// when the exit status is non-zero.
+#[allow(clippy::items_after_statements)]
 pub(crate) async fn exec_bash_ext(
     cmd: &str,
     workspace: &std::path::Path,
@@ -183,9 +184,9 @@ pub(crate) async fn exec_bash_ext(
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
-    let timeout = timeout_secs
-        .map(|t| t.min(SMEDJA_BASH_MAX_TIMEOUT_SECS))
-        .unwrap_or(EXEC_BASH_TIMEOUT_SECS);
+    let timeout = timeout_secs.map_or(EXEC_BASH_TIMEOUT_SECS, |t| {
+        t.min(SMEDJA_BASH_MAX_TIMEOUT_SECS)
+    });
 
     let mut builder = tokio::process::Command::new("sh");
     builder

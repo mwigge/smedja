@@ -284,7 +284,7 @@ impl TurnOrchestrator {
     /// [`TurnEvent::fail`] events and the task is marked `"failed"` in the
     /// ingot.  The function returns `()` rather than propagating, matching the
     /// existing `tokio::spawn` call sites.
-    #[allow(clippy::too_many_lines)] // sequential turn pipeline kept inline to preserve a single tracing span scope
+    #[allow(clippy::too_many_lines, clippy::items_after_statements)] // sequential turn pipeline kept inline to preserve a single tracing span scope
     pub(crate) async fn run(self, session_id: String, turn_id: String) {
         const MAX_RATE_LIMIT_RETRIES: u32 = 4;
         const RATE_LIMIT_BACKOFF_BASE_SECS: u64 = 1;

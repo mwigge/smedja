@@ -124,6 +124,7 @@ fn build_body(messages: &[Message], opts: &CallOptions) -> serde_json::Value {
 /// Drives the SSE receive loop, sending parsed [`Delta`] items into `tx`.
 ///
 /// Returns `(input_tokens, output_tokens, ttft_ms)` extracted from the stream.
+#[allow(clippy::too_many_lines)]
 async fn run_sse_loop(
     resp: reqwest::Response,
     tx: &tokio::sync::mpsc::Sender<Result<Delta, AdapterError>>,
