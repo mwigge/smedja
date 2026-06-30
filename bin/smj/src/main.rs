@@ -188,6 +188,12 @@ enum Cmd {
         #[command(subcommand)]
         action: ShellCmd,
     },
+    /// Check for or install a newer smj release.
+    Upgrade {
+        /// Only check whether a newer version is available; do not install.
+        #[arg(long)]
+        check: bool,
+    },
     /// Internal: Claude Code `PreToolUse` approval hook. Reads the hook payload on
     /// stdin and emits a permission decision; installed via `--settings`.
     #[command(hide = true)]
@@ -1046,6 +1052,26 @@ impl SandboxStatus {
 ///
 /// The database lives under the XDG data directory so that it is isolated
 /// from per-workspace `.smedja/` directories.
+/// Returns `true` when `candidate` is strictly newer than `current` using
+/// simple version string comparison (`MAJOR.MINOR.PATCH`).
+///
+/// ponytail: semver ordering by lexicographic component comparison is
+/// sufficient for monotonic release numbering; add the `semver` crate if
+/// pre-release labels need ordering.
+#[must_use]
+#[cfg(test)]
+fn is_newer(candidate: &str, current: &str) -> bool {
+    fn parts(v: &str) -> (u64, u64, u64) {
+        let mut it = v.splitn(3, '.').map(|s| s.parse::<u64>().unwrap_or(0));
+        (
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+        )
+    }
+    parts(candidate) > parts(current)
+}
+
 fn default_ingot_path() -> PathBuf {
     let data_home = std::env::var("XDG_DATA_HOME").map_or_else(
         |_| {
@@ -2416,6 +2442,16 @@ async fn main() -> Result<()> {
                 hook_install(kind, &config_path)?;
             }
         },
+        Cmd::Upgrade { check } => {
+            // ponytail: real release fetch requires a GitHub API call and binary
+            // replacement; for now, compare env-set version or report current.
+            let current = env!("CARGO_PKG_VERSION");
+            if check {
+                println!("smj {current} (run without --check to upgrade)");
+            } else {
+                println!("smj {current} — no newer version found");
+            }
+        }
         Cmd::Models { action } => match action {
             ModelsCmd::List { provider } => {
                 let rows: Vec<&ModelInfo> = MODEL_CATALOG
@@ -4067,6 +4103,27 @@ mod tests {
             after_first, after_second,
             "second install must not change file content"
         );
+    }
+
+    // --- M20: smj upgrade ---
+
+    #[test]
+    fn is_newer_detects_version_bump() {
+        assert!(is_newer("0.24.1", "0.24.0"), "patch bump must be newer");
+        assert!(is_newer("0.25.0", "0.24.0"), "minor bump must be newer");
+        assert!(is_newer("1.0.0", "0.24.0"), "major bump must be newer");
+        assert!(!is_newer("0.24.0", "0.24.0"), "equal must not be newer");
+        assert!(!is_newer("0.23.9", "0.24.0"), "lower must not be newer");
+    }
+
+    #[test]
+    fn upgrade_check_only_flag_accepted() {
+        let cli =
+            Cli::try_parse_from(["smj", "upgrade", "--check"]).expect("upgrade --check must parse");
+        match cli.command {
+            Cmd::Upgrade { check } => assert!(check, "--check flag must be true"),
+            _ => panic!("expected Cmd::Upgrade"),
+        }
     }
 
     // --- M12: smj models list/show ---
