@@ -6,8 +6,8 @@ use std::sync::Mutex;
 use smedja_adapter::{
     AnthropicProvider, BergetProvider, ClaudeCliProvider, CodexCliProvider, CopilotProvider,
     DeepSeekProvider, GpuSnapshot, GroqProvider, LocalModel, LocalProvider, MinimaxProvider,
-    OpenAiProvider, PerplexityProvider, PoolCliProvider, PoolsideProvider, Provider,
-    SubprocessProvider, TogetherProvider, XAiProvider,
+    OllamaProvider, OpenAiProvider, PerplexityProvider, PoolCliProvider, PoolsideProvider,
+    Provider, SubprocessProvider, TogetherProvider, XAiProvider,
 };
 use smedja_assayer::{Runner, Tier};
 use tracing::{error, info, warn};
@@ -555,7 +555,16 @@ pub async fn build_provider_pool() -> ProviderPool {
         info!(runner = "xai", "provider ready");
     }
 
-    // 12. Local rs-llmctl
+    // 12. Ollama — local inference; present when OLLAMA_HOST is set or the
+    //     default port is reachable.  detect() never fails, so guard on the
+    //     env var; connection failures surface only at turn time.
+    if std::env::var("OLLAMA_HOST").is_ok() {
+        let p = OllamaProvider::detect();
+        add!(Runner::Local, Tier::Local, p, "ollama", "llama3");
+        info!(runner = "ollama", "provider ready");
+    }
+
+    // 13. Local rs-llmctl
     let local = LocalProvider::connect().await;
     let mut local_control: Option<LocalControl> = None;
     if local.capability.healthy {

@@ -160,8 +160,7 @@ impl McpHttpClient {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .connect_timeout(std::time::Duration::from_secs(5))
-                .build()
-                .unwrap_or_default(),
+                .build()?,
         })
     }
 
