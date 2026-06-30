@@ -6,6 +6,26 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.23.0] — 2026-06-30
+
+### Added
+
+- **Large response offload** — tool responses >100 k chars are written to `$TMPDIR/smedja-tool-responses/<hash>` and replaced with a compact reference in the model context; prevents single large outputs exhausting the context window (WI-022)
+- **Extended skill frontmatter** — `arguments`, `tags`, and `supporting_files` fields on skill manifests; `apply_skill_arguments()` substitutes `$NAME`, `$ARGUMENTS`, and `$ARGUMENTS[n]` placeholders in skill bodies (WI-023)
+- **Multi-IDE skill symlinks** — `smj skills link-ides [--dir <project>]` creates `.codex/skills` and `.cursor/skills` symlinks to `~/.claude/skills/` (WI-024)
+- **Unicode tag sanitization** — U+E0000–U+E007F stripped from user messages before forwarding to providers (WI-025)
+- **Turn-context injection** — a `<turn-context>` XML block with the current date and working directory is prepended to the first user message of each turn (WI-026)
+- **`load_skill` built-in tool** — registered in LOCAL_TOOLS, MCP_SERVER_TOOLS, and READ_ONLY_TOOLS; loads a skill by name from the default registry and returns it wrapped in XML (WI-027)
+- **`TurnEvent::HistoryReplaced`** — emitted after auto-summarisation succeeds, carrying session ID, turn ID, and estimated summary token count (WI-028)
+- **Warm message truncation** — warm-stratum messages that exceed the remaining token budget are now truncated to the budget with a `[... truncated]` notice instead of being dropped entirely (WI-029)
+- **Session search** — `Ingot::search_sessions(query)` and `IngotHandle::search_sessions(query)` do case-insensitive substring search on `title` and `workspace_root`; exposed as `session.search` RPC (M4)
+
+### Fixed
+
+- **Pre-commit hang** — `LandlockBackend::netns_supported()` now probes with a 3-second thread timeout; the netns-degraded-path test is marked `#[ignore]` (CI-only) to prevent indefinite blocking on machines where the kernel policy stalls namespace creation
+
+---
+
 ## [0.22.1] — 2026-06-30
 
 ### Fixed
