@@ -6,6 +6,29 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.22.0] — 2026-06-30
+
+### Added
+
+- **Executor tools** — `grep_files`, `find_files`, `move_file`, `copy_file`, `delete_file` with workspace-containment and session permission checks (WI-019)
+- **Parallel multi-tool execution** — read-only tools in a multi-tool model response run concurrently via `FuturesUnordered`; writes go through the cowork gate sequentially (WI-020)
+- **Mid-stream usage events** — `StreamEvent::Usage` emitted for each `Delta::Usage` from the provider so clients can show live token budgets (WI-021)
+- **Tool-call chunk streaming** — `StreamEvent::ToolCallChunk` emitted for each partial `input_json` fragment from Anthropic and OpenAI providers; `StreamEvent::ToolCall` remains as the terminal complete event (WI-021)
+- **Fetch-web tool** — `fetch_web` with SSRF protection via `NetworkPolicy` and configurable `max_bytes` cap (WI-013)
+- **Declarative cowork permission rules** — `[[permission.rules]]` in `.smedja/workspace.toml` for tool-level allow/deny patterns without interactive prompting (WI-014)
+- **Bash extensions** — per-call `timeout_secs`, `env`, `stdin`; configurable compact threshold; denylist enforcement; stderr block on non-zero exit; partial output on timeout (WI-011, WI-012)
+- **Loop parallel slice execution** — `drive()` runs up to `max_parallel_slices` slices concurrently via bounded semaphore (WI-015)
+- **Max-tool-turns cap and loop checkpoint/resume** — `limits.max_tool_turns` terminates runaway tool loops; `.smedja/loop-state.json` checkpoint enables `loop.resume` re-entry (WI-016, WI-017)
+- **Poolside pool adapter** — `Pool` runner wraps the `pool` CLI subprocess for `poolside-ai` remote execution (WI-018)
+- **Read-file line ranges and base64 encoding** — `start_line`/`end_line` and `encoding: base64` on `read_file`; `depth`/`pattern` on `list_files` (WI-010)
+- **Fork-at-turn** — `session.fork` with `turn_n` allows re-entering a session from any prior turn (WI-010)
+
+### Fixed
+
+- **Clippy pedantic** — resolved `cast_possible_truncation`, `items_after_statements`, `option_if_let_else`, `must_use`, and `too_many_lines` warnings introduced across WI-001–WI-021
+
+---
+
 ## [0.20.9] — 2026-06-28
 
 ### Changed
