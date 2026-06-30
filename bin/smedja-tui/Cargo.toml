@@ -20,6 +20,7 @@ rustyline          = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 sha2               = { workspace = true }
+similar            = { workspace = true }
 smedja-bellows      = { path = "../../crates/smedja-bellows" }
 smedja-lsp         = { path = "../../crates/smedja-lsp" }
 smedja-rpc         = { path = "../../crates/smedja-rpc" }

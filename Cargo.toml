@@ -96,6 +96,7 @@ serde_json   = "1"
 serde_yaml   = "0.9"
 
 sha2         = "0.10"
+similar      = "2"
 
 # code graph
 streaming-iterator = "0.1"

@@ -6,10 +6,44 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
+use similar::{ChangeTag, TextDiff};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 use unicode_width::UnicodeWidthChar;
+
+// ---------------------------------------------------------------------------
+// M15 — Word-level diff highlighting using the `similar` crate
+// ---------------------------------------------------------------------------
+
+/// Produces word-level diff spans by comparing `before` and `after` word by
+/// word.  Words present only in `after` are styled with a bright green
+/// foreground (added); words only in `before` are styled with a bright red
+/// strikethrough (removed).  Unchanged words keep the default style.
+///
+/// Designed for inline diff display on single `+`/`-` lines where both
+/// versions of the line are known.
+#[must_use]
+pub fn word_diff_spans(before: &str, after: &str) -> Line<'static> {
+    let p = palette();
+    let diff = TextDiff::from_words(before, after);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for change in diff.iter_all_changes() {
+        let word = change.value().to_owned();
+        let span = match change.tag() {
+            ChangeTag::Equal => Span::raw(word),
+            ChangeTag::Insert => Span::styled(word, Style::default().fg(p.code_added)),
+            ChangeTag::Delete => Span::styled(
+                word,
+                Style::default()
+                    .fg(p.code_removed)
+                    .add_modifier(Modifier::CROSSED_OUT),
+            ),
+        };
+        spans.push(span);
+    }
+    Line::from(spans)
+}
 
 /// Hard-wraps a styled [`Line`] into one or more visual rows, each at most
 /// `width` display columns, splitting spans at column boundaries while
@@ -1956,6 +1990,56 @@ mod tests {
         assert!(
             panel.lines[1].spans.is_some(),
             "unlabeled rust block must be retroactively highlighted"
+        );
+    }
+
+    // --- M15: word-level diff highlighting ---
+
+    #[test]
+    fn diff_line_spans_added_has_word_styling() {
+        // A line with an inserted word should produce spans — some styled.
+        let line = word_diff_spans("hello world", "hello Rust world");
+        // There must be more than one span (unchanged + changed portions).
+        assert!(
+            line.spans.len() > 1,
+            "word diff should produce multiple spans, got: {:?}",
+            line.spans
+        );
+        // At least one span must have a non-default fg colour (the added word).
+        let has_styled = line.spans.iter().any(|s| s.style.fg.is_some());
+        assert!(
+            has_styled,
+            "at least one span must be styled for the added word"
+        );
+    }
+
+    #[test]
+    fn similar_word_diff_finds_changed_word() {
+        let line = word_diff_spans("foo bar baz", "foo qux baz");
+        // "bar" should be marked deleted and "qux" should be marked inserted.
+        let deleted: Vec<_> = line
+            .spans
+            .iter()
+            .filter(|s| {
+                s.style.fg.is_some() && s.style.add_modifier.contains(Modifier::CROSSED_OUT)
+            })
+            .collect();
+        let inserted: Vec<_> = line
+            .spans
+            .iter()
+            .filter(|s| {
+                s.style.fg.is_some() && !s.style.add_modifier.contains(Modifier::CROSSED_OUT)
+            })
+            .collect();
+        assert!(
+            !deleted.is_empty(),
+            "deleted word must be present: {:?}",
+            line.spans
+        );
+        assert!(
+            !inserted.is_empty(),
+            "inserted word must be present: {:?}",
+            line.spans
         );
     }
 }
