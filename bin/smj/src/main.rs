@@ -464,6 +464,12 @@ enum SkillCmd {
         /// Path to a directory of skills (e.g. agent-toolkit-bundle/skills)
         path: PathBuf,
     },
+    /// Create .codex/skills and .cursor/skills symlinks pointing to ~/.claude/skills
+    LinkIdes {
+        /// Project directory to link into (default: current directory)
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -885,6 +891,9 @@ async fn main() -> Result<()> {
                 SkillCmd::Update { name, path } => cmd_skill_update(&registry, &name, &path)?,
                 SkillCmd::Remove { name } => cmd_skill_remove(&registry, &name)?,
                 SkillCmd::Sync { path } => cmd_skill_sync(&registry, &path)?,
+                SkillCmd::LinkIdes { dir } => {
+                    cmd_skill_link_ides(&SkillRegistry::default_path(), &dir)?;
+                }
             }
         }
         Cmd::Task { action } => {
@@ -2572,6 +2581,27 @@ fn cmd_skill_remove(registry: &SkillRegistry, name: &str) -> Result<()> {
     Ok(())
 }
 
+fn cmd_skill_link_ides(skills_src: &std::path::Path, project_dir: &std::path::Path) -> Result<()> {
+    for ide in &[".codex", ".cursor"] {
+        let ide_dir = project_dir.join(ide);
+        std::fs::create_dir_all(&ide_dir)
+            .with_context(|| format!("cannot create {}", ide_dir.display()))?;
+        let link = ide_dir.join("skills");
+        if link.is_symlink() {
+            if std::fs::read_link(&link).is_ok_and(|t| t == skills_src) {
+                println!("  skip: {}", link.display());
+                continue;
+            }
+            std::fs::remove_file(&link)
+                .with_context(|| format!("cannot replace {}", link.display()))?;
+        }
+        std::os::unix::fs::symlink(skills_src, &link)
+            .with_context(|| format!("cannot symlink {}", link.display()))?;
+        println!("  linked: {}", link.display());
+    }
+    Ok(())
+}
+
 fn cmd_skill_sync(registry: &SkillRegistry, path: &std::path::Path) -> Result<()> {
     println!("Syncing from {} ...", path.display());
     let r = registry
@@ -3499,5 +3529,40 @@ mod tests {
                 || nouns.contains(&"WorkingMemory")
                 || nouns.contains(&"seal_prefix"),
         );
+    }
+
+    #[test]
+    fn link_ides_creates_codex_and_cursor_symlinks() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let skills_src = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_src).unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        cmd_skill_link_ides(&skills_src, &project).expect("link_ides");
+
+        let codex_link = project.join(".codex").join("skills");
+        let cursor_link = project.join(".cursor").join("skills");
+        assert!(codex_link.is_symlink(), ".codex/skills must be a symlink");
+        assert!(cursor_link.is_symlink(), ".cursor/skills must be a symlink");
+        assert_eq!(std::fs::read_link(&codex_link).unwrap(), skills_src);
+        assert_eq!(std::fs::read_link(&cursor_link).unwrap(), skills_src);
+    }
+
+    #[test]
+    fn link_ides_skips_existing_correct_symlinks() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let skills_src = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_src).unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        // Create first time.
+        cmd_skill_link_ides(&skills_src, &project).expect("first");
+        // Second call must not error.
+        cmd_skill_link_ides(&skills_src, &project).expect("second");
+
+        let codex_link = project.join(".codex").join("skills");
+        assert_eq!(std::fs::read_link(&codex_link).unwrap(), skills_src);
     }
 }
