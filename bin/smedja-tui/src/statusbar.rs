@@ -9,6 +9,10 @@ pub struct ModuleCtx<'a> {
     pub pending: bool,
     /// True when the input bar is active (not in scroll/normal mode).
     pub input_mode: bool,
+    /// True when vim Normal mode is active inside the input bar.
+    ///
+    /// Only meaningful when `input_mode` is `true`; ignored otherwise.
+    pub vim_normal_mode: bool,
     /// Context window fill percentage (0–100), shown as a gauge chip when present.
     pub ctx_pct: Option<u8>,
 }
@@ -42,7 +46,11 @@ pub struct ModuleConfig {
 
 fn segment_input_mode(ctx: &ModuleCtx<'_>) -> String {
     if ctx.input_mode {
-        "[I]".to_owned()
+        if ctx.vim_normal_mode {
+            "[NORMAL]".to_owned()
+        } else {
+            "[I]".to_owned()
+        }
     } else {
         "[N]".to_owned()
     }
@@ -181,6 +189,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: false,
+            vim_normal_mode: false,
             ctx_pct: None,
         };
         let bar = render_status_bar(&ctx);
@@ -197,6 +206,7 @@ mod tests {
             runner: None,
             pending: true,
             input_mode: false,
+            vim_normal_mode: false,
             ctx_pct: None,
         };
         assert!(render_status_bar(&ctx).contains('\u{27f3}'));
@@ -211,6 +221,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: false,
+            vim_normal_mode: false,
             ctx_pct: None,
         };
         assert!(!render_status_bar(&ctx).contains('\u{27f3}'));
@@ -228,6 +239,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: false,
+            vim_normal_mode: false,
             ctx_pct: None,
         };
         let _ = render_status_bar_with_timeout(&ctx, 0);
@@ -243,6 +255,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: false,
+            vim_normal_mode: false,
             ctx_pct: None,
         };
         let config = StatusBarConfig {
@@ -266,6 +279,7 @@ mod tests {
             runner: Some("claude-sonnet"),
             pending: false,
             input_mode: false,
+            vim_normal_mode: false,
             ctx_pct: None,
         };
         let bar = render_status_bar(&ctx);
@@ -284,6 +298,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: false,
+            vim_normal_mode: false,
             ctx_pct: None,
         };
         let bar = render_status_bar(&ctx);
@@ -302,6 +317,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: false,
+            vim_normal_mode: false,
             ctx_pct: None,
         };
         // Request session before tier.
@@ -326,6 +342,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: true,
+            vim_normal_mode: false,
             ctx_pct: None,
         };
         let ctx_n = ModuleCtx {
@@ -335,6 +352,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: false,
+            vim_normal_mode: false,
             ctx_pct: None,
         };
         assert_eq!(segment_input_mode(&ctx_i), "[I]");
@@ -350,6 +368,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: true,
+            vim_normal_mode: false,
             ctx_pct: None,
         };
         let bar = render_status_bar(&ctx);
@@ -372,6 +391,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: false,
+            vim_normal_mode: false,
             ctx_pct: Some(79),
         };
         let bar = render_status_bar(&ctx);
@@ -390,6 +410,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: false,
+            vim_normal_mode: false,
             ctx_pct: Some(80),
         };
         let bar = render_status_bar(&ctx);
@@ -408,6 +429,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: false,
+            vim_normal_mode: false,
             ctx_pct: Some(95),
         };
         let bar = render_status_bar(&ctx);

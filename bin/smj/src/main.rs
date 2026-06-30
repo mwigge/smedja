@@ -386,12 +386,24 @@ enum HookCmd {
 #[must_use]
 pub(crate) fn hook_content(kind: ShellKind) -> String {
     match kind {
-        ShellKind::Bash | ShellKind::Zsh => {
-            // precmd fires before each prompt in bash (PROMPT_COMMAND) and zsh.
+        ShellKind::Bash => {
+            // DEBUG trap fires before each command; BASH_COMMAND holds the raw
+            // command text.  PROMPT_COMMAND wires the function into the prompt cycle.
             [
                 "# smedja-hook-begin",
-                "_smj_precmd() { smj session prompt --message \"$HISTCMD\" 2>/dev/null || true; }",
+                "_smj_precmd() { smj session prompt --message \"$BASH_COMMAND\" 2>/dev/null || true; }",
                 "PROMPT_COMMAND=\"_smj_precmd;${PROMPT_COMMAND}\"",
+                "# smedja-hook-end",
+            ]
+            .join("\n")
+        }
+        ShellKind::Zsh => {
+            // precmd_functions is the idiomatic zsh hook array; history[$HISTCMD]
+            // expands to the last executed command text.
+            [
+                "# smedja-hook-begin",
+                "_smj_precmd() { smj session prompt --message \"${history[$HISTCMD]}\" 2>/dev/null || true; }",
+                "precmd_functions+=(_smj_precmd)",
                 "# smedja-hook-end",
             ]
             .join("\n")
@@ -1464,18 +1476,18 @@ async fn main() -> Result<()> {
                         session,
                         json: json_output,
                     } => {
-                        let mut payload = json!({ "message": message });
+                        let mut payload = json!({ "content": message });
                         if let Some(sid) = session {
                             payload["session_id"] = json!(sid);
                         }
                         let resp = client
-                            .call("session.submit", payload)
+                            .call("turn.submit", payload)
                             .await
-                            .context("session.submit failed")?;
+                            .context("turn.submit failed")?;
                         if json_output {
                             println!("{}", serde_json::to_string_pretty(&resp)?);
-                        } else if let Some(text) = resp["content"].as_str() {
-                            println!("{text}");
+                        } else if let Some(task_id) = resp["task_id"].as_str() {
+                            println!("{task_id}");
                         } else {
                             println!("{}", serde_json::to_string_pretty(&resp)?);
                         }
@@ -2443,13 +2455,13 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Upgrade { check } => {
-            // ponytail: real release fetch requires a GitHub API call and binary
-            // replacement; for now, compare env-set version or report current.
             let current = env!("CARGO_PKG_VERSION");
             if check {
-                println!("smj {current} (run without --check to upgrade)");
+                eprintln!("smj {current} — upgrade check not yet implemented");
+                std::process::exit(1);
             } else {
-                println!("smj {current} — no newer version found");
+                eprintln!("smj {current} — self-upgrade not yet implemented; install a new binary from releases");
+                std::process::exit(1);
             }
         }
         Cmd::Models { action } => match action {
@@ -2725,6 +2737,11 @@ async fn cmd_doctor(sock: &std::path::Path, json: bool) -> Result<()> {
         ("GITHUB_TOKEN", "copilot"),
         ("MINIMAX_API_KEY", "minimax"),
         ("BERGET_API_KEY", "berget"),
+        ("GROQ_API_KEY", "groq"),
+        ("DEEPSEEK_API_KEY", "deepseek"),
+        ("TOGETHER_API_KEY", "together"),
+        ("PERPLEXITY_API_KEY", "perplexity"),
+        ("XAI_API_KEY", "xai"),
         ("SMEDJA_LOCAL_ENDPOINT", "local"),
     ];
 

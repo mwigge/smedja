@@ -60,6 +60,7 @@ impl OllamaProvider {
     pub async fn list_models(&self) -> Vec<String> {
         let url = format!("{}/api/tags", self.base_url);
         let Ok(resp) = Client::new().get(&url).send().await else {
+            tracing::warn!(url = %url, "Ollama unreachable — list_models returning empty");
             return Vec::new();
         };
         let Ok(json) = resp.json::<serde_json::Value>().await else {

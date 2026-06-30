@@ -3,26 +3,35 @@
 # update with: smj prices update --file <path>
 
 [input]
-"claude-haiku-4-5-20251001" = 0.80
-"claude-sonnet-4-6"         = 3.00
-"claude-opus-4-8"           = 15.00
-"gpt-4o-mini"               = 0.15
-"gpt-4o"                    = 2.50
-"o3-mini"                   = 1.10
+"claude-haiku-4-5-20251001"              = 0.80
+"claude-sonnet-4-6"                      = 3.00
+"claude-opus-4-8"                        = 15.00
+"gpt-4o-mini"                            = 0.15
+"gpt-4o"                                 = 2.50
+"o3-mini"                                = 1.10
+"llama-3.3-70b-versatile"               = 0.59
+"deepseek-chat"                          = 0.14
+"anthropic.claude-3-5-sonnet-20241022-v2:0" = 3.00
 
 [output]
-"claude-haiku-4-5-20251001" = 4.00
-"claude-sonnet-4-6"         = 15.00
-"claude-opus-4-8"           = 75.00
-"gpt-4o-mini"               = 0.60
-"gpt-4o"                    = 10.00
-"o3-mini"                   = 4.40
+"claude-haiku-4-5-20251001"              = 4.00
+"claude-sonnet-4-6"                      = 15.00
+"claude-opus-4-8"                        = 75.00
+"gpt-4o-mini"                            = 0.60
+"gpt-4o"                                 = 10.00
+"o3-mini"                                = 4.40
+"llama-3.3-70b-versatile"               = 0.79
+"deepseek-chat"                          = 0.28
+"anthropic.claude-3-5-sonnet-20241022-v2:0" = 15.00
 
 # Context window sizes in tokens. Used by the TUI context rail.
 [windows]
-"claude-haiku-4-5-20251001" = 200000
-"claude-sonnet-4-6"         = 200000
-"claude-opus-4-8"           = 200000
-"gpt-4o-mini"               = 128000
-"gpt-4o"                    = 128000
-"o3-mini"                   = 200000
+"claude-haiku-4-5-20251001"              = 200000
+"claude-sonnet-4-6"                      = 200000
+"claude-opus-4-8"                        = 200000
+"gpt-4o-mini"                            = 128000
+"gpt-4o"                                 = 128000
+"o3-mini"                                = 200000
+"llama-3.3-70b-versatile"               = 128000
+"deepseek-chat"                          = 64000
+"anthropic.claude-3-5-sonnet-20241022-v2:0" = 200000

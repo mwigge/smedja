@@ -23,6 +23,30 @@ pub struct OpenAiCompatSpec {
     pub base_url: &'static str,
 }
 
+impl OpenAiCompatSpec {
+    /// Returns a short human-readable provider name derived from the API key
+    /// environment variable, suitable for logging.
+    ///
+    /// Example: `"GROQ_API_KEY"` → `"groq"`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        // Strip the trailing `_API_KEY` suffix and lower-case what remains.
+        // Because `env_var` is `'static` and all known values are ASCII we use
+        // a match rather than an allocation so the return lifetime is `'static`.
+        match self.env_var {
+            "MINIMAX_API_KEY" => "minimax",
+            "BERGET_API_KEY" => "berget",
+            "OPENCODE_API_KEY" => "opencode",
+            "GROQ_API_KEY" => "groq",
+            "DEEPSEEK_API_KEY" => "deepseek",
+            "TOGETHER_API_KEY" => "together",
+            "PERPLEXITY_API_KEY" => "perplexity",
+            "XAI_API_KEY" => "xai",
+            _ => "openai-compat",
+        }
+    }
+}
+
 /// Built-in spec for the Minimax API.
 pub const MINIMAX: OpenAiCompatSpec = OpenAiCompatSpec {
     env_var: "MINIMAX_API_KEY",
