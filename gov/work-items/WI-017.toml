@@ -1,6 +1,6 @@
 id     = "WI-017"
 title  = "File tools: grep_files, find_files, move_file, copy_file, delete_file"
-status = "planned"
+status = "done"
 priority = "P2"
 
 [detail]

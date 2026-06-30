@@ -53,6 +53,22 @@ pub(crate) fn role_allows_write_bash(session: &Session) -> bool {
 /// Returns the JSON error string `{"error": "path outside workspace"}` (byte for
 /// byte identical to the previous inline rejection) when the resolved path
 /// escapes the workspace root.
+/// Lexically normalises a path by resolving `..` and `.` components without
+/// touching the filesystem, so boundary checks work for non-existent paths.
+fn normalize_path(p: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 pub(crate) fn assert_within_workspace(
     workspace: &std::path::Path,
     path_str: &str,
@@ -64,11 +80,12 @@ pub(crate) fn assert_within_workspace(
     let full = if let Ok(p) = raw_join.canonicalize() {
         p
     } else {
-        let tentative = workspace.join(path_str);
-        if !tentative.starts_with(&workspace_canon) {
+        // File does not exist yet — normalize lexically to catch `..` traversal.
+        let normalized = normalize_path(&raw_join);
+        if !normalized.starts_with(&workspace_canon) {
             return Err(r#"{"error": "path outside workspace"}"#.to_owned());
         }
-        tentative
+        normalized
     };
     if !full.starts_with(&workspace_canon) {
         return Err(r#"{"error": "path outside workspace"}"#.to_owned());
@@ -85,6 +102,16 @@ mod tests {
         let result = super::assert_within_workspace(&ws, "sub/file.rs");
         assert!(result.is_ok(), "in-workspace path must be accepted");
         assert!(result.unwrap().starts_with(&ws));
+    }
+
+    #[test]
+    fn assert_within_workspace_rejects_nonexistent_traversal_path() {
+        // Destination does not exist — canonicalize fails, so the lexical
+        // normalizer must catch the `..` traversal.
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let result = super::assert_within_workspace(&ws, "../../tmp/evil.txt");
+        assert!(result.is_err(), "non-existent traversal must be rejected");
     }
 
     #[test]
