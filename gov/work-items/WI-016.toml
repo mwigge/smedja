@@ -1,0 +1,44 @@
+id     = "WI-016"
+title  = "Auto-compact session when context window reaches 85% capacity"
+status = "planned"
+priority = "P2"
+
+[detail]
+description = """
+smedja has all the compaction machinery (WorkingMemory strata, session.compact
+RPC, structured-JSON compaction via the compact role) but compaction is only
+triggered when the user or a tool explicitly calls session.compact. kimi-code
+triggers compaction automatically when the context fills.
+
+In the orchestrator turn loop, after building the prompt and before submitting
+to the provider, check:
+  used_tok / window_tok > 0.85
+
+where used_tok and window_tok come from session.context (handlers/session.rs
+:763-802). If over threshold, run the compact role inline before continuing the
+turn, then rebuild the prompt from the compacted memory.
+
+The 0.85 threshold should be configurable via SMEDJA_COMPACT_THRESHOLD env
+var (default 0.85). Below 0.5 should never trigger (guard against bad estimates).
+
+Also emit a StreamEvent::Quality or a log line noting the auto-compact so the
+user can see it happened rather than having it appear as a silent pause.
+
+Note: the compact role calls the model, so this adds latency to the affected
+turn. A future optimisation could run compaction as a background task
+triggered at 0.80 so it finishes before 0.85 is reached.
+"""
+
+source   = "deep gap analysis 2026-06-30; memory.rs:248-298, orchestrator/mod.rs"
+estimate = "M"
+
+[acceptance]
+criteria = [
+  "orchestrator checks used_tok/window_tok before each turn submission",
+  "compact role runs inline when ratio exceeds SMEDJA_COMPACT_THRESHOLD (default 0.85)",
+  "prompt rebuilt from compacted memory before submitting the turn",
+  "StreamEvent or structured log emitted when auto-compact fires",
+  "SMEDJA_COMPACT_THRESHOLD env var overrides the default threshold",
+  "threshold below 0.5 is rejected with a config error at startup",
+  "unit tests: ratio above threshold triggers compact; below does not",
+]

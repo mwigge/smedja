@@ -1,0 +1,44 @@
+id     = "WI-019"
+title  = "bash/run_command: per-call timeout, env map, stdin (complement to WI-012)"
+status = "planned"
+priority = "P3"
+
+[detail]
+description = """
+Three small ergonomic gaps in the bash tool that complement WI-012
+(streaming output). These are independent of the streaming change and
+can land before or after it.
+
+GAP A — per-call timeout override:
+EXEC_BASH_TIMEOUT_SECS is a compile-time constant (30 s). Some commands
+legitimately need longer (e.g. cargo build). Add an optional timeout_secs
+field to the bash/run_command input schema. When provided, use it instead
+of the compile-time default. Cap at a daemon-level maximum
+(SMEDJA_BASH_MAX_TIMEOUT_SECS, default 600 s) to prevent unbounded waits.
+
+GAP B — per-call env map:
+No way for the model to inject environment variables into a bash call.
+Add an optional env field (map of String→String). Entries are merged
+with the daemon's controlled env allowlist (controlledExternalCLIEnv
+pattern from milliways). Reject keys in a blocklist:
+PATH, LD_PRELOAD, LD_LIBRARY_PATH, HOME, USER, SHELL, SMEDJA_*.
+
+GAP C — stdin parameter:
+Already listed in WI-012 as part of the streaming rewrite, but the
+stdin input field can be added independently without streaming:
+if stdin is provided and streaming is not yet implemented, write bytes,
+close stdin handle, then continue with .output() as today.
+Pull this sub-item into WI-012 if that lands first; mark resolved here.
+"""
+
+source   = "deep gap analysis 2026-06-30; main.rs:163-175, executor/mod.rs:434"
+estimate = "S"
+
+[acceptance]
+criteria = [
+  "timeout_secs field on bash/run_command input overrides the compile-time default",
+  "timeout_secs capped at SMEDJA_BASH_MAX_TIMEOUT_SECS (default 600)",
+  "env map merged with controlled env; blocklisted keys rejected with tool error",
+  "stdin field accepted; bytes written to child stdin before reading output",
+  "unit tests: timeout override, env injection, blocklisted key rejection, stdin write",
+]
