@@ -45,6 +45,51 @@ pub fn word_diff_spans(before: &str, after: &str) -> Line<'static> {
     Line::from(spans)
 }
 
+// ---------------------------------------------------------------------------
+// M21 — Image detection and Kitty/placeholder rendering
+// ---------------------------------------------------------------------------
+
+/// Detects whether `line` contains an image reference — either a `data:image/`
+/// URI or a file path ending in a recognised image extension.
+///
+/// Returns the image source string (the URI or path) if found, or `None` for
+/// plain text.
+#[must_use]
+pub fn detect_image_in_line(line: &str) -> Option<&str> {
+    // File path extensions that indicate an image.
+    const IMAGE_EXTS: &[&str] = &[".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"];
+
+    // data: URI check — e.g. `data:image/png;base64,...`
+    if let Some(start) = line.find("data:image/") {
+        // Scan for the end of the URI (whitespace or `"` or `'` or `)`).
+        let src = &line[start..];
+        let end = src
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')'))
+            .unwrap_or(src.len());
+        return Some(&src[..end]);
+    }
+    // File path with image extension — match space-delimited token.
+    for token in line.split_whitespace() {
+        let lower = token.to_ascii_lowercase();
+        let lower = lower.trim_matches(|c: char| matches!(c, '"' | '\'' | '(' | ')' | '[' | ']'));
+        if IMAGE_EXTS.iter().any(|ext| lower.ends_with(ext)) {
+            // Return the original (un-lowercased) token slice.
+            let start = line.find(token).unwrap_or(0);
+            return Some(&line[start..start + token.len()]);
+        }
+    }
+    None
+}
+
+/// Returns a text placeholder for an image that cannot be rendered as pixels
+/// (e.g. when Kitty graphics protocol or Sixel is unavailable).
+///
+/// Format: `[image: <src>]`
+#[must_use]
+pub fn render_image_placeholder(src: &str) -> String {
+    format!("[image: {src}]")
+}
+
 /// Hard-wraps a styled [`Line`] into one or more visual rows, each at most
 /// `width` display columns, splitting spans at column boundaries while
 /// preserving each span's style. An empty line yields a single empty row.
@@ -2107,6 +2152,47 @@ mod tests {
             !inserted.is_empty(),
             "inserted word must be present: {:?}",
             line.spans
+        );
+    }
+
+    // --- M21: image detection and placeholder rendering ---
+
+    #[test]
+    fn detect_image_finds_data_uri() {
+        let line = "Here is an image: data:image/png;base64,abc123 and some text";
+        let src = detect_image_in_line(line);
+        assert!(src.is_some(), "data URI must be detected");
+        assert!(
+            src.unwrap().starts_with("data:image/"),
+            "src must start with data:image/"
+        );
+    }
+
+    #[test]
+    fn detect_image_finds_png_path() {
+        let line = "Screenshot saved to /tmp/shot.png for reference";
+        let src = detect_image_in_line(line);
+        assert!(src.is_some(), "png path must be detected: {line}");
+        assert!(
+            std::path::Path::new(src.unwrap())
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("png")),
+            "detected src must end with .png"
+        );
+    }
+
+    #[test]
+    fn render_image_placeholder_format() {
+        let placeholder = render_image_placeholder("data:image/png;base64,abc");
+        assert_eq!(placeholder, "[image: data:image/png;base64,abc]");
+    }
+
+    #[test]
+    fn no_image_in_plain_text() {
+        let line = "This is plain text with no image reference.";
+        assert!(
+            detect_image_in_line(line).is_none(),
+            "plain text must not trigger image detection"
         );
     }
 }
