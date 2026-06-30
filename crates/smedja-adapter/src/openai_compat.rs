@@ -41,6 +41,95 @@ pub const OPENCODE: OpenAiCompatSpec = OpenAiCompatSpec {
     base_url: "https://api.opencode.ai/v1",
 };
 
+// ---------------------------------------------------------------------------
+// M11b — OpenAI-compat presets: Groq, DeepSeek, Together, Perplexity, xAI
+// ---------------------------------------------------------------------------
+
+/// Built-in spec for the Groq API.
+pub const GROQ: OpenAiCompatSpec = OpenAiCompatSpec {
+    env_var: "GROQ_API_KEY",
+    base_url: "https://api.groq.com/openai/v1",
+};
+
+/// Built-in spec for the [`DeepSeek`] API.
+pub const DEEPSEEK: OpenAiCompatSpec = OpenAiCompatSpec {
+    env_var: "DEEPSEEK_API_KEY",
+    base_url: "https://api.deepseek.com/v1",
+};
+
+/// Built-in spec for the Together AI API.
+pub const TOGETHER: OpenAiCompatSpec = OpenAiCompatSpec {
+    env_var: "TOGETHER_API_KEY",
+    base_url: "https://api.together.xyz/v1",
+};
+
+/// Built-in spec for the Perplexity AI API.
+pub const PERPLEXITY: OpenAiCompatSpec = OpenAiCompatSpec {
+    env_var: "PERPLEXITY_API_KEY",
+    base_url: "https://api.perplexity.ai",
+};
+
+/// Built-in spec for the xAI API.
+pub const XAI: OpenAiCompatSpec = OpenAiCompatSpec {
+    env_var: "XAI_API_KEY",
+    base_url: "https://api.x.ai/v1",
+};
+
+/// Entry point for the Groq API.
+pub struct GroqProvider;
+
+impl GroqProvider {
+    /// Returns `Some` when `GROQ_API_KEY` is set in the environment.
+    #[must_use]
+    pub fn detect() -> Option<OpenAiCompatProvider> {
+        OpenAiCompatProvider::detect(GROQ)
+    }
+}
+
+/// Entry point for the [`DeepSeek`] API.
+pub struct DeepSeekProvider;
+
+impl DeepSeekProvider {
+    /// Returns `Some` when `DEEPSEEK_API_KEY` is set in the environment.
+    #[must_use]
+    pub fn detect() -> Option<OpenAiCompatProvider> {
+        OpenAiCompatProvider::detect(DEEPSEEK)
+    }
+}
+
+/// Entry point for the Together AI API.
+pub struct TogetherProvider;
+
+impl TogetherProvider {
+    /// Returns `Some` when `TOGETHER_API_KEY` is set in the environment.
+    #[must_use]
+    pub fn detect() -> Option<OpenAiCompatProvider> {
+        OpenAiCompatProvider::detect(TOGETHER)
+    }
+}
+
+/// Entry point for the Perplexity AI API.
+pub struct PerplexityProvider;
+
+impl PerplexityProvider {
+    /// Returns `Some` when `PERPLEXITY_API_KEY` is set in the environment.
+    #[must_use]
+    pub fn detect() -> Option<OpenAiCompatProvider> {
+        OpenAiCompatProvider::detect(PERPLEXITY)
+    }
+}
+
+/// Entry point for the xAI API.
+pub struct XAiProvider;
+
+impl XAiProvider {
+    /// Returns `Some` when `XAI_API_KEY` is set in the environment.
+    #[must_use]
+    pub fn detect() -> Option<OpenAiCompatProvider> {
+        OpenAiCompatProvider::detect(XAI)
+    }
+}
+
 /// A provider for any service that speaks the `OpenAI` chat-completions
 /// protocol, parameterised by an [`OpenAiCompatSpec`].
 pub struct OpenAiCompatProvider {
@@ -298,5 +387,36 @@ mod tests {
         );
         assert_eq!(err.kind(), "context_length_exceeded");
         assert!(err.is_retryable());
+    }
+
+    // -------------------------------------------------------------------------
+    // M11b — OpenAI-compat presets
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn groq_preset_sets_correct_base_url() {
+        assert_eq!(GROQ.base_url, "https://api.groq.com/openai/v1");
+        assert_eq!(GROQ.env_var, "GROQ_API_KEY");
+    }
+
+    #[test]
+    fn deepseek_preset_sets_correct_base_url() {
+        assert_eq!(DEEPSEEK.base_url, "https://api.deepseek.com/v1");
+        assert_eq!(DEEPSEEK.env_var, "DEEPSEEK_API_KEY");
+    }
+
+    #[test]
+    fn together_preset_sets_correct_base_url() {
+        assert_eq!(TOGETHER.base_url, "https://api.together.xyz/v1");
+    }
+
+    #[test]
+    fn perplexity_preset_sets_correct_base_url() {
+        assert!(PERPLEXITY.base_url.contains("perplexity.ai"));
+    }
+
+    #[test]
+    fn xai_preset_sets_correct_base_url() {
+        assert!(XAI.base_url.contains("x.ai"));
     }
 }

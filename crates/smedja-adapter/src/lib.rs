@@ -29,6 +29,7 @@ pub mod error;
 pub mod gemini;
 pub mod gpu;
 pub mod local;
+pub mod ollama;
 pub mod openai;
 pub mod openai_compat;
 pub mod pool_cli;
