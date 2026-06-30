@@ -105,6 +105,7 @@ pub fn parse_skill(content: &str, path: &Path) -> Result<Skill, PluginsError> {
 /// - `$ARGUMENTS[n]` → 0-based positional (empty string if out of bounds)
 /// - `$name` → value of the argument named `name`; falls back to its declared
 ///   `default`, then to an empty string if neither is provided
+#[must_use]
 pub fn apply_skill_arguments(body: &str, args: &[&str], manifest: &SkillManifest) -> String {
     let all = args.join(" ");
 

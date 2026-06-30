@@ -21,6 +21,65 @@ use smedja_vault::Vault;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+const REPLAY_CAP: usize = 512;
+
+/// Bounded per-turn replay buffer for SSE `Last-Event-ID` reconnect support.
+pub struct EventBuffer {
+    // ponytail: global lock — per-turn sharding if contention observed
+    inner: std::sync::Mutex<
+        std::collections::HashMap<String, std::collections::VecDeque<(u64, String)>>,
+    >,
+    cap: usize,
+}
+
+impl Default for EventBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EventBuffer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cap: REPLAY_CAP,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cap,
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (another thread panicked while
+    /// holding the lock).
+    pub fn push(&self, turn_id: &str, seq: u64, data: String) {
+        let mut map = self.inner.lock().expect("event buffer lock not poisoned");
+        let q = map.entry(turn_id.to_owned()).or_default();
+        q.push_back((seq, data));
+        while q.len() > self.cap {
+            q.pop_front();
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn events_after(&self, turn_id: &str, last_seq: u64) -> Vec<(u64, String)> {
+        let map = self.inner.lock().expect("event buffer lock not poisoned");
+        map.get(turn_id)
+            .map(|q| q.iter().filter(|(s, _)| *s > last_seq).cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
 /// Shared state for ACP route handlers.
 #[derive(Clone)]
 pub struct AcpState {
@@ -33,6 +92,10 @@ pub struct AcpState {
     pub vault: Arc<Mutex<Vault>>,
     /// Embedding backend shared with MCP server-mode tool dispatch.
     pub embedder: Arc<dyn crate::embedder_port::Embedder>,
+    /// Per-turn SSE replay buffer — enables `Last-Event-ID` reconnect.
+    pub replay: Arc<EventBuffer>,
+    /// Monotonic counter for SSE event `id:` sequence numbers.
+    pub next_seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Builds the ACP router with auth middleware applied to every route.
@@ -40,6 +103,10 @@ pub fn build_acp_router(state: AcpState) -> Router {
     Router::new()
         .route("/acp/v1/session/new", post(create_session))
         .route("/acp/v1/session/{id}/prompt", post(submit_prompt))
+        .route(
+            "/acp/v1/session/{id}/events/{turn_id}",
+            get(get_turn_events),
+        )
         .route("/acp/v1/session/{id}/model", post(set_model))
         .route("/acp/v1/session/{id}/mode", post(set_mode))
         .route("/acp/v1/session/{id}", delete(close_session))
@@ -156,38 +223,58 @@ fn is_terminal_for(event: &TurnEvent, turn_id: &str) -> bool {
 /// Builds an SSE response that forwards every [`TurnEvent`] for `turn_id` from
 /// `receiver`, terminating after the turn's terminal event. A keep-alive
 /// heartbeat prevents idle-timeout disconnects.
+///
+/// Each emitted event carries an `id:` sequence number and is stored in
+/// `replay` so reconnecting clients can catch up via `Last-Event-ID`.
+///
+/// `pending` is empty for new connections and pre-populated with buffered
+/// events when a client reconnects with `Last-Event-ID`.
 fn build_turn_sse(
     receiver: tokio::sync::broadcast::Receiver<TurnEvent>,
     turn_id: String,
+    pending: std::collections::VecDeque<(u64, String)>,
+    replay: Arc<EventBuffer>,
+    next_seq: Arc<std::sync::atomic::AtomicU64>,
 ) -> axum::response::Sse<
     impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
 > {
+    use std::sync::atomic::Ordering;
+
     use axum::response::sse::{Event, KeepAlive, Sse};
 
     let stream = futures_util::stream::unfold(
-        (receiver, turn_id, false),
-        |(mut rx, turn_id, finished)| async move {
+        (receiver, turn_id, pending, false, replay, next_seq),
+        |(mut rx, turn_id, mut pending, finished, replay, next_seq)| async move {
             if finished {
                 return None;
             }
+            // Phase 1: drain buffered replay events (reconnect path).
+            if let Some((seq, data)) = pending.pop_front() {
+                let sse_event = Event::default().id(seq.to_string()).data(data);
+                return Some((
+                    Ok(sse_event),
+                    (rx, turn_id, pending, false, replay, next_seq),
+                ));
+            }
+            // Phase 2: live events from the dispatcher.
             loop {
                 match rx.recv().await {
                     Ok(event) => {
-                        // Forward only events for this turn; an event with no
-                        // turn correlation is skipped.
                         match turn_id_of(&event) {
                             Some(tid) if tid == turn_id => {}
                             _ => continue,
                         }
                         let terminal = is_terminal_for(&event, &turn_id);
-                        // The event is already JSON; carry it as the SSE data.
                         let data = serde_json::to_string(&event).unwrap_or_default();
-                        let sse_event = Event::default().data(data);
-                        return Some((Ok(sse_event), (rx, turn_id, terminal)));
+                        let seq = next_seq.fetch_add(1, Ordering::Relaxed);
+                        replay.push(&turn_id, seq, data.clone());
+                        let sse_event = Event::default().id(seq.to_string()).data(data);
+                        return Some((
+                            Ok(sse_event),
+                            (rx, turn_id, pending, terminal, replay, next_seq),
+                        ));
                     }
-                    // A lagged subscriber skips dropped events and re-loops.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    // The dispatcher closed — end the stream.
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                 }
             }
@@ -195,6 +282,24 @@ fn build_turn_sse(
     );
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// GET `/acp/v1/session/{id}/events/{turn_id}` — SSE stream for a running or
+/// completed turn, with `Last-Event-ID` reconnect support.
+async fn get_turn_events(
+    Path((_, turn_id)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    State(s): State<AcpState>,
+) -> impl IntoResponse {
+    let last_seq: u64 = headers
+        .get("Last-Event-ID")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    let pending = std::collections::VecDeque::from(s.replay.events_after(&turn_id, last_seq));
+    let receiver = s.dispatcher.subscribe();
+    build_turn_sse(receiver, turn_id, pending, s.replay, s.next_seq)
 }
 
 async fn submit_prompt(
@@ -229,7 +334,14 @@ async fn submit_prompt(
                 turn_id.to_string(),
                 Arc::clone(&s.dispatcher),
             );
-            build_turn_sse(receiver, turn_id.to_string()).into_response()
+            build_turn_sse(
+                receiver,
+                turn_id.to_string(),
+                std::collections::VecDeque::new(),
+                s.replay,
+                s.next_seq,
+            )
+            .into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -301,6 +413,8 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use axum::response::IntoResponse as _;
+
+    use super::EventBuffer;
     use smedja_bellows::Dispatcher;
     use tower::ServiceExt as _;
 
@@ -317,6 +431,8 @@ mod tests {
                 smedja_vault::Vault::open_in_memory().expect("in-memory vault"),
             )),
             embedder: Arc::new(crate::embedder_port::FnvEmbedder::new()),
+            replay: Arc::new(EventBuffer::new()),
+            next_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }
 
@@ -379,6 +495,35 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn event_buffer_stores_and_returns_events_after_seq() {
+        let buf = EventBuffer::new();
+        buf.push("t1", 1, "ev1".into());
+        buf.push("t1", 2, "ev2".into());
+        buf.push("t1", 3, "ev3".into());
+        let after = buf.events_after("t1", 1);
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0], (2, "ev2".to_owned()));
+        assert_eq!(after[1], (3, "ev3".to_owned()));
+    }
+
+    #[test]
+    fn event_buffer_caps_at_max_size() {
+        let buf = EventBuffer::with_capacity(3);
+        for i in 1u64..=5 {
+            buf.push("t", i, format!("ev{i}"));
+        }
+        let all = buf.events_after("t", 0);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].0, 3); // oldest kept is seq 3
+    }
+
+    #[test]
+    fn event_buffer_empty_for_unknown_turn() {
+        let buf = EventBuffer::new();
+        assert!(buf.events_after("nosuch", 0).is_empty());
     }
 
     #[tokio::test]
@@ -595,7 +740,13 @@ mod tests {
             correlation: CorrelationCtx::default(),
         });
 
-        let sse = super::build_turn_sse(rx, turn_id);
+        let sse = super::build_turn_sse(
+            rx,
+            turn_id,
+            std::collections::VecDeque::new(),
+            Arc::new(super::EventBuffer::new()),
+            Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        );
         let resp = sse.into_response();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -638,7 +789,13 @@ mod tests {
             correlation: CorrelationCtx::default(),
         });
 
-        let sse = super::build_turn_sse(rx, turn_id);
+        let sse = super::build_turn_sse(
+            rx,
+            turn_id,
+            std::collections::VecDeque::new(),
+            Arc::new(super::EventBuffer::new()),
+            Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        );
         let resp = sse.into_response();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await

@@ -254,7 +254,7 @@ async fn list_with(ig: &smedja_ingot::IngotHandle) -> Result<Value, RpcError> {
     Ok(Value::Array(out))
 }
 
-/// Handles `session.search`: returns sessions whose title or workspace_root matches `query`.
+/// Handles `session.search`: returns sessions whose title or `workspace_root` matches `query`.
 ///
 /// # Errors
 ///

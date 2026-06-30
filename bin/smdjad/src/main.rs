@@ -1333,6 +1333,8 @@ async fn main() -> anyhow::Result<()> {
                 workspace: workspace_root.clone(),
                 vault: Arc::clone(&vault),
                 embedder: Arc::clone(&embedder),
+                replay: std::sync::Arc::new(acp::EventBuffer::new()),
+                next_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             };
             let acp_router = acp::build_acp_router(acp_state);
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));

@@ -350,15 +350,16 @@ pub fn load_role_skills(dir: &std::path::Path, role: &str) -> Result<Vec<String>
 
     let role_specific_dir = roles_dir.join(role);
     if role_specific_dir.is_dir() {
-        let mut files = Vec::new();
+        let mut files: Vec<(std::path::PathBuf, String)> = Vec::new();
         for entry in std::fs::read_dir(&role_specific_dir)? {
             let path = entry?.path();
             if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                files.push(std::fs::read_to_string(&path)?);
+                let content = std::fs::read_to_string(&path)?;
+                files.push((path, content));
             }
         }
-        files.sort();
-        out.extend(files);
+        files.sort_by(|(a, _), (b, _)| a.file_name().cmp(&b.file_name()));
+        out.extend(files.into_iter().map(|(_, c)| c));
     }
 
     Ok(out)
@@ -377,18 +378,17 @@ pub fn load_workspace_skills(dir: &std::path::Path) -> Result<Vec<String>, std::
     if !skills_dir.exists() {
         return Ok(Vec::new());
     }
-    let mut skills = Vec::new();
+    let mut skills: Vec<(std::path::PathBuf, String)> = Vec::new();
     for entry in std::fs::read_dir(&skills_dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("md") {
             let content = std::fs::read_to_string(&path)?;
-            skills.push(content);
+            skills.push((path, content));
         }
     }
-    // Sort for deterministic ordering (alphabetical by filename).
-    skills.sort();
-    Ok(skills)
+    skills.sort_by(|(a, _), (b, _)| a.file_name().cmp(&b.file_name()));
+    Ok(skills.into_iter().map(|(_, c)| c).collect())
 }
 
 /// Reads project-specific context files from `.smedja/context/*.md` in `dir`.
@@ -405,17 +405,17 @@ pub fn load_context_files(dir: &std::path::Path) -> Result<Vec<String>, std::io:
     if !ctx_dir.exists() {
         return Ok(Vec::new());
     }
-    let mut files = Vec::new();
+    let mut files: Vec<(std::path::PathBuf, String)> = Vec::new();
     for entry in std::fs::read_dir(&ctx_dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("md") {
             let content = std::fs::read_to_string(&path)?;
-            files.push(content);
+            files.push((path, content));
         }
     }
-    files.sort();
-    Ok(files)
+    files.sort_by(|(a, _), (b, _)| a.file_name().cmp(&b.file_name()));
+    Ok(files.into_iter().map(|(_, c)| c).collect())
 }
 
 /// Injects workspace skills into `WorkingMemory` as a single system message
@@ -1028,5 +1028,41 @@ mod tests {
         std::fs::write(ctx_dir.join("raw.txt"), "txt").unwrap();
         let result = super::load_context_files(tmp.path()).unwrap();
         assert_eq!(result, vec!["md"]);
+    }
+
+    #[test]
+    fn workspace_skills_ordered_by_filename_not_content() {
+        // z.md has content "AAA" — content-sort puts it first.
+        // a.md has content "ZZZ" — filename-sort puts it first.
+        // Correct: filename order (a.md before z.md) → ["ZZZ", "AAA"].
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join(".smedja").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(skills_dir.join("z.md"), "AAA").unwrap();
+        std::fs::write(skills_dir.join("a.md"), "ZZZ").unwrap();
+        let result = super::load_workspace_skills(tmp.path()).unwrap();
+        assert_eq!(result, vec!["ZZZ", "AAA"]);
+    }
+
+    #[test]
+    fn context_files_ordered_by_filename_not_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx_dir = tmp.path().join(".smedja").join("context");
+        std::fs::create_dir_all(&ctx_dir).unwrap();
+        std::fs::write(ctx_dir.join("z.md"), "AAA").unwrap();
+        std::fs::write(ctx_dir.join("a.md"), "ZZZ").unwrap();
+        let result = super::load_context_files(tmp.path()).unwrap();
+        assert_eq!(result, vec!["ZZZ", "AAA"]);
+    }
+
+    #[test]
+    fn role_skills_dir_ordered_by_filename_not_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roles_dir = tmp.path().join(".smedja").join("roles");
+        std::fs::create_dir_all(roles_dir.join("coder")).unwrap();
+        std::fs::write(roles_dir.join("coder").join("z.md"), "AAA").unwrap();
+        std::fs::write(roles_dir.join("coder").join("a.md"), "ZZZ").unwrap();
+        let result = super::load_role_skills(tmp.path(), "coder").unwrap();
+        assert_eq!(result, vec!["ZZZ", "AAA"]);
     }
 }

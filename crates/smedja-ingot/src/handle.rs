@@ -195,7 +195,7 @@ impl IngotHandle {
         self.run_blocking(Ingot::list_sessions).await
     }
 
-    /// Searches sessions by title or workspace_root substring (case-insensitive).
+    /// Searches sessions by title or `workspace_root` substring (case-insensitive).
     ///
     /// # Errors
     ///
