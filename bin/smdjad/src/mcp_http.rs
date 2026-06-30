@@ -3,7 +3,7 @@
 //! Connects to an MCP server at a known URL. OAuth PKCE flow is a
 //! future extension; for now, a static Bearer token is supported.
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, OnceCell};
 
 use serde::{Deserialize, Serialize};
 
@@ -145,6 +145,9 @@ pub struct McpHttpClient {
     url: String,
     token: String,
     http: reqwest::Client,
+    /// Protocol version negotiated with the server on first contact.
+    /// Initialised lazily via [`Self::ensure_initialized`].
+    negotiated_version: OnceCell<&'static str>,
 }
 
 impl McpHttpClient {
@@ -161,7 +164,45 @@ impl McpHttpClient {
                 .timeout(std::time::Duration::from_secs(30))
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .build()?,
+            negotiated_version: OnceCell::new(),
         })
+    }
+
+    /// Sends the MCP `initialize` handshake and records the negotiated protocol
+    /// version.  Called lazily on first contact; errors are non-fatal (many
+    /// servers do not implement `initialize`) and fall back to the oldest known
+    /// version.
+    async fn ensure_initialized(&self) {
+        self.negotiated_version
+            .get_or_init(|| async {
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": MCP_PROTOCOL_VERSIONS[0],
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "smdjad",
+                            "version": env!("CARGO_PKG_VERSION")
+                        }
+                    }
+                });
+                let mut req = self.http.post(&self.url).json(&body);
+                if !self.token.is_empty() {
+                    req = req.bearer_auth(&self.token);
+                }
+                // Errors are non-fatal: many MCP servers don't implement initialize.
+                let negotiated = async {
+                    let resp = req.send().await.ok()?;
+                    let v = resp.json::<serde_json::Value>().await.ok()?;
+                    let ver = v["result"]["protocolVersion"].as_str()?.to_owned();
+                    Some(negotiate_protocol_version(&ver))
+                }
+                .await;
+                negotiated.unwrap_or(MCP_PROTOCOL_VERSIONS[MCP_PROTOCOL_VERSIONS.len() - 1])
+            })
+            .await;
     }
 
     /// Calls `tools/call` on the MCP server and returns the result as a JSON
@@ -230,10 +271,14 @@ impl McpHttpClient {
 
     /// Calls `tools/list` on the MCP server and returns the tool list.
     ///
+    /// Performs the MCP `initialize` handshake on first call to negotiate the
+    /// protocol version; subsequent calls skip it via the `OnceCell` guard.
+    ///
     /// # Errors
     ///
     /// Returns an error on network failure or if the response is not valid JSON-RPC.
     pub async fn list_tools(&self) -> Result<Vec<McpTool>, String> {
+        self.ensure_initialized().await;
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,

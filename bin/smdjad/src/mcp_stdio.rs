@@ -17,7 +17,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
-use crate::mcp_http::McpHttpClient;
+use crate::mcp_http::{McpHttpClient, RECONNECT_DELAYS_SECS};
 
 /// Per-call read timeout for a stdio child response.
 const STDIO_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -192,7 +192,28 @@ impl McpStdioClient {
         let read =
             tokio::time::timeout(read_timeout, child.stdout.read_line(&mut response_line)).await;
         match read {
-            Ok(Ok(0)) => Err("stdio MCP server closed the connection".to_owned()),
+            Ok(Ok(0)) => {
+                // Child closed stdout (EOF). Drop the current child and attempt
+                // reconnect with exponential backoff before reporting the error.
+                *guard = None;
+                for (attempt, &delay) in RECONNECT_DELAYS_SECS.iter().enumerate() {
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    match self.spawn() {
+                        Ok(new_child) => {
+                            *guard = Some(new_child);
+                            tracing::info!(attempt, "MCP stdio server reconnected");
+                            break;
+                        }
+                        Err(e) if attempt + 1 == RECONNECT_DELAYS_SECS.len() => {
+                            tracing::error!(error = %e, "MCP stdio server failed after all retries");
+                        }
+                        Err(e) => {
+                            tracing::warn!(attempt, error = %e, "MCP stdio reconnect failed, retrying");
+                        }
+                    }
+                }
+                Err("stdio MCP server closed the connection".to_owned())
+            }
             Ok(Ok(_)) => serde_json::from_str(response_line.trim_end())
                 .map_err(|e| format!("stdio response parse failed: {e}")),
             Ok(Err(e)) => Err(format!("stdio read failed: {e}")),

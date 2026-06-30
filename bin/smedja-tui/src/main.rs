@@ -4559,9 +4559,12 @@ async fn main() -> Result<()> {
                     StreamEvent::HistoryReplaced { summary_tokens } => {
                         state.main_panel.push_seam(summary_tokens);
                     }
-                    StreamEvent::Unknown
-                    | StreamEvent::Usage { .. }
-                    | StreamEvent::ToolCallChunk { .. } => {}
+                    StreamEvent::Unknown => {
+                        tracing::debug!(
+                            "received unknown stream event type — daemon may be newer than TUI"
+                        );
+                    }
+                    StreamEvent::Usage { .. } | StreamEvent::ToolCallChunk { .. } => {}
                 }
             }
 
