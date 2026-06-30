@@ -829,6 +829,26 @@ pub(crate) async fn submit(input: &str, state: &mut AppState, client: &mut Clien
     if state.prompt_history.len() > PROMPT_HISTORY_CAP {
         state.prompt_history.remove(0);
     }
+    // Append-only write so history survives an unclean shutdown.
+    // The full rewrite in save_history is still called on clean exit.
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let path = dirs_tui_history_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            if let Ok(line) = serde_json::to_string(&text) {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+    }
     state.history_idx = None;
     state.saved_input.clear();
     let user_msg = Message {

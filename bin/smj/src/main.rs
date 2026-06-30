@@ -2770,6 +2770,10 @@ async fn cmd_doctor(sock: &std::path::Path, json: bool) -> Result<()> {
         ("TOGETHER_API_KEY", "together"),
         ("PERPLEXITY_API_KEY", "perplexity"),
         ("XAI_API_KEY", "xai"),
+        ("OLLAMA_HOST", "ollama"),
+        ("AWS_ACCESS_KEY_ID", "bedrock"),
+        ("AWS_SECRET_ACCESS_KEY", "bedrock"),
+        ("AWS_DEFAULT_REGION", "bedrock"),
         ("SMEDJA_LOCAL_ENDPOINT", "local"),
     ];
 

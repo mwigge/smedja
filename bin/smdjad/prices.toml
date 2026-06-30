@@ -21,6 +21,8 @@
 "llama-3.1-sonar-small-128k-online"      = 0.20
 "grok-beta"                              = 5.00
 "grok-2"                                 = 2.00
+"sonar-pro"                              = 3.00
+"grok-3-beta"                            = 3.00
 
 [output]
 "claude-haiku-4-5-20251001"              = 4.00
@@ -41,6 +43,8 @@
 "llama-3.1-sonar-small-128k-online"      = 0.20
 "grok-beta"                              = 15.00
 "grok-2"                                 = 10.00
+"sonar-pro"                              = 15.00
+"grok-3-beta"                            = 15.00
 
 # Context window sizes in tokens. Used by the TUI context rail.
 [windows]
@@ -62,3 +66,5 @@
 "llama-3.1-sonar-small-128k-online"      = 127072
 "grok-beta"                              = 131072
 "grok-2"                                 = 131072
+"sonar-pro"                              = 127072
+"grok-3-beta"                            = 131072
