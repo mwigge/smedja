@@ -260,6 +260,16 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                             evict_and_push(buf, line);
                         }
                     }
+                    TurnEvent::HistoryReplaced {
+                        ref session_id,
+                        ref turn_id,
+                        summary_tokens,
+                    } => {
+                        if let Some(buf) = store.get_mut(turn_id) {
+                            let line = json!({"type": "history_replaced", "session_id": session_id, "summary_tokens": summary_tokens}).to_string();
+                            evict_and_push(buf, line);
+                        }
+                    }
                 }
             } // lock released here
               // Schedule buffer eviction after TTL so late-connecting stream
@@ -569,6 +579,7 @@ fn turn_event_to_ndjson(
             });
             (turn_id.clone(), line, false)
         }
+        TurnEvent::HistoryReplaced { turn_id, .. } => (Some(turn_id.clone()), String::new(), false),
     }
 }
 

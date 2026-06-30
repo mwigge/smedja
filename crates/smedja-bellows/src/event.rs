@@ -217,6 +217,22 @@ pub enum TurnEvent {
         correlation: CorrelationCtx,
     },
 
+    /// Auto-compaction fired and the conversation history was replaced with a summary.
+    ///
+    /// Emitted after the summariser model runs and the vault entry is stored.
+    /// Subscribers (e.g. the TUI) can use this to display a "context compacted"
+    /// notice and know that the raw history before this point is no longer in
+    /// the active context window.
+    HistoryReplaced {
+        /// Identifier for the session whose history was replaced.
+        session_id: String,
+        /// Turn identifier during which compaction fired.
+        turn_id: String,
+        /// Approximate token count of the summary stored to the vault.
+        #[serde(default)]
+        summary_tokens: usize,
+    },
+
     /// A tool call is awaiting human approval at the cowork gate.
     ///
     /// Published by `CoworkGate::intercept` immediately after registering the
@@ -678,6 +694,37 @@ mod tests {
             assert!(file_advisories.is_empty());
             assert!(skill_advisories.is_empty());
             assert!(turn_id.is_none());
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    // --- WI-028: HistoryReplaced ---
+
+    #[test]
+    fn history_replaced_serializes_and_deserializes() {
+        let ev = TurnEvent::HistoryReplaced {
+            session_id: "sess-1".into(),
+            turn_id: "turn-1".into(),
+            summary_tokens: 512,
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(
+            json.contains("\"HistoryReplaced\"")
+                || json.contains("history_replaced")
+                || json.contains("HistoryReplaced"),
+            "must tag as HistoryReplaced"
+        );
+        let decoded: TurnEvent = serde_json::from_str(&json).expect("deserialize");
+        if let TurnEvent::HistoryReplaced {
+            session_id,
+            turn_id,
+            summary_tokens,
+        } = decoded
+        {
+            assert_eq!(session_id, "sess-1");
+            assert_eq!(turn_id, "turn-1");
+            assert_eq!(summary_tokens, 512);
         } else {
             panic!("wrong variant");
         }

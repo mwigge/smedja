@@ -132,7 +132,8 @@ fn turn_id_of(event: &TurnEvent) -> Option<&str> {
     match event {
         TurnEvent::Started { turn_id, .. }
         | TurnEvent::Completed { turn_id, .. }
-        | TurnEvent::Failed { turn_id, .. } => Some(turn_id.as_str()),
+        | TurnEvent::Failed { turn_id, .. }
+        | TurnEvent::HistoryReplaced { turn_id, .. } => Some(turn_id.as_str()),
         TurnEvent::ToolCalled { turn_id, .. }
         | TurnEvent::AssistantDelta { turn_id, .. }
         | TurnEvent::ThinkingDelta { turn_id, .. }
