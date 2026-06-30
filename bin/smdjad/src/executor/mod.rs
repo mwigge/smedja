@@ -66,6 +66,19 @@ pub(crate) fn role_allows_write_bash_for_test(session: &smedja_ingot::Session) -
 /// Every tool whose dispatch is handled natively inside [`execute_tool`] must
 /// appear here.  Anything absent from this list is routed to [`dispatch_mcp_tool`]
 /// and classified as an `"extension"` in telemetry.
+/// Load and return a named skill from `skills_dir`, wrapped in an XML envelope.
+pub(crate) fn execute_load_skill(name: &str, skills_dir: &std::path::Path) -> String {
+    let registry = smedja_plugins::SkillRegistry::new(skills_dir);
+    match registry.find(name) {
+        Ok(Some(skill)) => smedja_plugins::wrap_skill_body(&skill.manifest.name, &skill.body),
+        Ok(None) => format!(
+            "error: skill '{name}' not found in {}",
+            skills_dir.display()
+        ),
+        Err(e) => format!("error: skill registry error: {e}"),
+    }
+}
+
 pub(crate) const LOCAL_TOOLS: &[&str] = &[
     "bash",
     "run_command",
@@ -83,6 +96,7 @@ pub(crate) const LOCAL_TOOLS: &[&str] = &[
     "smedja_vault_store",
     "smedja_retrieve",
     "graph_query",
+    "load_skill",
     "otel_query",
     "metric_query",
     "log_tail",
@@ -102,6 +116,7 @@ pub(crate) const MCP_SERVER_TOOLS: &[&str] = &[
     "find_files",
     "read_file",
     "list_files",
+    "load_skill",
     "smedja_vault_search",
     "smedja_retrieve",
     "otel_query",
@@ -119,6 +134,7 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "grep_files",
     "find_files",
     "graph_query",
+    "load_skill",
     "otel_query",
     "metric_query",
     "log_tail",
@@ -1055,6 +1071,10 @@ pub(crate) async fn execute_tool(
                 format!("error: hash not found: {hash}")
             }
         }
+        "load_skill" => {
+            let name = input.get("name").and_then(Value::as_str).unwrap_or("");
+            execute_load_skill(name, &smedja_plugins::SkillRegistry::default_path())
+        }
         "graph_query" => {
             let query = input.get("query").and_then(Value::as_str).unwrap_or("");
             let depth =
@@ -1822,6 +1842,7 @@ mod tests {
             "find_files",
             "read_file",
             "list_files",
+            "load_skill",
             "smedja_vault_search",
             "smedja_retrieve",
             "otel_query",
@@ -3479,5 +3500,30 @@ mod tests {
         .await;
 
         assert_eq!(out, small, "small output must pass through unchanged");
+    }
+
+    // --- WI-027: load_skill tool ---
+
+    #[tokio::test]
+    async fn load_skill_returns_wrapped_body_for_installed_skill() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let skills_dir = tmp.path().to_path_buf();
+        // Write a minimal flat skill file.
+        let skill_content = "---\nname: myskill\ndescription: A test skill.\n---\nDo the thing.\n";
+        std::fs::write(skills_dir.join("myskill.md"), skill_content).unwrap();
+
+        let result = super::execute_load_skill("myskill", &skills_dir);
+        assert!(result.contains("Do the thing."), "body must be present");
+        assert!(result.contains("<skill_content"), "must be wrapped");
+    }
+
+    #[tokio::test]
+    async fn load_skill_returns_error_for_missing_skill() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let result = super::execute_load_skill("nonexistent", tmp.path());
+        assert!(
+            result.starts_with("error:"),
+            "missing skill must return error"
+        );
     }
 }

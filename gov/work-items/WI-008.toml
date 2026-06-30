@@ -1,6 +1,6 @@
 id     = "WI-008"
 title  = "Poolside runner — pool CLI subprocess adapter"
-status = "planned"
+status = "done"
 priority = "P2"
 
 [detail]

@@ -221,6 +221,27 @@ Omit sections that have no content. Keep total length under 400 words.\n\n\
     )
 }
 
+/// Strips Unicode Private Use Area characters in the tag block (U+E0000–U+E007F).
+///
+/// These code points can be used to inject hidden instructions via Unicode tag
+/// characters that are visually invisible but parsed by some LLM tokenizers.
+pub(crate) fn sanitize_unicode_tags(s: &str) -> String {
+    s.chars()
+        .filter(|&c| !('\u{E0000}'..='\u{E007F}').contains(&c))
+        .collect()
+}
+
+/// Builds a `<turn-context>` XML block injected at the start of each user turn.
+///
+/// The block carries per-turn metadata (current date, working directory) that
+/// helps the model orient itself without polluting the stable system-prompt
+/// prefix used for prompt cache hits.
+pub(crate) fn build_turn_context(date: &str, cwd: &str) -> String {
+    format!(
+        "<turn-context>\n<current-date>{date}</current-date>\n<working-directory>{cwd}</working-directory>\n</turn-context>"
+    )
+}
+
 /// Owns all the shared resources needed to execute a single agent turn.
 pub(crate) struct TurnOrchestrator {
     ingot: IngotHandle,
@@ -641,6 +662,17 @@ impl TurnOrchestrator {
                     "required": ["query"]
                 }
             }),
+            serde_json::json!({
+                "name": "load_skill",
+                "description": "Load a skill by name and return its body wrapped in XML. \
+                    Use this to load a skill at runtime when invoking it via a slash command \
+                    or when instructed to apply a specific skill.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "name": { "type": "string", "description": "Skill name (e.g. 'rust', 'tdd-workflow')" } },
+                    "required": ["name"]
+                }
+            }),
         ];
         let is_sre_mode = session
             .as_ref()
@@ -765,7 +797,13 @@ impl TurnOrchestrator {
                     let _ = write!(content, "\n\n{diag_block}");
                 }
             }
-            content
+            // Sanitize Unicode tag block (U+E0000–U+E007F) to block prompt injection.
+            let content = sanitize_unicode_tags(&content);
+            // Prepend per-turn context block (date + cwd) for model orientation.
+            let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let cwd_str = workspace_root.to_string_lossy();
+            let turn_ctx = build_turn_context(&date, &cwd_str);
+            format!("{turn_ctx}\n\n{content}")
         };
 
         // Proactive vault recall: search the "default" namespace for entries
@@ -1746,6 +1784,7 @@ impl TurnOrchestrator {
                 .await
                 {
                     Ok((summary, _, _, _, _)) if !summary.is_empty() => {
+                        let summary_tokens = summary.split_whitespace().count();
                         let embedding = self.embedder.embed_query(&summary).await;
                         let model_id = self.embedder.model_id().to_owned();
                         let dim = self.embedder.dim();
@@ -1775,10 +1814,16 @@ impl TurnOrchestrator {
                                 tracing::warn!(error = %e, "auto-summarise: vault upsert failed");
                             }
                         });
+                        dispatcher.publish(smedja_bellows::TurnEvent::HistoryReplaced {
+                            session_id: session_id.clone(),
+                            turn_id: turn_id.clone(),
+                            summary_tokens,
+                        });
                         tracing::info!(
                             session_id = %session_id,
                             turn_n,
                             threshold = cpt,
+                            summary_tokens,
                             "auto-summarise: context compacted"
                         );
                     }
@@ -2957,6 +3002,43 @@ mod tests {
             call_count.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "exactly two model calls: one for batch tool calls, one for final response"
+        );
+    }
+
+    // --- WI-025: sanitize_unicode_tags ---
+
+    #[test]
+    fn sanitize_unicode_tags_strips_private_use_area_block() {
+        // U+E0000 tag block (used for prompt injection via Unicode tags)
+        let injected = "hello\u{E0001}world\u{E007F}!";
+        let clean = super::sanitize_unicode_tags(injected);
+        assert_eq!(clean, "helloworld!");
+    }
+
+    #[test]
+    fn sanitize_unicode_tags_leaves_normal_text_intact() {
+        let normal = "Hello, World! こんにちは 🦀";
+        assert_eq!(super::sanitize_unicode_tags(normal), normal);
+    }
+
+    // --- WI-026: build_turn_context ---
+
+    #[test]
+    fn build_turn_context_contains_date_and_cwd() {
+        let ctx = super::build_turn_context("2026-06-30", "/home/morgan/project");
+        assert!(ctx.starts_with("<turn-context>"), "must open tag");
+        assert!(ctx.ends_with("</turn-context>"), "must close tag");
+        assert!(ctx.contains("2026-06-30"), "must include date");
+        assert!(ctx.contains("/home/morgan/project"), "must include cwd");
+    }
+
+    #[test]
+    fn build_turn_context_is_stable_across_calls_same_input() {
+        let a = super::build_turn_context("2026-06-30", "/repo");
+        let b = super::build_turn_context("2026-06-30", "/repo");
+        assert_eq!(
+            a, b,
+            "same inputs must produce identical output for cache stability"
         );
     }
 }

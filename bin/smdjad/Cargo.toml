@@ -96,6 +96,7 @@ smedja-loop        = { path = "../../crates/smedja-loop" }
 smedja-lsp           = { path = "../../crates/smedja-lsp" }
 smedja-memory      = { path = "../../crates/smedja-memory" }
 smedja-methodology = { path = "../../crates/smedja-methodology" }
+smedja-plugins     = { path = "../../crates/smedja-plugins" }
 smedja-rpc         = { path = "../../crates/smedja-rpc" }
 smedja-security    = { path = "../../crates/smedja-security" }
 smedja-sre         = { path = "../../crates/smedja-sre" }
