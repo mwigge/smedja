@@ -1,0 +1,56 @@
+id     = "WI-017"
+title  = "File tools: grep_files, find_files, move_file, copy_file, delete_file"
+status = "planned"
+priority = "P2"
+
+[detail]
+description = """
+smedja's LOCAL_TOOLS list (executor/mod.rs:67-81) is missing five file
+operations that kimi-code ships as built-ins. Agents currently have to
+shell out via bash for all of these, which bypasses the cowork gate and
+produces verbose output.
+
+All five tools must enforce the workspace boundary (reject paths outside
+session workspace) and respect read_only sessions.
+
+1. grep_files — content search within workspace
+   Input: { pattern: String, path?: String (subdir, default "."), max_results?: u32 }
+   Backend: spawn rg (ripgrep) if available, fallback to grep -r
+   Output: array of { file, line, text } matches, capped at max_results (default 50)
+
+2. find_files — find files by name/glob pattern
+   Input: { pattern: String, path?: String, max_results?: u32 }
+   Backend: walkdir crate (already a dependency) with glob matching
+   Output: array of relative file paths, capped at max_results (default 100)
+
+3. move_file — rename/move within workspace
+   Input: { source: String, destination: String }
+   Guard: both paths must be within workspace boundary
+
+4. copy_file — copy within workspace
+   Input: { source: String, destination: String }
+   Guard: both paths within workspace boundary; destination parent dir auto-created
+
+5. delete_file — delete a file or empty directory
+   Input: { path: String }
+   Guard: workspace boundary; refuses to delete non-empty directories (use bash for that)
+   Note: always gate through cowork regardless of permission_mode (destructive)
+
+All five added to LOCAL_TOOLS and to the WRITE_TOOLS block-list for
+review-mode sessions (3, 4, 5 are mutations; 1, 2 are read-only and exempt).
+"""
+
+source   = "deep gap analysis 2026-06-30; executor/mod.rs:67-81, fs_tools.rs"
+estimate = "M"
+
+[acceptance]
+criteria = [
+  "grep_files returns line-level matches from workspace files; rg preferred over grep",
+  "find_files returns file paths matching a glob pattern within workspace",
+  "move_file, copy_file, delete_file enforce workspace boundary on all path args",
+  "delete_file always requires cowork gate approval regardless of permission_mode",
+  "grep_files and find_files added to read-safe tool set (allowed in review sessions)",
+  "move_file, copy_file, delete_file blocked in review sessions (WRITE_TOOLS list)",
+  "max_results cap respected; result count included in output",
+  "unit tests: boundary rejection, glob match, ripgrep fallback to grep",
+]

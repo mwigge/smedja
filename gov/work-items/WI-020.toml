@@ -1,0 +1,46 @@
+id     = "WI-020"
+title  = "Parallel tool execution for multi-tool model responses"
+status = "planned"
+priority = "P3"
+
+[detail]
+description = """
+The orchestrator tool loop (orchestrator/mod.rs) is strictly sequential:
+one tool call per iteration, result injected as a user message, then next
+model call. When the model requests multiple tools in a single response
+(valid in the Anthropic and OpenAI tool-use APIs), smedja executes them
+serially. kimi-code's tool-scheduler.ts executes concurrent tool calls
+from a single response in parallel.
+
+For independent read-only tools (read_file, list_files, graph_query) this
+is a significant latency win — a model that calls read_file on 5 files
+could get all results in parallel instead of 5 sequential round-trips.
+
+Implementation:
+1. The adapter layer already delivers multiple tool calls in one Delta::ToolCall
+   response (or consecutive ones before a non-tool delta). Collect all tool
+   calls from a single model response before executing any.
+2. Classify tools: read-only tools (read_file, list_files, grep_files,
+   find_files, graph_query, otel_query) can run concurrently via tokio::join!
+   or JoinSet. Write/exec tools (bash, write_file, edit_file) must still run
+   sequentially and in cowork-gate order.
+3. Aggregate results in call order and inject them as a single user message
+   block with multiple tool_result entries.
+4. The cowork gate path must not be parallelised — gate each write/exec tool
+   sequentially so the user sees one approval prompt at a time.
+
+Depends on: WI-017 (grep_files, find_files) to fill out the read-only set.
+"""
+
+source   = "deep gap analysis 2026-06-30; orchestrator/mod.rs tool_loop"
+estimate = "L"
+
+[acceptance]
+criteria = [
+  "multiple read-only tool calls in one model response execute concurrently",
+  "results aggregated in call order in the injected tool_result message",
+  "write/exec tools remain sequential and individually gated",
+  "cowork gate presents one prompt at a time even when multiple write tools requested",
+  "unit tests: 3 parallel read_file calls return in one injected message; timing < 3x serial",
+  "unit tests: mixed read+write batch — reads parallel, write gated after",
+]

@@ -1,0 +1,49 @@
+id     = "WI-021"
+title  = "Mid-stream token usage events and partial tool-call argument streaming"
+status = "planned"
+priority = "P3"
+
+[detail]
+description = """
+Two streaming gaps vs kimi-code:
+
+GAP A — mid-stream token usage events (M):
+Token counts (input_tok, output_tok) are only emitted in the terminal
+StreamEvent::Done. kimi-code and the Anthropic streaming API both emit
+per-chunk usage deltas. The adapter layer already has Delta::Usage
+(types.rs) — the bellows dispatcher receives it but does not forward it
+as a StreamEvent. Add StreamEvent::Usage { input_tok: u32, output_tok: u32 }
+and emit it from the dispatcher whenever Delta::Usage arrives. Consumers
+(TUI, stream socket clients) can use this for live token-budget displays.
+
+GAP B — partial tool-call argument streaming (L):
+StreamEvent::ToolCall emits only complete, fully-parsed tool calls
+(stream_event.rs:25-30). The underlying providers (Anthropic, OpenAI)
+stream tool call arguments as partial JSON chunks. smedja buffers until
+the arguments are complete JSON before emitting ToolCall. kimi-code
+streams partial chunks.
+
+Add StreamEvent::ToolCallChunk { id: String, name: String, partial_input: String }
+emitted for each raw chunk. Existing StreamEvent::ToolCall remains as the
+terminal "arguments complete" event. TUI and clients can choose to render
+partial arguments as they arrive (e.g. show the model constructing a bash
+command character by character).
+
+This requires the adapter layer to distinguish chunk events from completion
+events — claude_cli.rs and the OpenAI adapter both receive partial input_json
+fields in their stream; they currently accumulate before emitting ToolCall.
+"""
+
+source   = "deep gap analysis 2026-06-30; stream_event.rs, dispatcher.rs, types.rs"
+estimate = "M"
+
+[acceptance]
+criteria = [
+  "StreamEvent::Usage emitted whenever Delta::Usage arrives from the adapter",
+  "TUI and stream socket clients receive Usage events during a turn",
+  "Done event still carries final cumulative totals (unchanged)",
+  "StreamEvent::ToolCallChunk emitted for each partial input_json chunk from provider",
+  "StreamEvent::ToolCall still emitted on argument completion (terminal event)",
+  "Clients that ignore ToolCallChunk and wait for ToolCall see no behaviour change",
+  "unit tests: Usage event propagation; ToolCallChunk sequence then ToolCall terminal",
+]

@@ -1,0 +1,45 @@
+id     = "WI-018"
+title  = "read_file line ranges, list_files depth, session.fork at turn_n"
+status = "planned"
+priority = "P2"
+
+[detail]
+description = """
+Three small quality gaps in existing tools and session management:
+
+GAP A — read_file line ranges:
+read_file (executor/mod.rs:475-487) always reads the full file via
+read_to_string. For large files this blows up the context window. Add
+optional start_line and end_line params (1-indexed, inclusive). When
+provided, read only those lines. When omitted, behaviour is unchanged.
+Also add an optional encoding param: "text" (default) or "base64" to
+support binary file inspection without failing on non-UTF-8 bytes.
+
+GAP B — list_files depth:
+list_files (executor/mod.rs:489-505) is non-recursive. Add an optional
+depth param (default 1 = current directory only; 0 = unlimited). Uses
+walkdir with a max_depth constraint. Also add a pattern param to filter
+entries by glob (e.g. "*.rs").
+
+GAP C — session.fork at arbitrary turn_n:
+session.fork (handlers/session.rs:310-384) always forks from the latest
+checkpoint. Add an optional turn_n param: when provided, find the
+checkpoint closest to that turn index and fork from it instead. This
+enables branching at any historical point, not just the latest state.
+Reject turn_n values with no matching checkpoint with a clear error.
+"""
+
+source   = "deep gap analysis 2026-06-30; executor/mod.rs:475-505, session.rs:310-384"
+estimate = "S"
+
+[acceptance]
+criteria = [
+  "read_file start_line/end_line params return only the specified line range",
+  "read_file encoding=base64 returns base64-encoded bytes for binary files",
+  "read_file with no range params behaves identically to current implementation",
+  "list_files depth param controls recursion; depth=0 means unlimited",
+  "list_files pattern param filters results by glob (e.g. '*.toml')",
+  "session.fork with turn_n forks from the checkpoint nearest that turn",
+  "session.fork with turn_n past the last checkpoint returns a clear error",
+  "unit tests: line range clamp, base64 read, recursive list, fork-at-turn",
+]
