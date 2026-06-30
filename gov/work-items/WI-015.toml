@@ -1,0 +1,49 @@
+id     = "WI-015"
+title  = "Loop engine: parallel slice execution via JoinSet"
+status = "planned"
+priority = "P3"
+
+[detail]
+description = """
+engine.drive() currently iterates slices sequentially. kimi-code dispatches
+subagents concurrently via tool-scheduler.ts. smedja has task.parallel at the
+daemon handler level (worktree fan-out), but that mechanism sits outside the
+loop pipeline's verify/retry/review cycle — a parallel slice run today cannot
+benefit from the review gate or the failure-mining write-back.
+
+Replace the serial `for (idx, slice) in slices.iter()` loop in engine.rs with
+a JoinSet-based concurrent dispatch. Each slice runs its own
+implement→verify→review→retry pipeline in parallel. The loop completes when
+all slices reach a terminal state (Complete or Failed).
+
+Key design decisions to resolve before implementation:
+1. Partial failure policy: if 2 of 5 slices fail, does the loop fail overall
+   or report partial completion? Suggest: fail overall (conservative), with
+   slices_completed in LoopOutcome reflecting the passing count.
+2. Resource contention: concurrent agents share the provider pool. The pool's
+   eligible_ring already handles load balancing; no changes needed there. Add
+   a max_parallel_slices config field (default: min(4, slice_count)) to cap
+   concurrency.
+3. Ordering: slice results may complete out of order. The failure guide and
+   audit log must include the slice index to remain interpretable.
+4. Interaction with WI-013 (resume-from-failed-slice): parallel execution
+   complicates checkpointing — implement WI-013 first on the serial engine,
+   then extend to parallel.
+
+Depends on: WI-013 (for checkpoint/resume compatibility).
+"""
+
+source   = "gap analysis vs kimi-code 2026-06-30; deferred from initial triage"
+estimate = "L"
+
+[acceptance]
+criteria = [
+  "slices dispatched concurrently up to max_parallel_slices limit",
+  "max_parallel_slices configurable in loop.json limits block",
+  "each slice runs its own implement→verify→review pipeline independently",
+  "LoopOutcome.slices_completed reflects passing slice count even on partial failure",
+  "overall outcome is Failed if any slice fails (conservative policy)",
+  "slice index included in all failure guide entries and audit events",
+  "unit tests: 3 slices in parallel, one fails — outcome Failed, completed=2",
+  "unit tests: max_parallel_slices=1 degrades to serial behaviour",
+]
