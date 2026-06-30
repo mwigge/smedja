@@ -203,7 +203,22 @@ pub async fn drive<R: RoleRunner, S: StatusSink>(
             if verified {
                 if config.review.per_slice {
                     sink.set_status(&LoopState::Reviewing).await;
-                    let _ = run_role_traced(runner, &reviewer, idx, slice, attempt).await;
+                    let review_ok = run_role_traced(runner, &reviewer, idx, slice, attempt)
+                        .await
+                        .is_ok();
+                    if config.review.required && !review_ok {
+                        let _ = crate::mining::write_failure_guide(
+                            "reviewer",
+                            &[format!("slice {} rejected by reviewer", idx + 1)],
+                            workspace,
+                        );
+                        sink.set_status(&LoopState::Failed).await;
+                        finish(change_name, &LoopState::Failed, completed, started);
+                        return LoopOutcome {
+                            final_state: LoopState::Failed,
+                            slices_completed: completed,
+                        };
+                    }
                 }
                 passed = true;
                 break;
@@ -458,6 +473,71 @@ mod tests {
             .lock()
             .unwrap()
             .contains(&"policy_tampered".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn review_required_blocks_on_reviewer_failure() {
+        let dir = TempDir::new().unwrap();
+        let json = r#"{
+            "version": 1,
+            "limits": {"max_attempts": 3, "agent_timeout_s": 60},
+            "roles": [
+                {"name":"implementer","runner":"local","tier":"local","model":null,"read_only":false,"tools":[]},
+                {"name":"reviewer","runner":"minimax","tier":"fast","model":null,"read_only":true,"tools":[]}
+            ],
+            "verification": {"command": "true"},
+            "review": {"per_slice": true, "required": true},
+            "publication": {"max_pr_lines": 400}
+        }"#;
+        let path = dir.path().join("loop.json");
+        std::fs::write(&path, json).unwrap();
+        let cfg = LoopConfig::from_file(&path).unwrap();
+
+        /// Succeeds for every role except "reviewer".
+        #[derive(Default)]
+        struct ReviewerFailRunner {
+            statuses: Mutex<Vec<String>>,
+        }
+        impl RoleRunner for ReviewerFailRunner {
+            async fn run_role(
+                &self,
+                role: &LoopRole,
+                _slice_index: usize,
+                _slice: &str,
+            ) -> anyhow::Result<()> {
+                if role.name == "reviewer" {
+                    anyhow::bail!("reviewer rejected the slice")
+                }
+                Ok(())
+            }
+        }
+        impl StatusSink for ReviewerFailRunner {
+            async fn set_status(&self, state: &LoopState) {
+                self.statuses
+                    .lock()
+                    .unwrap()
+                    .push(state.as_str().to_owned());
+            }
+            async fn set_slice(&self, _slice: i64) {}
+        }
+
+        let rec = ReviewerFailRunner::default();
+        let out = drive(
+            &cfg,
+            dir.path(),
+            &path,
+            "demo",
+            &["slice".to_owned()],
+            &rec,
+            &rec,
+        )
+        .await;
+        assert_eq!(out.final_state, LoopState::Failed);
+        assert_eq!(out.slices_completed, 0);
+        assert!(
+            rec.statuses.lock().unwrap().contains(&"failed".to_owned()),
+            "loop must reach Failed when review.required and reviewer fails"
+        );
     }
 
     #[tokio::test]
