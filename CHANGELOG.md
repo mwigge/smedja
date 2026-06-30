@@ -6,6 +6,16 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.22.1] — 2026-06-30
+
+### Fixed
+
+- **Adapter bwrap crash** — disabled `claude` CLI's own bwrap subprocess isolation via `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0` and always pass `--dangerously-bypass-approvals-and-sandbox` to `codex`; both CLIs failed with `EAFNOSUPPORT` on `AF_NETLINK` when smdjad ran inside a Claude Code session whose seccomp filter blocked the required socket
+- **Model flag not forwarded to claude** — `opts.model` (e.g. `claude-haiku-4-5-20251001`) was captured but never passed as `--model` to the `claude` binary; haiku and other model selections had no effect
+- **Session list unbounded** — `session.list` now returns at most the 10 most recent sessions
+
+---
+
 ## [0.22.0] — 2026-06-30
 
 ### Added
