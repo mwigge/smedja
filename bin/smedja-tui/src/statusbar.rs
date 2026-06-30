@@ -68,6 +68,23 @@ fn segment_runner(ctx: &ModuleCtx<'_>) -> String {
     format!("[{runner}]")
 }
 
+/// Returns a context-window warning chip string when `pct` is ≥ 80, or `None`.
+///
+/// - 80–94 %: dim yellow `" ⚠ 80%"` chip.
+/// - ≥ 95 %: bold red `" ⚠ 95%"` chip.
+///
+/// The chip is a plain-text string for now; styled spans are added by the TUI
+/// renderer that calls `status_bar_line`.
+fn ctx_warning_chip(pct: u8) -> Option<String> {
+    if pct >= 95 {
+        Some(" \u{26a0} 95%".to_owned())
+    } else if pct >= 80 {
+        Some(" \u{26a0} 80%".to_owned())
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public render functions
 // ---------------------------------------------------------------------------
@@ -139,6 +156,13 @@ pub fn render_status_bar_configured(
 
     if ctx.pending {
         parts.push("\u{27f3}".to_owned());
+    }
+
+    // Context window warning chip appended after all other segments.
+    if let Some(pct) = ctx.ctx_pct {
+        if let Some(chip) = ctx_warning_chip(pct) {
+            parts.push(chip);
+        }
     }
 
     parts.join(" ")
@@ -332,6 +356,64 @@ mod tests {
         assert!(
             bar.contains("[I]"),
             "status bar must include [I] badge in input mode; got: {bar}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // M4 — Context window warning bar
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn status_bar_no_warning_below_80() {
+        let ctx = ModuleCtx {
+            session_id: "x",
+            mode: None,
+            tier: None,
+            runner: None,
+            pending: false,
+            input_mode: false,
+            ctx_pct: Some(79),
+        };
+        let bar = render_status_bar(&ctx);
+        assert!(
+            !bar.contains('\u{26a0}'),
+            "no warning chip expected below 80%; got: {bar}"
+        );
+    }
+
+    #[test]
+    fn status_bar_yellow_warning_at_80() {
+        let ctx = ModuleCtx {
+            session_id: "x",
+            mode: None,
+            tier: None,
+            runner: None,
+            pending: false,
+            input_mode: false,
+            ctx_pct: Some(80),
+        };
+        let bar = render_status_bar(&ctx);
+        assert!(
+            bar.contains('\u{26a0}') || bar.contains("80%"),
+            "warning chip expected at 80%; got: {bar}"
+        );
+    }
+
+    #[test]
+    fn status_bar_red_warning_at_95() {
+        let ctx = ModuleCtx {
+            session_id: "x",
+            mode: None,
+            tier: None,
+            runner: None,
+            pending: false,
+            input_mode: false,
+            ctx_pct: Some(95),
+        };
+        let bar = render_status_bar(&ctx);
+        assert!(
+            bar.contains('\u{26a0}'),
+            "warning chip expected at 95%; got: {bar}"
         );
     }
 }
