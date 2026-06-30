@@ -1,0 +1,50 @@
+id     = "WI-012"
+title  = "Bash tool: live output streaming + stdin piping"
+status = "planned"
+priority = "P2"
+
+[detail]
+description = """
+The current exec_bash implementation (smdjad/src/main.rs:157-175) uses
+.output() which buffers all stdout/stderr until the process exits. This means
+a 30-second command gives zero feedback to the agent until it completes or
+times out. kimi-code streams bash output line-by-line in real time.
+
+Also missing: stdin piping. kimi-code accepts a stdin parameter so agents
+can pipe input to commands (e.g. `echo '...' | jq`, `python script.py`);
+smedja inherits /dev/null as stdin.
+
+Changes:
+1. Streaming: replace .output() with .stdout(Stdio::piped()).stderr(Stdio::piped());
+   spawn the process, read stdout with tokio::io::BufReader::lines(), emit each
+   line as a ToolOutput delta through the Dispatcher immediately.
+   Collect stderr separately; append as [stderr] block after process exits.
+
+2. stdin: add optional `stdin` field to the bash tool input schema (String).
+   If present: .stdin(Stdio::piped()), spawn, write bytes, close stdin handle,
+   then stream stdout as above.
+
+3. Keep the 30 s hard timeout (extend to configurable via .smedja/workspace.toml
+   [tools.bash] timeout_secs). Timeout kills the process and returns partial output
+   collected so far plus an "error: timed out after Ns" suffix.
+
+4. Exit code: include the exit status in the return string when non-zero
+   ("error: exit status 1\n<stderr>") so agents can react to failure.
+
+Note: the Dispatcher already supports streaming deltas for model output;
+tool output streaming reuses the same TurnEvent::Delta path.
+"""
+
+source   = "gap analysis vs kimi-code 2026-06-30; executor/mod.rs depth review"
+estimate = "M"
+
+[acceptance]
+criteria = [
+  "long-running commands emit output lines to the agent stream as they arrive",
+  "stdin field accepted in bash tool input; bytes written before reading stdout",
+  "timeout kills the child and returns partial output + timeout message",
+  "non-zero exit code surfaced in the return value",
+  "stderr collected and appended as [stderr] block after stdout",
+  "configurable timeout_secs in .smedja/workspace.toml [tools.bash]",
+  "unit tests: streaming lines, stdin write, timeout kill, non-zero exit",
+]

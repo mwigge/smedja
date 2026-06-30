@@ -1,0 +1,44 @@
+id     = "WI-014"
+title  = "Bash command denylist and auto-mode audit event"
+status = "planned"
+priority = "P3"
+
+[detail]
+description = """
+Two small security/audit gaps in the bash tool and permission system:
+
+GAP A — command denylist:
+smedja classifies bash write-arity at the session-mode gate level (smedja-assayer)
+but has no per-command string denylist. An agent in auto mode can run any sh -c
+command without a content filter. kimi-code has configurable blocklists for
+dangerous shell patterns.
+
+Add [tools.bash] blocked_patterns in .smedja/workspace.toml:
+  [tools.bash]
+  blocked_patterns = ["rm -rf /", "curl * | sh", "wget * | bash", "> /etc/*"]
+
+Pattern is a substring/prefix match against the raw command string (no regex —
+keep it simple and auditable). A match returns a tool error before spawn,
+regardless of permission_mode.
+
+GAP B — auto-mode audit event:
+When PermissionMode::Auto is active, tool calls pass the cowork gate silently.
+The audit trail records the tool call (smdjad/src/audit.rs) but there is no
+distinct event type marking that the gate was bypassed rather than approved.
+Add AuditEvent::AutoApproved alongside the existing Approved/Denied variants,
+emitted when permission_mode == Auto and the tool would otherwise have been gated.
+This makes auto-mode bypass visible in audit exports.
+"""
+
+source   = "gap analysis vs kimi-code 2026-06-30"
+estimate = "S"
+
+[acceptance]
+criteria = [
+  "blocked_patterns list in [tools.bash] evaluated before sh -c spawn",
+  "matching command returns tool error with the matched pattern in the message",
+  "blocked_patterns respected in all permission modes including auto",
+  "AuditEvent::AutoApproved emitted when auto-mode bypasses a gate",
+  "smj audit show distinguishes AutoApproved from Approved events",
+  "unit tests: blocked pattern match; auto-mode audit event emission",
+]

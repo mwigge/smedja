@@ -1,0 +1,40 @@
+id     = "WI-009"
+title  = "fetch_web tool — built-in URL fetch for agents"
+status = "planned"
+priority = "P2"
+
+[detail]
+description = """
+Add a first-party `fetch_web` tool so agents can retrieve URLs without
+requiring an operator-configured MCP server. kimi-code ships this as a
+default built-in; smedja has no equivalent — the only escape hatch today
+is MCP fallthrough, which is undocumented and has no SSRF protection.
+
+Implementation notes:
+- New arm in executor/mod.rs `execute_tool` match
+- Input schema: { url: String, max_bytes?: u32 (default 256 KB) }
+- Uses the existing `reqwest` client already in scope for MCP OAuth
+- HTML response: strip tags to plain text (scraper/htmd or simple regex)
+- SSRF protection: run URL through the existing `is_blocked_ip()` check
+  (crates/smedja-security/src/ssrf.rs) before connecting
+- Network policy gate: only reachable when session NetworkPolicy != None;
+  if None → return tool error "network access disabled by sandbox policy"
+- Size limit enforced before body read (stream with byte counter)
+- Content-type gate: only text/*, application/json, application/xml
+- Add `fetch_web` to LOCAL_TOOLS allowlist (executor/mod.rs:67)
+- Unit tests: SSRF block, size cap, policy=None blocks, happy path
+"""
+
+source   = "gap analysis vs kimi-code 2026-06-30"
+estimate = "M"
+
+[acceptance]
+criteria = [
+  "fetch_web tool callable from agent sessions; returns page text or error",
+  "SSRF: RFC-1918 / loopback / link-local addresses blocked at DNS and IP level",
+  "NetworkPolicy::None → tool returns error without making any connection",
+  "response capped at 256 KB by default; configurable via tool input max_bytes",
+  "HTML responses stripped to plain text before returning to agent",
+  "binary / image content types return error rather than raw bytes",
+  "unit tests cover: blocked IP, size cap, policy block, plain text, HTML strip",
+]
