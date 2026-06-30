@@ -16,6 +16,6 @@ pub mod telemetry;
 pub mod verify;
 
 pub use config::LoopConfig;
-pub use engine::{drive, LoopOutcome, RoleRunner, StatusSink};
+pub use engine::{drive, LoopCheckpoint, LoopOutcome, RoleRunner, StatusSink};
 pub use role::{DataAccess, LoopRole, Runner, Tier};
 pub use state::LoopState;

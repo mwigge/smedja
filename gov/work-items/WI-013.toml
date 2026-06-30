@@ -1,6 +1,6 @@
 id     = "WI-013"
 title  = "Loop engine: max_steps_per_turn bound and resume-from-failed-slice"
-status = "planned"
+status = "done"
 priority = "P2"
 
 [detail]

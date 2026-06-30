@@ -773,6 +773,8 @@ fn build_router(
     );
     // Drives the smedja-loop engine: policy hash, evaluator separation, slice pipeline.
     route!(router, "loop.run", state, handlers::loops::run);
+    // Re-enters drive() from the last checkpointed slice index.
+    route!(router, "loop.resume", state, handlers::loops::resume);
     route!(router, "audit.list", state, handlers::audit::list);
     // Bounded read-only repo/PR/branch audit; returns findings + report.
     route!(router, "audit.run", state, handlers::auditor::run);
