@@ -180,6 +180,43 @@ pub enum TurnEvent {
         correlation: CorrelationCtx,
     },
 
+    /// Mid-stream token usage delta emitted per-chunk from providers that
+    /// report usage before the final `Completed` event.
+    ///
+    /// `Completed` still carries the definitive cumulative totals; this variant
+    /// is informational and may arrive multiple times per turn (e.g. Anthropic
+    /// emits one `message_start` usage event and one `message_delta` event).
+    TokenUsage {
+        /// Input tokens reported by this usage chunk.
+        input_tok: u32,
+        /// Output tokens reported by this usage chunk.
+        output_tok: u32,
+        /// Turn identifier; correlates this event with the enclosing turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        /// Correlation context (trace, conversation, agent, status).
+        #[serde(flatten)]
+        correlation: CorrelationCtx,
+    },
+
+    /// A partial chunk of a tool call's input arguments (streaming display only).
+    ///
+    /// Emitted for each raw `input_json_delta` / `function.arguments` fragment
+    /// before the complete `ToolCalled` event.  Consumers that only need
+    /// complete tool calls can ignore this variant.
+    ToolCallChunk {
+        /// Tool name.
+        name: String,
+        /// Partial argument JSON fragment.
+        partial_input: String,
+        /// Turn identifier; correlates this event with the enclosing turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        /// Correlation context (trace, conversation, agent, status).
+        #[serde(flatten)]
+        correlation: CorrelationCtx,
+    },
+
     /// A tool call is awaiting human approval at the cowork gate.
     ///
     /// Published by `CoworkGate::intercept` immediately after registering the

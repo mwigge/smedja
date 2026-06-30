@@ -137,7 +137,9 @@ fn turn_id_of(event: &TurnEvent) -> Option<&str> {
         | TurnEvent::AssistantDelta { turn_id, .. }
         | TurnEvent::ThinkingDelta { turn_id, .. }
         | TurnEvent::QualitySnapshot { turn_id, .. }
-        | TurnEvent::CoworkRequest { turn_id, .. } => turn_id.as_deref(),
+        | TurnEvent::CoworkRequest { turn_id, .. }
+        | TurnEvent::TokenUsage { turn_id, .. }
+        | TurnEvent::ToolCallChunk { turn_id, .. } => turn_id.as_deref(),
     }
 }
 

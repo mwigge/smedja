@@ -231,6 +231,24 @@ pub(crate) async fn drain_stream(
                 input_tokens = input_tokens.max(i);
                 output_tokens = output_tokens.max(n);
                 cache_read_tokens = cache_read_tokens.max(c);
+                // Forward as a mid-stream usage event so TUI can show live budget.
+                dispatcher.publish(TurnEvent::TokenUsage {
+                    input_tok: i,
+                    output_tok: n,
+                    turn_id: turn_id.map(str::to_owned),
+                    correlation: correlation.clone(),
+                });
+            }
+            Some(Ok(Delta::ToolCallChunk {
+                name,
+                partial_input,
+            })) => {
+                dispatcher.publish(TurnEvent::ToolCallChunk {
+                    name,
+                    partial_input,
+                    turn_id: turn_id.map(str::to_owned),
+                    correlation: correlation.clone(),
+                });
             }
             Some(Ok(Delta::ToolCall { name, input })) => {
                 // A human-readable one-line summary (the command, path, pattern…)
@@ -484,6 +502,73 @@ mod tests {
         assert!(
             matches!(result, Err(DrainError::Other(_))),
             "non-retryable parse error must map to DrainError::Other"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_stream_emits_token_usage_event_on_delta_usage() {
+        use smedja_adapter::Delta;
+        let dispatcher = Dispatcher::new(32);
+        let mut rx = dispatcher.subscribe();
+        let stream = Box::pin(futures_util::stream::iter(vec![
+            Ok(Delta::Usage {
+                input_tokens: 42,
+                output_tokens: 17,
+                cache_read_tokens: 0,
+            }),
+            Ok(Delta::Text("done".to_owned())),
+        ]));
+        let _ = drain_stream(stream, &dispatcher, Some("t-1"), &CorrelationCtx::default()).await;
+
+        let mut usage_seen = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let TurnEvent::TokenUsage {
+                input_tok,
+                output_tok,
+                ..
+            } = ev
+            {
+                assert_eq!(input_tok, 42);
+                assert_eq!(output_tok, 17);
+                usage_seen = true;
+            }
+        }
+        assert!(
+            usage_seen,
+            "TurnEvent::TokenUsage must be published on Delta::Usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_stream_emits_tool_call_chunk_event() {
+        use smedja_adapter::Delta;
+        let dispatcher = Dispatcher::new(32);
+        let mut rx = dispatcher.subscribe();
+        let stream = Box::pin(futures_util::stream::iter(vec![
+            Ok(Delta::ToolCallChunk {
+                name: "bash".to_owned(),
+                partial_input: r#"{"command":"ls"#.to_owned(),
+            }),
+            Ok(Delta::Text("done".to_owned())),
+        ]));
+        let _ = drain_stream(stream, &dispatcher, Some("t-2"), &CorrelationCtx::default()).await;
+
+        let mut chunk_seen = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let TurnEvent::ToolCallChunk {
+                name,
+                partial_input,
+                ..
+            } = ev
+            {
+                assert_eq!(name, "bash");
+                assert!(partial_input.contains("command"));
+                chunk_seen = true;
+            }
+        }
+        assert!(
+            chunk_seen,
+            "TurnEvent::ToolCallChunk must be published on Delta::ToolCallChunk"
         );
     }
 }

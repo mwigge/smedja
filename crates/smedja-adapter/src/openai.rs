@@ -5,8 +5,9 @@ use serde_json::json;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt as _};
 
 use crate::{
-    otel::inject_traceparent, sse::parse_openai_line, AdapterError, CallOptions, Delta,
-    DeltaStream, Message, Provider, Role,
+    otel::inject_traceparent,
+    sse::{parse_openai_line, parse_openai_tool_call_chunk},
+    AdapterError, CallOptions, Delta, DeltaStream, Message, Provider, Role,
 };
 
 /// `OpenAI`-compatible streaming chat-completion provider.
@@ -202,6 +203,19 @@ impl Provider for OpenAiProvider {
                     buf.drain(..=nl);
 
                     if let Some(data) = line.strip_prefix("data: ") {
+                        // Emit partial tool-call argument chunks before the generic parse.
+                        if let Some((name, partial_input)) = parse_openai_tool_call_chunk(data) {
+                            if tx
+                                .send(Ok(Delta::ToolCallChunk {
+                                    name,
+                                    partial_input,
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                break 'outer;
+                            }
+                        }
                         match parse_openai_line(data) {
                             Ok(Some(delta)) => {
                                 if matches!(delta, Delta::Text(_)) && ttft_ms.is_none() {
