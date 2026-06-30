@@ -359,6 +359,9 @@ enum SessionCmd {
         /// Maximum budget in USD for this session
         #[arg(long)]
         max_budget_usd: Option<f64>,
+        /// Tool permission level: default | accept-edits | bypass-permissions | plan
+        #[arg(long, value_parser = parse_permission_mode)]
+        permission_mode: Option<PermissionMode>,
     },
     List,
     Show {
@@ -422,6 +425,44 @@ fn parse_max_turns(s: &str) -> Result<usize, String> {
         Err("--max-turns must be ≥ 1".to_owned())
     } else {
         Ok(n)
+    }
+}
+
+/// Tool-gate permission level for a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PermissionMode {
+    /// Standard tool-approval flow (ask before each sensitive tool).
+    Default,
+    /// Auto-approve file-edit tools; ask for others.
+    AcceptEdits,
+    /// Skip all tool approval — all tool calls are auto-approved.
+    BypassPermissions,
+    /// Read-only planning mode; tools that write files are blocked.
+    Plan,
+}
+
+impl PermissionMode {
+    /// Returns the wire string sent to smdjad in the `session.create` payload.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "accept-edits",
+            Self::BypassPermissions => "bypass-permissions",
+            Self::Plan => "plan",
+        }
+    }
+}
+
+/// Parses the `--permission-mode` flag value into a [`PermissionMode`].
+pub(crate) fn parse_permission_mode(s: &str) -> Result<PermissionMode, String> {
+    match s {
+        "default" => Ok(PermissionMode::Default),
+        "accept-edits" => Ok(PermissionMode::AcceptEdits),
+        "bypass-permissions" => Ok(PermissionMode::BypassPermissions),
+        "plan" => Ok(PermissionMode::Plan),
+        other => Err(format!(
+            "unknown permission mode {other:?}; valid values: default, accept-edits, bypass-permissions, plan"
+        )),
     }
 }
 
@@ -1027,6 +1068,7 @@ async fn main() -> Result<()> {
                         task,
                         max_turns,
                         max_budget_usd,
+                        permission_mode,
                     } => {
                         let mut payload = json!({
                             "cowork_mode": cowork,
@@ -1037,6 +1079,9 @@ async fn main() -> Result<()> {
                         }
                         if let Some(b) = max_budget_usd {
                             payload["max_budget_usd"] = json!(b);
+                        }
+                        if let Some(m) = permission_mode {
+                            payload["permission_mode"] = json!(m.as_str());
                         }
                         let resp = client
                             .call("session.create", payload)
@@ -3624,6 +3669,34 @@ mod tests {
 
         let codex_link = project.join(".codex").join("skills");
         assert_eq!(std::fs::read_link(&codex_link).unwrap(), skills_src);
+    }
+
+    // -------------------------------------------------------------------------
+    // M9 — Permission mode flag
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn permission_mode_default_accepted() {
+        let mode = parse_permission_mode("default").unwrap();
+        assert_eq!(mode, PermissionMode::Default);
+        assert_eq!(mode.as_str(), "default");
+    }
+
+    #[test]
+    fn permission_mode_bypass_accepted() {
+        let mode = parse_permission_mode("bypass-permissions").unwrap();
+        assert_eq!(mode, PermissionMode::BypassPermissions);
+        assert_eq!(mode.as_str(), "bypass-permissions");
+    }
+
+    #[test]
+    fn permission_mode_invalid_rejected() {
+        let result = parse_permission_mode("nonsense");
+        assert!(result.is_err(), "unknown mode must return an error");
+        assert!(
+            result.unwrap_err().contains("unknown permission mode"),
+            "error must describe the problem"
+        );
     }
 
     // -------------------------------------------------------------------------
