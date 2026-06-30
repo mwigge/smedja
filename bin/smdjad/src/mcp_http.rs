@@ -3,6 +3,8 @@
 //! Connects to an MCP server at a known URL. OAuth PKCE flow is a
 //! future extension; for now, a static Bearer token is supported.
 
+use tokio::sync::broadcast;
+
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -37,6 +39,74 @@ pub struct McpPrompt {
 pub struct McpNotification {
     pub server: String,
     pub method: String,
+}
+
+// ---------------------------------------------------------------------------
+// M18 — MCP notification bus and background reader
+// ---------------------------------------------------------------------------
+
+/// Capacity of the notification broadcast channel.
+const NOTIFICATION_CHANNEL_CAP: usize = 64;
+
+/// Type alias for the sender half of the MCP notification bus.
+pub type McpNotificationTx = broadcast::Sender<McpNotification>;
+
+/// Creates a new notification bus and returns `(tx, rx)`.
+///
+/// Multiple consumers may subscribe by calling [`McpNotificationTx::subscribe`].
+#[must_use]
+pub fn notification_bus() -> (
+    broadcast::Sender<McpNotification>,
+    broadcast::Receiver<McpNotification>,
+) {
+    broadcast::channel(NOTIFICATION_CHANNEL_CAP)
+}
+
+/// Classifies a JSON-RPC notification by its `method` field and decides
+/// whether it should trigger a tool-list refresh.
+///
+/// Returns `true` for `notifications/tools/list_changed`.
+#[must_use]
+pub fn is_tools_list_change(notification: &McpNotification) -> bool {
+    notification.method == "notifications/tools/list_changed"
+}
+
+/// Spawns a background Tokio task that reads newline-delimited JSON-RPC
+/// messages from `reader`, parses them as notifications, and broadcasts them
+/// on `tx`.  The task exits when the reader returns EOF or an error.
+///
+/// This is the stdio-transport notification pump: attach it to the stdout pipe
+/// of a stdio MCP server process.
+pub fn spawn_notification_reader<R>(
+    server: String,
+    reader: R,
+    tx: McpNotificationTx,
+) -> tokio::task::JoinHandle<()>
+where
+    R: tokio::io::AsyncBufRead + Send + Unpin + 'static,
+{
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt as _;
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            // A notification has "method" but no "id".
+            if v.get("id").is_some() {
+                continue;
+            }
+            let Some(method) = v["method"].as_str() else {
+                continue;
+            };
+            let notification = McpNotification {
+                server: server.clone(),
+                method: method.to_owned(),
+            };
+            // Ignore send errors (no active receivers is fine).
+            let _ = tx.send(notification);
+        }
+    })
 }
 
 /// Returns the negotiated protocol version given the server's declared version.
@@ -663,5 +733,26 @@ mod tests {
             method: v["method"].as_str().unwrap().to_owned(),
         };
         assert_eq!(n.method, "notifications/tools/list_changed");
+    }
+
+    #[tokio::test]
+    async fn tools_list_change_triggers_refresh() {
+        let (tx, mut rx) = notification_bus();
+        // Feed a single notification line through the background reader.
+        let json = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n";
+        let reader = std::io::Cursor::new(json.as_bytes());
+        let handle = spawn_notification_reader("test-server".into(), reader, tx);
+        // Wait for the notification to arrive.
+        let notification = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for notification")
+            .expect("channel closed");
+        // The notification should be classified as a tool-list change.
+        assert!(
+            is_tools_list_change(&notification),
+            "notification must be classified as a tool-list change"
+        );
+        assert_eq!(notification.server, "test-server");
+        handle.await.ok();
     }
 }
