@@ -237,8 +237,9 @@ pub(crate) async fn list(state: HandlerState, _params: Value) -> Result<Value, R
 /// without constructing a full [`HandlerState`].
 async fn list_with(ig: &smedja_ingot::IngotHandle) -> Result<Value, RpcError> {
     let sessions = ig.list_sessions().await.map_err(|e| ingot_err(&e))?;
-    let out: Vec<Value> = sessions
-        .into_iter()
+    let start = sessions.len().saturating_sub(10);
+    let out: Vec<Value> = sessions[start..]
+        .iter()
         .map(|s| {
             json!({
                 "id": s.id,
@@ -968,6 +969,26 @@ mod tests {
         let titles: Vec<&str> = arr.iter().map(|v| v["title"].as_str().unwrap()).collect();
         assert!(titles.contains(&"alpha"), "missing 'alpha'");
         assert!(titles.contains(&"beta"), "missing 'beta'");
+    }
+
+    #[tokio::test]
+    async fn list_caps_at_ten_most_recent_sessions() {
+        let ig = handle();
+        for i in 0u8..15 {
+            ig.create_session(sample_session(Uuid::new_v4(), &format!("s{i}")))
+                .await
+                .unwrap();
+        }
+        let resp = list_with(&ig).await.unwrap();
+        let arr = resp.as_array().unwrap();
+        assert_eq!(arr.len(), 10, "must return at most 10 sessions");
+        // The last 10 created are s5..s14; the first 5 (s0..s4) are dropped.
+        let titles: Vec<&str> = arr.iter().map(|v| v["title"].as_str().unwrap()).collect();
+        assert!(
+            titles.contains(&"s14"),
+            "most recent session must be present"
+        );
+        assert!(!titles.contains(&"s4"), "oldest sessions must be dropped");
     }
 
     // ── session.fork ─────────────────────────────────────────────────────────
