@@ -5,8 +5,9 @@ use std::sync::Mutex;
 
 use smedja_adapter::{
     AnthropicProvider, BergetProvider, ClaudeCliProvider, CodexCliProvider, CopilotProvider,
-    GpuSnapshot, LocalModel, LocalProvider, MinimaxProvider, OpenAiProvider, PoolCliProvider,
-    PoolsideProvider, Provider, SubprocessProvider,
+    DeepSeekProvider, GpuSnapshot, GroqProvider, LocalModel, LocalProvider, MinimaxProvider,
+    OpenAiProvider, PerplexityProvider, PoolCliProvider, PoolsideProvider, Provider,
+    SubprocessProvider, TogetherProvider, XAiProvider,
 };
 use smedja_assayer::{Runner, Tier};
 use tracing::{error, info, warn};
@@ -512,7 +513,49 @@ pub async fn build_provider_pool() -> ProviderPool {
         info!(runner = "berget", "provider ready");
     }
 
-    // 7. Local rs-llmctl
+    // 7. Groq
+    if let Some(p) = GroqProvider::detect() {
+        add!(
+            Runner::Codex,
+            Tier::Fast,
+            p,
+            "groq",
+            "llama-3.3-70b-versatile"
+        );
+        info!(runner = "groq", "provider ready");
+    }
+
+    // 8. DeepSeek
+    if let Some(p) = DeepSeekProvider::detect() {
+        add!(Runner::Codex, Tier::Deep, p, "deepseek", "deepseek-chat");
+        info!(runner = "deepseek", "provider ready");
+    }
+
+    // 9. Together
+    if let Some(p) = TogetherProvider::detect() {
+        add!(
+            Runner::Local,
+            Tier::Fast,
+            p,
+            "together",
+            "meta-llama/Llama-3-8b-chat-hf"
+        );
+        info!(runner = "together", "provider ready");
+    }
+
+    // 10. Perplexity
+    if let Some(p) = PerplexityProvider::detect() {
+        add!(Runner::Local, Tier::Fast, p, "perplexity", "sonar-pro");
+        info!(runner = "perplexity", "provider ready");
+    }
+
+    // 11. xAI
+    if let Some(p) = XAiProvider::detect() {
+        add!(Runner::Local, Tier::Fast, p, "xai", "grok-3-beta");
+        info!(runner = "xai", "provider ready");
+    }
+
+    // 12. Local rs-llmctl
     let local = LocalProvider::connect().await;
     let mut local_control: Option<LocalControl> = None;
     if local.capability.healthy {

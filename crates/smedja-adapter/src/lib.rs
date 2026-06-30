@@ -67,9 +67,11 @@ pub use local::{
     fetch_inventory, install_model, issue_swap_request, parse_model_inventory, record_local_swap,
     InstallOutcome, LocalCapability, LocalModel, LocalProvider, SwapOutcome,
 };
+pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
 pub use openai_compat::{
-    BergetProvider, MinimaxProvider, OpenAiCompatProvider, OpenAiCompatSpec, OpenCodeProvider,
+    BergetProvider, DeepSeekProvider, GroqProvider, MinimaxProvider, OpenAiCompatProvider,
+    OpenAiCompatSpec, OpenCodeProvider, PerplexityProvider, TogetherProvider, XAiProvider,
 };
 pub use pool_cli::PoolCliProvider;
 pub use poolside::PoolsideProvider;
