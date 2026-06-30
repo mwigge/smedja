@@ -1,6 +1,6 @@
 id     = "WI-009"
 title  = "fetch_web tool — built-in URL fetch for agents"
-status = "planned"
+status = "done"
 priority = "P2"
 
 [detail]
