@@ -51,6 +51,7 @@ async-trait  = "0.1"
 
 # http
 axum         = { version = "0.8", features = ["ws"] }
+base64         = "0.22"
 
 # byte casting (zero-cost f32 ↔ u8 for embedding BLOB serialisation)
 bytemuck     = "1"

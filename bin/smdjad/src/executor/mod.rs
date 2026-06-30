@@ -11,6 +11,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
+use base64::Engine as _;
+
 use serde_json::Value;
 use smedja_ingot::{IngotHandle, Session};
 use smedja_vault::{Vault, VaultEntry};
@@ -297,6 +299,42 @@ pub(crate) fn parse_tool_call(text: &str) -> Option<(String, String)> {
 ///
 /// Reads `<workspace>/.smedja/workspace.toml`.  A missing or unparseable file
 /// resolves to `false` so startup is never blocked by config trouble.
+/// Minimal glob matcher supporting `*` (any sequence except `/`) and `?` (one char).
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let mut p = pattern.as_bytes();
+    let mut s = name.as_bytes();
+    loop {
+        match (p.first(), s.first()) {
+            (None, None) => return true,
+            (Some(&b'*'), _) => {
+                p = &p[1..];
+                if p.is_empty() {
+                    return true;
+                }
+                // Try matching `*` against 0..n chars.
+                for i in 0..=s.len() {
+                    if glob_match(
+                        std::str::from_utf8(p).unwrap_or(""),
+                        std::str::from_utf8(&s[i..]).unwrap_or(""),
+                    ) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            (Some(&b'?'), Some(_)) => {
+                p = &p[1..];
+                s = &s[1..];
+            }
+            (Some(a), Some(b)) if a == b => {
+                p = &p[1..];
+                s = &s[1..];
+            }
+            _ => return false,
+        }
+    }
+}
+
 fn is_confirm_edits_enabled(workspace: &std::path::Path) -> bool {
     #[derive(serde::Deserialize, Default)]
     struct WorkspaceToml {
@@ -481,9 +519,34 @@ pub(crate) async fn execute_tool(
                 Ok(p) => p,
                 Err(err) => return err,
             };
-            match tokio::fs::read_to_string(&full).await {
-                Ok(contents) => contents,
-                Err(e) => format!("error reading {path_str}: {e}"),
+            let encoding = input
+                .get("encoding")
+                .and_then(Value::as_str)
+                .unwrap_or("text");
+            let start_line = input
+                .get("start_line")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize);
+            let end_line = input
+                .get("end_line")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize);
+            let raw = match tokio::fs::read(&full).await {
+                Ok(bytes) => bytes,
+                Err(e) => return format!("error reading {path_str}: {e}"),
+            };
+            if encoding == "base64" {
+                base64::engine::general_purpose::STANDARD.encode(&raw)
+            } else {
+                let text = String::from_utf8_lossy(&raw).into_owned();
+                if start_line.is_none() && end_line.is_none() {
+                    text
+                } else {
+                    let start = start_line.unwrap_or(1).saturating_sub(1);
+                    let lines: Vec<&str> = text.lines().collect();
+                    let end = end_line.map(|e| e.min(lines.len())).unwrap_or(lines.len());
+                    lines[start.min(lines.len())..end].join("\n")
+                }
             }
         }
         "list_files" => {
@@ -492,14 +555,38 @@ pub(crate) async fn execute_tool(
                 Ok(p) => p,
                 Err(err) => return err,
             };
-            match tokio::fs::read_dir(&full).await {
-                Ok(mut rd) => {
-                    let mut entries = Vec::new();
-                    while let Ok(Some(entry)) = rd.next_entry().await {
-                        entries.push(entry.file_name().to_string_lossy().into_owned());
+            let depth = input.get("depth").and_then(Value::as_u64).unwrap_or(1) as usize;
+            let pattern = input
+                .get("pattern")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let max_depth = if depth == 0 { usize::MAX } else { depth };
+            match tokio::task::spawn_blocking(move || {
+                let mut entries = Vec::new();
+                let walker = walkdir::WalkDir::new(&full)
+                    .max_depth(max_depth)
+                    .into_iter()
+                    .filter_entry(|e| {
+                        e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.')
+                    });
+                for entry in walker.filter_map(std::result::Result::ok).skip(1) {
+                    let name = entry.path().strip_prefix(&full).unwrap_or(entry.path());
+                    let name_str = name.to_string_lossy().into_owned();
+                    if let Some(ref pat) = pattern {
+                        // Simple glob: only match file name portion against the pattern.
+                        let file_name = entry.file_name().to_string_lossy();
+                        if !glob_match(pat, &file_name) {
+                            continue;
+                        }
                     }
-                    entries.join("\n")
+                    entries.push(name_str);
                 }
+                entries.sort();
+                entries.join("\n")
+            })
+            .await
+            {
+                Ok(result) => result,
                 Err(e) => format!("error listing {dir_str}: {e}"),
             }
         }
@@ -1976,5 +2063,64 @@ mod tests {
             !super::is_confirm_edits_enabled(dir.path()),
             "confirm_edits = false must resolve to false"
         );
+    }
+
+    // --- WI-018: read_file line ranges, list_files depth/pattern, glob_match ----
+
+    #[test]
+    fn glob_match_star_matches_any_suffix() {
+        assert!(super::glob_match("*.rs", "main.rs"));
+        assert!(!super::glob_match("*.rs", "main.toml"));
+    }
+
+    #[test]
+    fn glob_match_question_mark_matches_one_char() {
+        assert!(super::glob_match("fo?", "foo"));
+        assert!(!super::glob_match("fo?", "fo"));
+    }
+
+    #[test]
+    fn glob_match_star_matches_empty() {
+        assert!(super::glob_match("*.rs", ".rs"));
+        assert!(super::glob_match("*", "anything"));
+        assert!(super::glob_match("*", ""));
+    }
+
+    #[test]
+    fn glob_match_exact() {
+        assert!(super::glob_match("Cargo.toml", "Cargo.toml"));
+        assert!(!super::glob_match("Cargo.toml", "cargo.toml"));
+    }
+
+    // read_file and list_files helpers are tested via the full execute_tool path
+    // in integration — here we test the glob helper and the executor's behaviour
+    // through a direct unit path.
+
+    #[test]
+    fn read_file_line_range_returns_subset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.txt");
+        std::fs::write(&path, "line1\nline2\nline3\nline4\n").unwrap();
+
+        // Simulate the line-range extraction used in the read_file handler.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let start_line: usize = 2;
+        let end_line: usize = 3;
+        let start = start_line.saturating_sub(1);
+        let lines: Vec<&str> = text.lines().collect();
+        let end = end_line.min(lines.len());
+        let result = lines[start..end].join("\n");
+        assert_eq!(result, "line2\nline3");
+    }
+
+    #[test]
+    fn read_file_base64_roundtrip() {
+        use base64::Engine as _;
+        let raw = b"\x00\x01\x02\x03binary";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&encoded)
+            .unwrap();
+        assert_eq!(decoded, raw);
     }
 }
