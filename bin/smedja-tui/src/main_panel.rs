@@ -376,6 +376,35 @@ pub fn detect_lang(lines: &[&str]) -> &'static str {
     ""
 }
 
+// ---------------------------------------------------------------------------
+// M16 — Cell spacing modes
+// ---------------------------------------------------------------------------
+
+/// Controls how much vertical breathing room is inserted between structural
+/// elements (chips, tool-result cards, seam dividers) during rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Spacing {
+    /// No blank rows inserted anywhere.
+    Compact,
+    /// One blank row after each chip (styled card).
+    #[default]
+    Comfortable,
+    /// Two blank rows after each chip.
+    Spacious,
+}
+
+impl Spacing {
+    /// Returns the number of blank rows to insert after a chip line.
+    #[must_use]
+    pub fn blank_rows_after_chip(self) -> usize {
+        match self {
+            Self::Compact => 0,
+            Self::Comfortable => 1,
+            Self::Spacious => 2,
+        }
+    }
+}
+
 /// Scrollable panel displaying styled message lines.
 #[derive(Debug)]
 pub struct MainPanel {
@@ -388,6 +417,8 @@ pub struct MainPanel {
     /// default). Manual scroll-up clears it; scrolling back to the bottom re-arms
     /// it. `scroll` is only consulted as the top anchor when `follow` is `false`.
     follow: bool,
+    /// Vertical spacing mode between structural elements.
+    pub spacing: Spacing,
     /// Whether the next pushed line should be treated as code.
     in_code_block: bool,
     /// Language tag from the opening fence (e.g. "rust"), empty if none.
@@ -468,6 +499,7 @@ impl MainPanel {
             scroll: 0,
             display_start: 0,
             follow: true,
+            spacing: Spacing::Comfortable,
             in_code_block: false,
             code_lang: String::new(),
             code_buf: Vec::new(),
@@ -2011,6 +2043,41 @@ mod tests {
             has_styled,
             "at least one span must be styled for the added word"
         );
+    }
+
+    // --- M16: cell spacing modes ---
+
+    #[test]
+    fn compact_spacing_no_blank_rows_between_lines() {
+        let spacing = Spacing::Compact;
+        // A chip line (spans present) in Compact mode produces 0 blank rows.
+        assert_eq!(
+            spacing.blank_rows_after_chip(),
+            0,
+            "Compact must not insert any blank rows"
+        );
+    }
+
+    #[test]
+    fn comfortable_spacing_inserts_one_blank_row_after_chip() {
+        let spacing = Spacing::Comfortable;
+        assert_eq!(
+            spacing.blank_rows_after_chip(),
+            1,
+            "Comfortable must insert one blank row after a chip"
+        );
+    }
+
+    #[test]
+    fn spacious_spacing_inserts_two_blank_rows_after_chip() {
+        let spacing = Spacing::Spacious;
+        assert_eq!(spacing.blank_rows_after_chip(), 2);
+    }
+
+    #[test]
+    fn panel_default_spacing_is_comfortable() {
+        let panel = MainPanel::new();
+        assert_eq!(panel.spacing, Spacing::Comfortable);
     }
 
     #[test]
