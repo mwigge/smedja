@@ -75,6 +75,7 @@ path = "src/main.rs"
 anyhow             = { workspace = true }
 async-trait        = { workspace = true }
 axum               = { workspace = true }
+base64             = { workspace = true }
 chrono             = { workspace = true }
 futures-util       = { workspace = true }
 opentelemetry          = { workspace = true }
@@ -109,6 +110,7 @@ tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 url                = { workspace = true }
 uuid               = { workspace = true }
+walkdir            = { workspace = true }
 which              = { workspace = true }
 
 # Linux-only Landlock LSM bindings for the native sandbox backend. Target-gated

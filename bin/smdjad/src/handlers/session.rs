@@ -313,12 +313,24 @@ pub(crate) async fn fork(state: HandlerState, params: Value) -> Result<Value, Rp
         .and_then(Value::as_str)
         .ok_or_else(|| missing_param("session_id"))?
         .to_owned();
-    fork_with(&state.ingot, session_id).await
+    let turn_n = params
+        .get("turn_n")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    fork_with(&state.ingot, session_id, turn_n).await
 }
 
 /// Core of `session.fork`, parameterised on the ingot handle so it is testable
 /// without constructing a full [`HandlerState`].
-async fn fork_with(ig: &smedja_ingot::IngotHandle, session_id: String) -> Result<Value, RpcError> {
+///
+/// When `turn_n` is `Some`, the checkpoint closest to (and not exceeding) that
+/// turn is used instead of the latest checkpoint. Returns an error if `turn_n`
+/// is provided but no checkpoints exist for the session.
+async fn fork_with(
+    ig: &smedja_ingot::IngotHandle,
+    session_id: String,
+    turn_n: Option<u32>,
+) -> Result<Value, RpcError> {
     // Each DB call acquires and immediately releases the lock so other
     // concurrent RPC handlers (including turn.subscribe's polling loop)
     // are not serialised behind the entire fork sequence.
@@ -334,7 +346,35 @@ async fn fork_with(ig: &smedja_ingot::IngotHandle, session_id: String) -> Result
             })?
     };
 
-    let latest_cp = {
+    let selected_cp = if let Some(target_turn) = turn_n {
+        // Find the checkpoint with the largest turn_n that does not exceed target_turn.
+        let all_cps = ig
+            .list_checkpoints(&session_id)
+            .await
+            .map_err(|e| ingot_err(&e))?;
+        if all_cps.is_empty() {
+            return Err(RpcError::new(
+                codes::INTERNAL_ERROR,
+                format!(
+                    "no checkpoints for session {session_id}; cannot fork at turn {target_turn}"
+                ),
+            ));
+        }
+        let target = i64::from(target_turn);
+        let cp = all_cps
+            .into_iter()
+            .filter(|c| c.turn_n <= target)
+            .max_by_key(|c| c.turn_n)
+            .ok_or_else(|| {
+                RpcError::new(
+                    codes::INTERNAL_ERROR,
+                    format!(
+                        "no checkpoint at or before turn {target_turn} for session {session_id}"
+                    ),
+                )
+            })?;
+        Some(cp)
+    } else {
         ig.latest_checkpoint(&session_id)
             .await
             .map_err(|e| ingot_err(&e))?
@@ -362,8 +402,8 @@ async fn fork_with(ig: &smedja_ingot::IngotHandle, session_id: String) -> Result
         .map_err(|e| ingot_err(&e))?;
     }
 
-    let has_checkpoint = latest_cp.is_some();
-    if let Some(cp) = latest_cp {
+    let has_checkpoint = selected_cp.is_some();
+    if let Some(cp) = selected_cp {
         ig.save_checkpoint(Checkpoint {
             id: Uuid::new_v4(),
             session_id: new_id.clone(),
@@ -940,7 +980,7 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = fork_with(&ig, parent_id.to_string()).await.unwrap();
+        let resp = fork_with(&ig, parent_id.to_string(), None).await.unwrap();
 
         // The response reports the new session id and the parent.
         assert_eq!(resp["forked_from"], parent_id.to_string());
@@ -961,7 +1001,7 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = fork_with(&ig, parent_id.to_string()).await.unwrap();
+        let resp = fork_with(&ig, parent_id.to_string(), None).await.unwrap();
         assert_eq!(resp["has_checkpoint"], false);
     }
 
@@ -983,7 +1023,7 @@ mod tests {
         .await
         .unwrap();
 
-        let resp = fork_with(&ig, parent_id.to_string()).await.unwrap();
+        let resp = fork_with(&ig, parent_id.to_string(), None).await.unwrap();
         assert_eq!(resp["has_checkpoint"], true, "checkpoint should be copied");
 
         let new_id = resp["session_id"].as_str().unwrap();
@@ -995,7 +1035,91 @@ mod tests {
     #[tokio::test]
     async fn fork_returns_error_for_unknown_session() {
         let ig = handle();
-        let err = fork_with(&ig, "no-such-id".to_owned()).await.unwrap_err();
+        let err = fork_with(&ig, "no-such-id".to_owned(), None)
+            .await
+            .unwrap_err();
         assert_eq!(err.code, smedja_rpc::codes::INTERNAL_ERROR);
+    }
+
+    // --- WI-018 GAP C: session.fork at arbitrary turn_n ----------------------
+
+    #[tokio::test]
+    async fn fork_at_turn_n_selects_closest_checkpoint() {
+        let ig = handle();
+        let parent_id = Uuid::new_v4();
+        ig.create_session(sample_session(parent_id, "s"))
+            .await
+            .unwrap();
+        for turn in [1i64, 3, 5] {
+            ig.save_checkpoint(Checkpoint {
+                id: Uuid::new_v4(),
+                session_id: parent_id.to_string(),
+                turn_n: turn,
+                messages_json: format!(r#"["turn-{turn}"]"#),
+                created_at: Timestamp::now(),
+                compaction_id: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        // Fork at turn 4 → closest checkpoint not exceeding 4 is turn 3.
+        let resp = fork_with(&ig, parent_id.to_string(), Some(4))
+            .await
+            .unwrap();
+        assert_eq!(resp["has_checkpoint"], true);
+        let new_id = resp["session_id"].as_str().unwrap();
+        let cp = ig.latest_checkpoint(new_id).await.unwrap().unwrap();
+        assert_eq!(
+            cp.turn_n, 3,
+            "expected checkpoint at turn 3, got {}",
+            cp.turn_n
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_at_turn_n_past_last_returns_error() {
+        let ig = handle();
+        let parent_id = Uuid::new_v4();
+        ig.create_session(sample_session(parent_id, "s"))
+            .await
+            .unwrap();
+        // No checkpoints exist.
+        let err = fork_with(&ig, parent_id.to_string(), Some(99))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            smedja_rpc::codes::INTERNAL_ERROR,
+            "must error when no checkpoints"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_at_turn_n_before_all_checkpoints_returns_error() {
+        let ig = handle();
+        let parent_id = Uuid::new_v4();
+        ig.create_session(sample_session(parent_id, "s"))
+            .await
+            .unwrap();
+        ig.save_checkpoint(Checkpoint {
+            id: Uuid::new_v4(),
+            session_id: parent_id.to_string(),
+            turn_n: 5,
+            messages_json: r#"["hello"]"#.to_owned(),
+            created_at: Timestamp::now(),
+            compaction_id: None,
+        })
+        .await
+        .unwrap();
+        // Request turn 2 but the only checkpoint is at turn 5.
+        let err = fork_with(&ig, parent_id.to_string(), Some(2))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            smedja_rpc::codes::INTERNAL_ERROR,
+            "must error when no checkpoint <= requested turn"
+        );
     }
 }
