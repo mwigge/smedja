@@ -1396,6 +1396,12 @@ pub(crate) async fn dispatch_slash(
             });
             Ok(true)
         }
+        "spacing" => {
+            state.main_panel.spacing = state.main_panel.spacing.next();
+            let mode = format!("{:?}", state.main_panel.spacing).to_lowercase();
+            push_system_message(state, format!("spacing → {mode}"));
+            Ok(true)
+        }
         _ => Ok(false),
     }
 }

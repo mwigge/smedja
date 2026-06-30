@@ -456,6 +456,16 @@ impl Spacing {
             Self::Spacious => 2,
         }
     }
+
+    /// Cycles to the next spacing mode: Compact → Comfortable → Spacious → Compact.
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            Self::Compact => Self::Comfortable,
+            Self::Comfortable => Self::Spacious,
+            Self::Spacious => Self::Compact,
+        }
+    }
 }
 
 /// Scrollable panel displaying styled message lines.

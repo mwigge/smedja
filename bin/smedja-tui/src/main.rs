@@ -1056,7 +1056,12 @@ pub(crate) fn format_tool_detail(name: &str, full: &str) -> Vec<String> {
 /// blocks instead of one running mass of text.
 fn push_author_chip(panel: &mut main_panel::MainPanel, label: &str, color: Color, no_color: bool) {
     if !panel.is_empty() {
-        panel.push_styled_line(Line::from(""));
+        let blanks = panel.spacing.blank_rows_after_chip();
+        // Compact mode inserts no spacer; default (Comfortable) inserts one.
+        let blanks = blanks.max(1);
+        for _ in 0..blanks {
+            panel.push_styled_line(Line::from(""));
+        }
     }
     panel.push_styled_line(author_chip(label, color, no_color));
 }
@@ -4670,6 +4675,7 @@ async fn main() -> Result<()> {
                         state.last_poll = None;
                         state.turn_in_flight = false;
                         state.poll_retry_count = 0;
+                        let _ = emit_turn_notifications(&mut std::io::stdout());
 
                         if let Ok(ctx) = client
                             .call("session.context", json!({ "session_id": state.session_id }))
