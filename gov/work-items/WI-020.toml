@@ -1,6 +1,6 @@
 id     = "WI-020"
 title  = "Parallel tool execution for multi-tool model responses"
-status = "planned"
+status = "done"
 priority = "P3"
 
 [detail]
