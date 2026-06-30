@@ -285,6 +285,63 @@ fn diff_line_spans(text: &str) -> Line<'static> {
     ])
 }
 
+/// Detects the programming language from the first few lines of code content.
+///
+/// Checks shebangs first, then keyword patterns.  Returns a `'static` string
+/// suitable for passing to `apply_syntect`, or `""` when detection fails.
+#[must_use]
+pub fn detect_lang(lines: &[&str]) -> &'static str {
+    // 1. Shebang on the first non-empty line.
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(interp) = trimmed.strip_prefix("#!") {
+            if interp.contains("python") {
+                return "python";
+            }
+            if interp.contains("/bash") || interp == "/bin/sh" || interp.ends_with(" sh") {
+                return "bash";
+            }
+            if interp.contains("node") {
+                return "javascript";
+            }
+        }
+        break; // only inspect the first non-empty line for shebangs
+    }
+
+    // Collect all lines into a single text for keyword checks.
+    let combined = lines.join("\n");
+
+    // 2. Keyword heuristics (priority order matters — check Rust before others).
+    if combined.contains("fn main()")
+        || combined.contains("impl ")
+        || combined.contains("let mut ")
+        || combined.contains("pub fn ")
+    {
+        return "rust";
+    }
+    if combined.contains("func ") && combined.contains("package ") {
+        return "go";
+    }
+    if combined.contains("def ") && combined.contains("import ") {
+        return "python";
+    }
+    let upper = combined.to_uppercase();
+    if upper.contains("SELECT ") || upper.contains("INSERT INTO") {
+        return "sql";
+    }
+    if combined.contains("class ") && combined.contains("public static void") {
+        return "java";
+    }
+    if combined.contains("const ") && combined.contains("function ") {
+        return "javascript";
+    }
+
+    ""
+}
+
 /// Scrollable panel displaying styled message lines.
 #[derive(Debug)]
 pub struct MainPanel {
@@ -301,6 +358,12 @@ pub struct MainPanel {
     in_code_block: bool,
     /// Language tag from the opening fence (e.g. "rust"), empty if none.
     code_lang: String,
+    /// Buffered code lines for an unlabeled fence, used for retroactive
+    /// language detection when the closing fence arrives.
+    code_buf: Vec<String>,
+    /// Index into `lines` where the buffered (unlabeled) code lines start,
+    /// so they can be retroactively re-highlighted on fence close.
+    code_buf_start: usize,
     /// Inner (border-excluded) rect of the last render — for mouse hit-testing.
     last_inner: Rect,
     /// Logical line index for each visual row drawn in the last render window,
@@ -368,6 +431,8 @@ impl MainPanel {
             follow: true,
             in_code_block: false,
             code_lang: String::new(),
+            code_buf: Vec::new(),
+            code_buf_start: 0,
             last_inner: Rect::new(0, 0, 0, 0),
             row_logical: Vec::new(),
             row_charbounds: Vec::new(),
@@ -419,6 +484,7 @@ impl MainPanel {
     ///   present on the opening fence.
     ///
     /// Auto-scrolls to follow new content when the view is already at the bottom.
+    #[allow(clippy::too_many_lines)] // fence handling + retroactive detection; splitting would obscure the flow
     pub fn push_line(&mut self, text: String) {
         // Tool-result meta lines ("↳ ok · …") render dim and on their own line,
         // never as code/diff — short-circuit before fence/prefix classification.
@@ -441,7 +507,34 @@ impl MainPanel {
         // Detect fence boundaries (``` with optional language tag).
         if text.trim_start().starts_with("```") {
             if self.in_code_block {
-                // Closing fence — push it as Code and exit code mode.
+                // Closing fence — if we buffered unlabeled code lines, try to
+                // detect the language and retroactively re-highlight them.
+                if self.code_lang.is_empty() && !self.code_buf.is_empty() {
+                    let buf_refs: Vec<&str> = self.code_buf.iter().map(String::as_str).collect();
+                    let detected = detect_lang(&buf_refs);
+                    if !detected.is_empty() {
+                        // Re-highlight all buffered lines in place.
+                        let start = self.code_buf_start;
+                        let end = start + self.code_buf.len();
+                        let highlighted_all: Vec<StyledLine> = self
+                            .code_buf
+                            .iter()
+                            .flat_map(|l| {
+                                let h = apply_syntect(detected, l);
+                                if h.is_empty() {
+                                    vec![StyledLine::plain(l.clone(), LineStyle::Code)]
+                                } else {
+                                    h
+                                }
+                            })
+                            .collect();
+                        // Replace the plain Code lines with highlighted ones.
+                        self.lines.splice(start..end, highlighted_all);
+                    }
+                }
+                self.code_buf.clear();
+                self.code_buf_start = 0;
+                // Push closing fence and exit code mode.
                 self.lines.push(StyledLine::plain(text, LineStyle::Code));
                 self.in_code_block = false;
                 self.code_lang = String::new();
@@ -451,6 +544,10 @@ impl MainPanel {
                 self.code_lang = lang;
                 self.in_code_block = true;
                 self.lines.push(StyledLine::plain(text, LineStyle::Code));
+                // If unlabeled, note where buffered lines will start.
+                if self.code_lang.is_empty() {
+                    self.code_buf_start = self.lines.len();
+                }
             }
         } else if self.in_code_block {
             // Inside a fenced block: apply syntect if we know the language.
@@ -465,6 +562,8 @@ impl MainPanel {
                     spans: Some(spans),
                 });
             } else if self.code_lang.is_empty() {
+                // Buffer this line for retroactive detection at fence close.
+                self.code_buf.push(text.clone());
                 self.lines.push(StyledLine::plain(text, LineStyle::Code));
             } else {
                 let lang = self.code_lang.clone();
@@ -1724,5 +1823,57 @@ mod tests {
             "zero tokens must not show count"
         );
         assert!(panel.lines[0].text.contains("summarized"));
+    }
+
+    // -------------------------------------------------------------------------
+    // M3 — Language auto-detection for unlabeled fenced code blocks
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn detect_lang_rust_fn_main() {
+        assert_eq!(detect_lang(&["fn main() {"]), "rust");
+    }
+
+    #[test]
+    fn detect_lang_python_shebang() {
+        assert_eq!(
+            detect_lang(&["#!/usr/bin/python", "print('hello')"]),
+            "python"
+        );
+    }
+
+    #[test]
+    fn detect_lang_bash_shebang() {
+        assert_eq!(detect_lang(&["#!/bin/bash", "echo hi"]), "bash");
+    }
+
+    #[test]
+    fn detect_lang_go_package() {
+        assert_eq!(detect_lang(&["package main", "func main() {"]), "go");
+    }
+
+    #[test]
+    fn detect_lang_sql_select() {
+        assert_eq!(detect_lang(&["SELECT id FROM users"]), "sql");
+    }
+
+    #[test]
+    fn detect_lang_unknown_falls_back() {
+        assert_eq!(detect_lang(&["hello world"]), "");
+    }
+
+    #[test]
+    fn push_line_unlabeled_rust_block_detected() {
+        let mut panel = MainPanel::new();
+        // Opening fence with no language.
+        panel.push_line("```".into());
+        panel.push_line("fn main() {}".into());
+        // Closing fence — detection fires here.
+        panel.push_line("```".into());
+        // The code line (index 1) should be syntax-highlighted (spans present).
+        assert!(
+            panel.lines[1].spans.is_some(),
+            "unlabeled rust block must be retroactively highlighted"
+        );
     }
 }
