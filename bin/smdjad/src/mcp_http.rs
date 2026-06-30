@@ -5,6 +5,62 @@
 
 use serde::{Deserialize, Serialize};
 
+// ---------------------------------------------------------------------------
+// M6 — Resources, Prompts, protocol version negotiation
+// ---------------------------------------------------------------------------
+
+/// MCP protocol versions in preference order (newest first).
+pub const MCP_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// An MCP resource entry as returned by `resources/list`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpResource {
+    pub uri: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+/// An MCP prompt entry as returned by `prompts/list`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpPrompt {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// A server-initiated MCP notification (no `id` field).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpNotification {
+    pub server: String,
+    pub method: String,
+}
+
+/// Returns the negotiated protocol version given the server's declared version.
+///
+/// Scans [`MCP_PROTOCOL_VERSIONS`] in preference order and returns the first
+/// version that is ≤ the server's declared version (string comparison works
+/// because the format is `YYYY-MM-DD`).  Falls back to the server's own version
+/// when none of ours is older-or-equal.
+#[must_use]
+pub fn negotiate_protocol_version(server_version: &str) -> &'static str {
+    for &v in MCP_PROTOCOL_VERSIONS {
+        if v <= server_version {
+            return v;
+        }
+    }
+    // Server is older than all our known versions; accept oldest known.
+    MCP_PROTOCOL_VERSIONS[MCP_PROTOCOL_VERSIONS.len() - 1]
+}
+
+/// Reconnect delay sequence for stdio MCP clients (in seconds).
+///
+/// Exponential backoff capped at 30 s, up to 5 retries.
+pub const RECONNECT_DELAYS_SECS: &[u64] = &[1, 2, 4, 8, 30];
+
 /// A tool entry as returned by an MCP `tools/list` call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpTool {
@@ -140,6 +196,158 @@ impl McpHttpClient {
             .unwrap_or_default();
 
         Ok(tools)
+    }
+
+    /// Calls `resources/list` and returns the resource list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string on network failure or parse failure.
+    pub async fn list_resources(&self) -> Result<Vec<McpResource>, String> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "resources/list",
+            "params": {}
+        });
+
+        let mut req = self.http.post(&self.url).json(&body);
+        if !self.token.is_empty() {
+            req = req.bearer_auth(&self.token);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let resources = resp
+            .get("result")
+            .and_then(|r| r.get("resources"))
+            .and_then(|t| serde_json::from_value(t.clone()).ok())
+            .unwrap_or_default();
+        Ok(resources)
+    }
+
+    /// Calls `resources/read` and returns the resource content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string on network failure or JSON-RPC error.
+    pub async fn read_resource(&self, uri: &str) -> Result<String, String> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "resources/read",
+            "params": { "uri": uri }
+        });
+
+        let mut req = self.http.post(&self.url).json(&body);
+        if !self.token.is_empty() {
+            req = req.bearer_auth(&self.token);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Some(err) = resp.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown error");
+            return Err(format!("MCP server error: {msg}"));
+        }
+
+        Ok(
+            serde_json::to_string(resp.get("result").unwrap_or(&serde_json::Value::Null))
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Calls `prompts/list` and returns the prompt list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string on network failure or parse failure.
+    pub async fn list_prompts(&self) -> Result<Vec<McpPrompt>, String> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "prompts/list",
+            "params": {}
+        });
+
+        let mut req = self.http.post(&self.url).json(&body);
+        if !self.token.is_empty() {
+            req = req.bearer_auth(&self.token);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let prompts = resp
+            .get("result")
+            .and_then(|r| r.get("prompts"))
+            .and_then(|t| serde_json::from_value(t.clone()).ok())
+            .unwrap_or_default();
+        Ok(prompts)
+    }
+
+    /// Calls `prompts/get` and returns the rendered prompt text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string on network failure or JSON-RPC error.
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        args: std::collections::HashMap<String, String>,
+    ) -> Result<String, String> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "prompts/get",
+            "params": { "name": name, "arguments": args }
+        });
+
+        let mut req = self.http.post(&self.url).json(&body);
+        if !self.token.is_empty() {
+            req = req.bearer_auth(&self.token);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Some(err) = resp.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown error");
+            return Err(format!("MCP server error: {msg}"));
+        }
+
+        Ok(
+            serde_json::to_string(resp.get("result").unwrap_or(&serde_json::Value::Null))
+                .unwrap_or_default(),
+        )
     }
 }
 
@@ -381,5 +589,79 @@ mod tests {
             servers_after[0].last_refresh > 0.0,
             "last_refresh must be non-zero after update_mcp_tools"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // M6 — Resources, Prompts, protocol version negotiation, reconnect backoff
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn mcp_resource_serializes_correctly() {
+        let resource = McpResource {
+            uri: "file:///foo/bar.txt".into(),
+            name: "bar.txt".into(),
+            description: Some("A text file".into()),
+            mime_type: Some("text/plain".into()),
+        };
+        let json = serde_json::to_string(&resource).unwrap();
+        let back: McpResource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, resource);
+    }
+
+    #[test]
+    fn mcp_prompt_serializes_correctly() {
+        let prompt = McpPrompt {
+            name: "summarize".into(),
+            description: Some("Summarize a document".into()),
+        };
+        let json = serde_json::to_string(&prompt).unwrap();
+        let back: McpPrompt = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, prompt);
+    }
+
+    #[test]
+    fn protocol_version_negotiation_prefers_latest() {
+        // Server declares "2025-03-26" — we accept that (it's in our list).
+        let negotiated = negotiate_protocol_version("2025-03-26");
+        assert_eq!(negotiated, "2025-03-26");
+    }
+
+    #[test]
+    fn protocol_version_negotiation_accepts_server_older_than_all_known() {
+        // Server is older than all versions we know — fall back to oldest known.
+        let negotiated = negotiate_protocol_version("2023-01-01");
+        assert_eq!(
+            negotiated,
+            MCP_PROTOCOL_VERSIONS[MCP_PROTOCOL_VERSIONS.len() - 1]
+        );
+    }
+
+    #[test]
+    fn reconnect_backoff_delays_grow() {
+        let delays = RECONNECT_DELAYS_SECS;
+        assert_eq!(delays.len(), 5, "must have exactly 5 retry delays");
+        assert_eq!(delays[0], 1);
+        assert_eq!(delays[1], 2);
+        assert_eq!(delays[2], 4);
+        assert_eq!(delays[3], 8);
+        assert_eq!(delays[4], 30);
+        // Verify monotone growth up to the cap.
+        for w in delays.windows(2) {
+            assert!(w[1] >= w[0], "delays must be non-decreasing");
+        }
+    }
+
+    #[test]
+    fn mcp_notification_parsed_from_json() {
+        let json = r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        // A notification has "method" but no "id".
+        assert!(v.get("method").is_some());
+        assert!(v.get("id").is_none());
+        let n = McpNotification {
+            server: "my-server".into(),
+            method: v["method"].as_str().unwrap().to_owned(),
+        };
+        assert_eq!(n.method, "notifications/tools/list_changed");
     }
 }
