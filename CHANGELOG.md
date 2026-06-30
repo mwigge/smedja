@@ -6,6 +6,16 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.24.0] — 2026-06-30
+
+### Added
+
+- **SSE event sequence IDs** — every event emitted over the ACP SSE stream now carries an `id:` sequence number assigned from an atomic counter, enabling clients to track position
+- **SSE replay buffer** — `EventBuffer` stores the last 512 events per turn in `AcpState`; a new `GET /acp/v1/session/{id}/events/{turn_id}` endpoint reads `Last-Event-ID` and replays missed events before switching to the live stream, matching goose reconnect semantics
+- **Filename-stable skill ordering** — workspace skills, role skills, and context files are now sorted by filename (not content), so the system-prompt block is byte-for-byte identical across runs and maximises provider-side KV-cache hit rates
+
+---
+
 ## [0.23.0] — 2026-06-30
 
 ### Added
