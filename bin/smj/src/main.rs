@@ -303,6 +303,34 @@ static MODEL_CATALOG: &[ModelInfo] = &[
         input_usd_mtk: None,
         output_usd_mtk: None,
     },
+    ModelInfo {
+        provider: "bedrock",
+        id: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        context_window: Some(200_000),
+        input_usd_mtk: Some(3.00),
+        output_usd_mtk: Some(15.00),
+    },
+    ModelInfo {
+        provider: "bedrock",
+        id: "anthropic.claude-3-haiku-20240307-v1:0",
+        context_window: Some(200_000),
+        input_usd_mtk: Some(0.25),
+        output_usd_mtk: Some(1.25),
+    },
+    ModelInfo {
+        provider: "bedrock",
+        id: "amazon.nova-pro-v1:0",
+        context_window: Some(300_000),
+        input_usd_mtk: Some(0.80),
+        output_usd_mtk: Some(3.20),
+    },
+    ModelInfo {
+        provider: "bedrock",
+        id: "amazon.nova-lite-v1:0",
+        context_window: Some(300_000),
+        input_usd_mtk: Some(0.06),
+        output_usd_mtk: Some(0.24),
+    },
 ];
 
 /// Formats a `ModelInfo` slice as table lines (header + rows).
@@ -4187,5 +4215,44 @@ mod tests {
             lines[2].contains("openai"),
             "data row must name the provider"
         );
+    }
+
+    #[test]
+    fn models_list_includes_bedrock_entries() {
+        let bedrock_rows: Vec<&ModelInfo> = MODEL_CATALOG
+            .iter()
+            .filter(|m| m.provider == "bedrock")
+            .collect();
+        assert!(
+            !bedrock_rows.is_empty(),
+            "bedrock must have at least one entry in MODEL_CATALOG"
+        );
+        let ids: Vec<&str> = bedrock_rows.iter().map(|m| m.id).collect();
+        assert!(
+            ids.contains(&"anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            "Bedrock Sonnet 3.5 v2 must be in the catalog"
+        );
+        assert!(
+            ids.contains(&"amazon.nova-pro-v1:0"),
+            "Bedrock Nova Pro must be in the catalog"
+        );
+        // All bedrock entries must have a known context window and pricing.
+        for entry in &bedrock_rows {
+            assert!(
+                entry.context_window.is_some(),
+                "bedrock entry {} must have a context_window",
+                entry.id
+            );
+            assert!(
+                entry.input_usd_mtk.is_some(),
+                "bedrock entry {} must have input pricing",
+                entry.id
+            );
+            assert!(
+                entry.output_usd_mtk.is_some(),
+                "bedrock entry {} must have output pricing",
+                entry.id
+            );
+        }
     }
 }
