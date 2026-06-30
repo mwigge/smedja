@@ -1,0 +1,40 @@
+id     = "WI-008"
+title  = "Poolside runner — pool CLI subprocess adapter"
+status = "planned"
+priority = "P2"
+
+[detail]
+description = """
+Add a `pool` CLI subprocess adapter so smdjad can route turns to Poolside
+(Laguna M.1 / Laguna XS.2) using the same subprocess pattern as claude-cli
+and codex-cli.
+
+Protocol (from milliways reference implementation):
+- Spawn: `pool exec --output markdown -f <tmpfile> [--directory <workspace>]`
+- Prompt is written to a temp file (mode 0600) to avoid shell arg limits
+- Auth is handled by the pool CLI itself via ~/.config/poolside/credentials.json
+- No API key env var needed; probe at startup via `pool --version`
+- Output is streamed markdown text → mapped to Delta::Text events
+
+Runner registration:
+- Add `Pool` variant to the `Runner` enum in crates/smedja-types/src/lib.rs
+- Add `PoolProvider` in crates/smedja-adapter/src/pool_cli.rs
+- Add probe block in bin/smdjad/src/provider_pool.rs (Pool, Tier::Fast)
+- Re-export from crates/smedja-adapter/src/lib.rs
+
+No session resume support on first pass (pool's session continuity is
+undocumented in the public CLI). Add if pool --help reveals a --session flag.
+"""
+
+source   = "milliways reference impl (runners/pool.go); gap analysis 2026-06-30"
+estimate = "S"
+
+[acceptance]
+criteria = [
+  "`runner.list` RPC includes `pool` when the pool binary is on PATH",
+  "turn routed to pool runner produces Delta::Text events from pool's markdown output",
+  "workspace is forwarded via --directory when session.workspace is set",
+  "prompt written to 0600 temp file, cleaned up after subprocess exits",
+  "`pool` absent from PATH → runner silently absent (not an error)",
+  "unit tests: pool adapter maps markdown lines to Text deltas; missing binary returns absent",
+]

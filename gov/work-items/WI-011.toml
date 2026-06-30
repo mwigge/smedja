@@ -1,0 +1,54 @@
+id     = "WI-011"
+title  = "Declarative per-tool permission rules in workspace config"
+status = "planned"
+priority = "P2"
+
+[detail]
+description = """
+Replace the hard-coded three-bucket tool classification (ReadOnly/Edit/Exec
+in smedja-assayer) with a declarative [[permission.rules]] system in the
+workspace config, matching kimi-code's per-tool glob pattern model.
+
+Current state:
+- Tool classification: hard-coded match in executor/mod.rs and smedja-assayer
+- Permission modes (ask/accept_edits/plan/auto) are session-global
+- No way to say "auto-approve read_file but gate write_file to path X"
+
+What to add:
+1. [[permission.rules]] table in .smedja/workspace.toml (or ~/.config/smedja/config.toml):
+   [[permission.rules]]
+   tool = "write_file"
+   path_glob = "src/**"
+   mode = "ask"          # ask | allow | deny
+
+   [[permission.rules]]
+   tool = "bash"
+   command_pattern = "rm -rf*"
+   mode = "deny"
+
+2. Rule evaluator: check rules in order; first match wins; fallback to session
+   permission_mode. Evaluated in cowork.gate_tool before the existing mode check.
+
+3. Schema: tool (required), path_glob (optional, for file tools), command_pattern
+   (optional, for bash), mode (ask|allow|deny).
+
+4. Extend smj permission rules list / add / remove subcommands.
+
+Note: smedja already has the cowork gate infrastructure; this adds a config-driven
+rule layer on top of it without changing the gate mechanism itself.
+"""
+
+source   = "gap analysis vs kimi-code 2026-06-30"
+estimate = "M"
+
+[acceptance]
+criteria = [
+  "[[permission.rules]] parsed from .smedja/workspace.toml",
+  "first matching rule determines gate outcome; no match falls through to session mode",
+  "path_glob matched against tool input path for file tools",
+  "command_pattern (prefix glob) matched against bash command string",
+  "mode=deny returns tool error without showing cowork gate to the user",
+  "mode=allow bypasses the gate; mode=ask always shows the gate",
+  "smj permission rules list shows active rules for current workspace",
+  "unit tests: rule ordering, glob match, deny short-circuit, fallthrough",
+]

@@ -1,0 +1,51 @@
+id     = "WI-013"
+title  = "Loop engine: max_steps_per_turn bound and resume-from-failed-slice"
+status = "planned"
+priority = "P2"
+
+[detail]
+description = """
+Two related loop safety/resilience gaps vs kimi-code:
+
+GAP A — max_steps_per_turn:
+kimi-code bounds the number of tool-call turns an agent can take within a
+single session call (max_steps_per_turn). smedja has max_attempts (slice
+retries) but no bound on how deep an agent goes within a single run_role call.
+A runaway agent can loop indefinitely if the model keeps calling tools.
+
+The adapter layer (smedja-adapter) needs a `max_tool_turns` field in
+CallOptions; the daemon passes it from LoopConfig.limits; each adapter
+enforces it by counting tool-call/response cycles and returning an error when
+the limit is exceeded. LoopConfig.limits grows:
+  max_attempts: u32       (existing)
+  agent_timeout_s: u64    (existing)
+  max_tool_turns: u32     (new, default 50)
+
+GAP B — resume from failed slice:
+When the loop fails after max_attempts on a slice, it terminates with
+LoopState::Failed and the completed slice count is lost. Resuming requires
+re-running all slices from scratch. kimi-code can resume from the last
+failing step.
+
+Add a loop checkpoint: on slice start, persist the current slice index and
+completed count to a JSON sidecar (.smedja/loop-state.json). On a new
+loop.run call, if the sidecar exists and the change_name matches and the
+policy hash matches, offer resume from the last passing slice index.
+
+New RPC method: loop.resume (re-enters drive() starting from the checkpointed
+slice index). Existing loop.run always starts from slice 0.
+"""
+
+source   = "gap analysis vs kimi-code 2026-06-30"
+estimate = "M"
+
+[acceptance]
+criteria = [
+  "LoopConfig.limits has max_tool_turns field (default 50, configurable in loop.json)",
+  "adapter returns Err when max_tool_turns exceeded within a single run_role call",
+  "loop.json template updated with max_tool_turns example",
+  "slice index and completed count written to .smedja/loop-state.json on each slice start",
+  "loop.resume RPC re-enters drive() from the checkpointed slice index",
+  "loop.resume rejects resume when policy hash has changed since checkpoint",
+  "unit tests: max_tool_turns exceeded aborts the role; resume starts from checkpoint",
+]

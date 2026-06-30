@@ -1,0 +1,47 @@
+id     = "WI-010"
+title  = "Plugin marketplace — remote skill registry with trust tiers"
+status = "planned"
+priority = "P3"
+
+[detail]
+description = """
+Extend the existing local skill registry (crates/smedja-plugins/src/) with a
+remote marketplace layer so skills can be installed from a curated registry
+or any GitHub repository, matching kimi-code's plugin system.
+
+Current state:
+- crates/smedja-plugins/src/registry.rs has scan/install/update/remove (local only)
+- SkillManifest has name, description, version, trigger_phrases — no provenance fields
+- smj skill subcommands: scan and install-from-content only
+
+What to add:
+1. Marketplace index: a hosted (or .smedja-committed) marketplace.json with
+   official / curated / community tiers, each entry pointing at a GitHub repo
+2. smj skill install <owner>/<repo> — fetch SKILL.md (and optional assets) via
+   GitHub raw API, verify SHA-256 checksum, prompt user for trust level
+3. Trust tiers: official (Morphic-signed), curated (reviewed), community (unverified)
+   — community tier prompts a visible warning before install
+4. SkillManifest additions: trust_level, source_url, checksum, installed_at
+5. extra_skill_dirs: config key in ~/.config/smedja/config.toml to load
+   workspace-local skill directories (e.g. .smedja/skills/) alongside ~/.claude/skills/
+6. smj skill list --marketplace: show available registry entries with tier badges
+7. smj skill update [--all]: re-fetch from source_url, verify checksum
+
+Security: downloaded content is treated as Markdown (rendered only, never exec'd).
+Checksum mismatch → reject install. No WASM/code execution, just skill text files.
+"""
+
+source   = "gap analysis vs kimi-code 2026-06-30"
+estimate = "L"
+
+[acceptance]
+criteria = [
+  "smj skill install <owner>/<repo> fetches SKILL.md from GitHub and installs it",
+  "trust tier is recorded in SkillManifest and shown in smj skill list",
+  "community-tier install shows a visible warning and requires confirmation",
+  "SHA-256 checksum of downloaded content is stored and verified on update",
+  "extra_skill_dirs config key loads additional directories at daemon startup",
+  "smj skill list --marketplace shows the remote registry with tier labels",
+  "smj skill update re-fetches and verifies; mismatched checksum aborts",
+  "unit tests: install flow, checksum verify, trust-tier gating",
+]
