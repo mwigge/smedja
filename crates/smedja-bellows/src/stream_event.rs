@@ -75,6 +75,15 @@ pub enum StreamEvent {
         reasoning: String,
     },
 
+    /// Mid-stream token usage update (informational; Done still carries final totals).
+    Usage { input_tok: u32, output_tok: u32 },
+
+    /// A partial chunk of a tool call's input arguments (display only).
+    ///
+    /// Clients that only care about complete tool calls can ignore this and wait
+    /// for the terminal `ToolCall` event.
+    ToolCallChunk { name: String, partial_input: String },
+
     /// Catchall for unknown future event types — never matched by the TUI.
     #[serde(other)]
     Unknown,
@@ -264,6 +273,31 @@ mod tests {
         assert!(json.contains(r#""type":"cowork_request""#));
         assert!(json.contains("uuid-123"));
         assert!(json.contains("bash"));
+    }
+
+    #[test]
+    fn usage_roundtrips() {
+        let ev = StreamEvent::Usage {
+            input_tok: 100,
+            output_tok: 50,
+        };
+        assert_eq!(roundtrip(&ev), ev);
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""type":"usage""#), "{json}");
+        assert!(json.contains("100"), "{json}");
+        assert!(json.contains("50"), "{json}");
+    }
+
+    #[test]
+    fn tool_call_chunk_roundtrips() {
+        let ev = StreamEvent::ToolCallChunk {
+            name: "bash".into(),
+            partial_input: r#"{"cmd":"ls"#.into(),
+        };
+        assert_eq!(roundtrip(&ev), ev);
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""type":"tool_call_chunk""#), "{json}");
+        assert!(json.contains("bash"), "{json}");
     }
 
     #[test]

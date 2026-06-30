@@ -4315,7 +4315,9 @@ async fn main() -> Result<()> {
                             });
                         }
                     }
-                    StreamEvent::Unknown => {}
+                    StreamEvent::Unknown
+                    | StreamEvent::Usage { .. }
+                    | StreamEvent::ToolCallChunk { .. } => {}
                 }
             }
 

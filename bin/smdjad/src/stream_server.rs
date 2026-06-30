@@ -236,6 +236,30 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                             evict_and_push(buf, line);
                         }
                     }
+                    TurnEvent::TokenUsage {
+                        input_tok,
+                        output_tok,
+                        ref turn_id,
+                        ..
+                    } => {
+                        let Some(tid) = turn_id else { continue };
+                        if let Some(buf) = store.get_mut(tid) {
+                            let line = json!({"type": "usage", "input_tok": input_tok, "output_tok": output_tok}).to_string();
+                            evict_and_push(buf, line);
+                        }
+                    }
+                    TurnEvent::ToolCallChunk {
+                        ref name,
+                        ref partial_input,
+                        ref turn_id,
+                        ..
+                    } => {
+                        let Some(tid) = turn_id else { continue };
+                        if let Some(buf) = store.get_mut(tid) {
+                            let line = json!({"type": "tool_call_chunk", "name": name, "partial_input": partial_input}).to_string();
+                            evict_and_push(buf, line);
+                        }
+                    }
                 }
             } // lock released here
               // Schedule buffer eviction after TTL so late-connecting stream
@@ -518,6 +542,30 @@ fn turn_event_to_ndjson(
                 step_n: *step_n,
                 args_display: args_display.clone(),
                 reasoning: reasoning.clone(),
+            });
+            (turn_id.clone(), line, false)
+        }
+        TurnEvent::TokenUsage {
+            input_tok,
+            output_tok,
+            turn_id,
+            ..
+        } => {
+            let line = ser(&StreamEvent::Usage {
+                input_tok: *input_tok,
+                output_tok: *output_tok,
+            });
+            (turn_id.clone(), line, false)
+        }
+        TurnEvent::ToolCallChunk {
+            name,
+            partial_input,
+            turn_id,
+            ..
+        } => {
+            let line = ser(&StreamEvent::ToolCallChunk {
+                name: name.clone(),
+                partial_input: partial_input.clone(),
             });
             (turn_id.clone(), line, false)
         }

@@ -133,6 +133,8 @@ async fn run_sse_loop(
     let mut buf = String::new();
     // Track the current SSE `event:` type across lines.
     let mut current_event: Option<String> = None;
+    // Track the active tool_use block (name) for input_json_delta chunks.
+    let mut current_tool_name: Option<String> = None;
     let mut input_tok: Option<u32> = None;
     let mut output_tok: Option<u32> = None;
     let mut ttft_ms: Option<i64> = None;
@@ -164,46 +166,98 @@ async fn run_sse_loop(
             }
 
             if let Some(data) = line.strip_prefix("data: ") {
-                if let Some(ev) = &current_event {
-                    match parse_anthropic_event(ev, data) {
-                        Ok(Some(delta)) => {
-                            if matches!(delta, Delta::Text(_)) && ttft_ms.is_none() {
-                                ttft_ms = Some(
-                                    request_start
-                                        .elapsed()
-                                        .as_millis()
-                                        .try_into()
-                                        .unwrap_or(i64::MAX),
-                                );
-                            }
-                            if let Delta::Usage {
-                                input_tokens,
-                                output_tokens,
-                                cache_read_tokens,
-                            } = delta
+                let Some(ev) = &current_event else {
+                    continue;
+                };
+
+                // Handle tool-use content block events before the generic parser.
+                if ev == "content_block_start" {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                        if v.get("content_block")
+                            .and_then(|b| b.get("type"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("tool_use")
+                        {
+                            current_tool_name = v
+                                .get("content_block")
+                                .and_then(|b| b.get("name"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned);
+                        }
+                    }
+                    continue;
+                }
+
+                if ev == "content_block_stop" {
+                    current_tool_name = None;
+                    continue;
+                }
+
+                if ev == "content_block_delta" {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(partial) = v
+                            .get("delta")
+                            .filter(|d| {
+                                d.get("type").and_then(serde_json::Value::as_str)
+                                    == Some("input_json_delta")
+                            })
+                            .and_then(|d| d.get("partial_json"))
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            let name = current_tool_name.clone().unwrap_or_default();
+                            if tx
+                                .send(Ok(Delta::ToolCallChunk {
+                                    name,
+                                    partial_input: partial.to_owned(),
+                                }))
+                                .await
+                                .is_err()
                             {
-                                input_tok = Some(input_tokens);
-                                output_tok = Some(output_tokens);
-                                if tx
-                                    .send(Ok(Delta::Usage {
-                                        input_tokens,
-                                        output_tokens,
-                                        cache_read_tokens,
-                                    }))
-                                    .await
-                                    .is_err()
-                                {
-                                    return (input_tok, output_tok, ttft_ms);
-                                }
-                            } else if tx.send(Ok(delta)).await.is_err() {
                                 return (input_tok, output_tok, ttft_ms);
                             }
+                            continue;
                         }
-                        Ok(None) => {}
-                        Err(e) => {
-                            let _ = tx.send(Err(e)).await;
+                    }
+                }
+
+                match parse_anthropic_event(ev, data) {
+                    Ok(Some(delta)) => {
+                        if matches!(delta, Delta::Text(_)) && ttft_ms.is_none() {
+                            ttft_ms = Some(
+                                request_start
+                                    .elapsed()
+                                    .as_millis()
+                                    .try_into()
+                                    .unwrap_or(i64::MAX),
+                            );
+                        }
+                        if let Delta::Usage {
+                            input_tokens,
+                            output_tokens,
+                            cache_read_tokens,
+                        } = delta
+                        {
+                            input_tok = Some(input_tokens);
+                            output_tok = Some(output_tokens);
+                            if tx
+                                .send(Ok(Delta::Usage {
+                                    input_tokens,
+                                    output_tokens,
+                                    cache_read_tokens,
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                return (input_tok, output_tok, ttft_ms);
+                            }
+                        } else if tx.send(Ok(delta)).await.is_err() {
                             return (input_tok, output_tok, ttft_ms);
                         }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return (input_tok, output_tok, ttft_ms);
                     }
                 }
             }

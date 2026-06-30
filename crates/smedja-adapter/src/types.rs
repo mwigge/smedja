@@ -182,6 +182,17 @@ pub enum Delta {
         /// (e.g. CLI adapters that do not surface cache counts).
         cache_read_tokens: u32,
     },
+    /// A partial chunk of a tool call's input arguments (streaming display only).
+    ///
+    /// Emitted for each `input_json_delta` / `function.arguments` fragment before
+    /// the full `ToolCall` arrives.  Consumers that only need complete tool calls
+    /// can ignore this variant.
+    ToolCallChunk {
+        /// Tool name (may be empty for intermediate OpenAI chunks).
+        name: String,
+        /// Partial argument JSON fragment.
+        partial_input: String,
+    },
 }
 
 #[cfg(test)]
