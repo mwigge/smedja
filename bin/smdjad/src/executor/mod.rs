@@ -335,6 +335,27 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     }
 }
 
+fn bash_blocked_patterns(workspace: &std::path::Path) -> Vec<String> {
+    #[derive(serde::Deserialize, Default)]
+    struct WorkspaceToml {
+        tools: Option<ToolsSection>,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct ToolsSection {
+        bash: Option<BashSection>,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct BashSection {
+        blocked_patterns: Option<Vec<String>>,
+    }
+    let path = workspace.join(".smedja").join("workspace.toml");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| toml::from_str::<WorkspaceToml>(&s).ok())
+        .and_then(|c| c.tools?.bash?.blocked_patterns)
+        .unwrap_or_default()
+}
+
 fn is_confirm_edits_enabled(workspace: &std::path::Path) -> bool {
     #[derive(serde::Deserialize, Default)]
     struct WorkspaceToml {
@@ -476,6 +497,41 @@ pub(crate) async fn execute_tool(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
 
+            // Blocked patterns — checked before any spawn, all permission modes.
+            for pat in bash_blocked_patterns(workspace) {
+                if cmd.contains(&*pat) {
+                    return format!("error: command blocked by policy (matched pattern: {pat})");
+                }
+            }
+
+            // Per-call env map — validate keys against the security blocklist.
+            const ENV_BLOCKLIST: &[&str] = &[
+                "PATH",
+                "LD_PRELOAD",
+                "LD_LIBRARY_PATH",
+                "HOME",
+                "USER",
+                "SHELL",
+            ];
+            let env_extra: Option<std::collections::HashMap<String, String>> =
+                input.get("env").and_then(Value::as_object).map(|map| {
+                    map.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                        .collect()
+                });
+            if let Some(ref env) = env_extra {
+                for key in env.keys() {
+                    if ENV_BLOCKLIST.contains(&key.as_str()) || key.starts_with("SMEDJA_") {
+                        return format!("error: env key '{key}' is not allowed");
+                    }
+                }
+            }
+            let timeout_secs = input.get("timeout_secs").and_then(Value::as_u64);
+            let stdin_bytes: Option<Vec<u8>> = input
+                .get("stdin")
+                .and_then(Value::as_str)
+                .map(|s| s.as_bytes().to_vec());
+
             // Enforce read-only mode for review sessions.
             if session.is_some_and(|s| !role_allows_write_bash(s)) {
                 let arity = smedja_assayer::classify_bash(cmd);
@@ -491,14 +547,15 @@ pub(crate) async fn execute_tool(
             // (auto/required/off) is enforced inside `run_confined`.
             let sandbox = SandboxExecutor::new();
             let raw = if SandboxExecutor::is_exempt(tool_name) {
-                super::exec_bash(cmd, workspace).await
+                super::exec_bash_ext(cmd, workspace, timeout_secs, env_extra, stdin_bytes).await
             } else {
                 let confined_root = confined_root_for(workspace);
                 let cmd_owned = cmd.to_owned();
                 let ws = workspace.to_owned();
                 sandbox
                     .run_confined(cmd, &confined_root, || async move {
-                        super::exec_bash(&cmd_owned, &ws).await
+                        super::exec_bash_ext(&cmd_owned, &ws, timeout_secs, env_extra, stdin_bytes)
+                            .await
                     })
                     .await
             };
@@ -2122,5 +2179,165 @@ mod tests {
             .decode(&encoded)
             .unwrap();
         assert_eq!(decoded, raw);
+    }
+
+    // --- WI-014: bash blocked_patterns ---
+
+    #[test]
+    fn bash_blocked_patterns_empty_when_no_workspace_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            super::bash_blocked_patterns(dir.path()).is_empty(),
+            "missing workspace.toml must return empty patterns"
+        );
+    }
+
+    #[test]
+    fn bash_blocked_patterns_loaded_from_workspace_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let smedja = dir.path().join(".smedja");
+        std::fs::create_dir_all(&smedja).unwrap();
+        std::fs::write(
+            smedja.join("workspace.toml"),
+            "[tools.bash]\nblocked_patterns = [\"rm -rf /\", \"curl * | sh\"]\n",
+        )
+        .unwrap();
+        let patterns = super::bash_blocked_patterns(dir.path());
+        assert_eq!(patterns, vec!["rm -rf /", "curl * | sh"]);
+    }
+
+    #[tokio::test]
+    async fn bash_blocked_pattern_match_returns_error() {
+        use smedja_ingot::{Ingot, IngotHandle};
+        use smedja_vault::Vault;
+        use tokio::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let smedja = dir.path().join(".smedja");
+        std::fs::create_dir_all(&smedja).unwrap();
+        std::fs::write(
+            smedja.join("workspace.toml"),
+            "[tools.bash]\nblocked_patterns = [\"rm -rf /\"]\n",
+        )
+        .unwrap();
+
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+
+        let result = super::execute_tool(
+            "bash",
+            r#"{"command":"rm -rf / --no-preserve-root"}"#,
+            dir.path(),
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        assert!(
+            result.contains("blocked by policy"),
+            "blocked command must return policy error, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_non_blocked_command_not_affected() {
+        use smedja_ingot::{Ingot, IngotHandle};
+        use smedja_vault::Vault;
+        use tokio::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let smedja = dir.path().join(".smedja");
+        std::fs::create_dir_all(&smedja).unwrap();
+        std::fs::write(
+            smedja.join("workspace.toml"),
+            "[tools.bash]\nblocked_patterns = [\"rm -rf /\"]\n",
+        )
+        .unwrap();
+
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+
+        let result = super::execute_tool(
+            "bash",
+            r#"{"command":"echo hello"}"#,
+            dir.path(),
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        assert!(
+            result.contains("hello"),
+            "non-blocked command must execute normally, got: {result}"
+        );
+    }
+
+    // --- WI-019: bash timeout_secs, env map, stdin ---
+
+    #[tokio::test]
+    async fn bash_env_blocklisted_key_rejected() {
+        use smedja_ingot::{Ingot, IngotHandle};
+        use smedja_vault::Vault;
+        use tokio::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+
+        let result = super::execute_tool(
+            "bash",
+            r#"{"command":"echo hi","env":{"PATH":"/evil"}}"#,
+            dir.path(),
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        assert!(
+            result.contains("not allowed"),
+            "blocklisted env key must return error, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_env_injected_into_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let env: std::collections::HashMap<String, String> =
+            [("MY_VAR".into(), "smedja_test".into())].into();
+        let result = crate::exec_bash_ext("echo $MY_VAR", dir.path(), None, Some(env), None).await;
+        assert!(
+            result.contains("smedja_test"),
+            "injected env var must appear in output, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_stdin_fed_to_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = crate::exec_bash_ext(
+            "cat",
+            dir.path(),
+            None,
+            None,
+            Some(b"hello from stdin".to_vec()),
+        )
+        .await;
+        assert!(
+            result.contains("hello from stdin"),
+            "stdin must be forwarded to command, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_secs_short_timeout_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = crate::exec_bash_ext("sleep 10", dir.path(), Some(1), None, None).await;
+        assert!(
+            result.contains("timed out"),
+            "short timeout must return timeout error, got: {result}"
+        );
     }
 }

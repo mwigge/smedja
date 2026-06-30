@@ -176,14 +176,26 @@ pub(crate) fn format_lsp_diagnostics(snapshot: &smedja_lsp::LspSnapshot) -> Opti
     ))
 }
 
-/// Returns `true` when context fill exceeds the 80% auto-summarisation threshold.
-pub(crate) fn context_pressure_exceeds_threshold(input_tokens: u32, context_window: usize) -> bool {
+/// Returns the auto-compact threshold from `val` (an optional env value string), defaulting to
+/// 0.85. Values below 0.5 are clamped to 0.5 to prevent spurious compaction.
+pub(crate) fn compact_threshold_from_env(val: Option<&str>) -> f64 {
+    val.and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.85)
+        .max(0.5)
+}
+
+/// Returns `true` when context fill exceeds the auto-summarisation threshold.
+pub(crate) fn context_pressure_exceeds_threshold(
+    input_tokens: u32,
+    context_window: usize,
+    threshold: f64,
+) -> bool {
     if context_window == 0 {
         return false;
     }
     #[allow(clippy::cast_precision_loss)]
     let ratio = f64::from(input_tokens) / context_window as f64;
-    ratio >= 0.80
+    ratio >= threshold
 }
 
 /// Builds the prompt sent to the LLM to produce a conversation summary.
@@ -1172,6 +1184,7 @@ impl TurnOrchestrator {
                         // auto-approved even in Auto/AcceptEdits — because the ops
                         // (apply/destroy) are dangerous and hard to reverse.
                         let push = Some((dispatcher.as_ref(), Some(turn_id.as_str())));
+                        let gate_mode = gate.mode().await;
                         let decision = if role.is_high_risk()
                             && crate::cowork::evaluate(
                                 crate::cowork::PermissionMode::Plan,
@@ -1183,6 +1196,34 @@ impl TurnOrchestrator {
                         } else {
                             gate.gate_tool(0, &tool_name, args_scrubbed, "", push).await
                         };
+                        // Record auto_approved when Auto mode bypassed a gate that Ask would
+                        // have held for human approval, so the audit trail shows the bypass.
+                        if matches!(&decision, Decision::Approve)
+                            && gate_mode == crate::cowork::PermissionMode::Auto
+                            && crate::cowork::evaluate(
+                                crate::cowork::PermissionMode::Ask,
+                                &tool_name,
+                            ) == crate::cowork::PermissionDecision::Ask
+                        {
+                            let ev = smedja_ingot::AuditEvent {
+                                id: Uuid::new_v4(),
+                                ts: Timestamp::now(),
+                                session_id: session_id.clone(),
+                                turn_id: Some(turn_id.clone()),
+                                action_type: "auto_approved".into(),
+                                actor: "smdjad".into(),
+                                tool_name: Some(tool_name.clone()),
+                                tool_call_id: Some(tool_call_id.clone()),
+                                ..smedja_ingot::AuditEvent::default()
+                            };
+                            if let Err(e) = ingot.record_timeline_event(ev).await {
+                                warn!(
+                                    turn_id = %turn_id,
+                                    error = %e,
+                                    "failed to record auto_approved event"
+                                );
+                            }
+                        }
                         match decision {
                             Decision::Approve => None,
                             Decision::Deny(reason) => Some(format!("denied: {reason}")),
@@ -1520,8 +1561,10 @@ impl TurnOrchestrator {
             }
         }
 
-        // 9b. Auto-summarise when context pressure exceeds 80%.
-        if context_pressure_exceeds_threshold(total_input_tokens, turn_context_window) {
+        // 9b. Auto-summarise when context pressure exceeds the configured threshold.
+        let cpt =
+            compact_threshold_from_env(std::env::var("SMEDJA_COMPACT_THRESHOLD").ok().as_deref());
+        if context_pressure_exceeds_threshold(total_input_tokens, turn_context_window, cpt) {
             let history: Vec<(String, String)> = mem
                 .messages()
                 .iter()
@@ -1600,7 +1643,12 @@ impl TurnOrchestrator {
                                 tracing::warn!(error = %e, "auto-summarise: vault upsert failed");
                             }
                         });
-                        tracing::debug!(session_id = %session_id, turn_n, "auto-summarise: context compacted");
+                        tracing::info!(
+                            session_id = %session_id,
+                            turn_n,
+                            threshold = cpt,
+                            "auto-summarise: context compacted"
+                        );
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -2445,17 +2493,47 @@ mod tests {
 
     #[test]
     fn pressure_below_threshold_is_not_exceeded() {
-        assert!(!super::context_pressure_exceeds_threshold(79_999, 100_000));
+        assert!(!super::context_pressure_exceeds_threshold(
+            79_999, 100_000, 0.85
+        ));
     }
 
     #[test]
     fn pressure_at_threshold_is_exceeded() {
-        assert!(super::context_pressure_exceeds_threshold(80_000, 100_000));
+        assert!(super::context_pressure_exceeds_threshold(
+            85_000, 100_000, 0.85
+        ));
     }
 
     #[test]
     fn pressure_with_zero_window_is_never_exceeded() {
-        assert!(!super::context_pressure_exceeds_threshold(1_000, 0));
+        assert!(!super::context_pressure_exceeds_threshold(1_000, 0, 0.85));
+    }
+
+    #[test]
+    fn pressure_with_custom_threshold_respects_it() {
+        assert!(super::context_pressure_exceeds_threshold(
+            75_000, 100_000, 0.70
+        ));
+        assert!(!super::context_pressure_exceeds_threshold(
+            74_999, 100_000, 0.75
+        ));
+    }
+
+    #[test]
+    fn compact_threshold_clamps_below_half() {
+        // Values below 0.5 are clamped to 0.5 — safety guard.
+        assert!(super::compact_threshold_from_env(Some("0.3")) >= 0.5);
+    }
+
+    #[test]
+    fn compact_threshold_default_is_eighty_five_percent() {
+        assert!((super::compact_threshold_from_env(None) - 0.85).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compact_threshold_reads_env_value() {
+        assert!((super::compact_threshold_from_env(Some("0.90")) - 0.90).abs() < f64::EPSILON);
     }
 
     // --- format_vault_recalled tests ---

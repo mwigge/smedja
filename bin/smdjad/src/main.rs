@@ -157,20 +157,60 @@ pub(crate) fn missing_param(name: &str) -> RpcError {
 /// Timeout for `exec_bash` commands (git diff on large repos, cargo clippy, etc.).
 const EXEC_BASH_TIMEOUT_SECS: u64 = 30;
 
+/// Maximum per-call timeout accepted via the `timeout_secs` input field.
+pub(crate) const SMEDJA_BASH_MAX_TIMEOUT_SECS: u64 = 600;
+
 /// Executes a bash command in `workspace` using `sh -c`, returning stdout or a
 /// formatted error string. Bounded by [`EXEC_BASH_TIMEOUT_SECS`]; a hung command
 /// (e.g. git diff on a large repo) returns a timeout error rather than blocking.
 pub(crate) async fn exec_bash(cmd: &str, workspace: &std::path::Path) -> String {
-    let run = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(workspace)
-        .output();
-    match tokio::time::timeout(std::time::Duration::from_secs(EXEC_BASH_TIMEOUT_SECS), run).await {
+    exec_bash_ext(cmd, workspace, None, None, None).await
+}
+
+/// Extended `exec_bash` supporting per-call timeout, extra env vars, and stdin.
+pub(crate) async fn exec_bash_ext(
+    cmd: &str,
+    workspace: &std::path::Path,
+    timeout_secs: Option<u64>,
+    env_extra: Option<std::collections::HashMap<String, String>>,
+    stdin_bytes: Option<Vec<u8>>,
+) -> String {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt as _;
+
+    let timeout = timeout_secs
+        .map(|t| t.min(SMEDJA_BASH_MAX_TIMEOUT_SECS))
+        .unwrap_or(EXEC_BASH_TIMEOUT_SECS);
+
+    let mut builder = tokio::process::Command::new("sh");
+    builder.arg("-c").arg(cmd).current_dir(workspace);
+    if let Some(ref env_map) = env_extra {
+        for (k, v) in env_map {
+            builder.env(k, v);
+        }
+    }
+
+    let run = async move {
+        if let Some(bytes) = stdin_bytes {
+            builder
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = builder.spawn()?;
+            if let Some(mut h) = child.stdin.take() {
+                let _ = h.write_all(&bytes).await;
+            }
+            child.wait_with_output().await
+        } else {
+            builder.output().await
+        }
+    };
+
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout), run).await {
         Ok(Ok(out)) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
         Ok(Ok(out)) => format!("error: {}", String::from_utf8_lossy(&out.stderr)),
         Ok(Err(e)) => format!("error: {e}"),
-        Err(_) => format!("error: command timed out after {EXEC_BASH_TIMEOUT_SECS}s"),
+        Err(_) => format!("error: command timed out after {timeout}s"),
     }
 }
 
@@ -812,6 +852,25 @@ async fn main() -> anyhow::Result<()> {
     }
 
     init_tracing();
+
+    // Validate SMEDJA_COMPACT_THRESHOLD at startup — reject invalid values early.
+    if let Ok(val) = std::env::var("SMEDJA_COMPACT_THRESHOLD") {
+        match val.parse::<f64>() {
+            Ok(t) if t < 0.5 => {
+                anyhow::bail!(
+                    "SMEDJA_COMPACT_THRESHOLD={val} is below the minimum of 0.5; \
+                     set it to a value in [0.5, 1.0] or unset it to use the default (0.85)"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    value = %val,
+                    "SMEDJA_COMPACT_THRESHOLD is not a valid float; using default 0.85"
+                );
+            }
+            Ok(_) => {}
+        }
+    }
 
     // Install the W3C trace-context propagator process-wide so outbound HTTP
     // calls inject `traceparent`/`tracestate` and inbound contexts are
