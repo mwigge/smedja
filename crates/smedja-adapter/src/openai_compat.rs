@@ -163,17 +163,22 @@ pub struct OpenAiCompatProvider {
 
 impl OpenAiCompatProvider {
     /// Creates a provider for `spec` using the given API key.
+    ///
+    /// The `gen_ai.system` `OTel` attribute is set to `spec.name()` so that
+    /// traces identify the actual provider (e.g. `"groq"`, `"deepseek"`)
+    /// rather than the generic `"openai"`.
     #[must_use]
     pub fn new(spec: OpenAiCompatSpec, api_key: impl Into<String>) -> Self {
         Self {
             spec,
-            inner: OpenAiProvider::new(spec.base_url, api_key),
+            inner: OpenAiProvider::new_with_system(spec.base_url, api_key, spec.name()),
         }
     }
 
     /// Creates a provider for `spec` with an explicit base URL override.
     ///
     /// Used when a service permits redirecting its endpoint (e.g. staging).
+    /// The `gen_ai.system` attribute is still set to `spec.name()`.
     #[must_use]
     pub fn with_base_url(
         spec: OpenAiCompatSpec,
@@ -182,7 +187,7 @@ impl OpenAiCompatProvider {
     ) -> Self {
         Self {
             spec,
-            inner: OpenAiProvider::new(base_url, api_key),
+            inner: OpenAiProvider::new_with_system(base_url, api_key, spec.name()),
         }
     }
 
@@ -442,5 +447,37 @@ mod tests {
     #[test]
     fn xai_preset_sets_correct_base_url() {
         assert!(XAI.base_url.contains("x.ai"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Provider name used for OTel gen_ai.system attribution
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn spec_name_returns_correct_provider_string_for_known_vars() {
+        assert_eq!(GROQ.name(), "groq");
+        assert_eq!(DEEPSEEK.name(), "deepseek");
+        assert_eq!(TOGETHER.name(), "together");
+        assert_eq!(PERPLEXITY.name(), "perplexity");
+        assert_eq!(XAI.name(), "xai");
+        assert_eq!(MINIMAX.name(), "minimax");
+        assert_eq!(BERGET.name(), "berget");
+        assert_eq!(OPENCODE.name(), "opencode");
+    }
+
+    #[test]
+    fn spec_name_falls_back_for_unknown_env_var() {
+        let unknown = OpenAiCompatSpec {
+            env_var: "UNKNOWN_API_KEY",
+            base_url: "https://example.com",
+        };
+        assert_eq!(unknown.name(), "openai-compat");
+    }
+
+    #[test]
+    fn provider_inner_system_name_matches_spec_name() {
+        let provider = OpenAiCompatProvider::new(GROQ, "test-key");
+        // The inner OpenAiProvider should report "groq", not "openai".
+        assert_eq!(provider.inner.system_name(), "groq");
     }
 }

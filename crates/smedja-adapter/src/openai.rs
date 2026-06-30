@@ -14,19 +14,44 @@ use crate::{
 ///
 /// Sends requests to the `/v1/chat/completions` endpoint and translates the
 /// SSE response into a [`DeltaStream`].
+///
+/// The `system_name` field controls the `gen_ai.system` span attribute so that
+/// providers that delegate to this struct (e.g. Groq, `DeepSeek`, Ollama) appear
+/// under their own name in traces rather than `"openai"`.
 pub struct OpenAiProvider {
     client: Client,
     base_url: String,
     api_key: String,
+    /// Value written to the `gen_ai.system` `OTel` attribute. Defaults to
+    /// `"openai"` when constructed via [`OpenAiProvider::new`].
+    system_name: &'static str,
 }
 
 impl OpenAiProvider {
-    /// Creates a new [`OpenAiProvider`].
+    /// Creates a new [`OpenAiProvider`] attributed to `"openai"` in traces.
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
             client: Client::new(),
             base_url: base_url.into(),
             api_key: api_key.into(),
+            system_name: "openai",
+        }
+    }
+
+    /// Creates a new [`OpenAiProvider`] with an explicit `gen_ai.system` name.
+    ///
+    /// Use this when the provider is not `OpenAI` itself (e.g. `"groq"`,
+    /// `"ollama"`) so that `OTel` traces carry the correct provider attribution.
+    pub fn new_with_system(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        system_name: &'static str,
+    ) -> Self {
+        Self {
+            client: Client::new(),
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            system_name,
         }
     }
 
@@ -40,7 +65,14 @@ impl OpenAiProvider {
             client,
             base_url: base_url.into(),
             api_key: api_key.into(),
+            system_name: "openai",
         }
+    }
+
+    /// Returns the `gen_ai.system` name this provider reports in `OTel` spans.
+    #[must_use]
+    pub fn system_name(&self) -> &'static str {
+        self.system_name
     }
 }
 
@@ -109,6 +141,7 @@ impl Provider for OpenAiProvider {
         let model_name_for_span = body["model"].as_str().unwrap_or("").to_owned();
         let max_tokens_for_span: Option<i64> = body["max_tokens"].as_i64();
 
+        let system_name = self.system_name;
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Delta, AdapterError>>(64);
 
         tokio::spawn(async move {
@@ -124,7 +157,10 @@ impl Provider for OpenAiProvider {
                 tel::OPERATION_NAME,
                 tel::OPERATION_CHAT,
             ));
-            llm_span.set_attribute(opentelemetry::KeyValue::new(tel::GEN_AI_SYSTEM, "openai"));
+            llm_span.set_attribute(opentelemetry::KeyValue::new(
+                tel::GEN_AI_SYSTEM,
+                system_name,
+            ));
             llm_span.set_attribute(opentelemetry::KeyValue::new(
                 tel::REQUEST_MODEL,
                 model_name_for_span.clone(),

@@ -32,6 +32,9 @@ pub struct OllamaProvider {
 
 impl OllamaProvider {
     /// Creates a provider pointing at `base_url` (no API key needed).
+    ///
+    /// Sets `gen_ai.system = "ollama"` on `OTel` spans so traces distinguish
+    /// Ollama from `OpenAI` despite sharing the same wire protocol.
     #[must_use]
     pub fn new(base_url: impl Into<String>) -> Self {
         let base_url = base_url.into();
@@ -39,7 +42,7 @@ impl OllamaProvider {
         let api_base = format!("{base_url}/v1");
         Self {
             base_url,
-            inner: OpenAiProvider::new(api_base, ""),
+            inner: OpenAiProvider::new_with_system(api_base, "", "ollama"),
         }
     }
 
@@ -110,5 +113,12 @@ mod tests {
     fn ollama_provider_custom_base_url() {
         let provider = OllamaProvider::new("http://my-gpu-box:11434");
         assert_eq!(provider.base_url, "http://my-gpu-box:11434");
+    }
+
+    #[test]
+    fn ollama_provider_reports_ollama_as_system_name() {
+        let provider = OllamaProvider::new("http://localhost:11434");
+        // Traces must attribute to "ollama", not "openai".
+        assert_eq!(provider.inner.system_name(), "ollama");
     }
 }
