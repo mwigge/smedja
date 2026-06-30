@@ -45,6 +45,10 @@ pub struct Limits {
     /// `None` defers to the daemon default (`SMEDJA_MAX_TOOL_TURNS`, default 10).
     #[serde(default)]
     pub max_tool_turns: Option<u32>,
+    /// Maximum number of slices that run concurrently.
+    /// `None` defaults to `min(4, slice_count)`.
+    #[serde(default)]
+    pub max_parallel_slices: Option<u32>,
 }
 
 /// Verification gate configuration.
@@ -248,6 +252,36 @@ mod tests {
         std::fs::write(&path, json).unwrap();
         let cfg = LoopConfig::from_file(&path).unwrap();
         assert_eq!(cfg.limits.max_tool_turns, Some(25));
+    }
+
+    #[test]
+    fn max_parallel_slices_defaults_to_none_when_absent() {
+        let json = minimal_json(1);
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("loop.json");
+        std::fs::write(&path, &json).unwrap();
+        let cfg = LoopConfig::from_file(&path).unwrap();
+        assert_eq!(
+            cfg.limits.max_parallel_slices, None,
+            "absent field must default to None"
+        );
+    }
+
+    #[test]
+    fn max_parallel_slices_loaded_from_json() {
+        let json = r#"{
+            "version": 1,
+            "limits": {"max_attempts": 3, "agent_timeout_s": 60, "max_parallel_slices": 3},
+            "roles": [],
+            "verification": {"command": "true"},
+            "review": {"per_slice": false, "required": false},
+            "publication": {"max_pr_lines": 400}
+        }"#;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("loop.json");
+        std::fs::write(&path, json).unwrap();
+        let cfg = LoopConfig::from_file(&path).unwrap();
+        assert_eq!(cfg.limits.max_parallel_slices, Some(3));
     }
 
     #[test]

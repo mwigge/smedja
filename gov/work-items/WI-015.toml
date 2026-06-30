@@ -1,6 +1,6 @@
 id     = "WI-015"
 title  = "Loop engine: parallel slice execution via JoinSet"
-status = "planned"
+status = "done"
 priority = "P3"
 
 [detail]

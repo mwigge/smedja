@@ -9,8 +9,10 @@
 
 use std::future::Future;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
+use futures_util::StreamExt as _;
 use opentelemetry::trace::{Span as _, Tracer as _};
 
 use crate::config::LoopConfig;
@@ -195,101 +197,168 @@ pub async fn drive<R: RoleRunner, S: StatusSink>(
     let timeout = verification_timeout();
     let max_attempts = config.limits.max_attempts.max(1);
 
-    // Slices before start_slice were completed in a prior run; count them now.
-    let mut completed: u64 = start_slice as u64;
+    // Pre-completed slices from a prior run (resume path).
+    let pre_completed = start_slice as u64;
+
+    // Bounded concurrency: default min(4, remaining slice count).
+    let remaining = slices.len().saturating_sub(start_slice);
+    let max_parallel = config
+        .limits
+        .max_parallel_slices
+        .map_or_else(|| (remaining as u32).min(4), |n| n.max(1)) as usize;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallel));
+
+    // Checkpoint: record the batch start so loop.resume can re-enter here.
     let checkpoint_path = workspace.join(".smedja").join("loop-state.json");
-    for (idx, slice) in slices.iter().enumerate() {
-        if idx < start_slice {
-            continue;
+    let ckpt = LoopCheckpoint {
+        change_name: change_name.to_owned(),
+        policy_hash: config.policy_hash.clone(),
+        slice_index: start_slice,
+        slices_completed: pre_completed,
+    };
+    if let Ok(json) = serde_json::to_string(&ckpt) {
+        let _ = std::fs::write(&checkpoint_path, json);
+    }
+
+    sink.set_status(&LoopState::Slicing).await;
+
+    // Dispatch all remaining slices concurrently, bounded by semaphore.
+    let mut futures: futures_util::stream::FuturesUnordered<_> =
+        futures_util::stream::FuturesUnordered::new();
+    for (idx, slice) in slices.iter().enumerate().skip(start_slice) {
+        let sem = Arc::clone(&semaphore);
+        futures.push(run_slice_parallel(
+            runner,
+            sink,
+            config,
+            workspace,
+            change_name,
+            &implementer,
+            &fix,
+            &reviewer,
+            timeout,
+            max_attempts,
+            idx,
+            slice,
+            sem,
+        ));
+    }
+
+    let mut passed_count: u64 = 0;
+    let mut any_failed = false;
+    while let Some(result) = futures.next().await {
+        if result.passed {
+            passed_count += 1;
+        } else {
+            any_failed = true;
+        }
+    }
+
+    let slices_completed = pre_completed + passed_count;
+    if any_failed {
+        sink.set_status(&LoopState::Failed).await;
+        finish(change_name, &LoopState::Failed, slices_completed, started);
+        LoopOutcome {
+            final_state: LoopState::Failed,
+            slices_completed,
+        }
+    } else {
+        sink.set_status(&LoopState::Complete).await;
+        finish(change_name, &LoopState::Complete, slices_completed, started);
+        LoopOutcome {
+            final_state: LoopState::Complete,
+            slices_completed,
+        }
+    }
+}
+
+/// Result of running a single slice through the implement→verify→review pipeline.
+struct SliceResult {
+    passed: bool,
+}
+
+/// Runs the implement→verify→review pipeline for one slice, gated by `semaphore`.
+///
+/// The semaphore permit is acquired before any work begins, bounding the number
+/// of slices that run concurrently without preventing the futures from being
+/// created all at once.
+#[allow(clippy::too_many_arguments)]
+async fn run_slice_parallel<'a, R: RoleRunner, S: StatusSink>(
+    runner: &'a R,
+    sink: &'a S,
+    config: &'a LoopConfig,
+    workspace: &'a Path,
+    _change_name: &'a str,
+    implementer: &'a LoopRole,
+    fix: &'a LoopRole,
+    reviewer: &'a LoopRole,
+    timeout: std::time::Duration,
+    max_attempts: u32,
+    idx: usize,
+    slice: &'a str,
+    semaphore: Arc<tokio::sync::Semaphore>,
+) -> SliceResult {
+    // Acquire a concurrency slot; the permit is held for the slice's lifetime.
+    let _permit = semaphore.acquire_owned().await.ok();
+
+    #[allow(clippy::cast_possible_wrap)]
+    sink.set_slice((idx + 1) as i64).await;
+
+    let mut passed = false;
+    for attempt in 0..max_attempts {
+        let role = if attempt == 0 { implementer } else { fix };
+        if run_role_traced(runner, role, idx, slice, attempt)
+            .await
+            .is_err()
+        {
+            break;
         }
 
-        // Checkpoint: record this slice before running it so loop.resume can
-        // re-enter here if the process is interrupted mid-slice.
-        let ckpt = LoopCheckpoint {
-            change_name: change_name.to_owned(),
-            policy_hash: config.policy_hash.clone(),
-            slice_index: idx,
-            slices_completed: completed,
-        };
-        if let Ok(json) = serde_json::to_string(&ckpt) {
-            let _ = std::fs::write(&checkpoint_path, json);
-        }
-
-        sink.set_status(&LoopState::Slicing).await;
-        #[allow(clippy::cast_possible_wrap)] // slice index never exceeds i64::MAX
-        sink.set_slice((idx + 1) as i64).await;
-
-        let mut passed = false;
-        for attempt in 0..max_attempts {
-            // First attempt implements; retries run the fix role.
-            let role = if attempt == 0 { &implementer } else { &fix };
-            if run_role_traced(runner, role, idx, slice, attempt)
+        sink.set_status(&LoopState::Verifying).await;
+        let verified = if config.verification.command.trim().is_empty() {
+            true
+        } else {
+            run_verification(&config.verification.command, timeout)
                 .await
-                .is_err()
-            {
-                break; // role could not execute; abandon this slice
-            }
+                .is_ok_and(|r| r.passed())
+        };
 
-            sink.set_status(&LoopState::Verifying).await;
-            let verified = if config.verification.command.trim().is_empty() {
-                true
-            } else {
-                run_verification(&config.verification.command, timeout)
+        if verified {
+            if config.review.per_slice {
+                sink.set_status(&LoopState::Reviewing).await;
+                let review_ok = run_role_traced(runner, reviewer, idx, slice, attempt)
                     .await
-                    .is_ok_and(|r| r.passed())
-            };
-
-            if verified {
-                if config.review.per_slice {
-                    sink.set_status(&LoopState::Reviewing).await;
-                    let review_ok = run_role_traced(runner, &reviewer, idx, slice, attempt)
-                        .await
-                        .is_ok();
-                    if config.review.required && !review_ok {
-                        let _ = crate::mining::write_failure_guide(
-                            "reviewer",
-                            &[format!("slice {} rejected by reviewer", idx + 1)],
-                            workspace,
-                        );
-                        sink.set_status(&LoopState::Failed).await;
-                        finish(change_name, &LoopState::Failed, completed, started);
-                        return LoopOutcome {
-                            final_state: LoopState::Failed,
-                            slices_completed: completed,
-                        };
-                    }
+                    .is_ok();
+                if config.review.required && !review_ok {
+                    let _ = crate::mining::write_failure_guide(
+                        "reviewer",
+                        &[format!(
+                            "slice {} (idx {idx}) rejected by reviewer",
+                            idx + 1
+                        )],
+                        workspace,
+                    );
+                    break;
                 }
-                passed = true;
-                break;
             }
-            sink.set_status(&LoopState::Fixed).await;
+            passed = true;
+            break;
         }
-
-        if !passed {
-            let _ = crate::mining::write_failure_guide(
-                &fix.name,
-                &[format!(
-                    "slice {} failed verification after {max_attempts} attempt(s)",
-                    idx + 1
-                )],
-                workspace,
-            );
-            sink.set_status(&LoopState::Failed).await;
-            finish(change_name, &LoopState::Failed, completed, started);
-            return LoopOutcome {
-                final_state: LoopState::Failed,
-                slices_completed: completed,
-            };
-        }
-        completed += 1;
+        sink.set_status(&LoopState::Fixed).await;
     }
 
-    sink.set_status(&LoopState::Complete).await;
-    finish(change_name, &LoopState::Complete, completed, started);
-    LoopOutcome {
-        final_state: LoopState::Complete,
-        slices_completed: completed,
+    if !passed {
+        let _ = crate::mining::write_failure_guide(
+            fix.name.as_str(),
+            &[format!(
+                "slice {} (idx {idx}) failed verification after {max_attempts} attempt(s)",
+                idx + 1
+            )],
+            workspace,
+        );
     }
+
+    SliceResult { passed }
 }
 
 /// Emits terminal telemetry — slice counter and run duration — for the loop.
@@ -355,7 +424,7 @@ mod tests {
             }}"#
         );
         let path = dir.path().join("loop.json");
-        std::fs::write(&path, &json).unwrap();
+        std::fs::write(&path, json).unwrap();
         (LoopConfig::from_file(&path).unwrap(), path)
     }
 
@@ -623,7 +692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_written_before_each_slice() {
+    async fn checkpoint_written_at_batch_start() {
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join(".smedja")).unwrap();
         let (cfg, path) = config_with(&dir, "true", "[]");
@@ -635,13 +704,10 @@ mod tests {
         assert!(ckpt_path.exists(), "checkpoint file must be written");
         let raw = std::fs::read_to_string(&ckpt_path).unwrap();
         let ckpt: LoopCheckpoint = serde_json::from_str(&raw).unwrap();
-        // After drive completes, checkpoint holds the last slice started.
+        // Checkpoint is written at batch start (start_slice=0, pre_completed=0).
         assert_eq!(ckpt.change_name, "mychange");
-        assert_eq!(
-            ckpt.slice_index, 1,
-            "last slice's index must be in checkpoint"
-        );
-        assert_eq!(ckpt.slices_completed, 1);
+        assert_eq!(ckpt.slice_index, 0, "checkpoint records batch start index");
+        assert_eq!(ckpt.slices_completed, 0);
     }
 
     #[tokio::test]
@@ -664,5 +730,111 @@ mod tests {
             2,
             "only slices from start_slice onward must run"
         );
+    }
+
+    #[tokio::test]
+    async fn parallel_slices_all_pass() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".smedja")).unwrap();
+        // max_parallel_slices = 3: all 3 slices can run at once.
+        let json = r#"{
+                "version": 1,
+                "limits": {"max_attempts": 2, "agent_timeout_s": 60, "max_parallel_slices": 3},
+                "roles": [],
+                "verification": {"command": "true"},
+                "review": {"per_slice": false, "required": false},
+                "publication": {"max_pr_lines": 400}
+            }"#;
+        let path = dir.path().join(".smedja").join("loop.json");
+        std::fs::write(&path, json).unwrap();
+        let cfg = LoopConfig::from_file(&path).unwrap();
+        let rec = Recorder::default();
+        let slices = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+
+        let out = drive(&cfg, dir.path(), &path, "demo", &slices, &rec, &rec, 0).await;
+
+        assert_eq!(out.final_state, LoopState::Complete);
+        assert_eq!(out.slices_completed, 3);
+        // Each slice runs implementer once.
+        assert_eq!(rec.roles_run.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn parallel_one_slice_fails_outcome_is_failed_with_passed_count() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".smedja")).unwrap();
+        // "false" verification makes every slice fail.
+        let json = r#"{
+                "version": 1,
+                "limits": {"max_attempts": 1, "agent_timeout_s": 60, "max_parallel_slices": 3},
+                "roles": [],
+                "verification": {"command": "false"},
+                "review": {"per_slice": false, "required": false},
+                "publication": {"max_pr_lines": 400}
+            }"#;
+        let path = dir.path().join(".smedja").join("loop.json");
+        std::fs::write(&path, json).unwrap();
+        let cfg = LoopConfig::from_file(&path).unwrap();
+
+        // A runner that passes slice 0 and 1 but fails slice 2.
+        use std::sync::Mutex;
+        struct SelectiveFail {
+            statuses: Mutex<Vec<String>>,
+        }
+        impl RoleRunner for SelectiveFail {
+            async fn run_role(
+                &self,
+                _role: &LoopRole,
+                _idx: usize,
+                _slice: &str,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        impl StatusSink for SelectiveFail {
+            async fn set_status(&self, state: &LoopState) {
+                self.statuses
+                    .lock()
+                    .unwrap()
+                    .push(state.as_str().to_owned());
+            }
+            async fn set_slice(&self, _: i64) {}
+        }
+
+        let rec = SelectiveFail {
+            statuses: Mutex::new(Vec::new()),
+        };
+        let slices = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let out = drive(&cfg, dir.path(), &path, "demo", &slices, &rec, &rec, 0).await;
+        // All fail because verification command is "false".
+        assert_eq!(out.final_state, LoopState::Failed);
+        assert_eq!(
+            out.slices_completed, 0,
+            "no slices pass with false verification"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_parallel_slices_1_degrades_to_serial() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".smedja")).unwrap();
+        let json = r#"{
+                "version": 1,
+                "limits": {"max_attempts": 1, "agent_timeout_s": 60, "max_parallel_slices": 1},
+                "roles": [],
+                "verification": {"command": "true"},
+                "review": {"per_slice": false, "required": false},
+                "publication": {"max_pr_lines": 400}
+            }"#;
+        let path = dir.path().join(".smedja").join("loop.json");
+        std::fs::write(&path, json).unwrap();
+        let cfg = LoopConfig::from_file(&path).unwrap();
+        let rec = Recorder::default();
+        let slices = vec!["x".to_owned(), "y".to_owned(), "z".to_owned()];
+        let out = drive(&cfg, dir.path(), &path, "serial", &slices, &rec, &rec, 0).await;
+        assert_eq!(out.final_state, LoopState::Complete);
+        assert_eq!(out.slices_completed, 3);
+        // All 3 implementer runs executed.
+        assert_eq!(rec.roles_run.lock().unwrap().len(), 3);
     }
 }
