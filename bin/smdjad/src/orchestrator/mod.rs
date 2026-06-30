@@ -1180,56 +1180,77 @@ impl TurnOrchestrator {
                         };
                         let args_scrubbed =
                             serde_json::from_str(&tool_input).unwrap_or(serde_json::Value::Null);
-                        // High-risk roles (IaC) always confirm a mutation — never
-                        // auto-approved even in Auto/AcceptEdits — because the ops
-                        // (apply/destroy) are dangerous and hard to reverse.
-                        let push = Some((dispatcher.as_ref(), Some(turn_id.as_str())));
-                        let gate_mode = gate.mode().await;
-                        let decision = if role.is_high_risk()
-                            && crate::cowork::evaluate(
-                                crate::cowork::PermissionMode::Plan,
-                                &tool_name,
-                            ) == crate::cowork::PermissionDecision::Deny
-                        {
-                            gate.gate_tool_forced_ask(0, &tool_name, args_scrubbed, "", push)
-                                .await
+
+                        // Declarative permission rules take priority over session mode.
+                        let perm_rules = crate::cowork::load_permission_rules(&workspace_root);
+                        let rule_decision = crate::cowork::evaluate_permission_rules(
+                            &perm_rules,
+                            &tool_name,
+                            &args_scrubbed,
+                        );
+
+                        if matches!(rule_decision, Some(crate::cowork::PermissionDecision::Deny)) {
+                            // Deny before reaching the cowork gate; no audit event needed.
+                            Some(format!(
+                                "denied: blocked by permission rule for {tool_name}"
+                            ))
                         } else {
-                            gate.gate_tool(0, &tool_name, args_scrubbed, "", push).await
-                        };
-                        // Record auto_approved when Auto mode bypassed a gate that Ask would
-                        // have held for human approval, so the audit trail shows the bypass.
-                        if matches!(&decision, Decision::Approve)
-                            && gate_mode == crate::cowork::PermissionMode::Auto
-                            && crate::cowork::evaluate(
-                                crate::cowork::PermissionMode::Ask,
-                                &tool_name,
-                            ) == crate::cowork::PermissionDecision::Ask
-                        {
-                            let ev = smedja_ingot::AuditEvent {
-                                id: Uuid::new_v4(),
-                                ts: Timestamp::now(),
-                                session_id: session_id.clone(),
-                                turn_id: Some(turn_id.clone()),
-                                action_type: "auto_approved".into(),
-                                actor: "smdjad".into(),
-                                tool_name: Some(tool_name.clone()),
-                                tool_call_id: Some(tool_call_id.clone()),
-                                ..smedja_ingot::AuditEvent::default()
+                            // High-risk roles (IaC) always confirm a mutation — never
+                            // auto-approved even in Auto/AcceptEdits — because the ops
+                            // (apply/destroy) are dangerous and hard to reverse.
+                            let push = Some((dispatcher.as_ref(), Some(turn_id.as_str())));
+                            let gate_mode = gate.mode().await;
+                            let decision = if matches!(
+                                rule_decision,
+                                Some(crate::cowork::PermissionDecision::Allow)
+                            ) {
+                                Decision::Approve
+                            } else if role.is_high_risk()
+                                && crate::cowork::evaluate(
+                                    crate::cowork::PermissionMode::Plan,
+                                    &tool_name,
+                                ) == crate::cowork::PermissionDecision::Deny
+                            {
+                                gate.gate_tool_forced_ask(0, &tool_name, args_scrubbed, "", push)
+                                    .await
+                            } else {
+                                gate.gate_tool(0, &tool_name, args_scrubbed, "", push).await
                             };
-                            if let Err(e) = ingot.record_timeline_event(ev).await {
-                                warn!(
-                                    turn_id = %turn_id,
-                                    error = %e,
-                                    "failed to record auto_approved event"
-                                );
+                            // Record auto_approved when Auto mode bypassed a gate that Ask would
+                            // have held for human approval, so the audit trail shows the bypass.
+                            if matches!(&decision, Decision::Approve)
+                                && gate_mode == crate::cowork::PermissionMode::Auto
+                                && crate::cowork::evaluate(
+                                    crate::cowork::PermissionMode::Ask,
+                                    &tool_name,
+                                ) == crate::cowork::PermissionDecision::Ask
+                            {
+                                let ev = smedja_ingot::AuditEvent {
+                                    id: Uuid::new_v4(),
+                                    ts: Timestamp::now(),
+                                    session_id: session_id.clone(),
+                                    turn_id: Some(turn_id.clone()),
+                                    action_type: "auto_approved".into(),
+                                    actor: "smdjad".into(),
+                                    tool_name: Some(tool_name.clone()),
+                                    tool_call_id: Some(tool_call_id.clone()),
+                                    ..smedja_ingot::AuditEvent::default()
+                                };
+                                if let Err(e) = ingot.record_timeline_event(ev).await {
+                                    warn!(
+                                        turn_id = %turn_id,
+                                        error = %e,
+                                        "failed to record auto_approved event"
+                                    );
+                                }
                             }
-                        }
-                        match decision {
-                            Decision::Approve => None,
-                            Decision::Deny(reason) => Some(format!("denied: {reason}")),
-                            Decision::Modify(new_input) => {
-                                tool_input = new_input;
-                                None
+                            match decision {
+                                Decision::Approve => None,
+                                Decision::Deny(reason) => Some(format!("denied: {reason}")),
+                                Decision::Modify(new_input) => {
+                                    tool_input = new_input;
+                                    None
+                                }
                             }
                         }
                     };

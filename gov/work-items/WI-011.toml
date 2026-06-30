@@ -1,6 +1,6 @@
 id     = "WI-011"
 title  = "Declarative per-tool permission rules in workspace config"
-status = "planned"
+status = "done"
 priority = "P2"
 
 [detail]
