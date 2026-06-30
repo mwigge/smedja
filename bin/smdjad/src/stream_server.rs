@@ -579,7 +579,18 @@ fn turn_event_to_ndjson(
             });
             (turn_id.clone(), line, false)
         }
-        TurnEvent::HistoryReplaced { turn_id, .. } => (Some(turn_id.clone()), String::new(), false),
+        TurnEvent::HistoryReplaced {
+            turn_id,
+            summary_tokens,
+            ..
+        } => {
+            let line = serde_json::json!({
+                "type": "history_replaced",
+                "summary_tokens": summary_tokens
+            })
+            .to_string();
+            (Some(turn_id.clone()), line, false)
+        }
     }
 }
 

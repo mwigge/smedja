@@ -1095,9 +1095,13 @@ fn status_bar_line(ctx: &ModuleCtx<'_>, no_color: bool) -> Line<'static> {
     };
 
     let mut spans: Vec<Span<'static>> = Vec::new();
-    // Mode pip — input vs scroll.
+    // Mode pip — input (insert/normal) vs scroll.
     let (pip, pip_label) = if ctx.input_mode {
-        ("●", "INSERT")
+        if ctx.vim_normal_mode {
+            ("◇", "NORMAL")
+        } else {
+            ("●", "INSERT")
+        }
     } else {
         ("◆", "SCROLL")
     };
@@ -1133,9 +1137,9 @@ fn status_bar_line(ctx: &ModuleCtx<'_>, no_color: bool) -> Line<'static> {
     ));
     if let Some(pct) = ctx.ctx_pct {
         spans.push(sep());
-        let color = if pct >= 80 {
+        let color = if pct >= 95 {
             p.error
-        } else if pct >= 60 {
+        } else if pct >= 80 {
             p.warn
         } else {
             p.text_dim
@@ -2986,6 +2990,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         runner: Some(&state.runner),
         pending: state.pending_task_id.is_some(),
         input_mode: !state.scroll_focus,
+        vim_normal_mode: state.vim_input_mode == InputMode::Normal,
         ctx_pct,
     };
     // Starship-style segmented status line (left), with a dim discoverability
@@ -3405,6 +3410,52 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     // -- Slash-completion popup -----------------------------------------------
     if state.slash_popup_visible && !state.slash_completions.is_empty() {
         render_slash_popup(frame, area, state);
+    }
+
+    // -- Session browser overlay ----------------------------------------------
+    if state.session_browser_open && !state.session_rail_items.is_empty() {
+        let items = &state.session_rail_items;
+        let total = items.len();
+        let cursor = state.session_browser_cursor;
+        #[allow(clippy::cast_possible_truncation)]
+        let popup_h = (total as u16 + 2).min(area.height.saturating_sub(2));
+        let popup_w = 40u16.min(area.width);
+        let popup_x = area.x + area.width.saturating_sub(popup_w) / 2;
+        let popup_y = area.y + area.height.saturating_sub(popup_h) / 2;
+        let popup_rect = ratatui::layout::Rect::new(popup_x, popup_y, popup_w, popup_h);
+        let browser_lines: Vec<Line<'_>> = items
+            .iter()
+            .enumerate()
+            .map(|(i, (_id, label))| {
+                let text = format!(" {label}");
+                if i == cursor {
+                    Line::from(Span::styled(
+                        text,
+                        Style::default()
+                            .fg(p.bg)
+                            .bg(p.text_bright)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                } else {
+                    Line::from(Span::styled(text, Style::default().fg(p.text)))
+                }
+            })
+            .collect();
+        let browser_title = format!(
+            " sessions {}/{} ",
+            cursor.saturating_add(1).min(total),
+            total
+        );
+        frame.render_widget(Clear, popup_rect);
+        frame.render_widget(
+            Paragraph::new(browser_lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(p.border))
+                    .title(browser_title),
+            ),
+            popup_rect,
+        );
     }
 
     // -- File picker overlay --------------------------------------------------
@@ -4984,7 +5035,9 @@ fn dirs_home() -> std::path::PathBuf {
 // ---------------------------------------------------------------------------
 
 /// Maximum entries kept in the persisted TUI history file.
-const HISTORY_FILE_CAP: usize = 200;
+///
+/// Matches [`PROMPT_HISTORY_CAP`] so the file and in-memory ring stay in sync.
+const HISTORY_FILE_CAP: usize = 500;
 
 /// Serialises `history` to `path` as JSONL (one JSON string per line).
 ///
@@ -4992,10 +5045,16 @@ const HISTORY_FILE_CAP: usize = 200;
 /// bounded.  Best-effort — errors are returned to the caller.
 pub(crate) fn save_history(history: &[String], path: &std::path::Path) -> std::io::Result<()> {
     use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = std::fs::File::create(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
     let start = history.len().saturating_sub(HISTORY_FILE_CAP);
     for entry in &history[start..] {
         let line = serde_json::to_string(entry)
@@ -5030,6 +5089,8 @@ const LARGE_PASTE_THRESHOLD: usize = 1024;
 /// message.  When `text` is small, returns `None` (caller keeps text as-is).
 pub(crate) fn large_paste_token(text: &str) -> Option<(String, String)> {
     use sha2::Digest as _;
+    use std::fmt::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     if text.len() <= LARGE_PASTE_THRESHOLD {
         return None;
     }
@@ -5037,14 +5098,20 @@ pub(crate) fn large_paste_token(text: &str) -> Option<(String, String)> {
     hasher.update(text.as_bytes());
     let digest = hasher.finalize();
     let hex: String = digest.iter().fold(String::with_capacity(64), |mut s, b| {
-        use std::fmt::Write as _;
         let _ = write!(s, "{b:02x}");
         s
     });
     let sha8 = &hex[..8];
     let path = std::path::PathBuf::from(format!("/tmp/smedja-paste-{sha8}.txt"));
-    // Best-effort write; if it fails the token is still substituted.
-    let _ = std::fs::write(&path, text);
+    // Write paste file with user-only permissions to prevent info leak.
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true) // fails if path exists — prevents symlink attack
+        .mode(0o600)
+        .open(&path)
+    {
+        let _ = std::io::Write::write_all(&mut f, text.as_bytes());
+    }
     let token = format!("@paste:{sha8}");
     let msg = format!("paste saved \u{2192} {token} ({} bytes)", text.len());
     Some((token, msg))
@@ -5254,6 +5321,7 @@ mod tests {
             runner: Some("claude-cli"),
             pending: false,
             input_mode: true,
+            vim_normal_mode: false,
             ctx_pct: None,
         };
         let text: String = status_bar_line(&ctx, true)
@@ -5276,6 +5344,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: true,
+            vim_normal_mode: false,
             ctx_pct: Some(61),
         };
         let text: String = status_bar_line(&ctx, true)
@@ -5295,6 +5364,7 @@ mod tests {
             runner: None,
             pending: false,
             input_mode: true,
+            vim_normal_mode: false,
             ctx_pct: None,
         };
         let text: String = status_bar_line(&ctx, true)
@@ -8879,16 +8949,18 @@ status = "draft"
     }
 
     #[test]
-    fn save_history_caps_at_200() {
+    fn save_history_caps_at_file_cap() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("history.jsonl");
-        let entries: Vec<String> = (0..250).map(|i| format!("entry{i}")).collect();
+        // Write more entries than the cap so the old ones are dropped.
+        let entries: Vec<String> = (0..600).map(|i| format!("entry{i}")).collect();
         save_history(&entries, &path).unwrap();
         let loaded = load_history(&path);
-        assert_eq!(loaded.len(), 200);
-        // The last 200 entries should have been kept.
-        assert_eq!(loaded[0], "entry50");
-        assert_eq!(loaded[199], "entry249");
+        assert_eq!(loaded.len(), HISTORY_FILE_CAP);
+        // The last HISTORY_FILE_CAP entries should have been kept.
+        let expected_first = format!("entry{}", 600 - HISTORY_FILE_CAP);
+        assert_eq!(loaded[0], expected_first);
+        assert_eq!(loaded[HISTORY_FILE_CAP - 1], "entry599");
     }
 
     #[test]
