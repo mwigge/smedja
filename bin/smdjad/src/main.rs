@@ -656,6 +656,7 @@ fn build_router(
 
     route!(router, "session.create", state, handlers::session::create);
     route!(router, "session.list", state, handlers::session::list);
+    route!(router, "session.search", state, handlers::session::search);
     route!(router, "session.get", state, handlers::session::get);
     route!(router, "session.delete", state, handlers::session::delete);
     route!(router, "session.fork", state, handlers::session::fork);

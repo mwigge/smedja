@@ -283,6 +283,13 @@ impl WorkingMemory {
                     if budget >= token_estimate {
                         budget = budget.saturating_sub(token_estimate);
                         result.push(msg.clone());
+                    } else if budget > 0 {
+                        let char_limit = (budget * 4).min(msg.content.len());
+                        let mut truncated = msg.clone();
+                        truncated.content =
+                            format!("{}\n[... truncated]", &msg.content[..char_limit]);
+                        result.push(truncated);
+                        budget = 0;
                     } else {
                         omitted = omitted.saturating_add(token_estimate);
                     }
@@ -771,6 +778,55 @@ mod tests {
         );
         // The prompt itself excludes the cold turns it counted as omitted.
         assert!(prompt.len() < m.len() + 1);
+    }
+
+    #[test]
+    fn warm_message_too_large_is_truncated_not_dropped() {
+        let mut m = WorkingMemory::new(4096);
+        m.push(Message::system("sys"));
+        m.seal_prefix();
+        // deep: hot=5, warm=30. Push large_content first, then 5 short messages.
+        // After 6 mutable pushes (len=7, stable_prefix=1):
+        //   large_content at abs_index=1 → from_end=5 → Warm
+        //   5 short messages at abs_index=2..6 → from_end=4..0 → Hot
+        let large_content = "x".repeat(400); // token_estimate = 100+1 = 101
+        m.push(Message::user(large_content.clone()));
+        for _ in 0..5 {
+            m.push(Message::user("short"));
+        }
+        // Budget of 10 tokens (40 chars) < 101 → must truncate, not drop.
+        let (prompt, _omitted) = m.build_prompt_with_omitted(10);
+        let truncated: Vec<_> = prompt
+            .iter()
+            .filter(|msg| msg.content.contains("[... truncated]"))
+            .collect();
+        assert!(
+            !truncated.is_empty(),
+            "large warm message must be truncated and included, not dropped"
+        );
+        assert!(truncated[0].content.len() < large_content.len());
+    }
+
+    #[test]
+    fn warm_message_fits_exactly_is_not_truncated() {
+        let mut m = WorkingMemory::new(4096);
+        m.push(Message::system("sys"));
+        m.seal_prefix();
+        // "12345678" = 8 chars → token_estimate = 8/4+1 = 3. Budget = 3 → exact fit.
+        // Push it first, then 5 short messages so it lands in the Warm stratum.
+        m.push(Message::user("12345678"));
+        for _ in 0..5 {
+            m.push(Message::user("short"));
+        }
+        let (prompt, _) = m.build_prompt_with_omitted(3);
+        let truncated: Vec<_> = prompt
+            .iter()
+            .filter(|msg| msg.content.contains("[... truncated]"))
+            .collect();
+        assert!(
+            truncated.is_empty(),
+            "message that fits exactly must not be marked as truncated"
+        );
     }
 
     #[test]

@@ -57,16 +57,22 @@ pub fn inject_conciseness(prompt: &str, used: usize, window: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
 
+    // Serialize env-mutating tests; env vars are process-global so parallel
+    // threads race on set/remove without this guard.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     fn clear_env() {
-        // Remove the bypass env var if set from a previous test.
-        // SAFETY: test-only mutation; no concurrent threads read this var in tests.
+        // SAFETY: test-only mutation; caller holds ENV_LOCK.
         unsafe { std::env::remove_var("SMEDJA_NO_VERBOSITY_STEER") };
     }
 
     #[test]
     fn below_threshold_unchanged() {
+        let _g = ENV_LOCK.lock().unwrap();
         clear_env();
         // 59% fill → no directive
         let out = inject_conciseness("hello", 59, 100);
@@ -75,6 +81,7 @@ mod tests {
 
     #[test]
     fn above_threshold_appends_directive() {
+        let _g = ENV_LOCK.lock().unwrap();
         clear_env();
         // 61% fill → directive appended
         let out = inject_conciseness("hello", 61, 100);
@@ -87,16 +94,18 @@ mod tests {
 
     #[test]
     fn env_bypass_returns_unchanged() {
-        // SAFETY: test-only mutation; no concurrent threads read this var in tests.
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: test-only mutation; ENV_LOCK serializes all env-touching tests.
         unsafe { std::env::set_var("SMEDJA_NO_VERBOSITY_STEER", "1") };
         let out = inject_conciseness("hello", 99, 100);
         assert_eq!(out, "hello", "env bypass must suppress directive");
-        // SAFETY: test-only mutation; no concurrent threads read this var in tests.
+        // SAFETY: same guard held for the full scope.
         unsafe { std::env::remove_var("SMEDJA_NO_VERBOSITY_STEER") };
     }
 
     #[test]
     fn exactly_sixty_percent_unchanged() {
+        let _g = ENV_LOCK.lock().unwrap();
         clear_env();
         // exactly 60% → not > 0.60 → no directive
         let out = inject_conciseness("test", 60, 100);

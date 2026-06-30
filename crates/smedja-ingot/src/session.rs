@@ -219,6 +219,43 @@ pub(crate) fn update_cowork_mode(
     Ok(())
 }
 
+/// Searches sessions where `title` or `workspace_root` contains `query` (case-insensitive).
+///
+/// Uses SQL `LIKE` matching — sufficient for typical session counts. Returns sessions
+/// ordered by `created_at` ascending.
+///
+/// # Errors
+///
+/// Returns [`IngotError::Db`] if the query fails.
+pub(crate) fn search(conn: &rusqlite::Connection, query: &str) -> Result<Vec<Session>, IngotError> {
+    let pattern = format!("%{query}%");
+    let mut stmt = conn.prepare(
+        "SELECT id, created_at, updated_at, status, task_id, mode, title, cowork_mode, workspace_root, model_override, runner_override \
+         FROM sessions WHERE title LIKE ?1 OR workspace_root LIKE ?1 ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![pattern], |row| {
+        let id_str: String = row.get(0)?;
+        let id = Uuid::parse_str(&id_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+        let cowork_raw: i64 = row.get(7).unwrap_or(0);
+        Ok(Session {
+            id,
+            created_at: Timestamp::from_micros(crate::read_micros(row, 1)?),
+            updated_at: Timestamp::from_micros(crate::read_micros(row, 2)?),
+            status: row.get(3)?,
+            task_id: row.get(4)?,
+            mode: row.get(5)?,
+            title: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+            cowork_mode: cowork_raw != 0,
+            workspace_root: row.get(8)?,
+            model_override: row.get(9)?,
+            runner_override: row.get(10)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(IngotError::Db)
+}
+
 /// Sets the `title` field for the session identified by `id`.
 ///
 /// # Errors
@@ -508,5 +545,50 @@ mod tests {
     fn update_title_unknown_id_is_noop() {
         let ingot = Ingot::open_in_memory().unwrap();
         update_title(&ingot.conn, "no-such-id", "ignored").unwrap();
+    }
+
+    #[test]
+    fn search_sessions_matches_title_substring() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let mut s = sample_session();
+        s.title = "rust memory pressure investigation".to_string();
+        ingot.create_session(&s).unwrap();
+
+        let results = ingot.search_sessions("memory").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, s.id);
+    }
+
+    #[test]
+    fn search_sessions_matches_workspace_root() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let mut s = sample_session();
+        s.workspace_root = Some("/home/user/projects/smedja".to_string());
+        ingot.create_session(&s).unwrap();
+
+        let results = ingot.search_sessions("smedja").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, s.id);
+    }
+
+    #[test]
+    fn search_sessions_returns_empty_for_no_match() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let s = sample_session();
+        ingot.create_session(&s).unwrap();
+
+        let results = ingot.search_sessions("zzznomatch").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_sessions_is_case_insensitive() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let mut s = sample_session();
+        s.title = "Rust Project".to_string();
+        ingot.create_session(&s).unwrap();
+
+        let results = ingot.search_sessions("rust").unwrap();
+        assert_eq!(results.len(), 1);
     }
 }
