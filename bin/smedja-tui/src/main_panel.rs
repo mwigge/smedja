@@ -7,10 +7,18 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use similar::{ChangeTag, TextDiff};
+use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 use unicode_width::UnicodeWidthChar;
+
+static SYNTAX_SET: OnceLock<syntect::parsing::SyntaxSet> = OnceLock::new();
+static THEME_SET: OnceLock<syntect::highlighting::ThemeSet> = OnceLock::new();
+
+/// Byte length at which a pending word is force-flushed even without a space
+/// boundary — prevents unbounded buffering of CJK text and long URLs.
+const WORD_FLUSH_BYTES: usize = 40;
 
 // ---------------------------------------------------------------------------
 // M15 — Word-level diff highlighting using the `similar` crate
@@ -603,6 +611,22 @@ impl MainPanel {
     /// Auto-scrolls to follow new content when the view is already at the bottom.
     #[allow(clippy::too_many_lines)] // fence handling + retroactive detection; splitting would obscure the flow
     pub fn push_line(&mut self, text: String) {
+        // Image references are intercepted early — any prose line containing a
+        // data URI or file path with a known image extension is replaced with a
+        // text placeholder.  Guarded by `!in_code_block` so that image paths in
+        // code or diff fences are left for syntax highlighting.
+        if !self.in_code_block {
+            if let Some(src) = detect_image_in_line(&text) {
+                let placeholder = render_image_placeholder(src);
+                self.lines
+                    .push(StyledLine::plain(placeholder, LineStyle::Normal));
+                if self.follow {
+                    self.scroll = self.lines.len().saturating_sub(1);
+                }
+                return;
+            }
+        }
+
         // Tool-result meta lines ("↳ ok · …") render dim and on their own line,
         // never as code/diff — short-circuit before fence/prefix classification.
         if !self.in_code_block && text.starts_with('↳') {
@@ -736,6 +760,15 @@ impl MainPanel {
                 } else {
                     self.lines.push(StyledLine::plain(text, style));
                 }
+            } else if matches!(style, LineStyle::Added) {
+                // Word-level diff highlight on added lines: compare empty baseline
+                // to the added text so every word shows as "added" (green).
+                let spans = Some(word_diff_spans("", &text));
+                self.lines.push(StyledLine {
+                    text,
+                    style: LineStyle::Added,
+                    spans,
+                });
             } else {
                 self.lines.push(StyledLine::plain(text, style));
             }
@@ -1111,6 +1144,21 @@ impl MainPanel {
                     .push(StyledLine::plain(flushed, LineStyle::Normal));
             }
         }
+
+        // Secondary flush: CJK text and long URLs never contain spaces, so the
+        // pending buffer would grow without bound. Flush once the buffer exceeds
+        // the threshold so the display stays responsive.
+        if self.pending_word.len() > WORD_FLUSH_BYTES {
+            // Flush long token (CJK, URLs) to avoid unbounded buffering.
+            let flushed = std::mem::take(&mut self.pending_word);
+            if let Some(last) = self.lines.last_mut() {
+                last.text.push_str(&flushed);
+                last.spans = None;
+            } else {
+                self.lines
+                    .push(StyledLine::plain(flushed, LineStyle::Normal));
+            }
+        }
     }
 
     /// Returns the full text content of all stored lines joined by newlines.
@@ -1345,8 +1393,8 @@ pub fn render_math(text: &str) -> String {
 /// or highlighting fails.
 #[must_use]
 pub fn apply_syntect(lang: &str, code: &str) -> Vec<StyledLine> {
-    let ss = SyntaxSet::load_defaults_newlines();
-    let ts = ThemeSet::load_defaults();
+    let ss = SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines);
+    let ts = THEME_SET.get_or_init(ThemeSet::load_defaults);
 
     let syntax = ss
         .find_syntax_by_token(lang)
@@ -1371,7 +1419,7 @@ pub fn apply_syntect(lang: &str, code: &str) -> Vec<StyledLine> {
 
     for line in syntect::util::LinesWithEndings::from(code) {
         let text = line.trim_end_matches(['\n', '\r']).to_owned();
-        match highlighter.highlight_line(line, &ss) {
+        match highlighter.highlight_line(line, ss) {
             Ok(regions) => {
                 let spans: Vec<Span<'static>> = regions
                     .iter()
