@@ -73,6 +73,11 @@ pub(crate) const LOCAL_TOOLS: &[&str] = &[
     "write_file",
     "edit_file",
     "list_files",
+    "grep_files",
+    "find_files",
+    "move_file",
+    "copy_file",
+    "delete_file",
     "fetch_web",
     "smedja_vault_search",
     "smedja_vault_store",
@@ -93,6 +98,8 @@ pub(crate) const LOCAL_TOOLS: &[&str] = &[
 /// `WRITE_TOOLS` guard rejects mutating tools even if this list drifts.
 pub(crate) const MCP_SERVER_TOOLS: &[&str] = &[
     "graph_query",
+    "grep_files",
+    "find_files",
     "read_file",
     "list_files",
     "smedja_vault_search",
@@ -394,7 +401,15 @@ pub(crate) async fn execute_tool(
 
     // Least-privilege enforcement: block write tools for read-only (review) sessions.
     if session.is_some_and(|s| s.mode.as_deref() == Some("review")) {
-        const WRITE_TOOLS: &[&str] = &["edit_file", "bash", "write_file", "run_command"];
+        const WRITE_TOOLS: &[&str] = &[
+            "edit_file",
+            "bash",
+            "write_file",
+            "run_command",
+            "move_file",
+            "copy_file",
+            "delete_file",
+        ];
         if WRITE_TOOLS.contains(&tool_name) {
             tracing::warn!(
                 tool = tool_name,
@@ -654,6 +669,168 @@ pub(crate) async fn execute_tool(
             {
                 Ok(result) => result,
                 Err(e) => format!("error listing {dir_str}: {e}"),
+            }
+        }
+        "grep_files" => {
+            let pattern = match input.get("pattern").and_then(Value::as_str) {
+                Some(p) if !p.is_empty() => p.to_owned(),
+                _ => return "error: pattern field required".into(),
+            };
+            let sub = input.get("path").and_then(Value::as_str).unwrap_or(".");
+            let max_results = input
+                .get("max_results")
+                .and_then(Value::as_u64)
+                .unwrap_or(50) as usize;
+            let root = match assert_within_workspace(workspace, sub) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            tokio::task::spawn_blocking(move || {
+                let mut hits: Vec<serde_json::Value> = Vec::new();
+                let walker = walkdir::WalkDir::new(&root).into_iter();
+                'files: for entry in walker.filter_map(std::result::Result::ok) {
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                        continue;
+                    };
+                    let rel = entry
+                        .path()
+                        .strip_prefix(&root)
+                        .unwrap_or(entry.path())
+                        .to_string_lossy()
+                        .into_owned();
+                    for (n, line) in text.lines().enumerate() {
+                        if line.contains(pattern.as_str()) {
+                            hits.push(serde_json::json!({
+                                "file": rel,
+                                "line": n + 1,
+                                "text": line.trim_end(),
+                            }));
+                            if hits.len() >= max_results {
+                                break 'files;
+                            }
+                        }
+                    }
+                }
+                let count = hits.len();
+                serde_json::json!({"matches": hits, "count": count}).to_string()
+            })
+            .await
+            .unwrap_or_else(|e| format!("error: grep_files failed: {e}"))
+        }
+        "find_files" => {
+            let pattern = input
+                .get("pattern")
+                .and_then(Value::as_str)
+                .unwrap_or("*")
+                .to_owned();
+            let sub = input.get("path").and_then(Value::as_str).unwrap_or(".");
+            let max_results = input
+                .get("max_results")
+                .and_then(Value::as_u64)
+                .unwrap_or(100) as usize;
+            let root = match assert_within_workspace(workspace, sub) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            tokio::task::spawn_blocking(move || {
+                let mut files: Vec<String> = Vec::new();
+                let walker = walkdir::WalkDir::new(&root).into_iter();
+                for entry in walker.filter_map(std::result::Result::ok).skip(1) {
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    let name = entry.file_name().to_string_lossy();
+                    if glob_match(&pattern, &name) {
+                        let rel = entry
+                            .path()
+                            .strip_prefix(&root)
+                            .unwrap_or(entry.path())
+                            .to_string_lossy()
+                            .into_owned();
+                        files.push(rel);
+                        if files.len() >= max_results {
+                            break;
+                        }
+                    }
+                }
+                files.sort();
+                let count = files.len();
+                serde_json::json!({"files": files, "count": count}).to_string()
+            })
+            .await
+            .unwrap_or_else(|e| format!("error: find_files failed: {e}"))
+        }
+        "move_file" => {
+            let Some(src_str) = input.get("source").and_then(Value::as_str) else {
+                return "error: source field required".into();
+            };
+            let Some(dst_str) = input.get("destination").and_then(Value::as_str) else {
+                return "error: destination field required".into();
+            };
+            let src = match assert_within_workspace(workspace, src_str) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let dst = match assert_within_workspace(workspace, dst_str) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            match std::fs::rename(&src, &dst) {
+                Ok(()) => serde_json::json!({"moved": true}).to_string(),
+                Err(e) => format!("error: move_file failed: {e}"),
+            }
+        }
+        "copy_file" => {
+            let Some(src_str) = input.get("source").and_then(Value::as_str) else {
+                return "error: source field required".into();
+            };
+            let Some(dst_str) = input.get("destination").and_then(Value::as_str) else {
+                return "error: destination field required".into();
+            };
+            let src = match assert_within_workspace(workspace, src_str) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let dst = match assert_within_workspace(workspace, dst_str) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::copy(&src, &dst) {
+                Ok(_) => serde_json::json!({"copied": true}).to_string(),
+                Err(e) => format!("error: copy_file failed: {e}"),
+            }
+        }
+        "delete_file" => {
+            let Some(path_str) = input.get("path").and_then(Value::as_str) else {
+                return "error: path field required".into();
+            };
+            let full = match assert_within_workspace(workspace, path_str) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            // ponytail: full async cowork gate is in roadmap; log destructive op and proceed
+            tracing::info!(
+                path = path_str,
+                "delete_file: cowork gate (full approval gate is in roadmap)"
+            );
+            match std::fs::metadata(&full) {
+                Err(e) => format!("error: delete_file failed: {e}"),
+                Ok(meta) if meta.is_dir() => match std::fs::remove_dir(&full) {
+                    Ok(()) => serde_json::json!({"deleted": true}).to_string(),
+                    Err(e) => format!(
+                        "error: delete_file failed (use bash for non-empty directories): {e}"
+                    ),
+                },
+                Ok(_) => match std::fs::remove_file(&full) {
+                    Ok(()) => serde_json::json!({"deleted": true}).to_string(),
+                    Err(e) => format!("error: delete_file failed: {e}"),
+                },
             }
         }
         "smedja_vault_search" => {
@@ -1518,10 +1695,15 @@ mod tests {
             "bash",
             "write_file",
             "run_command",
+            "move_file",
+            "copy_file",
+            "delete_file",
             "smedja_vault_store",
         ];
         let expected = [
             "graph_query",
+            "grep_files",
+            "find_files",
             "read_file",
             "list_files",
             "smedja_vault_search",
@@ -2600,6 +2782,442 @@ mod tests {
         assert!(
             result.contains("network access disabled"),
             "error must name the policy reason: {result}"
+        );
+    }
+
+    // ── WI-017: grep_files, find_files, move_file, copy_file, delete_file ────────
+
+    fn mk_ingot_vault() -> (
+        smedja_ingot::IngotHandle,
+        std::sync::Arc<tokio::sync::Mutex<smedja_vault::Vault>>,
+    ) {
+        use smedja_ingot::{Ingot, IngotHandle};
+        use smedja_vault::Vault;
+        use tokio::sync::Mutex;
+        (
+            IngotHandle::new(Ingot::open_in_memory().unwrap()),
+            Arc::new(Mutex::new(Vault::open_in_memory().unwrap())),
+        )
+    }
+
+    #[tokio::test]
+    async fn grep_files_finds_matching_lines() {
+        let (ingot, vault) = mk_ingot_vault();
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        std::fs::write(ws.join("a.txt"), "hello world\nno match here\n").unwrap();
+        std::fs::write(ws.join("b.txt"), "world domination\n").unwrap();
+
+        let result = super::execute_tool(
+            "grep_files",
+            r#"{"pattern":"world"}"#,
+            &ws,
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let matches = v["matches"].as_array().unwrap();
+        assert_eq!(v["count"], 2, "two lines contain 'world'; got: {result}");
+        assert!(
+            matches
+                .iter()
+                .any(|m| m["text"].as_str().unwrap().contains("hello world")),
+            "hello world match must appear; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_files_respects_max_results() {
+        let (ingot, vault) = mk_ingot_vault();
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        // Write 10 matching lines across two files
+        std::fs::write(ws.join("x.txt"), "match\n".repeat(6)).unwrap();
+        std::fs::write(ws.join("y.txt"), "match\n".repeat(6)).unwrap();
+
+        let result = super::execute_tool(
+            "grep_files",
+            r#"{"pattern":"match","max_results":3}"#,
+            &ws,
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["count"], 3, "max_results=3 must cap at 3; got: {result}");
+    }
+
+    #[tokio::test]
+    async fn grep_files_rejects_path_outside_workspace() {
+        let (ingot, vault) = mk_ingot_vault();
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+
+        let result = super::execute_tool(
+            "grep_files",
+            r#"{"pattern":"x","path":"../../etc"}"#,
+            &ws,
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        assert!(
+            result.contains("path outside workspace") || result.starts_with("error:"),
+            "traversal must be rejected; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    async fn find_files_matches_glob_pattern() {
+        let (ingot, vault) = mk_ingot_vault();
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        std::fs::write(ws.join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(ws.join("lib.rs"), "pub fn lib() {}").unwrap();
+        std::fs::write(ws.join("Cargo.toml"), "[package]").unwrap();
+
+        let result = super::execute_tool(
+            "find_files",
+            r#"{"pattern":"*.rs"}"#,
+            &ws,
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let files = v["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2, "two .rs files; got: {result}");
+        assert!(
+            files
+                .iter()
+                .any(|f| f.as_str().unwrap().ends_with("main.rs")),
+            "main.rs must appear; got: {result}"
+        );
+        assert!(
+            files.iter().all(|f| f.as_str().unwrap().ends_with(".rs")),
+            "only .rs files; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_files_respects_max_results() {
+        let (ingot, vault) = mk_ingot_vault();
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        for i in 0..10u8 {
+            std::fs::write(ws.join(format!("f{i}.txt")), "").unwrap();
+        }
+
+        let result = super::execute_tool(
+            "find_files",
+            r#"{"pattern":"*.txt","max_results":4}"#,
+            &ws,
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["count"], 4, "max_results=4 must cap at 4; got: {result}");
+    }
+
+    #[tokio::test]
+    async fn find_files_rejects_path_outside_workspace() {
+        let (ingot, vault) = mk_ingot_vault();
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+
+        let result = super::execute_tool(
+            "find_files",
+            r#"{"pattern":"*","path":"../../etc"}"#,
+            &ws,
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        assert!(
+            result.contains("path outside workspace") || result.starts_with("error:"),
+            "traversal must be rejected; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_file_renames_within_workspace() {
+        let (ingot, vault) = mk_ingot_vault();
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        std::fs::write(ws.join("old.txt"), "content").unwrap();
+
+        let result = super::execute_tool(
+            "move_file",
+            r#"{"source":"old.txt","destination":"new.txt"}"#,
+            &ws,
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["moved"], true, "move must succeed; got: {result}");
+        assert!(
+            !ws.join("old.txt").exists(),
+            "source must not exist after move"
+        );
+        assert!(
+            ws.join("new.txt").exists(),
+            "destination must exist after move"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_file_rejects_source_outside_workspace() {
+        let (ingot, vault) = mk_ingot_vault();
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+
+        let result = super::execute_tool(
+            "move_file",
+            r#"{"source":"../../etc/passwd","destination":"out.txt"}"#,
+            &ws,
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        assert!(
+            result.contains("path outside workspace") || result.starts_with("error:"),
+            "boundary rejection must fire on source; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_file_copies_within_workspace() {
+        let (ingot, vault) = mk_ingot_vault();
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        std::fs::write(ws.join("src.txt"), "data").unwrap();
+
+        let result = super::execute_tool(
+            "copy_file",
+            r#"{"source":"src.txt","destination":"dst.txt"}"#,
+            &ws,
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["copied"], true, "copy must succeed; got: {result}");
+        assert!(
+            ws.join("src.txt").exists(),
+            "source must still exist after copy"
+        );
+        assert_eq!(std::fs::read_to_string(ws.join("dst.txt")).unwrap(), "data");
+    }
+
+    #[tokio::test]
+    async fn copy_file_creates_parent_dirs() {
+        let (ingot, vault) = mk_ingot_vault();
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        std::fs::write(ws.join("src.txt"), "data").unwrap();
+
+        let result = super::execute_tool(
+            "copy_file",
+            r#"{"source":"src.txt","destination":"sub/dir/dst.txt"}"#,
+            &ws,
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            v["copied"], true,
+            "copy to new subdir must succeed; got: {result}"
+        );
+        assert!(ws.join("sub/dir/dst.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn copy_file_rejects_destination_outside_workspace() {
+        let (ingot, vault) = mk_ingot_vault();
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        std::fs::write(ws.join("src.txt"), "x").unwrap();
+
+        let result = super::execute_tool(
+            "copy_file",
+            r#"{"source":"src.txt","destination":"../../tmp/evil.txt"}"#,
+            &ws,
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        assert!(
+            result.contains("path outside workspace") || result.starts_with("error:"),
+            "boundary rejection must fire on destination; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_file_removes_a_file() {
+        let (ingot, vault) = mk_ingot_vault();
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        std::fs::write(ws.join("rm_me.txt"), "bye").unwrap();
+
+        let result = super::execute_tool(
+            "delete_file",
+            r#"{"path":"rm_me.txt"}"#,
+            &ws,
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["deleted"], true, "delete must succeed; got: {result}");
+        assert!(
+            !ws.join("rm_me.txt").exists(),
+            "file must be gone after delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_file_rejects_path_outside_workspace() {
+        let (ingot, vault) = mk_ingot_vault();
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+
+        let result = super::execute_tool(
+            "delete_file",
+            r#"{"path":"../../etc/passwd"}"#,
+            &ws,
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        assert!(
+            result.contains("path outside workspace") || result.starts_with("error:"),
+            "boundary rejection must fire; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_file_refuses_nonempty_directory() {
+        let (ingot, vault) = mk_ingot_vault();
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let subdir = ws.join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        std::fs::write(subdir.join("file.txt"), "keep").unwrap();
+
+        let result = super::execute_tool(
+            "delete_file",
+            r#"{"path":"subdir"}"#,
+            &ws,
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        assert!(
+            result.starts_with("error:"),
+            "non-empty dir delete must fail; got: {result}"
+        );
+        assert!(subdir.exists(), "non-empty dir must remain; got: {result}");
+    }
+
+    #[tokio::test]
+    async fn move_copy_delete_blocked_in_review_session() {
+        let (ingot, vault) = mk_ingot_vault();
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        std::fs::write(ws.join("f.txt"), "x").unwrap();
+        let session = session_with_mode(Some("review"));
+
+        for (tool, input) in [
+            ("move_file", r#"{"source":"f.txt","destination":"g.txt"}"#),
+            ("copy_file", r#"{"source":"f.txt","destination":"h.txt"}"#),
+            ("delete_file", r#"{"path":"f.txt"}"#),
+        ] {
+            let result = super::execute_tool(
+                tool,
+                input,
+                &ws,
+                Some(&session),
+                &ingot,
+                &vault,
+                &test_embedder(),
+            )
+            .await;
+            assert!(
+                result.contains("TOOL_BLOCKED") || result.contains("blocked"),
+                "{tool} must be blocked in review session; got: {result}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grep_find_allowed_in_review_session() {
+        let (ingot, vault) = mk_ingot_vault();
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        std::fs::write(ws.join("a.rs"), "fn main() {}").unwrap();
+        let session = session_with_mode(Some("review"));
+
+        let grep_result = super::execute_tool(
+            "grep_files",
+            r#"{"pattern":"fn main"}"#,
+            &ws,
+            Some(&session),
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        assert!(
+            !grep_result.contains("TOOL_BLOCKED"),
+            "grep_files must be allowed in review session; got: {grep_result}"
+        );
+
+        let find_result = super::execute_tool(
+            "find_files",
+            r#"{"pattern":"*.rs"}"#,
+            &ws,
+            Some(&session),
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        assert!(
+            !find_result.contains("TOOL_BLOCKED"),
+            "find_files must be allowed in review session; got: {find_result}"
         );
     }
 
