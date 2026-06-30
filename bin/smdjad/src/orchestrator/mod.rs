@@ -1123,285 +1123,385 @@ impl TurnOrchestrator {
                 total_cache_read_tokens = total_cache_read_tokens.saturating_add(cache_read_tokens);
 
                 // 5b. Parse tool calls from the response text.
-                let tool_call = crate::executor::parse_tool_call(&response_text);
+                let tool_calls = crate::executor::parse_all_tool_calls(&response_text);
 
-                if let Some((tool_name, mut tool_input)) = tool_call {
-                    let tool_call_id = Uuid::new_v4().to_string();
+                if tool_calls.is_empty() {
+                    // 5f. No tool call — this is the final response.
+                    full_response = response_text;
+                    break 'tool_loop;
+                }
 
-                    mem.push(AdapterMessage::assistant(response_text.clone()));
+                mem.push(AdapterMessage::assistant(response_text.clone()));
 
-                    let (ev_trace_id, ev_span_id) = {
-                        use opentelemetry::trace::TraceContextExt as _;
-                        let cx = opentelemetry::Context::current();
-                        let sc = cx.span().span_context().clone();
-                        if sc.is_valid() {
-                            (
-                                Some(format!("{}", sc.trace_id())),
-                                Some(format!("{}", sc.span_id())),
-                            )
-                        } else {
-                            (None, None)
-                        }
-                    };
-                    dispatcher.publish(TurnEvent::ToolCalled {
-                        tool_name: tool_name.clone(),
-                        input_summary: tool_input.chars().take(120).collect(),
-                        full_input: Some(tool_input.chars().take(4096).collect()),
-                        turn_id: Some(turn_id.clone()),
-                        correlation: CorrelationCtx {
-                            conversation_id: Some(session_id.clone()),
-                            trace_id: ev_trace_id,
-                            span_id: ev_span_id,
-                            parent_span_id: None,
-                            operation_name: Some(tel::OPERATION_EXECUTE_TOOL.to_owned()),
-                            agent_name: session
-                                .as_ref()
-                                .and_then(|s| s.mode.as_deref())
-                                .map(str::to_owned),
-                            status: None,
-                        },
-                        tool_call_id: Some(tool_call_id.clone()),
-                    });
+                if tool_calls.len() > 1 {
+                    // Multi-tool batch: read-only tools run concurrently; write/exec
+                    // tools run sequentially through a simplified cowork gate.
+                    let n = tool_calls.len();
+                    let mut ordered_results = vec![String::new(); n];
 
-                    // 5c. Permission gate. The session's permission policy
-                    // (default Ask) decides allow/deny outright or — for a
-                    // mutation under Ask — suspends until the user responds via
-                    // cowork.approve/deny (surfaced by the TUI's cowork.pending
-                    // poll). Ask-on-mutation is the default; Auto/Plan/
-                    // AcceptEdits are toggled from the TUI (cowork.set_mode).
-                    // The gate is created on demand so gating works without an
-                    // explicit `/cowork on`.
-                    let cowork_denied = if role.is_read_only()
-                        && crate::cowork::evaluate(crate::cowork::PermissionMode::Plan, &tool_name)
-                            == crate::cowork::PermissionDecision::Deny
+                    // Partition into (original_index, name, input) for reads and writes.
+                    let (read_slots, write_slots): (Vec<_>, Vec<_>) =
+                        tool_calls.iter().enumerate().partition(|(_, (name, _))| {
+                            crate::executor::READ_ONLY_TOOLS.contains(&name.as_str())
+                        });
+
+                    // (a) Parallel reads.
                     {
-                        // Read-only roles (plan/research/review/ask/orchestrator)
-                        // can never mutate, regardless of the permission mode.
-                        Some(format!(
-                            "denied: the {} role is read-only and cannot run {tool_name}",
-                            role.label()
-                        ))
-                    } else {
-                        let gate = {
-                            let mut g = gates.lock().await;
-                            Arc::clone(
-                                g.entry(session_id.clone())
-                                    .or_insert_with(|| Arc::new(CoworkGate::default())),
-                            )
-                        };
-                        let args_scrubbed =
-                            serde_json::from_str(&tool_input).unwrap_or(serde_json::Value::Null);
-
-                        // Declarative permission rules take priority over session mode.
-                        let perm_rules = crate::cowork::load_permission_rules(&workspace_root);
-                        let rule_decision = crate::cowork::evaluate_permission_rules(
-                            &perm_rules,
-                            &tool_name,
-                            &args_scrubbed,
-                        );
-
-                        if matches!(rule_decision, Some(crate::cowork::PermissionDecision::Deny)) {
-                            // Deny before reaching the cowork gate; no audit event needed.
-                            Some(format!(
-                                "denied: blocked by permission rule for {tool_name}"
-                            ))
-                        } else {
-                            // High-risk roles (IaC) always confirm a mutation — never
-                            // auto-approved even in Auto/AcceptEdits — because the ops
-                            // (apply/destroy) are dangerous and hard to reverse.
-                            let push = Some((dispatcher.as_ref(), Some(turn_id.as_str())));
-                            let gate_mode = gate.mode().await;
-                            let decision = if matches!(
-                                rule_decision,
-                                Some(crate::cowork::PermissionDecision::Allow)
-                            ) {
-                                Decision::Approve
-                            } else if role.is_high_risk()
-                                && crate::cowork::evaluate(
-                                    crate::cowork::PermissionMode::Plan,
-                                    &tool_name,
-                                ) == crate::cowork::PermissionDecision::Deny
-                            {
-                                gate.gate_tool_forced_ask(0, &tool_name, args_scrubbed, "", push)
-                                    .await
-                            } else {
-                                gate.gate_tool(0, &tool_name, args_scrubbed, "", push).await
-                            };
-                            // Record auto_approved when Auto mode bypassed a gate that Ask would
-                            // have held for human approval, so the audit trail shows the bypass.
-                            if matches!(&decision, Decision::Approve)
-                                && gate_mode == crate::cowork::PermissionMode::Auto
-                                && crate::cowork::evaluate(
-                                    crate::cowork::PermissionMode::Ask,
-                                    &tool_name,
-                                ) == crate::cowork::PermissionDecision::Ask
-                            {
-                                let ev = smedja_ingot::AuditEvent {
-                                    id: Uuid::new_v4(),
-                                    ts: Timestamp::now(),
-                                    session_id: session_id.clone(),
-                                    turn_id: Some(turn_id.clone()),
-                                    action_type: "auto_approved".into(),
-                                    actor: "smdjad".into(),
-                                    tool_name: Some(tool_name.clone()),
-                                    tool_call_id: Some(tool_call_id.clone()),
-                                    ..smedja_ingot::AuditEvent::default()
-                                };
-                                if let Err(e) = ingot.record_timeline_event(ev).await {
-                                    warn!(
-                                        turn_id = %turn_id,
-                                        error = %e,
-                                        "failed to record auto_approved event"
-                                    );
-                                }
-                            }
-                            match decision {
-                                Decision::Approve => None,
-                                Decision::Deny(reason) => Some(format!("denied: {reason}")),
-                                Decision::Modify(new_input) => {
-                                    tool_input = new_input;
-                                    None
-                                }
-                            }
+                        use futures_util::StreamExt as _;
+                        let mut futs = futures_util::stream::FuturesUnordered::new();
+                        for (i, (name, input)) in read_slots {
+                            let name = name.clone();
+                            let input = input.clone();
+                            let wsr = workspace_root.clone();
+                            let ig = ingot.clone();
+                            let vt = vault.clone();
+                            let em = Arc::clone(embedder);
+                            futs.push(async move {
+                                let result =
+                                    execute_tool(&name, &input, &wsr, None, &ig, &vt, &em).await;
+                                (i, result)
+                            });
                         }
-                    };
-
-                    // 5d. Execute the tool (or return the denial).
-                    let tool_result = if let Some(denial) = cowork_denied {
-                        denial
-                    } else {
-                        let tool_type_val =
-                            if crate::executor::LOCAL_TOOLS.contains(&tool_name.as_str()) {
-                                if matches!(
-                                    tool_name.as_str(),
-                                    "smedja_vault_search" | "smedja_vault_store" | "graph_query"
-                                ) {
-                                    "datastore"
-                                } else {
-                                    "function"
-                                }
-                            } else {
-                                "extension"
-                            };
-                        let mut tool_span = tracer.start(tel::SPAN_TOOL_EXECUTE);
-                        tool_span.set_attribute(KeyValue::new(
-                            tel::OPERATION_NAME,
-                            tel::OPERATION_EXECUTE_TOOL,
-                        ));
-                        tool_span.set_attribute(KeyValue::new(tel::TOOL_NAME, tool_name.clone()));
-                        tool_span.set_attribute(KeyValue::new(tel::TOOL_TYPE, tool_type_val));
-                        tool_span
-                            .set_attribute(KeyValue::new(tel::TOOL_CALL_ID, tool_call_id.clone()));
-                        match tel::tool_args_capture_mode() {
-                            tel::CaptureMode::Hash => {
-                                tool_span.set_attribute(KeyValue::new(
-                                    tel::TOOL_ARGS_HASH,
-                                    tel::content_hash(&tool_input),
-                                ));
-                            }
-                            tel::CaptureMode::Scrubbed | tel::CaptureMode::Full => {
-                                tool_span.set_attribute(KeyValue::new(
-                                    tel::TOOL_ARGS_HASH,
-                                    tel::content_hash(&tool_input),
-                                ));
-                                tool_span.set_attribute(KeyValue::new(
-                                    "gen_ai.tool.args",
-                                    tel::scrub_and_summarise(&tool_input),
-                                ));
-                            }
-                        }
-                        let result = execute_tool(
-                            &tool_name,
-                            &tool_input,
-                            &workspace_root,
-                            session.as_ref(),
-                            ingot,
-                            vault,
-                            embedder,
-                        )
-                        .await;
-                        tool_span.set_attribute(KeyValue::new(
-                            tel::TOOL_RESULT_HASH,
-                            tel::content_hash(&result),
-                        ));
-                        tool_span.set_attribute(KeyValue::new(
-                            tel::TOOL_RESULT_TOKENS,
-                            i64::try_from(result.split_whitespace().count()).unwrap_or(0),
-                        ));
-                        let outcome = classify_tool_outcome(&result);
-                        if outcome.is_success() {
-                            use opentelemetry::trace::Span as _;
-                            tool_span.set_status(opentelemetry::trace::Status::Ok);
-                        } else {
-                            use opentelemetry::trace::Span as _;
-                            tool_span.set_status(opentelemetry::trace::Status::error(
-                                result.chars().take(120).collect::<String>(),
-                            ));
-                        }
-                        tool_span.end();
-                        result
-                    };
-
-                    // Persist tool execution as a timeline event.
-                    {
-                        let tool_sc = {
-                            use opentelemetry::trace::TraceContextExt as _;
-                            let cx = opentelemetry::Context::current();
-                            cx.span().span_context().clone()
-                        };
-                        let (t_trace_id, t_span_id) = if tool_sc.is_valid() {
-                            (
-                                Some(format!("{}", tool_sc.trace_id())),
-                                Some(format!("{}", tool_sc.span_id())),
-                            )
-                        } else {
-                            (None, None)
-                        };
-                        let tool_audit = smedja_ingot::AuditEvent {
-                            id: Uuid::new_v4(),
-                            ts: Timestamp::now(),
-                            session_id: session_id.clone(),
-                            turn_id: Some(turn_id.clone()),
-                            action_type: "tool_exec".into(),
-                            actor: "smdjad".into(),
-                            tool_name: Some(tool_name.clone()),
-                            traceparent: None,
-                            trace_id: t_trace_id,
-                            span_id: t_span_id,
-                            conversation_id: Some(session_id.clone()),
-                            tool_call_id: Some(tool_call_id.clone()),
-                            operation_name: Some(tel::OPERATION_EXECUTE_TOOL.to_owned()),
-                            status: if tool_result.starts_with("error:")
-                                || tool_result.starts_with("permission denied")
-                            {
-                                Some("error".to_owned())
-                            } else {
-                                Some("ok".to_owned())
-                            },
-                            ..smedja_ingot::AuditEvent::default()
-                        };
-                        if let Err(e) = ingot.record_timeline_event(tool_audit).await {
-                            warn!(turn_id = %turn_id, error = %e, "failed to record tool audit event");
+                        while let Some((i, result)) = futs.next().await {
+                            ordered_results[i] = result;
                         }
                     }
 
-                    // 5e. Compress the tool result (SmartCrusher strips JSON nulls,
-                    // bypassed by SMEDJA_NO_TOOL_COMPRESS=1), then append it as a user
-                    // message and continue the loop. Compression runs before the push
-                    // so token budgeting reflects the crushed size.
-                    let crushed = smedja_adapter::crush::compress_tool_result(&tool_result);
-                    let escaped_result = crushed.replace('<', "&lt;").replace('>', "&gt;");
-                    mem.push(AdapterMessage::user(format!(
-                        "<tool_result tool=\"{tool_name}\">{escaped_result}</tool_result>"
-                    )));
+                    // (b) Sequential writes with simplified cowork gate.
+                    for (i, (name, input)) in write_slots {
+                        ordered_results[i] = if role.is_read_only() {
+                            format!(
+                                "denied: the {} role is read-only and cannot run {name}",
+                                role.label()
+                            )
+                        } else {
+                            let gate = {
+                                let mut g = gates.lock().await;
+                                Arc::clone(
+                                    g.entry(session_id.clone())
+                                        .or_insert_with(|| Arc::new(CoworkGate::default())),
+                                )
+                            };
+                            let args_val =
+                                serde_json::from_str(input).unwrap_or(serde_json::Value::Null);
+                            // ponytail: batch gate — interactive intercept deferred; auto-approves in Auto mode
+                            let decision = gate.gate_tool(0, name, args_val, "", None).await;
+                            match decision {
+                                Decision::Approve => {
+                                    execute_tool(
+                                        name,
+                                        input,
+                                        &workspace_root,
+                                        session.as_ref(),
+                                        ingot,
+                                        vault,
+                                        embedder,
+                                    )
+                                    .await
+                                }
+                                Decision::Deny(reason) => format!("denied: {reason}"),
+                                Decision::Modify(new_input) => {
+                                    execute_tool(
+                                        name,
+                                        &new_input,
+                                        &workspace_root,
+                                        session.as_ref(),
+                                        ingot,
+                                        vault,
+                                        embedder,
+                                    )
+                                    .await
+                                }
+                            }
+                        };
+                    }
 
+                    // (c) Combine results in call order.
+                    use std::fmt::Write as _;
+                    let mut combined = String::new();
+                    for (i, (name, _)) in tool_calls.iter().enumerate() {
+                        let crushed =
+                            smedja_adapter::crush::compress_tool_result(&ordered_results[i]);
+                        let escaped = crushed.replace('<', "&lt;").replace('>', "&gt;");
+                        let _ = writeln!(
+                            combined,
+                            "<tool_result tool=\"{name}\">{escaped}</tool_result>"
+                        );
+                    }
+                    mem.push(AdapterMessage::user(combined.trim_end().to_owned()));
                     full_response = response_text;
                     continue 'tool_loop;
                 }
 
-                // 5f. No tool call — this is the final response.
+                // Single tool call.
+                let (tool_name, mut tool_input) = tool_calls.into_iter().next().unwrap();
+                let tool_call_id = Uuid::new_v4().to_string();
+
+                let (ev_trace_id, ev_span_id) = {
+                    use opentelemetry::trace::TraceContextExt as _;
+                    let cx = opentelemetry::Context::current();
+                    let sc = cx.span().span_context().clone();
+                    if sc.is_valid() {
+                        (
+                            Some(format!("{}", sc.trace_id())),
+                            Some(format!("{}", sc.span_id())),
+                        )
+                    } else {
+                        (None, None)
+                    }
+                };
+                dispatcher.publish(TurnEvent::ToolCalled {
+                    tool_name: tool_name.clone(),
+                    input_summary: tool_input.chars().take(120).collect(),
+                    full_input: Some(tool_input.chars().take(4096).collect()),
+                    turn_id: Some(turn_id.clone()),
+                    correlation: CorrelationCtx {
+                        conversation_id: Some(session_id.clone()),
+                        trace_id: ev_trace_id,
+                        span_id: ev_span_id,
+                        parent_span_id: None,
+                        operation_name: Some(tel::OPERATION_EXECUTE_TOOL.to_owned()),
+                        agent_name: session
+                            .as_ref()
+                            .and_then(|s| s.mode.as_deref())
+                            .map(str::to_owned),
+                        status: None,
+                    },
+                    tool_call_id: Some(tool_call_id.clone()),
+                });
+
+                // 5c. Permission gate. The session's permission policy
+                // (default Ask) decides allow/deny outright or — for a
+                // mutation under Ask — suspends until the user responds via
+                // cowork.approve/deny (surfaced by the TUI's cowork.pending
+                // poll). Ask-on-mutation is the default; Auto/Plan/
+                // AcceptEdits are toggled from the TUI (cowork.set_mode).
+                // The gate is created on demand so gating works without an
+                // explicit `/cowork on`.
+                let cowork_denied = if role.is_read_only()
+                    && crate::cowork::evaluate(crate::cowork::PermissionMode::Plan, &tool_name)
+                        == crate::cowork::PermissionDecision::Deny
+                {
+                    // Read-only roles (plan/research/review/ask/orchestrator)
+                    // can never mutate, regardless of the permission mode.
+                    Some(format!(
+                        "denied: the {} role is read-only and cannot run {tool_name}",
+                        role.label()
+                    ))
+                } else {
+                    let gate = {
+                        let mut g = gates.lock().await;
+                        Arc::clone(
+                            g.entry(session_id.clone())
+                                .or_insert_with(|| Arc::new(CoworkGate::default())),
+                        )
+                    };
+                    let args_scrubbed =
+                        serde_json::from_str(&tool_input).unwrap_or(serde_json::Value::Null);
+
+                    // Declarative permission rules take priority over session mode.
+                    let perm_rules = crate::cowork::load_permission_rules(&workspace_root);
+                    let rule_decision = crate::cowork::evaluate_permission_rules(
+                        &perm_rules,
+                        &tool_name,
+                        &args_scrubbed,
+                    );
+
+                    if matches!(rule_decision, Some(crate::cowork::PermissionDecision::Deny)) {
+                        // Deny before reaching the cowork gate; no audit event needed.
+                        Some(format!(
+                            "denied: blocked by permission rule for {tool_name}"
+                        ))
+                    } else {
+                        // High-risk roles (IaC) always confirm a mutation — never
+                        // auto-approved even in Auto/AcceptEdits — because the ops
+                        // (apply/destroy) are dangerous and hard to reverse.
+                        let push = Some((dispatcher.as_ref(), Some(turn_id.as_str())));
+                        let gate_mode = gate.mode().await;
+                        let decision = if matches!(
+                            rule_decision,
+                            Some(crate::cowork::PermissionDecision::Allow)
+                        ) {
+                            Decision::Approve
+                        } else if role.is_high_risk()
+                            && crate::cowork::evaluate(
+                                crate::cowork::PermissionMode::Plan,
+                                &tool_name,
+                            ) == crate::cowork::PermissionDecision::Deny
+                        {
+                            gate.gate_tool_forced_ask(0, &tool_name, args_scrubbed, "", push)
+                                .await
+                        } else {
+                            gate.gate_tool(0, &tool_name, args_scrubbed, "", push).await
+                        };
+                        // Record auto_approved when Auto mode bypassed a gate that Ask would
+                        // have held for human approval, so the audit trail shows the bypass.
+                        if matches!(&decision, Decision::Approve)
+                            && gate_mode == crate::cowork::PermissionMode::Auto
+                            && crate::cowork::evaluate(
+                                crate::cowork::PermissionMode::Ask,
+                                &tool_name,
+                            ) == crate::cowork::PermissionDecision::Ask
+                        {
+                            let ev = smedja_ingot::AuditEvent {
+                                id: Uuid::new_v4(),
+                                ts: Timestamp::now(),
+                                session_id: session_id.clone(),
+                                turn_id: Some(turn_id.clone()),
+                                action_type: "auto_approved".into(),
+                                actor: "smdjad".into(),
+                                tool_name: Some(tool_name.clone()),
+                                tool_call_id: Some(tool_call_id.clone()),
+                                ..smedja_ingot::AuditEvent::default()
+                            };
+                            if let Err(e) = ingot.record_timeline_event(ev).await {
+                                warn!(
+                                    turn_id = %turn_id,
+                                    error = %e,
+                                    "failed to record auto_approved event"
+                                );
+                            }
+                        }
+                        match decision {
+                            Decision::Approve => None,
+                            Decision::Deny(reason) => Some(format!("denied: {reason}")),
+                            Decision::Modify(new_input) => {
+                                tool_input = new_input;
+                                None
+                            }
+                        }
+                    }
+                };
+
+                // 5d. Execute the tool (or return the denial).
+                let tool_result = if let Some(denial) = cowork_denied {
+                    denial
+                } else {
+                    let tool_type_val =
+                        if crate::executor::LOCAL_TOOLS.contains(&tool_name.as_str()) {
+                            if matches!(
+                                tool_name.as_str(),
+                                "smedja_vault_search" | "smedja_vault_store" | "graph_query"
+                            ) {
+                                "datastore"
+                            } else {
+                                "function"
+                            }
+                        } else {
+                            "extension"
+                        };
+                    let mut tool_span = tracer.start(tel::SPAN_TOOL_EXECUTE);
+                    tool_span.set_attribute(KeyValue::new(
+                        tel::OPERATION_NAME,
+                        tel::OPERATION_EXECUTE_TOOL,
+                    ));
+                    tool_span.set_attribute(KeyValue::new(tel::TOOL_NAME, tool_name.clone()));
+                    tool_span.set_attribute(KeyValue::new(tel::TOOL_TYPE, tool_type_val));
+                    tool_span.set_attribute(KeyValue::new(tel::TOOL_CALL_ID, tool_call_id.clone()));
+                    match tel::tool_args_capture_mode() {
+                        tel::CaptureMode::Hash => {
+                            tool_span.set_attribute(KeyValue::new(
+                                tel::TOOL_ARGS_HASH,
+                                tel::content_hash(&tool_input),
+                            ));
+                        }
+                        tel::CaptureMode::Scrubbed | tel::CaptureMode::Full => {
+                            tool_span.set_attribute(KeyValue::new(
+                                tel::TOOL_ARGS_HASH,
+                                tel::content_hash(&tool_input),
+                            ));
+                            tool_span.set_attribute(KeyValue::new(
+                                "gen_ai.tool.args",
+                                tel::scrub_and_summarise(&tool_input),
+                            ));
+                        }
+                    }
+                    let result = execute_tool(
+                        &tool_name,
+                        &tool_input,
+                        &workspace_root,
+                        session.as_ref(),
+                        ingot,
+                        vault,
+                        embedder,
+                    )
+                    .await;
+                    tool_span.set_attribute(KeyValue::new(
+                        tel::TOOL_RESULT_HASH,
+                        tel::content_hash(&result),
+                    ));
+                    tool_span.set_attribute(KeyValue::new(
+                        tel::TOOL_RESULT_TOKENS,
+                        i64::try_from(result.split_whitespace().count()).unwrap_or(0),
+                    ));
+                    let outcome = classify_tool_outcome(&result);
+                    if outcome.is_success() {
+                        use opentelemetry::trace::Span as _;
+                        tool_span.set_status(opentelemetry::trace::Status::Ok);
+                    } else {
+                        use opentelemetry::trace::Span as _;
+                        tool_span.set_status(opentelemetry::trace::Status::error(
+                            result.chars().take(120).collect::<String>(),
+                        ));
+                    }
+                    tool_span.end();
+                    result
+                };
+
+                // Persist tool execution as a timeline event.
+                {
+                    let tool_sc = {
+                        use opentelemetry::trace::TraceContextExt as _;
+                        let cx = opentelemetry::Context::current();
+                        cx.span().span_context().clone()
+                    };
+                    let (t_trace_id, t_span_id) = if tool_sc.is_valid() {
+                        (
+                            Some(format!("{}", tool_sc.trace_id())),
+                            Some(format!("{}", tool_sc.span_id())),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    let tool_audit = smedja_ingot::AuditEvent {
+                        id: Uuid::new_v4(),
+                        ts: Timestamp::now(),
+                        session_id: session_id.clone(),
+                        turn_id: Some(turn_id.clone()),
+                        action_type: "tool_exec".into(),
+                        actor: "smdjad".into(),
+                        tool_name: Some(tool_name.clone()),
+                        traceparent: None,
+                        trace_id: t_trace_id,
+                        span_id: t_span_id,
+                        conversation_id: Some(session_id.clone()),
+                        tool_call_id: Some(tool_call_id.clone()),
+                        operation_name: Some(tel::OPERATION_EXECUTE_TOOL.to_owned()),
+                        status: if tool_result.starts_with("error:")
+                            || tool_result.starts_with("permission denied")
+                        {
+                            Some("error".to_owned())
+                        } else {
+                            Some("ok".to_owned())
+                        },
+                        ..smedja_ingot::AuditEvent::default()
+                    };
+                    if let Err(e) = ingot.record_timeline_event(tool_audit).await {
+                        warn!(turn_id = %turn_id, error = %e, "failed to record tool audit event");
+                    }
+                }
+
+                // 5e. Compress the tool result (SmartCrusher strips JSON nulls,
+                // bypassed by SMEDJA_NO_TOOL_COMPRESS=1), then append it as a user
+                // message and continue the loop. Compression runs before the push
+                // so token budgeting reflects the crushed size.
+                let crushed = smedja_adapter::crush::compress_tool_result(&tool_result);
+                let escaped_result = crushed.replace('<', "&lt;").replace('>', "&gt;");
+                mem.push(AdapterMessage::user(format!(
+                    "<tool_result tool=\"{tool_name}\">{escaped_result}</tool_result>"
+                )));
+
                 full_response = response_text;
-                break 'tool_loop;
             }
 
             // Attempt finished. If no rotation was requested the turn succeeded
@@ -2608,5 +2708,255 @@ mod tests {
         assert!(result.contains("note one"));
         assert!(result.contains("note two"));
         assert!(result.contains("---"));
+    }
+
+    // --- parallel tool batch tests ---
+
+    /// A stateful provider: first call returns N embedded JSON tool calls; second
+    /// call returns `final_text` after receiving the combined tool_result message.
+    struct MultiToolProvider {
+        calls: Vec<String>,
+        final_text: &'static str,
+        call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Provider for MultiToolProvider {
+        fn stream_chat(&self, messages: &[AdapterMessage], _opts: &CallOptions) -> DeltaStream {
+            use smedja_adapter::types::Role;
+            let n = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                let text = self.calls.join("\n");
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(Delta::Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cache_read_tokens: 0,
+                    }),
+                    Ok(Delta::Text(text)),
+                ]))
+            } else {
+                // Verify the combined result was injected before our final text.
+                let last_user = messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == Role::User)
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default();
+                assert!(
+                    last_user.contains("<tool_result"),
+                    "second model call must receive combined tool_result; got: {last_user}"
+                );
+                let text = self.final_text.to_owned();
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(Delta::Usage {
+                        input_tokens: 5,
+                        output_tokens: 3,
+                        cache_read_tokens: 0,
+                    }),
+                    Ok(Delta::Text(text)),
+                ]))
+            }
+        }
+    }
+
+    async fn make_ws_session_and_task(
+        ingot: &IngotHandle,
+        ws_path: std::path::PathBuf,
+        title: &str,
+    ) -> (String, String) {
+        let sid = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let now = Timestamp::now();
+        ingot
+            .create_session(Session {
+                id: Uuid::parse_str(&sid).unwrap(),
+                created_at: now,
+                updated_at: now,
+                status: "active".to_owned(),
+                task_id: None,
+                mode: None,
+                title: title.to_owned(),
+                cowork_mode: false,
+                workspace_root: Some(ws_path.to_string_lossy().to_string()),
+                model_override: None,
+                runner_override: None,
+            })
+            .await
+            .unwrap();
+        ingot
+            .create_task(Task {
+                id: task_id,
+                title: title.to_owned(),
+                description: String::new(),
+                status: "planned".to_owned(),
+                created_at: now,
+                session_id: Some(sid.clone()),
+                response: None,
+            })
+            .await
+            .unwrap();
+        (sid, task_id.to_string())
+    }
+
+    fn collect_delta_text(rx: &mut tokio::sync::broadcast::Receiver<TurnEvent>) -> String {
+        let mut out = String::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let TurnEvent::AssistantDelta { content, .. } = ev {
+                out.push_str(&content);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn parallel_read_batch_injects_combined_result() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws_path = ws.path().to_owned();
+        std::fs::write(ws_path.join("a.txt"), b"alpha").unwrap();
+        std::fs::write(ws_path.join("b.txt"), b"beta").unwrap();
+        std::fs::write(ws_path.join("c.txt"), b"gamma").unwrap();
+
+        let calls = vec![
+            r#"{"tool":"read_file","input":{"path":"a.txt"}}"#.to_owned(),
+            r#"{"tool":"read_file","input":{"path":"b.txt"}}"#.to_owned(),
+            r#"{"tool":"read_file","input":{"path":"c.txt"}}"#.to_owned(),
+        ];
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = MultiToolProvider {
+            calls,
+            final_text: "files read",
+            call_count: std::sync::Arc::clone(&call_count),
+        };
+
+        let ingot = IngotHandle::new(Ingot::open_in_memory().expect("in-memory Ingot must open"));
+        let (session_id, turn_id) =
+            make_ws_session_and_task(&ingot, ws_path.clone(), "read files").await;
+
+        let dispatcher = Arc::new(Dispatcher::new(64));
+        let mut rx = dispatcher.subscribe();
+        let pool = ProviderPool::from_entries_for_test(vec![entry(
+            (Runner::Claude, Tier::Fast),
+            "claude-cli",
+            Box::new(provider),
+        )]);
+
+        let orc = orchestrator_with_pool(ingot, Arc::clone(&dispatcher), pool);
+        orc.run(session_id, turn_id).await;
+
+        let delta_text = collect_delta_text(&mut rx);
+        assert!(
+            delta_text.contains("files read"),
+            "final delta must contain the provider's final text; got: {delta_text}"
+        );
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly two model calls: one for tool calls, one for final response"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_runs_reads_then_write_sequentially() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws_path = ws.path().to_owned();
+        std::fs::write(ws_path.join("src.txt"), b"source content").unwrap();
+
+        let calls = vec![
+            r#"{"tool":"read_file","input":{"path":"src.txt"}}"#.to_owned(),
+            r#"{"tool":"write_file","input":{"path":"out.txt","content":"hello"}}"#.to_owned(),
+        ];
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = MultiToolProvider {
+            calls,
+            final_text: "mixed done",
+            call_count: std::sync::Arc::clone(&call_count),
+        };
+
+        let ingot = IngotHandle::new(Ingot::open_in_memory().expect("in-memory Ingot must open"));
+
+        // Use "impl" mode (AgentRole::Impl, not read-only). Impl+Coding routes
+        // Local/Local; Claude/Deep is compatible (rank 2 >= rank 1) so the
+        // Deep pool entry is used as fallback.
+        let sid = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4();
+        let now = Timestamp::now();
+        ingot
+            .create_session(Session {
+                id: Uuid::parse_str(&sid).unwrap(),
+                created_at: now,
+                updated_at: now,
+                status: "active".to_owned(),
+                task_id: None,
+                mode: Some("impl".to_owned()),
+                title: "mixed batch".to_owned(),
+                cowork_mode: false,
+                workspace_root: Some(ws_path.to_string_lossy().to_string()),
+                model_override: None,
+                runner_override: None,
+            })
+            .await
+            .unwrap();
+        ingot
+            .create_task(Task {
+                id: task_id,
+                title: "mixed batch".to_owned(),
+                description: String::new(),
+                status: "planned".to_owned(),
+                created_at: now,
+                session_id: Some(sid.clone()),
+                response: None,
+            })
+            .await
+            .unwrap();
+        let (session_id, turn_id) = (sid, task_id.to_string());
+
+        let dispatcher = Arc::new(Dispatcher::new(64));
+        let mut rx = dispatcher.subscribe();
+
+        // Pre-set the cowork gate to Auto so write_file is auto-approved.
+        let gates: Arc<Mutex<std::collections::HashMap<String, Arc<crate::cowork::CoworkGate>>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        {
+            let gate = Arc::new(crate::cowork::CoworkGate::default());
+            gate.set_mode(crate::cowork::PermissionMode::Auto).await;
+            gates.lock().await.insert(session_id.clone(), gate);
+        }
+
+        // Claude/Deep is compatible with Impl+Coding routing (Local/Local fallback).
+        let pool = ProviderPool::from_entries_for_test(vec![entry(
+            (Runner::Claude, Tier::Deep),
+            "claude-deep",
+            Box::new(provider),
+        )]);
+
+        let orc = super::TurnOrchestrator::new(
+            ingot,
+            Arc::clone(&dispatcher),
+            gates,
+            Arc::new(pool),
+            Arc::new(Assayer::default_rules()),
+            Arc::new(PriceTable::embedded()),
+            Arc::new(Mutex::new(Vault::open_in_memory().expect("vault"))),
+            Arc::new(crate::embedder_port::FnvEmbedder::new()),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+            None,
+            Arc::new(smedja_lsp::LspManager::new()),
+        );
+        orc.run(session_id, turn_id).await;
+
+        let delta_text = collect_delta_text(&mut rx);
+        // The turn must complete: both read (natively handled) and write (MCP-dispatched)
+        // results were combined and the model received them before emitting final text.
+        assert!(
+            delta_text.contains("mixed done"),
+            "mixed batch delta must contain final text; got: {delta_text}"
+        );
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly two model calls: one for batch tool calls, one for final response"
+        );
     }
 }

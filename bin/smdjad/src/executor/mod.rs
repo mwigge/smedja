@@ -109,6 +109,23 @@ pub(crate) const MCP_SERVER_TOOLS: &[&str] = &[
     "log_tail",
 ];
 
+/// Read-only tools that can run concurrently without cowork gate approval.
+///
+/// These tools never mutate workspace state, so they are safe to dispatch in
+/// parallel. Write/exec tools are not in this set and must be gated serially.
+pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
+    "read_file",
+    "list_files",
+    "grep_files",
+    "find_files",
+    "graph_query",
+    "otel_query",
+    "metric_query",
+    "log_tail",
+    "smedja_vault_search",
+    "smedja_retrieve",
+];
+
 /// In-memory store for content blocks addressed by SHA-256 hash.
 /// Used by the `smedja_retrieve` tool to look up compressed context blocks.
 fn retrieve_store() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
@@ -301,6 +318,63 @@ pub(crate) fn parse_tool_call(text: &str) -> Option<(String, String)> {
         .get("input")
         .map_or_else(|| "{}".to_owned(), std::string::ToString::to_string);
     Some((tool_name, input))
+}
+
+/// Parses all tool calls embedded in `text`, returning them in order.
+///
+/// Scans for every `{"tool": ..., "input": ...}` JSON object in the text.
+/// Correctly handles nested JSON by tracking brace depth, so an `"input"`
+/// that itself contains `{...}` does not produce spurious extra calls.
+pub(crate) fn parse_all_tool_calls(text: &str) -> Vec<(String, String)> {
+    use serde::Deserialize as _;
+    let mut calls = Vec::new();
+    let mut skip_until = 0usize;
+    for (i, &b) in text.as_bytes().iter().enumerate() {
+        if i < skip_until || b != b'{' {
+            continue;
+        }
+        let slice = &text[i..];
+        // Try to deserialize a JSON object starting at this position.
+        let mut de = serde_json::Deserializer::from_str(slice);
+        if let Ok(v) = serde_json::Value::deserialize(&mut de) {
+            if let Some(tool_name) = v.get("tool").and_then(|t| t.as_str()) {
+                let input = v
+                    .get("input")
+                    .map_or_else(|| "{}".to_owned(), std::string::ToString::to_string);
+                calls.push((tool_name.to_owned(), input));
+                skip_until = i + json_span(slice);
+            }
+        }
+    }
+    calls
+}
+
+/// Returns the byte length of the first JSON object (or value) starting at `s`.
+///
+/// Counts matching braces while ignoring escaped characters and strings.
+fn json_span(s: &str) -> usize {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, b) in s.bytes().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        match b {
+            b'\\' if in_string => escape = true,
+            b'"' => in_string = !in_string,
+            b'{' if !in_string => depth += 1,
+            b'}' if !in_string => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    s.len()
 }
 
 /// Returns `true` when the workspace `[tools]` config has `confirm_edits = true`.
@@ -1797,6 +1871,57 @@ mod tests {
         let json = r#"{"action":"bash","input":{"command":"ls"}}"#;
         let result = super::parse_tool_call(json);
         assert!(result.is_none(), "JSON without 'tool' key must yield None");
+    }
+
+    // ── parse_all_tool_calls ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_all_tool_calls_returns_empty_for_plain_text() {
+        assert!(super::parse_all_tool_calls("hello world").is_empty());
+    }
+
+    #[test]
+    fn parse_all_tool_calls_returns_single_call() {
+        let text = r#"{"tool":"read_file","input":{"path":"foo.txt"}}"#;
+        let calls = super::parse_all_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "read_file");
+    }
+
+    #[test]
+    fn parse_all_tool_calls_returns_multiple_calls_in_order() {
+        let text = concat!(
+            r#"{"tool":"read_file","input":{"path":"a.txt"}} "#,
+            r#"{"tool":"grep_files","input":{"pattern":"foo"}} "#,
+            r#"{"tool":"list_files","input":{}}"#,
+        );
+        let calls = super::parse_all_tool_calls(text);
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].0, "read_file");
+        assert_eq!(calls[1].0, "grep_files");
+        assert_eq!(calls[2].0, "list_files");
+    }
+
+    #[test]
+    fn parse_all_tool_calls_skips_past_consumed_json() {
+        // Nested JSON in `input` must not produce a spurious extra call.
+        let text = r#"{"tool":"write_file","input":{"path":"f","content":"{\"nested\":true}"}}"#;
+        let calls = super::parse_all_tool_calls(text);
+        assert_eq!(calls.len(), 1, "nested JSON must not produce extra calls");
+        assert_eq!(calls[0].0, "write_file");
+    }
+
+    #[test]
+    fn parse_all_tool_calls_embedded_in_prose() {
+        let text = concat!(
+            "Here are two reads:\n",
+            r#"{"tool":"read_file","input":{"path":"a.txt"}}"#,
+            " and ",
+            r#"{"tool":"read_file","input":{"path":"b.txt"}}"#,
+            "\nDone.",
+        );
+        let calls = super::parse_all_tool_calls(text);
+        assert_eq!(calls.len(), 2);
     }
 
     // ── path traversal guard ──────────────────────────────────────────────────
