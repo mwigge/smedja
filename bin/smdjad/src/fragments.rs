@@ -48,6 +48,8 @@ pub(crate) enum Fragment {
     /// `@lsp` — inject the current LSP diagnostic snapshot from the daemon's
     /// `LspManager`. Empty when no language servers are running.
     Lsp,
+    /// `@paste:{sha8}` — inject content from a temp paste file.
+    Paste(String),
 }
 
 /// Per-fragment and per-message size caps, with environment overrides resolved at
@@ -94,7 +96,10 @@ fn env_usize(key: &str) -> Option<usize> {
 
 /// Returns `true` when `kind` names a recognised fragment.
 fn is_known_kind(kind: &str) -> bool {
-    matches!(kind, "file" | "git" | "branch" | "shell" | "clippy" | "lsp")
+    matches!(
+        kind,
+        "file" | "git" | "branch" | "shell" | "clippy" | "lsp" | "paste"
+    )
 }
 
 /// Parses `content` into a sequence of literal-text and recognised-fragment
@@ -203,6 +208,19 @@ fn take_fragment(
             }
             Some((Fragment::Shell(cmd.to_owned()), cmd_end))
         }
+        "paste" => {
+            // The format is @paste:{sha8}. After "paste", the next char must be ':'.
+            if bytes.get(kind_end) != Some(&b':') {
+                return None;
+            }
+            let sha_start = kind_end + 1;
+            let sha_end = scan_word(bytes, sha_start);
+            if sha_end == sha_start {
+                return None;
+            }
+            let sha8 = content[sha_start..sha_end].to_owned();
+            Some((Fragment::Paste(sha8), sha_end))
+        }
         _ => None,
     }
 }
@@ -295,6 +313,13 @@ async fn expand_with_caps(
             Fragment::Lsp => {
                 let block = resolve_lsp(lsp);
                 push_block(&mut out, "lsp", "", block, caps, &mut budget);
+            }
+            Fragment::Paste(sha8) => {
+                let path = std::env::temp_dir().join(format!("smedja-paste-{sha8}.txt"));
+                let content = tokio::fs::read_to_string(&path)
+                    .await
+                    .unwrap_or_else(|_| format!("[paste {sha8} not found]"));
+                out.push_str(&content);
             }
         }
     }
@@ -577,6 +602,73 @@ mod tests {
     fn file_without_path_left_verbatim() {
         let frags = parse("@file\n");
         assert_eq!(frags, vec![Fragment::Literal("@file\n".to_owned())]);
+    }
+
+    #[test]
+    fn paste_fragment_parsed() {
+        let frags = parse("look at @paste:abc12345 please");
+        assert_eq!(
+            frags,
+            vec![
+                Fragment::Literal("look at ".to_owned()),
+                Fragment::Paste("abc12345".to_owned()),
+                Fragment::Literal(" please".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn paste_without_colon_left_verbatim() {
+        // "paste" without ":sha8" is not a valid fragment — left as literal.
+        let frags = parse("@paste nope");
+        assert_eq!(frags, vec![Fragment::Literal("@paste nope".to_owned())]);
+    }
+
+    #[test]
+    fn paste_with_empty_sha_left_verbatim() {
+        // "@paste:" with nothing after the colon is not a valid fragment.
+        let frags = parse("@paste: nope");
+        assert_eq!(frags, vec![Fragment::Literal("@paste: nope".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn paste_fragment_injects_temp_file_content() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let sha8 = "deadbeef";
+        let paste_path = std::env::temp_dir().join(format!("smedja-paste-{sha8}.txt"));
+        tokio::fs::write(&paste_path, b"pasted content here")
+            .await
+            .unwrap();
+        let out = expand_with_caps(
+            &format!("before @paste:{sha8} after"),
+            &ws,
+            None,
+            None,
+            caps(1 << 20, 2_000, 1 << 20),
+        )
+        .await;
+        tokio::fs::remove_file(&paste_path).await.ok();
+        assert_eq!(out, "before pasted content here after");
+    }
+
+    #[tokio::test]
+    async fn paste_fragment_missing_file_yields_marker() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let sha8 = "00000000";
+        // Ensure the file does not exist.
+        let paste_path = std::env::temp_dir().join(format!("smedja-paste-{sha8}.txt"));
+        tokio::fs::remove_file(&paste_path).await.ok();
+        let out = expand_with_caps(
+            &format!("@paste:{sha8}"),
+            &ws,
+            None,
+            None,
+            caps(1 << 20, 2_000, 1 << 20),
+        )
+        .await;
+        assert_eq!(out, format!("[paste {sha8} not found]"));
     }
 
     // ── 2. @file resolution ──────────────────────────────────────────────────
