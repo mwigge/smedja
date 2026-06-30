@@ -1,6 +1,6 @@
 id     = "WI-002"
 title  = "CodeWidget — tree-sitter composable code block widget"
-status = "planned"
+status = "done"
 priority = "P1"
 
 [detail]

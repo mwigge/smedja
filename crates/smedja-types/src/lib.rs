@@ -27,6 +27,8 @@ pub enum Runner {
     Minimax,
     /// Berget (cloud).
     Berget,
+    /// Poolside (cloud, `pool` CLI).
+    Pool,
 }
 
 /// The execution tier that controls latency vs. capability trade-offs.
@@ -285,6 +287,7 @@ mod tests {
             Runner::Copilot,
             Runner::Minimax,
             Runner::Berget,
+            Runner::Pool,
         ] {
             let json = serde_json::to_string(&runner).expect("serialise runner");
             let back: Runner = serde_json::from_str(&json).expect("deserialise runner");

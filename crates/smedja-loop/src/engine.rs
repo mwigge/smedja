@@ -81,6 +81,7 @@ fn runner_label(runner: Runner) -> &'static str {
         Runner::Copilot => "copilot",
         Runner::Minimax => "minimax",
         Runner::Berget => "berget",
+        Runner::Pool => "pool",
     }
 }
 

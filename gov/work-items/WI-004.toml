@@ -1,6 +1,6 @@
 id     = "WI-004"
 title  = "/gov create and /gov transition — artifact mutation commands"
-status = "planned"
+status = "done"
 priority = "P2"
 
 [detail]

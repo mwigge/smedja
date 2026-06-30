@@ -1,6 +1,6 @@
 id     = "WI-001"
 title  = "Role cockpit panel — active role, tier, in-flight turn status during /loop"
-status = "planned"
+status = "done"
 priority = "P1"
 
 [detail]

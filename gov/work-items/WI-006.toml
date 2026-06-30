@@ -1,6 +1,6 @@
 id     = "WI-006"
 title  = "OSC-9 unit test — abstract stdout write for testability"
-status = "planned"
+status = "done"
 priority = "P3"
 
 [detail]

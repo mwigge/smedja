@@ -31,6 +31,7 @@ pub mod gpu;
 pub mod local;
 pub mod openai;
 pub mod openai_compat;
+pub mod pool_cli;
 pub mod poolside;
 pub mod provider;
 pub mod subprocess;
@@ -67,6 +68,7 @@ pub use openai::OpenAiProvider;
 pub use openai_compat::{
     BergetProvider, MinimaxProvider, OpenAiCompatProvider, OpenAiCompatSpec, OpenCodeProvider,
 };
+pub use pool_cli::PoolCliProvider;
 pub use poolside::PoolsideProvider;
 pub use provider::{DeltaStream, Provider};
 pub use subprocess::SubprocessProvider;
