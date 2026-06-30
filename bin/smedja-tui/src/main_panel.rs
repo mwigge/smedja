@@ -364,6 +364,11 @@ pub struct MainPanel {
     /// Index into `lines` where the buffered (unlabeled) code lines start,
     /// so they can be retroactively re-highlighted on fence close.
     code_buf_start: usize,
+    /// Partial word held back during streaming so flushes happen at word
+    /// boundaries.  When a space arrives the buffered prefix (up to and
+    /// including the last space) is committed to the tail line; the suffix
+    /// (the new partial word) stays here until the next space.
+    pending_word: String,
     /// Inner (border-excluded) rect of the last render — for mouse hit-testing.
     last_inner: Rect,
     /// Logical line index for each visual row drawn in the last render window,
@@ -433,6 +438,7 @@ impl MainPanel {
             code_lang: String::new(),
             code_buf: Vec::new(),
             code_buf_start: 0,
+            pending_word: String::new(),
             last_inner: Rect::new(0, 0, 0, 0),
             row_logical: Vec::new(),
             row_charbounds: Vec::new(),
@@ -664,6 +670,17 @@ impl MainPanel {
     /// streamed code blocks get syntax-highlighted and diff lines get coloured —
     /// the same treatment [`push_line`] gives non-streamed content.
     pub fn finalize_last_line(&mut self) {
+        // Drain any partial word that was still buffered (no trailing space yet).
+        if !self.pending_word.is_empty() {
+            let pending = std::mem::take(&mut self.pending_word);
+            if let Some(last) = self.lines.last_mut() {
+                last.text.push_str(&pending);
+                last.spans = None;
+            } else {
+                self.lines
+                    .push(StyledLine::plain(pending, LineStyle::Normal));
+            }
+        }
         if let Some(last) = self.lines.pop() {
             // A line that already carries explicit spans (a card, a result meta
             // line, or already-highlighted code) is left as-is.
@@ -962,13 +979,26 @@ impl MainPanel {
     /// opening a new one, so callers can accumulate partial content until the
     /// turn completes and `push_line` takes over for the final render.
     pub fn push_delta(&mut self, text: &str) {
-        if let Some(last) = self.lines.last_mut() {
-            last.text.push_str(text);
-            // Clear cached spans since text changed.
-            last.spans = None;
-        } else {
-            self.lines
-                .push(StyledLine::plain(text.to_owned(), LineStyle::Normal));
+        // Append incoming text to the pending-word buffer first.
+        self.pending_word.push_str(text);
+
+        // Flush everything up to and including the last space in the buffer.
+        // The suffix after the last space is the new partial word; keep it pending.
+        if let Some(last_space) = self.pending_word.rfind(' ') {
+            // Split at last_space + 1 so the space itself is flushed.
+            let flush_end = last_space + 1;
+            let flushed = self.pending_word[..flush_end].to_owned();
+            let remainder = self.pending_word[flush_end..].to_owned();
+            self.pending_word = remainder;
+
+            if let Some(last) = self.lines.last_mut() {
+                last.text.push_str(&flushed);
+                // Clear cached spans since text changed.
+                last.spans = None;
+            } else {
+                self.lines
+                    .push(StyledLine::plain(flushed, LineStyle::Normal));
+            }
         }
     }
 
@@ -979,11 +1009,25 @@ impl MainPanel {
     #[cfg(test)]
     #[must_use]
     pub fn visible_text(&self) -> String {
-        self.lines
-            .iter()
-            .map(|l| l.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
+        let mut parts: Vec<&str> = self.lines.iter().map(|l| l.text.as_str()).collect();
+        // Include any partial word that is still pending (not yet space-flushed).
+        let pending = self.pending_word.as_str();
+        if !pending.is_empty() {
+            if parts.is_empty() {
+                // No committed lines yet — return just the pending word.
+                return pending.to_owned();
+            }
+            // Append pending word to the last line for display purposes.
+            let last = parts.pop().unwrap_or("");
+            let combined = format!("{last}{pending}");
+            let mut result = parts.join("\n");
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(&combined);
+            return result;
+        }
+        parts.join("\n")
     }
 }
 
@@ -1593,6 +1637,44 @@ mod tests {
         panel.push_delta("first");
         let content = panel.visible_text();
         assert!(content.contains("first"));
+    }
+
+    // --- M13: word-boundary streaming flush ---
+
+    #[test]
+    fn push_delta_with_space_flushes_word() {
+        let mut panel = MainPanel::new();
+        panel.push_delta("word ");
+        // "word " contains a space, so "word " is flushed to the committed line.
+        let content = panel.visible_text();
+        assert!(
+            content.contains("word "),
+            "visible_text should include the flushed word: {content:?}"
+        );
+    }
+
+    #[test]
+    fn push_delta_without_space_stays_pending() {
+        let mut panel = MainPanel::new();
+        panel.push_delta("word");
+        // No space — pending_word holds "word"; visible_text still shows it.
+        let content = panel.visible_text();
+        assert!(
+            content.contains("word"),
+            "visible_text should include the pending word: {content:?}"
+        );
+    }
+
+    #[test]
+    fn push_delta_multiple_spaces_flushes_all_complete_words() {
+        let mut panel = MainPanel::new();
+        panel.push_delta("one two three ");
+        // All complete words ("one two three ") are flushed.
+        let content = panel.visible_text();
+        assert!(
+            content.contains("one two three "),
+            "all complete words must be visible: {content:?}"
+        );
     }
 
     #[test]
