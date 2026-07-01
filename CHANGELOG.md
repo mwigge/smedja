@@ -6,6 +6,63 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.25.0] — 2026-07-01
+
+### Added
+
+- **OSC 99/777 desktop notifications** — Kitty (OSC 99) and VTE/Gnome Terminal (OSC 777) turn-complete notifications alongside existing iTerm2 (OSC 9); all three wrapped in tmux DCS passthrough when running inside tmux
+- **Terminal title animation** — braille spinner in window title while a turn is in-flight; resets to plain `smedja` on completion and on exit
+- **Context seam divider** — visual `↩ context summarized (N tok)` rule inserted in the transcript when the daemon fires auto-compaction (`HistoryReplaced` stream event)
+- **Language auto-detection for unlabeled code fences** — shebang, keyword, and extension heuristics detect Rust, Python, Go, Bash, SQL, JavaScript, Java for fences with no language tag
+- **Context window warning bar** — yellow chip at 80%, red chip at 95% of the active context window in the status bar
+- **Prompt history persistence** — TUI prompt history written to `~/.config/smedja/tui-history.jsonl` (cap 500, mode 0600) and loaded on startup; appended on each submit so crashes don't lose the session
+- **Large-paste protection** — pastes >1 024 bytes saved to `/tmp/smedja-paste-{sha8}.txt` (mode 0600, `O_EXCL`) and substituted with `@paste:{sha8}`; daemon fragment expander reads the file before model submission
+- **MCP resources and prompts** — `resources/list`, `resources/read`, `prompts/list`, `prompts/get` on both HTTP and stdio MCP transports
+- **MCP protocol version negotiation** — `initialize` handshake on first use; `negotiate_protocol_version` selects highest mutually supported version (2025-11-25 → 2024-11-05 fallback)
+- **MCP reconnect backoff** — stdio MCP clients retry failed child processes with exponential delays `[1, 2, 4, 8, 30]` seconds before marking the server failed
+- **MCP server-initiated notifications** — `notifications/tools/list_changed` triggers automatic tool-list refresh; notification reader runs as a background task per server
+- **Ctrl-S session browser overlay** — modal listing active sessions with arrow-key navigation and Enter-to-switch
+- **Vim normal mode** — `Esc` enters Normal mode; `i`/`a` returns to Insert; `h`/`l`/`w`/`b`/`0`/`$` motions; `x` delete-char; `dd` kill-line; `G`/`gg` scroll; `◇ NORMAL` indicator in status bar
+- **`smj session prompt`** — headless turn submission: calls `turn.submit` then streams the response to stdout; `--json` flag emits raw stream events
+- **`--max-turns N`** and **`--max-budget-usd N`** — session guards forwarded in `session.create` payload
+- **`--permission-mode`** — `default | accept-edits | bypass-permissions | plan` flag on `smj session start`
+- **`smj models list/show`** — static catalog of models across OpenAI, Anthropic, Groq, DeepSeek, Together, Perplexity, xAI, Ollama, and Bedrock with context windows and pricing; `--provider` filter
+- **Ollama first-class provider** — `OllamaProvider` wraps the OpenAI-compat `/v1` path; `list_models` queries `/api/tags`; detected via `OLLAMA_HOST` env var; wired into daemon provider pool
+- **OpenAI-compatible provider presets** — Groq, DeepSeek, Together AI, Perplexity, xAI; each detected from their respective `*_API_KEY` env vars and wired into the daemon pool
+- **AWS Bedrock provider** — `BedrockProvider` with SigV4 credential loading from env; Converse request format; streaming stub with actionable error message pending full EventStream implementation
+- **Streaming word-boundary flush** — `push_delta` flushes at word boundaries and every 40 bytes (CJK/URL threshold) for a typing-feel display
+- **Word-level diff highlighting** — `similar` crate diffs adjacent `+`/`-` line pairs; changed words underlined/highlighted in diff overlays
+- **Cell spacing modes** — `Compact / Comfortable / Spacious` control blank rows between message chips; toggled with `/spacing` slash command
+- **`smj shell hook install`** — appends idempotent `precmd` hooks to `~/.bashrc`, `~/.zshrc`, or `~/.config/fish/config.fish`; bash uses `PROMPT_COMMAND`, zsh uses `precmd_functions`, fish uses `fish_postexec`
+- **Image detection** — `detect_image_in_line` recognises `data:image/` URIs and common image paths; renders `[image: alt]` placeholder (Kitty Graphics Protocol rendering behind `SMEDJA_IMAGES=1`)
+- **`smj upgrade --check`** — exits non-zero with honest "not yet implemented" message; self-upgrade via `smedja-tui` `/upgrade` command remains functional
+
+### Fixed
+
+- **`AwsCredentials` debug leak** — manual `Debug` impl redacts `secret_access_key` and `session_token`; field is now private
+- **Paste and history file permissions** — both `/tmp/smedja-paste-*.txt` and `~/.config/smedja/tui-history.jsonl` created with mode `0o600` and `O_EXCL`/`O_CREAT` to prevent symlink attacks and world-readable exposure
+- **Stdio MCP registration blocked** — `is_safe_mcp_url` no longer applied to stdio server commands; stdio servers bypass the URL safety check
+- **Startup MCP refresh transport** — daemon startup now selects transport (HTTP vs stdio) per server rather than unconditionally using HTTP
+- **Session browser invisible** — `session_browser_open` overlay now rendered in `render()` with cursor highlighting and Enter-to-switch
+- **`HistoryReplaced` bare newline** — `turn_event_to_ndjson` now emits valid `{"type":"history_replaced","summary_tokens":N}` JSON instead of an empty string
+- **`smj session prompt` endpoint** — now calls `turn.submit` (registered RPC) instead of `session.submit` (unregistered)
+- **Syntect performance** — `SyntaxSet` and `ThemeSet` now initialised once via `OnceLock`; eliminated per-call deserialization of ~1.5 MB syntax data
+- **Context warning threshold** — 80% emits `p.warn` (yellow), 95% emits `p.error` (red); previously both thresholds used the same colour
+- **Provider re-exports** — `OllamaProvider`, `GroqProvider`, `DeepSeekProvider`, `TogetherProvider`, `PerplexityProvider`, `XAiProvider` now re-exported from `smedja-adapter::lib`
+- **OTel provider attribution** — `gen_ai.system` span attribute now reflects the actual provider (`"groq"`, `"ollama"`, etc.) rather than always `"openai"`
+- **Pricing for new providers** — Groq, DeepSeek, Together, Perplexity, xAI, and Bedrock entries added to `prices.toml`; `sonar-pro` and `grok-3-beta` model IDs added
+- **`McpHttpClient` timeout** — builder error now propagated with `?` instead of silently falling back to an unbounded-timeout default client
+- **MCP protocol negotiation** — `initialize` handshake now called lazily on first use via `OnceCell`; negotiated version stored per client
+- **Reconnect backoff wired** — `RECONNECT_DELAYS_SECS` now consumed in the stdio notification reader's reconnect loop
+- **`StreamEvent::Unknown` logged** — unknown event types from newer daemons now emit `tracing::debug!` rather than being silently dropped
+- **Cell spacing wired** — `push_author_chip` now reads `panel.spacing.blank_rows_after_chip()` instead of a hardcoded single blank line
+- **OSC notifications on poll fallback** — `emit_turn_notifications` now called on the `turn.subscribe` poll path as well as the streaming path
+- **`smj doctor`** — now lists `OLLAMA_HOST`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `TOGETHER_API_KEY`, `PERPLEXITY_API_KEY`, `XAI_API_KEY`
+- **Terminal title reset on exit** — `TerminalGuard::drop` emits OSC 0 to clear spinner before crossterm teardown
+- **History append-on-submit** — prompt history now appended to disk on each successful submit; clean-shutdown rewrite is a secondary flush
+
+---
+
 ## [0.24.0] — 2026-06-30
 
 ### Added

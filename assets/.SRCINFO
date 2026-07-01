@@ -1,6 +1,6 @@
 pkgbase = smedja
 	pkgdesc = GPU-accelerated terminal emulator and AI orchestration forge
-	pkgver = 0.21.0
+	pkgver = 0.25.0
 	pkgrel = 1
 	url = https://github.com/mwigge/smedja
 	arch = x86_64
