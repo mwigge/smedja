@@ -7,10 +7,13 @@ mod formatting;
 mod governance;
 mod local;
 mod loop_cmd;
+mod mcp;
 mod paths;
+mod prices;
 mod run;
 
 pub use run::run;
+mod sandbox;
 mod security;
 pub mod service;
 mod sessions;
@@ -35,23 +38,17 @@ use smedja_rpc::client::Client;
 #[cfg(test)]
 use crate::audit::build_audit_params;
 use crate::cli::*;
-use crate::daemon::{
-    cmd_daemon_start, cmd_daemon_status, connect_or_exit, init_tracing, wait_for_daemon_exit,
-};
 use crate::doctor::cmd_doctor;
 #[cfg(test)]
 use crate::doctor::is_subprocess_runner;
-use crate::eval::cmd_eval_run;
 use crate::formatting::{
     format_local_gpu, format_local_models, format_metrics_rows, format_savings_rows,
 };
-use crate::paths::{default_ingot_path, default_socket_path, xdg_config_dir};
+use crate::paths::{default_ingot_path, default_socket_path};
+#[cfg(test)]
 use crate::security::{cmd_security_report, cmd_security_sbom, cmd_security_scan};
-use crate::skills::{
-    cmd_skill_install, cmd_skill_link_ides, cmd_skill_list, cmd_skill_remove, cmd_skill_sync,
-    cmd_skill_update,
-};
-use crate::terminal::cmd_term_install;
+#[cfg(test)]
+use crate::skills::cmd_skill_link_ides;
 use crate::time_window::{build_metrics_params, since_to_micros};
 use crate::tool_gate::cmd_tool_gate;
 #[cfg(test)]

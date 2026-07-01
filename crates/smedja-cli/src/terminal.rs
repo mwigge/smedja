@@ -1,5 +1,36 @@
 use super::*;
 
+pub(crate) async fn dispatch_term(action: TermCmd) -> Result<()> {
+    match action {
+        TermCmd::Install { bin_path, prefix } => {
+            let prefix = prefix.unwrap_or_else(|| {
+                std::env::var("HOME").map_or_else(
+                    |_| PathBuf::from(".local/bin"),
+                    |h| PathBuf::from(h).join(".local/bin"),
+                )
+            });
+            let url = bin_path.unwrap_or_else(|| {
+                let os = std::env::consts::OS;
+                if os == "macos" {
+                    "https://github.com/mwigge/smedja/releases/latest/download/smedja-darwin-x86_64.tar.gz".to_owned()
+                } else {
+                    "https://github.com/mwigge/smedja/releases/latest/download/smedja-linux-x86_64.tar.gz".to_owned()
+                }
+            });
+            let prefix_clone = prefix.clone();
+            let url_clone = url.clone();
+            tokio::task::spawn_blocking(move || cmd_term_install(&url_clone, &prefix_clone))
+                .await
+                .context("install task panicked")??;
+        }
+        TermCmd::ConvertWezterm => {
+            eprintln!("smj term convert-wezterm: not yet implemented");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn cmd_term_install(url: &str, prefix: &std::path::Path) -> Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;

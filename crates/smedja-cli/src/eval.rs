@@ -1,5 +1,17 @@
 use super::*;
 
+pub(crate) fn dispatch_eval(action: EvalCmd) -> Result<()> {
+    match action {
+        EvalCmd::Run {
+            suite,
+            online,
+            json,
+            threshold,
+        } => cmd_eval_run(&suite, online, json, threshold)?,
+    }
+    Ok(())
+}
+
 pub(crate) fn cmd_eval_run(
     suite_dir: &std::path::Path,
     online: bool,

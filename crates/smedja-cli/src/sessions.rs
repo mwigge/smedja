@@ -1,4 +1,5 @@
 use super::*;
+use crate::daemon::connect_or_exit;
 
 pub(crate) async fn dispatch_session(action: SessionCmd, sock: &std::path::Path) -> Result<()> {
     if let SessionCmd::Blocks { id } = action {
