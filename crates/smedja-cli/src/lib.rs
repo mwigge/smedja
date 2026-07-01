@@ -46,6 +46,8 @@ use crate::formatting::{
 };
 use crate::paths::{default_ingot_path, default_socket_path};
 #[cfg(test)]
+use crate::sandbox::SandboxStatus;
+#[cfg(test)]
 use crate::security::{cmd_security_report, cmd_security_sbom, cmd_security_scan};
 #[cfg(test)]
 use crate::skills::cmd_skill_link_ides;
