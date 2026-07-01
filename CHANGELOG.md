@@ -6,6 +6,19 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.23.2] — 2026-07-01
+
+### Changed
+
+- **Thin CLI entrypoint** — `smj` dispatch now routes through focused modules (`audit`, `sessions`, `tasks`, `usage`, `workspace`, `timeline`, `local`, `governance`, `mcp`, `sandbox`, `security`, `terminal`, `eval`, and daemon control) instead of one large command body.
+- **Grouped CLI command definitions** — `clap` subcommand shapes moved under `crates/smedja-cli/src/cli/commands/` by domain, keeping `cli.rs` focused on the root parser and top-level `Cmd` enum.
+- **Thin terminal app entrypoint** — `st-app` tests moved out of `lib.rs`, leaving the terminal library entrypoint focused on startup and event-loop wiring.
+- **Maintenance documentation** — added `docs/maintenance.md` with module ownership, test placement policy, and verification commands; linked from README and docs index.
+
+### Fixed
+
+- **Refactor regression coverage** — CLI and terminal app test suites now live in dedicated test modules, preserving existing parser, formatting, workspace, security, input, title, and app-construction coverage after the module split.
+
 ## [0.23.0] — 2026-06-30
 
 ### Added
