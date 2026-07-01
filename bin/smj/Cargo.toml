@@ -12,22 +12,5 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow          = { workspace = true }
-chrono          = { workspace = true }
-clap            = { workspace = true }
-reqwest         = { workspace = true, features = ["blocking"] }
-serde           = { workspace = true }
-serde_json      = { workspace = true }
-smedja-assayer  = { path = "../../crates/smedja-assayer" }
-smedja-eval     = { path = "../../crates/smedja-eval" }
-smedja-ingot    = { path = "../../crates/smedja-ingot" }
-smedja-plugins  = { path = "../../crates/smedja-plugins" }
-smedja-rpc      = { path = "../../crates/smedja-rpc" }
-smedja-security = { path = "../../crates/smedja-security" }
+smedja-cli      = { path = "../../crates/smedja-cli" }
 tokio           = { workspace = true }
-tracing         = { workspace = true }
-tracing-subscriber = { workspace = true }
-which           = { workspace = true }
-
-[dev-dependencies]
-tempfile = "3"
-toml     = { workspace = true }
