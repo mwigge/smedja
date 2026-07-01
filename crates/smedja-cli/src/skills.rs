@@ -1,5 +1,20 @@
 use super::*;
 
+pub(crate) fn dispatch_skill(action: SkillCmd) -> Result<()> {
+    let registry = SkillRegistry::new(SkillRegistry::default_path());
+    match action {
+        SkillCmd::List => cmd_skill_list(&registry)?,
+        SkillCmd::Install { path } => cmd_skill_install(&registry, &path)?,
+        SkillCmd::Update { name, path } => cmd_skill_update(&registry, &name, &path)?,
+        SkillCmd::Remove { name } => cmd_skill_remove(&registry, &name)?,
+        SkillCmd::Sync { path } => cmd_skill_sync(&registry, &path)?,
+        SkillCmd::LinkIdes { dir } => {
+            cmd_skill_link_ides(&SkillRegistry::default_path(), &dir)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn cmd_skill_list(registry: &SkillRegistry) -> Result<()> {
     let skills = registry.scan()?;
     if skills.is_empty() {

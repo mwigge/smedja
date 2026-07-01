@@ -1,5 +1,38 @@
 use super::*;
 
+pub(crate) async fn dispatch_daemon(action: DaemonCmd, sock: &std::path::Path) -> Result<()> {
+    match action {
+        DaemonCmd::Status => cmd_daemon_status(sock).await?,
+        DaemonCmd::Start => cmd_daemon_start()?,
+        DaemonCmd::Stop => {
+            let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+            let pid_path = std::path::PathBuf::from(base).join("smdjad.pid");
+            let pid = std::fs::read_to_string(&pid_path)
+                .context("smdjad not running (no PID file)")?
+                .trim()
+                .to_owned();
+            std::process::Command::new("kill")
+                .args(["-TERM", &pid])
+                .status()
+                .context("kill -TERM failed")?;
+            println!("smdjad stopped (pid {pid})");
+        }
+        DaemonCmd::Restart => {
+            let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+            let pid_path = std::path::PathBuf::from(base).join("smdjad.pid");
+            if let Ok(pid) = std::fs::read_to_string(&pid_path).map(|s| s.trim().to_owned()) {
+                let _ = std::process::Command::new("kill")
+                    .args(["-TERM", &pid])
+                    .status();
+                wait_for_daemon_exit(&pid, sock).context("old smdjad did not shut down cleanly")?;
+            }
+            cmd_daemon_start()?;
+            println!("smdjad restarted");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn cmd_daemon_status(sock: &std::path::Path) -> Result<()> {
     match Client::connect(sock).await {
         Err(_) => {

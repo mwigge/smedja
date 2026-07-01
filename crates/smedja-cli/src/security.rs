@@ -1,5 +1,25 @@
 use super::*;
 
+pub(crate) fn dispatch_security(action: SecurityCmd) -> Result<()> {
+    match action {
+        SecurityCmd::Scan { path } => {
+            let target = path.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+            cmd_security_scan(&target);
+        }
+        SecurityCmd::Report => {
+            let db_path = default_ingot_path();
+            let ingot = Ingot::open(&db_path)
+                .with_context(|| format!("failed to open ingot at {}", db_path.display()))?;
+            cmd_security_report(&ingot)?;
+        }
+        SecurityCmd::Sbom { lockfile } => {
+            let lock = lockfile.unwrap_or_else(|| PathBuf::from("Cargo.lock"));
+            cmd_security_sbom(&lock)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn cmd_security_scan(workspace: &std::path::Path) {
     let findings = smedja_security::scan_posture(workspace);
     if findings.is_empty() {

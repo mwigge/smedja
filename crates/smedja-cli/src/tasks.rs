@@ -1,4 +1,5 @@
 use super::*;
+use crate::daemon::connect_or_exit;
 
 pub(crate) async fn dispatch_task(action: TaskCmd, sock: &std::path::Path) -> Result<()> {
     // Export and Import operate on the local Ingot DB directly without needing
