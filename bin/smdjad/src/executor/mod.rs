@@ -2919,6 +2919,21 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn bash_returns_when_background_child_keeps_pipe_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            crate::exec_bash_ext("printf done; sleep 1 &", dir.path(), Some(5), None, None),
+        )
+        .await
+        .expect("exec_bash_ext must not wait for a background child holding stdout");
+        assert!(
+            result.contains("done"),
+            "stdout emitted before shell exit must be preserved; got: {result}"
+        );
+    }
+
     // ── fetch_web ──────────────────────────────────────────────────────────────
 
     #[test]

@@ -1013,26 +1013,38 @@ mod tests {
     /// original value on drop.  Using this avoids cross-test pollution when
     /// tests run in the same process.
     struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
         key: String,
         previous: Option<String>,
     }
 
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     impl EnvGuard {
         fn set(key: &str, value: &str) -> Self {
+            let lock = env_lock().lock().expect("env test lock poisoned");
             let previous = std::env::var(key).ok();
-            // SAFETY: single-threaded test context; we restore on drop.
+            // SAFETY: environment-mutating tests are serialised by env_lock and
+            // the original value is restored while the lock is still held.
             unsafe { std::env::set_var(key, value) };
             Self {
+                _lock: lock,
                 key: key.to_owned(),
                 previous,
             }
         }
 
         fn remove(key: &str) -> Self {
+            let lock = env_lock().lock().expect("env test lock poisoned");
             let previous = std::env::var(key).ok();
-            // SAFETY: single-threaded test context; we restore on drop.
+            // SAFETY: environment-mutating tests are serialised by env_lock and
+            // the original value is restored while the lock is still held.
             unsafe { std::env::remove_var(key) };
             Self {
+                _lock: lock,
                 key: key.to_owned(),
                 previous,
             }

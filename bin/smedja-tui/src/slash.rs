@@ -854,7 +854,12 @@ pub(crate) async fn dispatch_slash(
 
             // Empty working-tree diff (everything committed) no longer hard-refuses:
             // fall back to a repository path scope instead.
-            let is_diff_scope = params.get("path").is_none()
+            let explicit_diff = params
+                .get("diff")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let is_diff_scope = !explicit_diff
+                && params.get("path").is_none()
                 && params.get("branch").is_none()
                 && params.get("pr").is_none();
             if is_diff_scope {
