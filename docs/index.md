@@ -8,3 +8,4 @@
 | [configuration.md](configuration.md) | agents.toml, loop.json, workspace.toml, methodology, env vars, theme colors |
 | [govctl.md](govctl.md) | govctl TOML artifacts: work items, RFCs, ADRs |
 | [terminal.md](terminal.md) | smedja GPU terminal: block model, Glyph Protocol, config |
+| [maintenance.md](maintenance.md) | Module ownership, test placement, and verification commands |

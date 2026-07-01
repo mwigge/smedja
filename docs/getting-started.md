@@ -166,3 +166,4 @@ See [`docs/configuration.md`](configuration.md) for the full config reference.
 - [`docs/configuration.md`](configuration.md) — agents.toml, loop.json, env vars
 - [`docs/govctl.md`](govctl.md) — govctl work items, RFCs, ADRs
 - [`docs/terminal.md`](terminal.md) — smedja GPU terminal guide
+- [`docs/maintenance.md`](maintenance.md) — module ownership and verification guide

@@ -711,6 +711,17 @@ The daemon reads `$XDG_RUNTIME_DIR/smdjad.sock` (falls back to `/tmp/smdjad.sock
 
 ---
 
+## Maintaining the Codebase
+
+The CLI and terminal entrypoints are intentionally thin. Add new behavior in the
+owning module, keep command/event routers small, and add tests near the behavior
+or in the crate-level test module when the behavior crosses modules.
+
+See [`docs/maintenance.md`](docs/maintenance.md) for the module map, test
+placement policy, and verification commands for `smedja-cli` and `st-app`.
+
+---
+
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
