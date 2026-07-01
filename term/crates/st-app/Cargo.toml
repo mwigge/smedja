@@ -1,0 +1,37 @@
+[package]
+name        = "st-app"
+description = "smedja terminal application shell and event loop"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+anyhow            = { workspace = true }
+arboard           = "3"
+clap              = { workspace = true }
+dirs              = "5"
+image             = { version = "0.25", default-features = false, features = ["png"] }
+pollster          = "0.3"
+russh             = "0.61"
+serde             = { workspace = true }
+st-agent          = { path = "../st-agent" }
+st-blocks         = { path = "../st-blocks" }
+st-config         = { path = "../st-config" }
+st-glyph          = { path = "../st-glyph" }
+st-pty            = { path = "../st-pty" }
+st-render         = { path = "../st-render" }
+st-statusbar      = { path = "../st-statusbar" }
+taffy             = { workspace = true }
+tokio             = { workspace = true }
+toml              = { workspace = true }
+tracing           = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid              = { workspace = true }
+wgpu              = { workspace = true }
+which             = { workspace = true }
+winit             = { workspace = true }
+
+[dev-dependencies]
+portable-pty = { workspace = true }
+vte          = { workspace = true }
