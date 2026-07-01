@@ -18,6 +18,7 @@ mod tasks;
 mod terminal;
 mod time_window;
 mod tool_gate;
+mod usage;
 mod workspace;
 
 use std::path::PathBuf;
@@ -49,7 +50,6 @@ use crate::skills::{
     cmd_skill_install, cmd_skill_link_ides, cmd_skill_list, cmd_skill_remove, cmd_skill_sync,
     cmd_skill_update,
 };
-use crate::tasks::{cmd_task_close, cmd_task_create, cmd_task_list, cmd_task_show};
 use crate::terminal::cmd_term_install;
 use crate::time_window::{build_metrics_params, since_to_micros};
 use crate::tool_gate::cmd_tool_gate;

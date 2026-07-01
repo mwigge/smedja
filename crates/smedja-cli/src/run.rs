@@ -2,6 +2,8 @@ use super::*;
 use crate::audit::dispatch_audit;
 use crate::loop_cmd::dispatch_loop;
 use crate::sessions::dispatch_session;
+use crate::tasks::dispatch_task;
+use crate::usage::{dispatch_cost, dispatch_metrics, dispatch_savings};
 
 pub async fn run() -> Result<()> {
     init_tracing();
@@ -52,244 +54,22 @@ pub async fn run() -> Result<()> {
                 }
             }
         }
-        Cmd::Task { action } => {
-            // Export and Import operate on the local Ingot DB directly without
-            // needing a running smdjad daemon.
-            match action {
-                TaskCmd::Export { change } => {
-                    let db_path = default_ingot_path();
-                    let ingot = Ingot::open(&db_path).with_context(|| {
-                        format!("failed to open ingot at {}", db_path.display())
-                    })?;
-                    let records = ingot
-                        .export_jsonl(change.as_deref())
-                        .context("export_jsonl failed")?;
-                    for rec in &records {
-                        println!("{}", serde_json::to_string(rec)?);
-                    }
-                    return Ok(());
-                }
-                TaskCmd::Import => {
-                    use std::io::BufRead as _;
-                    let db_path = default_ingot_path();
-                    let ingot = Ingot::open(&db_path).with_context(|| {
-                        format!("failed to open ingot at {}", db_path.display())
-                    })?;
-                    let stdin = std::io::stdin();
-                    let mut records: Vec<serde_json::Value> = Vec::new();
-                    for line in stdin.lock().lines() {
-                        let line = line.context("failed to read stdin")?;
-                        let line = line.trim().to_owned();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        let val: serde_json::Value =
-                            serde_json::from_str(&line).context("invalid JSON line")?;
-                        records.push(val);
-                    }
-                    let n = ingot
-                        .import_jsonl(&records)
-                        .context("import_jsonl failed")?;
-                    println!("Imported {n} record(s)");
-                    return Ok(());
-                }
-                _ => {}
-            }
-
-            let mut client = connect_or_exit(&sock).await;
-            match action {
-                TaskCmd::List { status } => cmd_task_list(&mut client, status.as_deref()).await?,
-                TaskCmd::Show { id } => cmd_task_show(&mut client, &id).await?,
-                TaskCmd::Create { title, description } => {
-                    cmd_task_create(&mut client, &title, description.as_deref()).await?;
-                }
-                TaskCmd::Close { id } => cmd_task_close(&mut client, &id).await?,
-                TaskCmd::Parallel { goal, roles } => {
-                    let resp = client
-                        .call("task.parallel", json!({ "goal": goal, "roles": roles }))
-                        .await
-                        .context("task.parallel failed")?;
-                    if let Some(tasks) = resp["tasks"].as_array() {
-                        for t in tasks {
-                            println!(
-                                "{} ({})",
-                                t["task_id"].as_str().unwrap_or("?"),
-                                t["role"].as_str().unwrap_or("?"),
-                            );
-                        }
-                    }
-                }
-                TaskCmd::Status { id } => {
-                    let resp = client
-                        .call("task.get", json!({ "id": id }))
-                        .await
-                        .context("task.get failed")?;
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&resp).unwrap_or_default()
-                    );
-                }
-                TaskCmd::Cancel { id } => {
-                    client
-                        .call("task.cancel", json!({ "task_id": id }))
-                        .await
-                        .context("task.cancel failed")?;
-                    println!("cancelled: {id}");
-                }
-                // Already handled above; unreachable but required for exhaustiveness.
-                TaskCmd::Export { .. } | TaskCmd::Import => unreachable!(),
-            }
-        }
+        Cmd::Task { action } => dispatch_task(action, &sock).await?,
         Cmd::Session { action } => dispatch_session(action, &sock).await?,
-        Cmd::Cost { session, json, .. } => {
-            let mut client = Client::connect(&sock)
-                .await
-                .with_context(|| format!("smdjad not running ({})", sock.display()))?;
-            if let Some(session_id) = session {
-                let resp = client
-                    .call("session.cost", json!({"session_id": session_id}))
-                    .await
-                    .context("session.cost failed")?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&resp)?);
-                } else {
-                    let usd = resp["total_usd"].as_f64().unwrap_or(0.0);
-                    println!("SESSION  {session_id}  TOTAL  ${usd:.6}");
-                    if let Some(rows) = resp["breakdown"].as_array() {
-                        if !rows.is_empty() {
-                            println!();
-                            println!(
-                                "{:<32}  {:<12}  {:>5}  {:>8}  {:>8}  {:>10}",
-                                "MODEL", "RUNNER", "TURNS", "INPUT", "OUTPUT", "COST"
-                            );
-                            println!("{}", "-".repeat(82));
-                            for row in rows {
-                                let model = row["model"].as_str().unwrap_or("-");
-                                let runner = row["runner"].as_str().unwrap_or("-");
-                                let turns = row["turns"].as_i64().unwrap_or(0);
-                                let input = row["input_tok"].as_i64().unwrap_or(0);
-                                let output = row["output_tok"].as_i64().unwrap_or(0);
-                                let cost = row["cost_usd"].as_f64().unwrap_or(0.0);
-                                println!(
-                                    "{model:<32}  {runner:<12}  {turns:>5}  {input:>8}  {output:>8}  ${cost:.6}",
-                                );
-                            }
-                        }
-                    }
-                }
-            } else {
-                // All-sessions summary
-                let sessions_resp = client
-                    .call("session.list", json!({}))
-                    .await
-                    .context("session.list failed")?;
-                let sessions = sessions_resp["sessions"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default();
-                if json {
-                    let mut all_costs: Vec<serde_json::Value> = Vec::new();
-                    for sess in &sessions {
-                        let sid = sess["id"].as_str().unwrap_or_default();
-                        if let Ok(cost_resp) = client
-                            .call("session.cost", json!({"session_id": sid}))
-                            .await
-                        {
-                            all_costs.push(cost_resp);
-                        }
-                    }
-                    println!("{}", serde_json::to_string_pretty(&all_costs)?);
-                } else {
-                    println!(
-                        "{:<32}  {:<12}  {:>5}  {:>8}  {:>8}  {:>10}",
-                        "model", "runner", "turns", "in_tok", "out_tok", "cost_usd"
-                    );
-                    println!("{}", "-".repeat(80));
-                    let mut total_cost = 0.0f64;
-                    for sess in &sessions {
-                        let sid = sess["id"].as_str().unwrap_or_default();
-                        if let Ok(cost_resp) = client
-                            .call("session.cost", json!({"session_id": sid}))
-                            .await
-                        {
-                            if let Some(rows) = cost_resp["breakdown"].as_array() {
-                                for row in rows {
-                                    let model = row["model"].as_str().unwrap_or("-");
-                                    let runner = row["runner"].as_str().unwrap_or("-");
-                                    let turns = row["turns"].as_i64().unwrap_or(0);
-                                    let input = row["input_tok"].as_i64().unwrap_or(0);
-                                    let output = row["output_tok"].as_i64().unwrap_or(0);
-                                    let cost = row["cost_usd"].as_f64().unwrap_or(0.0);
-                                    total_cost += cost;
-                                    println!(
-                                        "{model:<32}  {runner:<12}  {turns:>5}  {input:>8}  {output:>8}  ${cost:.6}",
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    println!("{}", "-".repeat(80));
-                    println!("{:<56}  ${total_cost:.6}", "TOTAL");
-                }
-            }
-        }
+        Cmd::Cost { session, json, .. } => dispatch_cost(session, json, &sock).await?,
         Cmd::Metrics {
             tier,
             since,
             until,
             runner,
             json,
-        } => {
-            let mut client = Client::connect(&sock)
-                .await
-                .with_context(|| format!("smdjad not running ({})", sock.display()))?;
-            let now_micros = chrono::Utc::now().timestamp_micros();
-            let since_micros = since_to_micros(&since, now_micros)?;
-            let until_micros = match until {
-                Some(spec) => Some(since_to_micros(&spec, now_micros)?),
-                None => None,
-            };
-            let params = build_metrics_params(&tier, since_micros, until_micros);
-            let resp = client
-                .call("metrics.summary", params)
-                .await
-                .context("metrics.summary failed")?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            } else {
-                for line in format_metrics_rows(&resp, runner.as_deref()) {
-                    println!("{line}");
-                }
-            }
-        }
+        } => dispatch_metrics(tier, since, until, runner, json, &sock).await?,
         Cmd::Savings {
             tier,
             since,
             until,
             json,
-        } => {
-            let mut client = Client::connect(&sock)
-                .await
-                .with_context(|| format!("smdjad not running ({})", sock.display()))?;
-            let now_micros = chrono::Utc::now().timestamp_micros();
-            let since_micros = since_to_micros(&since, now_micros)?;
-            let until_micros = match until {
-                Some(spec) => Some(since_to_micros(&spec, now_micros)?),
-                None => None,
-            };
-            let params = build_metrics_params(&tier, since_micros, until_micros);
-            let resp = client
-                .call("savings.summary", params)
-                .await
-                .context("savings.summary failed")?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            } else {
-                for line in format_savings_rows(&resp) {
-                    println!("{line}");
-                }
-            }
-        }
+        } => dispatch_savings(tier, since, until, json, &sock).await?,
         Cmd::Workspace { action } => match action {
             WorkspaceCmd::Agents {
                 action: agents_action,
