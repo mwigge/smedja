@@ -5,6 +5,7 @@ mod doctor;
 mod eval;
 mod formatting;
 mod governance;
+mod local;
 mod loop_cmd;
 mod paths;
 mod run;
@@ -43,7 +44,6 @@ use crate::eval::cmd_eval_run;
 use crate::formatting::{
     format_local_gpu, format_local_models, format_metrics_rows, format_savings_rows,
 };
-use crate::governance::find_gov_artifact;
 use crate::paths::{default_ingot_path, default_socket_path, xdg_config_dir};
 use crate::security::{cmd_security_report, cmd_security_sbom, cmd_security_scan};
 use crate::skills::{
