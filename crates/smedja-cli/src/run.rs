@@ -1,5 +1,7 @@
 use super::*;
 use crate::audit::dispatch_audit;
+use crate::governance::dispatch_gov;
+use crate::local::dispatch_local;
 use crate::loop_cmd::dispatch_loop;
 use crate::sessions::dispatch_session;
 use crate::tasks::dispatch_task;
@@ -407,171 +409,10 @@ pub async fn run() -> Result<()> {
                 threshold,
             } => cmd_eval_run(&suite, online, json, threshold)?,
         },
-        Cmd::Gov { action } => {
-            let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            match action {
-                GovCmd::List { kind } => {
-                    let gov_dir = ws.join("gov");
-                    let dirs: Vec<&str> = match kind.as_deref() {
-                        Some("wi") => vec!["work-items"],
-                        Some("rfc") => vec!["rfcs"],
-                        Some("adr") => vec!["adrs"],
-                        _ => vec!["work-items", "rfcs", "adrs"],
-                    };
-                    for dir_name in dirs {
-                        let dir = gov_dir.join(dir_name);
-                        if !dir.exists() {
-                            continue;
-                        }
-                        let mut entries: Vec<_> = std::fs::read_dir(&dir)
-                            .into_iter()
-                            .flatten()
-                            .flatten()
-                            .filter(|e| e.path().extension().is_some_and(|x| x == "toml"))
-                            .collect();
-                        entries.sort_by_key(std::fs::DirEntry::file_name);
-                        for entry in entries {
-                            let path = entry.path();
-                            let text = std::fs::read_to_string(&path).unwrap_or_default();
-                            let id = path
-                                .file_stem()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            let title = text
-                                .lines()
-                                .find(|l| l.starts_with("title"))
-                                .and_then(|l| l.split_once('=').map(|x| x.1))
-                                .map(|s| s.trim().trim_matches('"').to_owned())
-                                .unwrap_or_default();
-                            let status = text
-                                .lines()
-                                .find(|l| l.starts_with("status"))
-                                .and_then(|l| l.split_once('=').map(|x| x.1))
-                                .map(|s| s.trim().trim_matches('"').to_owned())
-                                .unwrap_or_default();
-                            println!("{id:<12}  {status:<14}  {title}");
-                        }
-                    }
-                }
-                GovCmd::Transition { id, status } => {
-                    const VALID: &[&str] = &["planned", "in_progress", "done", "cancelled"];
-                    if !VALID.contains(&status.as_str()) {
-                        eprintln!(
-                            "error: invalid status '{status}'. Valid: planned | in_progress | done | cancelled"
-                        );
-                        std::process::exit(1);
-                    }
-                    let gov_dir = ws.join("gov");
-                    let id_upper = id.to_uppercase();
-                    let found = find_gov_artifact(&gov_dir, &id_upper);
-                    if let Some(path) = found {
-                        let text = std::fs::read_to_string(&path)?;
-                        let updated = text
-                            .lines()
-                            .map(|l| {
-                                if l.trim_start().starts_with("status") {
-                                    format!("status = \"{status}\"")
-                                } else {
-                                    l.to_owned()
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        std::fs::write(&path, updated)?;
-                        println!("{id_upper}: status \u{2192} {status}");
-                    } else {
-                        eprintln!("error: artifact '{id}' not found in gov/");
-                        std::process::exit(1);
-                    }
-                }
-                GovCmd::Create { title, description } => {
-                    let wi_dir = ws.join("gov").join("work-items");
-                    std::fs::create_dir_all(&wi_dir)?;
-                    #[allow(clippy::cast_possible_truncation)]
-                    let next_n: u32 = std::fs::read_dir(&wi_dir)
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                        .filter(|e| e.path().extension().is_some_and(|x| x == "toml"))
-                        .count() as u32
-                        + 1;
-                    let id = format!("WI-{next_n:03}");
-                    let desc = description.as_deref().unwrap_or("");
-                    let toml = format!(
-                        "id = \"{id}\"\ntitle = \"{title}\"\nstatus = \"planned\"\ndescription = \"{desc}\"\ncreated = \"{}\"\n",
-                        chrono::Utc::now().format("%Y-%m-%d")
-                    );
-                    let path = wi_dir.join(format!("{}.toml", id.to_lowercase()));
-                    std::fs::write(&path, toml)?;
-                    println!("Created {id}: {title}");
-                }
-            }
-        }
+        Cmd::Gov { action } => dispatch_gov(action)?,
         Cmd::Doctor { json } => cmd_doctor(&sock, json).await?,
         Cmd::ToolGate => cmd_tool_gate(&sock).await,
-        Cmd::Local { action } => {
-            let mut client = Client::connect(&sock)
-                .await
-                .with_context(|| format!("smdjad not running ({})", sock.display()))?;
-            match action {
-                LocalCmd::List { json } => {
-                    let resp = client
-                        .call("local.models", json!({}))
-                        .await
-                        .context("local.models failed")?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&resp)?);
-                    } else {
-                        for line in format_local_models(&resp) {
-                            println!("{line}");
-                        }
-                    }
-                }
-                LocalCmd::Gpu { json } => {
-                    let resp = client
-                        .call("local.gpu", json!({}))
-                        .await
-                        .context("local.gpu failed")?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&resp)?);
-                    } else {
-                        println!("{}", format_local_gpu(&resp));
-                    }
-                }
-                LocalCmd::Swap { model } => {
-                    let resp = client
-                        .call("local.swap", json!({ "model": model }))
-                        .await
-                        .context("local.swap failed")?;
-                    let active = resp["active_model_id"].as_str().unwrap_or(&model);
-                    let latency = resp["swap_latency_ms"].as_u64().unwrap_or(0);
-                    let explicit = resp["explicit_swap"].as_bool().unwrap_or(false);
-                    let path = if explicit {
-                        "explicit swap"
-                    } else {
-                        "label fallback"
-                    };
-                    println!("swapped to {active} via {path} ({latency} ms)");
-                }
-                LocalCmd::Install { model } => {
-                    let resp = client
-                        .call("local.install", json!({ "model": model }))
-                        .await
-                        .context("local.install failed")?;
-                    let installed = resp["installed"].as_bool().unwrap_or(false);
-                    if installed {
-                        println!("installed {model} (verified in inventory)");
-                    } else {
-                        let installer_ok = resp["installer_ok"].as_bool().unwrap_or(false);
-                        let present = resp["present_in_inventory"].as_bool().unwrap_or(false);
-                        println!(
-                            "install of {model} not verified \
-                             (installer_ok={installer_ok}, present_in_inventory={present})"
-                        );
-                    }
-                }
-            }
-        }
+        Cmd::Local { action } => dispatch_local(action, &sock).await?,
     }
     Ok(())
 }
