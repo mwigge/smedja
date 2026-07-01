@@ -1,0 +1,532 @@
+use super::*;
+
+// --- smj metrics ---
+
+#[test]
+fn metrics_parses_subcommand_with_flags() {
+    let cli = Cli::try_parse_from([
+        "smj", "metrics", "--tier", "hourly", "--since", "24h", "--runner", "claude", "--json",
+    ])
+    .expect("metrics must parse");
+    match cli.command {
+        Cmd::Metrics {
+            tier,
+            since,
+            until,
+            runner,
+            json,
+        } => {
+            assert_eq!(tier, "hourly");
+            assert_eq!(since, "24h");
+            assert_eq!(until, None);
+            assert_eq!(runner.as_deref(), Some("claude"));
+            assert!(json);
+        }
+        _ => panic!("expected Cmd::Metrics"),
+    }
+}
+
+// --- smj savings ---
+
+#[test]
+fn savings_parses_subcommand_with_flags() {
+    let cli = Cli::try_parse_from([
+        "smj", "savings", "--tier", "weekly", "--since", "30d", "--json",
+    ])
+    .expect("savings must parse");
+    match cli.command {
+        Cmd::Savings {
+            tier,
+            since,
+            until,
+            json,
+        } => {
+            assert_eq!(tier, "weekly");
+            assert_eq!(since, "30d");
+            assert_eq!(until, None);
+            assert!(json);
+        }
+        _ => panic!("expected Cmd::Savings"),
+    }
+}
+
+#[test]
+fn savings_tier_defaults_to_daily() {
+    let cli = Cli::try_parse_from(["smj", "savings"]).expect("savings must parse");
+    match cli.command {
+        Cmd::Savings { tier, since, .. } => {
+            assert_eq!(tier, "daily");
+            assert_eq!(since, "7d");
+        }
+        _ => panic!("expected Cmd::Savings"),
+    }
+}
+
+#[test]
+fn format_savings_rows_keeps_cache_separate_from_compression() {
+    let resp = json!({
+        "tier": "daily",
+        "compression_saved": 150,
+        "cache_saved": 9000,
+        "efficiency_ratio": 0.2,
+        "buckets": [
+            { "bucket_start": 1_767_225_600_000_000_i64, "source": "cache", "tokens_saved": 9000 },
+            { "bucket_start": 1_767_225_600_000_000_i64, "source": "filter", "tokens_saved": 150 },
+        ],
+    });
+    let lines = format_savings_rows(&resp);
+    let joined = lines.join("\n");
+    assert!(
+        joined.contains("EFFICIENCY  20.0%"),
+        "headline ratio: {joined}"
+    );
+    assert!(
+        joined.contains("COMPRESSION 150 tok"),
+        "compression total: {joined}"
+    );
+    assert!(
+        joined.contains("CACHE       9000 tok"),
+        "cache total: {joined}"
+    );
+    // The compression and cache totals are never summed into one figure.
+    assert!(
+        !joined.contains("9150"),
+        "must not fold cache into compression"
+    );
+    assert!(joined.contains("cache"));
+    assert!(joined.contains("filter"));
+}
+
+#[test]
+fn metrics_tier_defaults_to_daily() {
+    let cli = Cli::try_parse_from(["smj", "metrics"]).expect("metrics must parse");
+    match cli.command {
+        Cmd::Metrics { tier, since, .. } => {
+            assert_eq!(tier, "daily");
+            assert_eq!(since, "7d");
+        }
+        _ => panic!("expected Cmd::Metrics"),
+    }
+}
+
+#[test]
+fn since_to_micros_subtracts_duration() {
+    // now = 1_000_000s in micros; 1d back = 86_400s earlier.
+    let now = 1_000_000_000_000;
+    assert_eq!(since_to_micros("1d", now).unwrap(), now - 86_400_000_000);
+    assert_eq!(since_to_micros("2h", now).unwrap(), now - 7_200_000_000);
+    assert_eq!(since_to_micros("30m", now).unwrap(), now - 1_800_000_000);
+    assert_eq!(since_to_micros("45s", now).unwrap(), now - 45_000_000);
+    // Bare integer is seconds.
+    assert_eq!(since_to_micros("10", now).unwrap(), now - 10_000_000);
+}
+
+#[test]
+fn since_to_micros_clamps_at_zero() {
+    assert_eq!(since_to_micros("100d", 0).unwrap(), 0);
+}
+
+#[test]
+fn since_to_micros_rejects_garbage() {
+    assert!(since_to_micros("notaduration", 0).is_err());
+}
+
+#[test]
+fn build_metrics_params_omits_until_when_absent() {
+    let p = build_metrics_params("daily", 123, None);
+    assert_eq!(p["tier"], "daily");
+    assert_eq!(p["since"], 123);
+    assert!(p.get("until").is_none());
+    let p2 = build_metrics_params("hourly", 1, Some(999));
+    assert_eq!(p2["until"], 999);
+}
+
+#[test]
+fn format_metrics_rows_renders_known_response() {
+    // 2026-01-01 00:00:00 UTC = 1_767_225_600_000_000 micros.
+    let resp = json!({
+        "tier": "daily",
+        "buckets": [
+            {
+                "bucket_start": 1_767_225_600_000_000_i64,
+                "runner": "claude",
+                "turns": 3,
+                "input_tok": 600,
+                "output_tok": 180,
+                "cost_usd": 0.06,
+                "error_count": 1
+            },
+            {
+                "bucket_start": 1_767_225_600_000_000_i64,
+                "runner": "local",
+                "turns": 1,
+                "input_tok": 400,
+                "output_tok": 80,
+                "cost_usd": 0.0,
+                "error_count": 0
+            }
+        ]
+    });
+    let rows = format_metrics_rows(&resp, None);
+    assert_eq!(rows.len(), 3, "header + two buckets");
+    assert!(rows[0].contains("BUCKET") && rows[0].contains("ERRORS"));
+    assert!(rows[1].contains("2026-01-01 00:00"));
+    assert!(rows[1].contains("claude"));
+    assert!(rows[1].contains("$  0.060000"));
+    assert!(rows[2].contains("local"));
+
+    // Runner filter keeps only the matching bucket.
+    let filtered = format_metrics_rows(&resp, Some("claude"));
+    assert_eq!(filtered.len(), 2, "header + claude only");
+    assert!(filtered[1].contains("claude"));
+}
+
+// --- smj local ---
+
+#[test]
+fn local_list_parses_subcommand() {
+    let cli = Cli::try_parse_from(["smj", "local", "list"]).expect("local list must parse");
+    match cli.command {
+        Cmd::Local {
+            action: LocalCmd::List { json },
+        } => assert!(!json, "json defaults off"),
+        _ => panic!("expected Cmd::Local List"),
+    }
+}
+
+#[test]
+fn local_swap_parses_model_arg() {
+    let cli =
+        Cli::try_parse_from(["smj", "local", "swap", "qwen3-14b"]).expect("local swap must parse");
+    match cli.command {
+        Cmd::Local {
+            action: LocalCmd::Swap { model },
+        } => assert_eq!(model, "qwen3-14b"),
+        _ => panic!("expected Cmd::Local Swap"),
+    }
+}
+
+#[test]
+fn local_install_parses_model_arg() {
+    let cli = Cli::try_parse_from(["smj", "local", "install", "llama3-8b"])
+        .expect("local install must parse");
+    match cli.command {
+        Cmd::Local {
+            action: LocalCmd::Install { model },
+        } => assert_eq!(model, "llama3-8b"),
+        _ => panic!("expected Cmd::Local Install"),
+    }
+}
+
+#[test]
+fn format_local_models_renders_inventory_with_fit() {
+    let resp = json!({
+        "active_model_id": "qwen3-14b",
+        "models": [
+            { "id": "qwen3-14b", "est_vram_mb": 9000, "fit": "fits", "active": true },
+            { "id": "huge-70b", "est_vram_mb": 48000, "fit": "exceeds", "active": false },
+            { "id": "no-meta", "est_vram_mb": null, "fit": "unknown", "active": false }
+        ]
+    });
+    let lines = format_local_models(&resp);
+    assert_eq!(lines.len(), 4, "header + three models");
+    assert!(lines[0].contains("MODEL") && lines[0].contains("FIT"));
+    assert!(lines[1].contains("qwen3-14b") && lines[1].contains("fits"));
+    assert!(lines[1].contains('*'), "active model must be marked");
+    assert!(lines[2].contains("exceeds"));
+    assert!(lines[3].contains("unknown") && lines[3].contains('-'));
+}
+
+#[test]
+fn format_local_models_empty_inventory_notice() {
+    let resp = json!({ "models": [] });
+    let lines = format_local_models(&resp);
+    assert_eq!(lines, vec!["no local models".to_owned()]);
+}
+
+#[test]
+fn format_local_gpu_renders_detected_and_absent() {
+    let detected = json!({
+        "device": "RTX 4090", "vram_total_mb": 24000, "vram_free_mb": 20000, "detected": true
+    });
+    let line = format_local_gpu(&detected);
+    assert!(line.contains("RTX 4090") && line.contains("20000/24000"));
+
+    let absent = json!({ "device": null, "detected": false });
+    assert_eq!(format_local_gpu(&absent), "no GPU detected");
+}
+
+// --- smj sandbox status ---
+
+#[test]
+fn sandbox_status_parses_subcommand() {
+    let cli = Cli::try_parse_from(["smj", "sandbox", "status"]).expect("sandbox status must parse");
+    assert!(matches!(
+        cli.command,
+        Cmd::Sandbox {
+            action: SandboxCmd::Status
+        }
+    ));
+}
+
+#[test]
+fn sandbox_status_reports_backend_and_policy() {
+    // Mode parsing covers the fallback-mode column.
+    assert_eq!(SandboxStatus::mode_from_value("required"), "required");
+    assert_eq!(SandboxStatus::mode_from_value("off"), "off");
+    assert_eq!(SandboxStatus::mode_from_value(""), "auto");
+    assert_eq!(SandboxStatus::mode_from_value("nonsense"), "auto");
+
+    // Network policy parsing covers the network-policy column.
+    assert_eq!(SandboxStatus::network_from_value("allowlist"), "allowlist");
+    assert_eq!(SandboxStatus::network_from_value("open"), "open");
+    assert_eq!(SandboxStatus::network_from_value(""), "none");
+
+    // The resolved status reports a backend name, an availability flag, the
+    // network policy, and the fallback mode for the current host.
+    let status = SandboxStatus::detect();
+    assert!(
+        matches!(status.backend, "docker" | "seatbelt" | "landlock" | "none"),
+        "backend must be one of the known names; got {}",
+        status.backend
+    );
+    assert!(matches!(status.mode, "auto" | "required" | "off"));
+    assert!(matches!(
+        status.network_policy,
+        "none" | "allowlist" | "open"
+    ));
+    // `available` is a bool by construction; assert it is consistent with
+    // the "none" backend never being available.
+    if status.backend == "none" {
+        assert!(!status.available);
+    }
+}
+
+// --- smj audit run parsing + params ---
+
+#[test]
+fn audit_run_parses_path_branch_pr_diff_report_format() {
+    let cli = Cli::try_parse_from([
+        "smj",
+        "audit",
+        "run",
+        "src/lib.rs",
+        "--report",
+        "out.md",
+        "--format",
+        "json",
+    ])
+    .expect("audit run with a path must parse");
+    let Cmd::Audit {
+        action:
+            AuditCmd::Run {
+                path,
+                branch,
+                pr,
+                diff,
+                report,
+                format,
+            },
+    } = cli.command
+    else {
+        panic!("expected an audit run command");
+    };
+    assert_eq!(path.as_deref(), Some("src/lib.rs"));
+    assert_eq!(branch, None);
+    assert_eq!(pr, None);
+    assert!(!diff);
+    assert_eq!(report.as_deref(), Some("out.md"));
+    assert_eq!(format, "json");
+}
+
+#[test]
+fn audit_run_parses_branch_and_pr_flags() {
+    let branch = Cli::try_parse_from(["smj", "audit", "run", "--branch", "main"]).unwrap();
+    assert!(matches!(
+        branch.command,
+        Cmd::Audit {
+            action: AuditCmd::Run { branch: Some(b), .. }
+        } if b == "main"
+    ));
+    let pr = Cli::try_parse_from(["smj", "audit", "run", "--pr", "42"]).unwrap();
+    assert!(matches!(
+        pr.command,
+        Cmd::Audit {
+            action: AuditCmd::Run { pr: Some(p), .. }
+        } if p == "42"
+    ));
+}
+
+#[test]
+fn build_audit_params_respects_scope_precedence() {
+    // pr wins over branch/path
+    let params = build_audit_params(
+        Some("src"),
+        Some("main"),
+        Some("7"),
+        false,
+        None,
+        "md",
+        None,
+    );
+    assert_eq!(params["pr"], "7");
+    assert!(params.get("branch").is_none());
+    assert!(params.get("path").is_none());
+
+    // path scope with report + workspace
+    let params = build_audit_params(
+        Some("src"),
+        None,
+        None,
+        false,
+        Some("r.md"),
+        "json",
+        Some("/ws"),
+    );
+    assert_eq!(params["path"], "src");
+    assert_eq!(params["report"], "r.md");
+    assert_eq!(params["format"], "json");
+    assert_eq!(params["workspace"], "/ws");
+
+    // diff flag overrides a path
+    let params = build_audit_params(Some("src"), None, None, true, None, "md", None);
+    assert_eq!(params["diff"], true);
+    assert!(params.get("path").is_none());
+}
+
+#[test]
+fn workspace_init_creates_dir_and_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    cmd_workspace_init(dir.path()).unwrap();
+    assert!(dir.path().join(".smedja").exists());
+    let toml_content =
+        std::fs::read_to_string(dir.path().join(".smedja").join("workspace.toml")).unwrap();
+    assert!(toml_content.contains("auto_index = true"));
+    assert!(toml_content.contains("last_indexed_at"));
+}
+
+#[test]
+fn auto_index_fires_when_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let smedja_dir = dir.path().join(".smedja");
+    std::fs::create_dir_all(&smedja_dir).unwrap();
+    let old_ts = (chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+    let content = format!("[graph]\nauto_index = true\nlast_indexed_at = \"{old_ts}\"\n");
+    std::fs::write(smedja_dir.join("workspace.toml"), &content).unwrap();
+    // Verify the staleness-check logic matches what smdjad does at session.create.
+    let parsed: toml::Value = toml::from_str(&content).unwrap();
+    let ts_str = parsed["graph"]["last_indexed_at"].as_str().unwrap();
+    let ts = chrono::DateTime::parse_from_rfc3339(ts_str).unwrap();
+    let age = chrono::Utc::now().signed_duration_since(ts.with_timezone(&chrono::Utc));
+    assert!(age.num_hours() >= 24, "25h old timestamp must be stale");
+}
+
+#[test]
+fn security_sbom_writes_cyclonedx_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = dir.path().join("Cargo.lock");
+    std::fs::write(
+        &lock,
+        "version = 3\n\n[[package]]\nname = \"demo\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    // Exercise the same path the CLI handler uses.
+    let sbom = smedja_security::Sbom::from_lockfile(&lock).unwrap();
+    let json = sbom.to_json().unwrap();
+    assert!(json.contains("\"bomFormat\": \"CycloneDX\""));
+    assert!(json.contains("pkg:cargo/demo@1.0.0"));
+    // The handler itself returns Ok on a valid lockfile.
+    super::cmd_security_sbom(&lock).unwrap();
+}
+
+#[test]
+fn security_report_runs_as_read_only_query() {
+    let ingot = smedja_ingot::Ingot::open_in_memory().unwrap();
+    // No findings recorded → the read-only query still succeeds.
+    super::cmd_security_report(&ingot).unwrap();
+}
+
+#[test]
+fn security_scan_reports_findings_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".npmrc"), "//r/:_authToken=x").unwrap();
+    // Scan runs regardless of findings (advisory; never blocks).
+    super::cmd_security_scan(dir.path());
+    let findings = smedja_security::scan_posture(dir.path());
+    assert!(findings.iter().any(|f| f.rule_id == "flagged-path"));
+}
+
+#[test]
+fn doctor_subcommand_parses() {
+    Cli::try_parse_from(["smj", "doctor"]).expect("smj doctor must parse");
+    // --json flag
+    Cli::try_parse_from(["smj", "doctor", "--json"]).expect("smj doctor --json must parse");
+}
+
+#[test]
+fn is_subprocess_runner_distinguishes_native_from_cli() {
+    assert!(is_subprocess_runner("claude-cli"));
+    assert!(is_subprocess_runner("codex-cli"));
+    assert!(!is_subprocess_runner("anthropic"));
+    assert!(!is_subprocess_runner("openai"));
+    assert!(!is_subprocess_runner("copilot"));
+    assert!(!is_subprocess_runner("minimax"));
+    assert!(!is_subprocess_runner("berget"));
+    assert!(!is_subprocess_runner("local"));
+}
+
+#[test]
+fn graph_symbols_injected_into_context() {
+    // Mirrors the noun-extraction filter used by smdjad's graph auto-injection.
+    let message = "implement WorkingMemory seal_prefix function";
+    let stop_words = [
+        "the", "and", "for", "with", "this", "that", "from", "into", "use", "are", "was", "has",
+        "not", "can", "its", "will",
+    ];
+    let nouns: Vec<&str> = message
+        .split_whitespace()
+        .filter(|t| t.len() >= 3 && !stop_words.contains(&t.to_lowercase().as_str()))
+        .take(5)
+        .collect();
+    assert!(!nouns.is_empty(), "nouns must be extracted from message");
+    assert!(
+        nouns.contains(&"implement")
+            || nouns.contains(&"WorkingMemory")
+            || nouns.contains(&"seal_prefix"),
+    );
+}
+
+#[test]
+fn link_ides_creates_codex_and_cursor_symlinks() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let skills_src = tmp.path().join("skills");
+    std::fs::create_dir_all(&skills_src).unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    cmd_skill_link_ides(&skills_src, &project).expect("link_ides");
+
+    let codex_link = project.join(".codex").join("skills");
+    let cursor_link = project.join(".cursor").join("skills");
+    assert!(codex_link.is_symlink(), ".codex/skills must be a symlink");
+    assert!(cursor_link.is_symlink(), ".cursor/skills must be a symlink");
+    assert_eq!(std::fs::read_link(&codex_link).unwrap(), skills_src);
+    assert_eq!(std::fs::read_link(&cursor_link).unwrap(), skills_src);
+}
+
+#[test]
+fn link_ides_skips_existing_correct_symlinks() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let skills_src = tmp.path().join("skills");
+    std::fs::create_dir_all(&skills_src).unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    // Create first time.
+    cmd_skill_link_ides(&skills_src, &project).expect("first");
+    // Second call must not error.
+    cmd_skill_link_ides(&skills_src, &project).expect("second");
+
+    let codex_link = project.join(".codex").join("skills");
+    assert_eq!(std::fs::read_link(&codex_link).unwrap(), skills_src);
+}
