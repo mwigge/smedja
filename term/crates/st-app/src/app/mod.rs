@@ -336,3 +336,17 @@ impl App {
         Some((col, row, grid.mouse_mode, grid.mouse_sgr))
     }
 }
+
+// ── Window icon ───────────────────────────────────────────────────────────────
+
+/// Loads the smedja brand icon from the embedded PNG and returns a winit `Icon`.
+///
+/// Only called on Linux; macOS uses the `.icns` bundle resource. Returns `None`
+/// on decode or icon-creation failure so the caller can skip silently.
+#[cfg(target_os = "linux")]
+fn load_window_icon() -> Option<winit::window::Icon> {
+    let png_bytes = include_bytes!("../../../../../assets/brand/smedja-256.png");
+    let img = image::load_from_memory(png_bytes).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    winit::window::Icon::from_rgba(img.into_raw(), w, h).ok()
+}

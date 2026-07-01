@@ -6,6 +6,14 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.23.3] — 2026-07-01
+
+### Fixed
+
+- **Release build icon embedding** — moved the Linux window icon loader to the
+  parent `st-app` module and fixed the embedded brand asset path after the app
+  module split.
+
 ## [0.23.2] — 2026-07-01
 
 ### Changed
