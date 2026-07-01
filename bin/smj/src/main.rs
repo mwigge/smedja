@@ -1911,7 +1911,7 @@ async fn main() -> Result<()> {
                 let url = bin_path.unwrap_or_else(|| {
                     let os = std::env::consts::OS;
                     if os == "macos" {
-                        "https://github.com/mwigge/smedja/releases/latest/download/smedja-macos-x86_64.tar.gz".to_owned()
+                        "https://github.com/mwigge/smedja/releases/latest/download/smedja-darwin-x86_64.tar.gz".to_owned()
                     } else {
                         "https://github.com/mwigge/smedja/releases/latest/download/smedja-linux-x86_64.tar.gz".to_owned()
                     }

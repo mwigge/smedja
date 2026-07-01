@@ -3,6 +3,12 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build, for example v0.23.1"
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,6 +42,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
@@ -69,6 +77,17 @@ jobs:
         run: |
           cargo build --release --target ${{ matrix.target }} \
             --bin smdjad --bin smj --bin smedja --bin smedja-tui
+
+      # cargo-deb and cargo-generate-rpm read asset paths from
+      # bin/smdjad/Cargo.toml. Those paths are target/release/*, while this
+      # workflow builds target/${{ matrix.target }}/release/*.
+      - name: stage linux package binaries
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p target/release
+          for bin in smdjad smj smedja smedja-tui; do
+            cp "target/${{ matrix.target }}/release/$bin" "target/release/$bin"
+          done
 
       - name: package tarball
         run: |
@@ -164,6 +183,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -178,19 +199,18 @@ jobs:
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
 
-      - name: create release
+      - name: publish release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
-            --notes-file - \
-            dist/*.tar.gz \
-            dist/*.deb \
-            dist/*.rpm \
-            dist/*.dmg \
-            dist/SHA256SUMS \
-            scripts/install.sh <<'EOF'
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *) echo "release tag must start with v: $RELEASE_TAG" >&2; exit 1 ;;
+          esac
+
+          NOTES_FILE="$RUNNER_TEMP/smedja-release-notes.md"
+          cat > "$NOTES_FILE" <<'EOF'
           See [README](https://github.com/mwigge/smedja#install) for installation instructions.
 
           **One-line install:**
@@ -199,3 +219,23 @@ jobs:
           ```
           EOF
 
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" --clobber \
+              dist/*.tar.gz \
+              dist/*.deb \
+              dist/*.rpm \
+              dist/*.dmg \
+              dist/SHA256SUMS \
+              scripts/install.sh
+          else
+            gh release create "$RELEASE_TAG" \
+              --verify-tag \
+              --title "$RELEASE_TAG" \
+              --notes-file "$NOTES_FILE" \
+              dist/*.tar.gz \
+              dist/*.deb \
+              dist/*.rpm \
+              dist/*.dmg \
+              dist/SHA256SUMS \
+              scripts/install.sh
+          fi

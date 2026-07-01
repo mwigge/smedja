@@ -17,6 +17,12 @@ pub(crate) fn save_secret(var: &str, value: &str) -> String {
 }
 
 fn save_to_path(var: &str, value: &str, path: &Path) -> String {
+    if !valid_env_name(var) {
+        return format!("login: invalid environment variable name: {var}");
+    }
+    if value.contains(['\n', '\r', '\0']) {
+        return "login: key must be a single line".to_owned();
+    }
     if let Some(dir) = path.parent() {
         if std::fs::create_dir_all(dir).is_err() {
             return "login: cannot create ~/.config/smedja".to_owned();
@@ -36,9 +42,29 @@ fn save_to_path(var: &str, value: &str, path: &Path) -> String {
     }
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     format!(
-        "\u{2713} saved {var} to {} (0600). Activate: add\n  EnvironmentFile=%h/.config/smedja/secrets.env\nto the smdjad unit, then: systemctl --user restart smdjad",
-        path.display()
+        "\u{2713} saved {var} to {} (0600). Activate: {}",
+        path.display(),
+        activation_hint()
     )
+}
+
+fn activation_hint() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "add\n  EnvironmentFile=%h/.config/smedja/secrets.env\nto the smdjad unit, then: systemctl --user restart smdjad"
+    } else if cfg!(target_os = "macos") {
+        "restart smdjad with `launchctl kickstart -k gui/$(id -u)/nu.wigge.smedja.smdjad`"
+    } else {
+        "restart smdjad so it inherits the updated environment"
+    }
+}
+
+fn valid_env_name(var: &str) -> bool {
+    let mut chars = var.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_uppercase())
+        && chars.all(|c| c == '_' || c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -90,5 +116,29 @@ mod tests {
             content.contains("FOO=foo-val"),
             "other vars must be preserved"
         );
+    }
+
+    #[test]
+    fn save_to_path_rejects_multiline_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.env");
+        let result = save_to_path("MY_API_KEY", "first\nSECOND=value", &path);
+        assert!(
+            result.contains("single line"),
+            "multiline secret must be rejected: {result}"
+        );
+        assert!(!path.exists(), "invalid secret must not create the file");
+    }
+
+    #[test]
+    fn save_to_path_rejects_invalid_var_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.env");
+        let result = save_to_path("bad-name", "value", &path);
+        assert!(
+            result.contains("invalid environment variable"),
+            "bad env var must be rejected: {result}"
+        );
+        assert!(!path.exists(), "invalid env var must not create the file");
     }
 }

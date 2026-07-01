@@ -1417,29 +1417,14 @@ fn save_generator_output(output_type: &OutputType, content: &str, state: &mut Ap
                 return;
             };
             let script_path = format!("{slug}-gen.py");
-            if let Err(e) = std::fs::write(&script_path, script) {
-                push_system_message(state, format!("failed to write script {script_path}: {e}"));
-                return;
-            }
-            match std::process::Command::new("python3")
-                .arg(&script_path)
-                .output()
-            {
-                Ok(out) if out.status.success() => {
-                    let pptx_path = format!("{slug}.pptx");
-                    let _ = std::fs::remove_file(&script_path);
-                    push_system_message(state, format!("presentation saved: ./{pptx_path}"));
-                }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    push_system_message(
-                        state,
-                        format!("python3 {script_path} failed: {}", stderr.trim()),
-                    );
-                }
-                Err(e) => {
-                    push_system_message(state, format!("failed to run python3: {e}"));
-                }
+            match std::fs::write(&script_path, script) {
+                Ok(()) => push_system_message(
+                    state,
+                    format!(
+                        "presentation script saved: ./{script_path}\nrun explicitly: python3 {script_path}"
+                    ),
+                ),
+                Err(e) => push_system_message(state, format!("failed to write script {script_path}: {e}")),
             }
         }
     }
@@ -5243,6 +5228,11 @@ mod tests {
     #[test]
     fn review_pr_flag_is_pr_scope() {
         assert_eq!(parse_review_scope("--pr 42"), json!({ "pr": "42" }));
+    }
+
+    #[test]
+    fn review_diff_flag_is_explicit_diff_scope() {
+        assert_eq!(parse_review_scope("--diff"), json!({ "diff": true }));
     }
 
     // --- /review findings summary rendering ---

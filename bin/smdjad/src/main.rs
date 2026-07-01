@@ -182,7 +182,7 @@ pub(crate) async fn exec_bash_ext(
     stdin_bytes: Option<Vec<u8>>,
 ) -> String {
     use std::process::Stdio;
-    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     let timeout = timeout_secs.map_or(EXEC_BASH_TIMEOUT_SECS, |t| {
         t.min(SMEDJA_BASH_MAX_TIMEOUT_SECS)
@@ -218,26 +218,54 @@ pub(crate) async fn exec_bash_ext(
         }
     }
 
-    async fn read_all(reader: impl tokio::io::AsyncRead + Unpin + Send + 'static) -> String {
-        let mut buf = String::new();
-        let mut r = BufReader::new(reader);
-        let mut line = String::new();
-        while r.read_line(&mut line).await.unwrap_or(0) > 0 {
-            buf.push_str(&line);
-            line.clear();
+    async fn read_into(
+        mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+        target: Arc<std::sync::Mutex<String>>,
+    ) {
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = match reader.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let text = String::from_utf8_lossy(&chunk[..n]);
+            if let Ok(mut buf) = target.lock() {
+                buf.push_str(&text);
+            }
         }
-        buf
+    }
+
+    fn snapshot(target: &Arc<std::sync::Mutex<String>>) -> String {
+        target
+            .lock()
+            .map_or_else(|_| String::new(), |buf| buf.clone())
+    }
+
+    async fn finish_reader(
+        task: tokio::task::JoinHandle<()>,
+        target: &Arc<std::sync::Mutex<String>>,
+    ) -> String {
+        let abort = task.abort_handle();
+        if tokio::time::timeout(std::time::Duration::from_millis(250), task)
+            .await
+            .is_err()
+        {
+            abort.abort();
+        }
+        snapshot(target)
     }
 
     let stdout_reader = child.stdout.take().expect("stdout piped");
     let stderr_reader = child.stderr.take().expect("stderr piped");
-    let stdout_task = tokio::spawn(read_all(stdout_reader));
-    let stderr_task = tokio::spawn(read_all(stderr_reader));
+    let stdout_buf = Arc::new(std::sync::Mutex::new(String::new()));
+    let stderr_buf = Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_task = tokio::spawn(read_into(stdout_reader, Arc::clone(&stdout_buf)));
+    let stderr_task = tokio::spawn(read_into(stderr_reader, Arc::clone(&stderr_buf)));
 
     match tokio::time::timeout(std::time::Duration::from_secs(timeout), child.wait()).await {
         Ok(Ok(status)) => {
-            let out = stdout_task.await.unwrap_or_default();
-            let err = stderr_task.await.unwrap_or_default();
+            let out = finish_reader(stdout_task, &stdout_buf).await;
+            let err = finish_reader(stderr_task, &stderr_buf).await;
             if status.success() {
                 out
             } else {
@@ -256,17 +284,11 @@ pub(crate) async fn exec_bash_ext(
         Ok(Err(e)) => format!("error: {e}"),
         Err(_) => {
             let _ = child.kill().await;
-            // Give readers 5 s to drain after kill.
-            let out = tokio::time::timeout(std::time::Duration::from_secs(5), stdout_task)
-                .await
-                .ok()
-                .and_then(std::result::Result::ok)
-                .unwrap_or_default();
-            let err = tokio::time::timeout(std::time::Duration::from_secs(5), stderr_task)
-                .await
-                .ok()
-                .and_then(std::result::Result::ok)
-                .unwrap_or_default();
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(100), child.wait()).await;
+            let out = snapshot(&stdout_buf);
+            let err = snapshot(&stderr_buf);
+            stdout_task.abort();
+            stderr_task.abort();
             let mut result = out;
             if !err.is_empty() {
                 if !result.ends_with('\n') {

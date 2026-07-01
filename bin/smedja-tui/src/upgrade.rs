@@ -46,19 +46,41 @@ pub(crate) fn is_newer(latest: &str, current: &str) -> bool {
     }
 }
 
+fn release_os() -> Option<&'static str> {
+    if cfg!(target_os = "linux") {
+        Some("linux")
+    } else if cfg!(target_os = "macos") {
+        Some("darwin")
+    } else {
+        None
+    }
+}
+
+fn release_arch() -> Option<&'static str> {
+    if cfg!(target_arch = "x86_64") {
+        Some("x86_64")
+    } else if cfg!(target_arch = "aarch64") {
+        Some("aarch64")
+    } else {
+        None
+    }
+}
+
 /// Downloads the latest release tarball and installs the binaries alongside
 /// the currently-running executable.
 ///
 /// Returns a human-readable outcome string (success or error details) so the
 /// caller can push it straight into the panel.
 pub(crate) async fn run_upgrade(latest_tag: &str) -> String {
-    let arch = if cfg!(target_arch = "x86_64") {
-        "x86_64"
-    } else {
-        "aarch64"
+    let Some(os) = release_os() else {
+        return "upgrade failed: unsupported operating system".into();
     };
+    let Some(arch) = release_arch() else {
+        return "upgrade failed: unsupported CPU architecture".into();
+    };
+    let artifact = format!("smedja-{os}-{arch}");
     let url = format!(
-        "https://github.com/mwigge/smedja/releases/download/{latest_tag}/smedja-linux-{arch}.tar.gz"
+        "https://github.com/mwigge/smedja/releases/download/{latest_tag}/{artifact}.tar.gz"
     );
 
     // Resolve the directory that contains the currently running smedja-tui
@@ -102,7 +124,7 @@ pub(crate) async fn run_upgrade(latest_tag: &str) -> String {
     }
 
     // Install each binary with mv (atomic) falling back to copy.
-    let src_dir = tmp.join(format!("smedja-linux-{arch}"));
+    let src_dir = tmp.join(&artifact);
     let bins = ["smedja", "smedja-tui", "smdjad", "smj"];
     let mut installed = Vec::new();
     let mut failed: Vec<String> = Vec::new();
@@ -124,13 +146,20 @@ pub(crate) async fn run_upgrade(latest_tag: &str) -> String {
         }
     }
     let _ = std::fs::remove_dir_all(&tmp);
+    if installed.is_empty() && failed.is_empty() {
+        return "upgrade failed: release artifact did not contain expected binaries".into();
+    }
 
-    // Restart smdjad if systemctl is available.
-    let smdjad_status = tokio::process::Command::new("systemctl")
-        .args(["--user", "restart", "smdjad"])
-        .status()
-        .await
-        .is_ok_and(|s| s.success());
+    #[cfg(target_os = "macos")]
+    for bin in bins {
+        let _ = tokio::process::Command::new("xattr")
+            .args(["-dr", "com.apple.quarantine"])
+            .arg(install_dir.join(bin))
+            .status()
+            .await;
+    }
+
+    let smdjad_restart = restart_smdjad_after_upgrade().await;
 
     let mut msg = if failed.is_empty() {
         format!(
@@ -144,10 +173,50 @@ pub(crate) async fn run_upgrade(latest_tag: &str) -> String {
             failed.join(", ")
         )
     };
-    if smdjad_status {
-        msg.push_str("\nsmdjad restarted via systemctl");
+    if let Some(restart_method) = smdjad_restart {
+        msg.push_str("\nsmdjad restarted via ");
+        msg.push_str(restart_method);
     }
     msg
+}
+
+async fn restart_smdjad_after_upgrade() -> Option<&'static str> {
+    #[cfg(target_os = "linux")]
+    {
+        return tokio::process::Command::new("systemctl")
+            .args(["--user", "restart", "smdjad"])
+            .status()
+            .await
+            .is_ok_and(|s| s.success())
+            .then_some("systemctl");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let uid = tokio::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .await
+            .ok()
+            .and_then(|out| {
+                out.status
+                    .success()
+                    .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            })?;
+        return tokio::process::Command::new("launchctl")
+            .args([
+                "kickstart",
+                "-k",
+                &format!("gui/{uid}/nu.wigge.smedja.smdjad"),
+            ])
+            .status()
+            .await
+            .is_ok_and(|s| s.success())
+            .then_some("launchctl");
+    }
+
+    #[allow(unreachable_code)]
+    None
 }
 
 pub(crate) async fn run_openspec(bin: &std::path::Path, args: &[&str]) -> Result<String, String> {
