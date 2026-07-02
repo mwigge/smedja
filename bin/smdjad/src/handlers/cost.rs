@@ -57,12 +57,22 @@ pub(crate) async fn cost(state: HandlerState, params: Value) -> Result<Value, Rp
 /// Returns an error when the ingot query fails.
 pub(crate) async fn active_change(state: HandlerState, _params: Value) -> Result<Value, RpcError> {
     let Some(ref change) = state.active_change else {
-        return Ok(json!({ "change_name": serde_json::Value::Null, "token_cost": 0u64 }));
+        return Ok(
+            json!({ "change_name": serde_json::Value::Null, "token_cost": 0u64, "cost_usd_micros": 0u64 }),
+        );
     };
     let token_cost = state
         .ingot
         .cost_for_change(change)
         .await
         .map_err(|e| ingot_err(&e))?;
-    Ok(json!({ "change_name": change.as_ref(), "token_cost": token_cost }))
+    let cost_usd_micros = state
+        .ingot
+        .cost_usd_for_change(change)
+        .await
+        .map_err(|e| ingot_err(&e))?
+        .as_micros();
+    Ok(
+        json!({ "change_name": change.as_ref(), "token_cost": token_cost, "cost_usd_micros": cost_usd_micros }),
+    )
 }

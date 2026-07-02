@@ -663,6 +663,22 @@ impl IngotHandle {
             .await
     }
 
+    /// Returns the cumulative USD cost (microdollars) for all cost-ledger
+    /// entries attributed to `change_name`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn cost_usd_for_change(
+        &self,
+        change_name: &str,
+    ) -> Result<smedja_types::Microdollars, IngotError> {
+        let change_name = change_name.to_owned();
+        self.run_blocking(move |ig| ig.cost_usd_for_change(&change_name))
+            .await
+    }
+
     /// Returns the model name from the most recent cost entry for `session_id`.
     ///
     /// # Errors

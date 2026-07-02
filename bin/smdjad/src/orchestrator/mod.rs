@@ -1633,6 +1633,7 @@ impl TurnOrchestrator {
                 output_tok: i64::from(total_output_tokens),
                 cost_usd: Microdollars::from_usd_f64(cost_usd),
                 created_at: Timestamp::now(),
+                change_name: self.active_change.clone(),
             };
             if let Err(e) = ingot.insert_cost(entry).await {
                 warn!(session_id = %session_id, turn_id = %turn_id, error = %e, "failed to record cost entry");

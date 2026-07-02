@@ -105,6 +105,7 @@ mod tests {
             output_tok: 50,
             cost_usd: Microdollars::from_usd_f64(0.01),
             created_at: Timestamp::from_micros(at),
+            change_name: None,
         }
     }
 

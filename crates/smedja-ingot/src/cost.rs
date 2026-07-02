@@ -43,6 +43,8 @@ pub struct CostEntry {
     pub cost_usd: Microdollars,
     /// Timestamp when the entry was recorded (micros since the Unix epoch).
     pub created_at: Timestamp,
+    /// Active openspec change name at the time of the turn, if any.
+    pub change_name: Option<String>,
 }
 
 /// A tokens-saved record from command-output filtering.
@@ -79,8 +81,8 @@ pub struct TokensSavedEntry {
 pub(crate) fn insert(conn: &rusqlite::Connection, entry: &CostEntry) -> Result<(), IngotError> {
     conn.execute(
         "INSERT INTO cost_ledger \
-         (id, session_id, turn_n, runner, model, input_tok, output_tok, cost_usd, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         (id, session_id, turn_n, runner, model, input_tok, output_tok, cost_usd, created_at, change_name) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             entry.id.to_string(),
             entry.session_id,
@@ -91,6 +93,7 @@ pub(crate) fn insert(conn: &rusqlite::Connection, entry: &CostEntry) -> Result<(
             entry.output_tok,
             entry.cost_usd.as_micros(),
             entry.created_at.as_micros(),
+            entry.change_name,
         ],
     )?;
     Ok(())
@@ -260,6 +263,7 @@ mod tests {
             output_tok: 100,
             cost_usd: Microdollars::from_usd_f64(cost_usd),
             created_at: Timestamp::from_secs_f64(1_700_000_000.0),
+            change_name: None,
         }
     }
 
@@ -305,6 +309,7 @@ mod tests {
             output_tok: 250,
             cost_usd: Microdollars::from_usd_f64(0.042),
             created_at: Timestamp::from_secs_f64(1_720_000_000.0),
+            change_name: None,
         };
         ingot.insert_cost(&entry).unwrap();
         let total = ingot.session_cost("s-rt").unwrap();
@@ -328,6 +333,7 @@ mod tests {
             output_tok: 100,
             cost_usd: Microdollars::from_usd_f64(cost_usd),
             created_at: Timestamp::from_secs_f64(1_700_000_000.0),
+            change_name: None,
         }
     }
 
@@ -538,5 +544,28 @@ mod tests {
         );
         // The all-source total still sums everything.
         assert_eq!(ingot.session_tokens_saved("s-src").unwrap(), 180);
+    }
+
+    #[test]
+    fn cost_usd_for_change_sums_micros_and_excludes_other_changes() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let mut e1 = make_entry("s1", 0.010, 0);
+        e1.change_name = Some("feat-a".to_owned());
+        let mut e2 = make_entry("s1", 0.020, 1);
+        e2.change_name = Some("feat-a".to_owned());
+        let mut e3 = make_entry("s1", 0.100, 2);
+        e3.change_name = Some("feat-b".to_owned());
+        ingot.insert_cost(&e1).unwrap();
+        ingot.insert_cost(&e2).unwrap();
+        ingot.insert_cost(&e3).unwrap();
+
+        let total = ingot.cost_usd_for_change("feat-a").unwrap();
+        assert_eq!(total, Microdollars::from_micros(30_000));
+
+        let other = ingot.cost_usd_for_change("feat-b").unwrap();
+        assert_eq!(other, Microdollars::from_micros(100_000));
+
+        let missing = ingot.cost_usd_for_change("no-such-change").unwrap();
+        assert_eq!(missing, Microdollars::from_micros(0));
     }
 }

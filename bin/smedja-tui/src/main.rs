@@ -4986,6 +4986,7 @@ async fn main() -> Result<()> {
             {
                 state.value_snapshot.change_name = vc["change_name"].as_str().map(str::to_owned);
                 state.value_snapshot.token_cost = vc["token_cost"].as_u64().unwrap_or(0);
+                state.value_snapshot.cost_usd_micros = vc["cost_usd_micros"].as_u64().unwrap_or(0);
                 state.value_snapshot.quality_avg = state.quality_snapshot.score;
             }
         }

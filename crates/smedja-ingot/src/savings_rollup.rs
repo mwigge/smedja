@@ -240,6 +240,7 @@ mod tests {
             output_tok: 0,
             cost_usd: Microdollars::from_micros(0),
             created_at: Timestamp::from_micros(at),
+            change_name: None,
         }
     }
 

@@ -206,6 +206,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         25,
         "ALTER TABLE audit_events ADD COLUMN change_name TEXT;",
     ),
+    // Value panel: stamp change_name on cost_ledger so the value panel can
+    // show cumulative USD spend per change, not just token count.
+    (
+        26,
+        "ALTER TABLE cost_ledger ADD COLUMN change_name TEXT; \
+         CREATE INDEX IF NOT EXISTS idx_cost_ledger_change_name \
+             ON cost_ledger(change_name) WHERE change_name IS NOT NULL;",
+    ),
 ];
 
 /// Aggregated statistics for a single multi-agent conversation.
@@ -532,6 +540,28 @@ impl Ingot {
             |row| row.get(0),
         )?;
         Ok(total.max(0).cast_unsigned())
+    }
+
+    /// Returns the cumulative USD cost (microdollars) across all cost-ledger
+    /// entries attributed to `change_name`.
+    ///
+    /// Returns `Ok(Microdollars::zero())` when no matching rows exist or when
+    /// the `change_name` column is absent on a pre-migration database.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned microdollar total"]
+    pub fn cost_usd_for_change(
+        &self,
+        change_name: &str,
+    ) -> Result<smedja_types::Microdollars, IngotError> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM cost_ledger WHERE change_name = ?1",
+            rusqlite::params![change_name],
+            |row| row.get(0),
+        )?;
+        Ok(smedja_types::Microdollars::from_micros(total.max(0)))
     }
 
     /// Persists a timeline event and, when the event carries a `conversation_id`,
