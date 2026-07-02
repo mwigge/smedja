@@ -897,6 +897,9 @@ pub struct Renderer {
     top_bar_segments: Vec<Segment>,
     /// Device pixel ratio for this window (1.0 on non-HiDPI, 2.0 on 2× displays).
     pub scale_factor: f64,
+    // ponytail: must be last — Instance owns the EGLDisplay/Wayland connection;
+    // all GPU resources hold internal back-refs into it and must drop first.
+    _instance: wgpu::Instance,
 }
 
 impl Renderer {
@@ -1314,6 +1317,7 @@ impl Renderer {
             status_bar_segments: Vec::new(),
             top_bar_segments: Vec::new(),
             scale_factor,
+            _instance: instance,
         })
     }
 

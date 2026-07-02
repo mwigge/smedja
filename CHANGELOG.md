@@ -6,6 +6,14 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.25.1] — 2026-07-02
+
+### Fixed
+
+- **SIGSEGV on exit** — `wgpu::Instance` was dropped at the end of `Renderer::new()`, destroying the EGLDisplay/Wayland connection while all GPU resources (bind groups, pipelines, surface, device) still held internal back-references into it; added `_instance` as the last field of `Renderer` so it outlives every resource it created.
+
+---
+
 ## [0.25.0] — 2026-07-01
 
 ### Added
