@@ -505,6 +505,21 @@ fn is_confirm_edits_enabled(workspace: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Shared HTTP client for the SRE tools (`otel_query`, `metric_query`,
+/// `log_tail`). Built once: connection pooling is lost when a client is rebuilt
+/// per call, and the previous per-call `.unwrap_or_default()` silently yielded a
+/// timeout-less client on the rare build failure.
+fn sre_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default()
+    })
+}
+
 /// Executes the named tool with the given JSON input string.
 ///
 /// Supported tools: `bash`, `run_command`, `read_file`, `list_files`, vault tools,
@@ -750,6 +765,97 @@ pub(crate) async fn execute_tool(
                     let end = end_line.map_or(lines.len(), |e| e.min(lines.len()));
                     lines[start.min(lines.len())..end].join("\n")
                 }
+            }
+        }
+        "write_file" => {
+            let path_str = input
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if path_str.is_empty() {
+                return "error: path field required".into();
+            }
+            // Boundary already enforced above; re-resolve to get the full path.
+            let full = match assert_within_workspace(workspace, path_str) {
+                Ok(p) => p,
+                Err(err) => return err,
+            };
+            let content = input
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if let Some(parent) = full.parent() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    return format!("error: write_file failed: {e}");
+                }
+            }
+            match tokio::fs::write(&full, content).await {
+                Ok(()) => serde_json::json!({"written": true, "bytes": content.len()}).to_string(),
+                Err(e) => format!("error: write_file failed: {e}"),
+            }
+        }
+        "edit_file" => {
+            let path_str = input
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if path_str.is_empty() {
+                return "error: path field required".into();
+            }
+            let full = match assert_within_workspace(workspace, path_str) {
+                Ok(p) => p,
+                Err(err) => return err,
+            };
+            let old = input
+                .get("old_string")
+                .or_else(|| input.get("old_str"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let new = input
+                .get("new_string")
+                .or_else(|| input.get("new_str"))
+                .or_else(|| input.get("content"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let replace_all = input
+                .get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            // Empty old_string means create-or-overwrite with `new`.
+            let current = match tokio::fs::read_to_string(&full).await {
+                Ok(s) => s,
+                Err(_) if old.is_empty() => String::new(),
+                Err(e) => return format!("error: edit_file failed to read {path_str}: {e}"),
+            };
+            let (updated, replacements) = if old.is_empty() {
+                (new.to_owned(), 1usize)
+            } else {
+                let count = current.matches(old).count();
+                if count == 0 {
+                    return format!("error: edit_file: old_string not found in {path_str}");
+                }
+                if count > 1 && !replace_all {
+                    return format!(
+                        "error: edit_file: old_string matches {count} times in {path_str}; \
+                         pass replace_all=true or include more surrounding context"
+                    );
+                }
+                if replace_all {
+                    (current.replace(old, new), count)
+                } else {
+                    (current.replacen(old, new, 1), 1)
+                }
+            };
+            if let Some(parent) = full.parent() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    return format!("error: edit_file failed: {e}");
+                }
+            }
+            match tokio::fs::write(&full, &updated).await {
+                Ok(()) => {
+                    serde_json::json!({"edited": true, "replacements": replacements}).to_string()
+                }
+                Err(e) => format!("error: edit_file failed: {e}"),
             }
         }
         "list_files" => {
@@ -1128,12 +1234,8 @@ pub(crate) async fn execute_tool(
                 .and_then(|n| u32::try_from(n).ok())
                 .unwrap_or(60);
             if let Ok(cfg) = smedja_sre::SreConfig::from_env() {
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(15))
-                    .connect_timeout(std::time::Duration::from_secs(5))
-                    .build()
-                    .unwrap_or_default();
-                match smedja_sre::otel_query(&client, &cfg, service, filter, range).await {
+                match smedja_sre::otel_query(sre_http_client(), &cfg, service, filter, range).await
+                {
                     Ok(v) => serde_json::to_string(&v).unwrap_or_default(),
                     Err(e) => format!("error: {e}"),
                 }
@@ -1149,12 +1251,7 @@ pub(crate) async fn execute_tool(
                 .and_then(|n| u32::try_from(n).ok())
                 .unwrap_or(60);
             if let Ok(cfg) = smedja_sre::SreConfig::from_env() {
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(15))
-                    .connect_timeout(std::time::Duration::from_secs(5))
-                    .build()
-                    .unwrap_or_default();
-                match smedja_sre::metric_query(&client, &cfg, promql, range).await {
+                match smedja_sre::metric_query(sre_http_client(), &cfg, promql, range).await {
                     Ok(v) => serde_json::to_string(&v).unwrap_or_default(),
                     Err(e) => format!("error: {e}"),
                 }
@@ -1174,12 +1271,7 @@ pub(crate) async fn execute_tool(
                 .and_then(|n| u32::try_from(n).ok())
                 .unwrap_or(100);
             if let Ok(cfg) = smedja_sre::SreConfig::from_env() {
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(15))
-                    .connect_timeout(std::time::Duration::from_secs(5))
-                    .build()
-                    .unwrap_or_default();
-                match smedja_sre::log_tail(&client, &cfg, service, filter, lines).await {
+                match smedja_sre::log_tail(sre_http_client(), &cfg, service, filter, lines).await {
                     Ok(v) => serde_json::to_string(&v).unwrap_or_default(),
                     Err(e) => format!("error: {e}"),
                 }
@@ -2014,6 +2106,64 @@ mod tests {
             result.contains("path outside workspace") || result.starts_with("error:"),
             "path traversal must be rejected; got: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn write_and_edit_file_are_native() {
+        use smedja_vault::Vault;
+        use tokio::sync::Mutex;
+        let ingot = smedja_ingot::IngotHandle::new(smedja_ingot::Ingot::open_in_memory().unwrap());
+        let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+
+        // write_file creates the file (incl. parent dirs) natively.
+        let w = super::execute_tool(
+            "write_file",
+            r#"{"path":"sub/a.txt","content":"hello world"}"#,
+            &ws,
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        assert!(w.contains("\"written\":true"), "got: {w}");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("sub/a.txt")).unwrap(),
+            "hello world"
+        );
+
+        // edit_file replaces a unique occurrence natively.
+        let e = super::execute_tool(
+            "edit_file",
+            r#"{"path":"sub/a.txt","old_string":"world","new_string":"smedja"}"#,
+            &ws,
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        assert!(e.contains("\"edited\":true"), "got: {e}");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("sub/a.txt")).unwrap(),
+            "hello smedja"
+        );
+
+        // Ambiguous edit without replace_all is rejected rather than silently guessing.
+        std::fs::write(ws.join("sub/a.txt"), "x x").unwrap();
+        let ambiguous = super::execute_tool(
+            "edit_file",
+            r#"{"path":"sub/a.txt","old_string":"x","new_string":"y"}"#,
+            &ws,
+            None,
+            &ingot,
+            &vault,
+            &test_embedder(),
+        )
+        .await;
+        assert!(ambiguous.contains("matches 2 times"), "got: {ambiguous}");
     }
 
     // ── methodology gate ──────────────────────────────────────────────────────

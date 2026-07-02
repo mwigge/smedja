@@ -42,6 +42,24 @@ pub mod types;
 pub(crate) mod otel;
 pub(crate) mod sse;
 
+/// Builds a [`reqwest::Client`] tuned for streaming LLM calls.
+///
+/// A plain `Client::new()` has no timeouts, so a stalled connection or a model
+/// that stops emitting mid-stream hangs the turn forever. An overall
+/// `.timeout()` is wrong for streaming (it would kill a legitimately long
+/// response), so this sets a connect timeout plus a per-read idle timeout:
+/// the stream is only aborted when *no* bytes arrive for `read_timeout`.
+///
+/// Falls back to an untimed client on the (practically impossible) TLS-init
+/// failure rather than panicking in an infallible constructor.
+pub(crate) fn streaming_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_mins(2))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// A single process-wide lock serialising tests that mutate global process
 /// state (e.g. `PATH`). Per-module locks do not serialise across modules, so
 /// CLI-provider tests in different modules raced on `PATH` under the parallel

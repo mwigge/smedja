@@ -31,7 +31,7 @@ impl OpenAiProvider {
     /// Creates a new [`OpenAiProvider`] attributed to `"openai"` in traces.
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::streaming_http_client(),
             base_url: base_url.into(),
             api_key: api_key.into(),
             system_name: "openai",
@@ -48,7 +48,7 @@ impl OpenAiProvider {
         system_name: &'static str,
     ) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::streaming_http_client(),
             base_url: base_url.into(),
             api_key: api_key.into(),
             system_name,

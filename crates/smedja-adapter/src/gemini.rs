@@ -33,7 +33,7 @@ impl GeminiProvider {
             AdapterError::Request("GEMINI_API_KEY environment variable is not set".to_owned())
         })?;
         Ok(Self {
-            client: Client::new(),
+            client: crate::streaming_http_client(),
             api_key,
         })
     }
@@ -41,7 +41,7 @@ impl GeminiProvider {
     /// Creates a new [`GeminiProvider`] with an explicit API key.
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::streaming_http_client(),
             api_key: api_key.into(),
         }
     }
@@ -175,8 +175,10 @@ impl Provider for GeminiProvider {
         let api_key = self.api_key.clone();
         let client = self.client.clone();
 
+        // Key goes in the `x-goog-api-key` header, not the query string: URLs are
+        // logged by proxies/servers/tracing far more readily than headers.
         let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?key={api_key}&alt=sse"
+            "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse"
         );
 
         let contents = build_contents(messages, opts);
@@ -205,6 +207,20 @@ impl Provider for GeminiProvider {
         tokio::spawn(async move {
             let mut headers = reqwest::header::HeaderMap::new();
             inject_traceparent(&mut headers);
+            match reqwest::header::HeaderValue::from_str(&api_key) {
+                Ok(mut v) => {
+                    v.set_sensitive(true);
+                    headers.insert("x-goog-api-key", v);
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(AdapterError::Request(format!(
+                            "invalid GEMINI_API_KEY: {e}"
+                        ))))
+                        .await;
+                    return;
+                }
+            }
 
             let resp = match client.post(&url).headers(headers).json(&body).send().await {
                 Ok(r) => r,
@@ -214,13 +230,24 @@ impl Provider for GeminiProvider {
                 }
             };
 
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(std::time::Duration::from_secs);
+                let _ = tx
+                    .send(Err(AdapterError::RateLimited { retry_after }))
+                    .await;
+                return;
+            }
+
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
                 let _ = tx
-                    .send(Err(AdapterError::InvalidResponse(format!(
-                        "HTTP {status}: {text}"
-                    ))))
+                    .send(Err(crate::classify_http_error(status, &text)))
                     .await;
                 return;
             }

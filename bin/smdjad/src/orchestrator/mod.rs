@@ -1194,9 +1194,13 @@ impl TurnOrchestrator {
                             let ig = ingot.clone();
                             let vt = vault.clone();
                             let em = Arc::clone(embedder);
+                            // Thread the session through so batched reads get the same
+                            // output secret-scan + session-scoped audit as single reads.
+                            let sess = session.clone();
                             futs.push(async move {
                                 let result =
-                                    execute_tool(&name, &input, &wsr, None, &ig, &vt, &em).await;
+                                    execute_tool(&name, &input, &wsr, sess.as_ref(), &ig, &vt, &em)
+                                        .await;
                                 (i, result)
                             });
                         }

@@ -228,10 +228,15 @@ pub(crate) fn update_cowork_mode(
 ///
 /// Returns [`IngotError::Db`] if the query fails.
 pub(crate) fn search(conn: &rusqlite::Connection, query: &str) -> Result<Vec<Session>, IngotError> {
-    let pattern = format!("%{query}%");
+    // Escape LIKE metacharacters so a query containing % or _ matches literally.
+    let escaped = query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%{escaped}%");
     let mut stmt = conn.prepare(
         "SELECT id, created_at, updated_at, status, task_id, mode, title, cowork_mode, workspace_root, model_override, runner_override \
-         FROM sessions WHERE title LIKE ?1 OR workspace_root LIKE ?1 ORDER BY created_at ASC",
+         FROM sessions WHERE title LIKE ?1 ESCAPE '\\' OR workspace_root LIKE ?1 ESCAPE '\\' ORDER BY created_at ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![pattern], |row| {
         let id_str: String = row.get(0)?;
