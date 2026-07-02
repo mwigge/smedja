@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 /// Immutable snapshot of quality gate results the panel needs to render.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct QualitySnapshot {
     /// Composite 0–100 quality score.
     pub score: u8,
@@ -27,6 +27,20 @@ pub struct QualitySnapshot {
     pub skill_advisories: Vec<String>,
     /// Slash command suggested by the LLM reviewer, if any.
     pub suggested_command: Option<String>,
+}
+
+impl Default for QualitySnapshot {
+    fn default() -> Self {
+        Self {
+            score: 100,
+            tdd_pass: true,
+            clean_pass: true,
+            llm_reviewed: false,
+            file_advisories: Vec::new(),
+            skill_advisories: Vec::new(),
+            suggested_command: None,
+        }
+    }
 }
 
 impl QualitySnapshot {

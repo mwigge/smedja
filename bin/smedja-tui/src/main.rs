@@ -4073,6 +4073,23 @@ async fn main() -> Result<()> {
         .main_panel
         .push_line("type a message or /help for commands".into());
 
+    // Seed context window so the obs panel shows a real % on the first frame.
+    if let Ok(ctx) = client
+        .call("session.context", json!({ "session_id": state.session_id }))
+        .await
+    {
+        if let Some(used) = ctx["used_tok"].as_i64() {
+            state.context_used = u64::try_from(used.max(0)).unwrap_or(0);
+        }
+        if let Some(window) = ctx["window_tok"].as_u64() {
+            if window > 0 {
+                state.context_window = window;
+            }
+        }
+        state.obs_snapshot.context_used = state.context_used;
+        state.obs_snapshot.context_window = state.context_window;
+    }
+
     // On resume, optionally rewind to --turn and replay history into the view
     // before the event loop starts. Done before terminal setup so a transport
     // failure surfaces as a normal panel line rather than mid-frame.
@@ -4690,6 +4707,14 @@ async fn main() -> Result<()> {
                                 format!("↳ {input_tok}↑ {output_tok}↓ tokens · {turn_ms}ms");
                             state.main_panel.push_line(footer);
                             state.last_traceparent = None;
+                            let in_u64 = u64::try_from(input_tok.max(0)).unwrap_or(0);
+                            let out_u64 = u64::try_from(output_tok.max(0)).unwrap_or(0);
+                            state.session_tokens_in =
+                                state.session_tokens_in.saturating_add(in_u64);
+                            state.session_tokens_out =
+                                state.session_tokens_out.saturating_add(out_u64);
+                            state.obs_snapshot.tokens_input = state.session_tokens_in;
+                            state.obs_snapshot.tokens_output = state.session_tokens_out;
                         }
                         state.pending_task_id = None;
                         state.last_poll = None;
@@ -4886,6 +4911,20 @@ async fn main() -> Result<()> {
                 .await
             {
                 state.metrics_snapshot = metrics_rows_from_summary(&resp);
+                // Fallback: if no persisted buckets yet, show current-session totals.
+                if state.metrics_snapshot.is_empty()
+                    && (state.session_tokens_in > 0 || state.session_tokens_out > 0)
+                {
+                    let total = state
+                        .session_tokens_in
+                        .saturating_add(state.session_tokens_out);
+                    state.metrics_snapshot = vec![metrics_view::MetricsRow {
+                        runner: state.runner.clone(),
+                        tokens: i64::try_from(total).unwrap_or(i64::MAX),
+                        cost_usd: 0.0,
+                        errors: 0,
+                    }];
+                }
                 // Extract 24h token total for the daily quota bar (buckets array).
                 if let Some(buckets) = resp["buckets"].as_array() {
                     let total_24h: u64 = buckets
@@ -4947,6 +4986,7 @@ async fn main() -> Result<()> {
             {
                 state.value_snapshot.change_name = vc["change_name"].as_str().map(str::to_owned);
                 state.value_snapshot.token_cost = vc["token_cost"].as_u64().unwrap_or(0);
+                state.value_snapshot.quality_avg = state.quality_snapshot.score;
             }
         }
 
