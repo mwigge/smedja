@@ -257,4 +257,19 @@ mod tests {
         let unique: std::collections::HashSet<char> = frames.iter().copied().collect();
         assert!(unique.len() >= 2, "spinner must cycle across ticks");
     }
+
+    #[test]
+    fn osc9_bytes_is_correct_sequence() {
+        let bytes = osc9_turn_complete_bytes();
+        assert_eq!(bytes, b"\x1b]9;turn complete\x07");
+    }
+    #[test]
+    fn emit_turn_notifications_writes_all_three_osc() {
+        let mut buf: Vec<u8> = Vec::new();
+        emit_turn_notifications(&mut buf).unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("]9;"), "OSC 9 present");
+        assert!(text.contains("]99;"), "OSC 99 present");
+        assert!(text.contains("]777;"), "OSC 777 present");
+    }
 }

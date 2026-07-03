@@ -234,3 +234,184 @@ pub(crate) fn gov_transition(workspace: &std::path::Path, rest: &str) -> String 
         Err(e) => format!("gov transition: write failed: {e}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_project_types_returns_cargo_when_only_cargo_toml_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(detect_project_types(dir.path()), vec!["Cargo.toml"]);
+    }
+
+    #[test]
+    fn detect_project_types_returns_all_present_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let types = detect_project_types(dir.path());
+        assert_eq!(types.len(), 2);
+        assert!(types.contains(&"Cargo.toml"));
+        assert!(types.contains(&"package.json"));
+    }
+
+    #[test]
+    fn detect_project_types_returns_empty_for_no_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(detect_project_types(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn scan_gov_artifacts_returns_empty_when_no_gov_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = scan_gov_artifacts(dir.path());
+        assert!(
+            artifacts.is_empty(),
+            "no gov/ dir should yield empty artifact list"
+        );
+    }
+
+    #[test]
+    fn scan_gov_artifacts_parses_work_item_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let wi_dir = dir.path().join("gov").join("work-items");
+        std::fs::create_dir_all(&wi_dir).unwrap();
+        std::fs::write(
+            wi_dir.join("WI-001.toml"),
+            r#"id = "WI-001"
+title = "Add thinking token streaming"
+status = "in_progress"
+"#,
+        )
+        .unwrap();
+        let artifacts = scan_gov_artifacts(dir.path());
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].id, "WI-001");
+        assert_eq!(artifacts[0].status, "in_progress");
+        assert_eq!(artifacts[0].kind, "work-items");
+    }
+
+    #[test]
+    fn scan_gov_artifacts_skips_files_without_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let wi_dir = dir.path().join("gov").join("work-items");
+        std::fs::create_dir_all(&wi_dir).unwrap();
+        std::fs::write(
+            wi_dir.join("bad.toml"),
+            r#"title = "missing id"
+status = "draft"
+"#,
+        )
+        .unwrap();
+        let artifacts = scan_gov_artifacts(dir.path());
+        assert!(
+            artifacts.is_empty(),
+            "TOML without 'id' field must be skipped"
+        );
+    }
+
+    #[test]
+    fn format_gov_list_shows_count_and_ids() {
+        let artifacts = vec![
+            GovArtifact {
+                id: "WI-001".into(),
+                kind: "work-items".into(),
+                title: "Add multi-line input".into(),
+                status: "done".into(),
+            },
+            GovArtifact {
+                id: "RFC-001".into(),
+                kind: "rfc".into(),
+                title: "Thinking token streaming".into(),
+                status: "accepted".into(),
+            },
+        ];
+        let output = format_gov_list(&artifacts);
+        assert!(output.contains("2 govctl artifact"), "count must appear");
+        assert!(output.contains("WI-001"), "WI-001 must appear");
+        assert!(output.contains("RFC-001"), "RFC-001 must appear");
+    }
+
+    #[test]
+    fn format_gov_list_empty_returns_hint() {
+        let output = format_gov_list(&[]);
+        assert!(
+            output.contains("gov/work-items"),
+            "empty list must include path hint"
+        );
+    }
+
+    #[test]
+    fn gov_create_work_item_creates_toml_with_planned_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let msg = gov_create(dir.path(), "work-item My first task");
+        assert!(
+            msg.contains("WI-001"),
+            "should report created id; got: {msg}"
+        );
+        let path = dir.path().join("gov/work-items/WI-001.toml");
+        assert!(
+            path.exists(),
+            "TOML file must be created at {}",
+            path.display()
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("planned"),
+            "status must be planned; got: {content}"
+        );
+    }
+
+    #[test]
+    fn gov_create_auto_increments_id() {
+        let dir = tempfile::tempdir().unwrap();
+        gov_create(dir.path(), "work-item First");
+        let msg = gov_create(dir.path(), "work-item Second");
+        assert!(
+            msg.contains("WI-002"),
+            "second item must get WI-002; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn gov_create_rfc_uses_draft_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let msg = gov_create(dir.path(), "rfc My RFC");
+        assert!(msg.contains("RFC-001"), "got: {msg}");
+        let content = std::fs::read_to_string(dir.path().join("gov/rfc/RFC-001.toml")).unwrap();
+        assert!(
+            content.contains("draft"),
+            "RFC default status must be draft; got: {content}"
+        );
+    }
+
+    #[test]
+    fn gov_transition_updates_status_in_file() {
+        let dir = tempfile::tempdir().unwrap();
+        gov_create(dir.path(), "work-item Test task");
+        let msg = gov_transition(dir.path(), "WI-001 in_progress");
+        assert!(
+            msg.contains("in_progress"),
+            "should confirm transition; got: {msg}"
+        );
+        let content =
+            std::fs::read_to_string(dir.path().join("gov/work-items/WI-001.toml")).unwrap();
+        assert!(
+            content.contains("\"in_progress\""),
+            "file must contain updated status; got: {content}"
+        );
+    }
+
+    #[test]
+    fn gov_transition_rejects_invalid_status() {
+        let dir = tempfile::tempdir().unwrap();
+        gov_create(dir.path(), "work-item Test task");
+        let msg = gov_transition(dir.path(), "WI-001 flying");
+        assert!(
+            msg.contains("invalid status"),
+            "must reject unknown status; got: {msg}"
+        );
+    }
+}

@@ -204,3 +204,73 @@ pub(crate) fn format_openspec_status(json: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use serde_json::{json, Value};
+
+    #[test]
+    fn format_openspec_list_empty_changes_returns_no_active() {
+        let json = r#"{"changes": []}"#;
+        assert_eq!(format_openspec_list(json), "no active changes");
+    }
+
+    #[test]
+    fn format_openspec_list_missing_changes_key_returns_no_active() {
+        let json = r"{}";
+        assert_eq!(format_openspec_list(json), "no active changes");
+    }
+
+    #[test]
+    fn format_openspec_list_two_changes_shows_both_names() {
+        let json = r#"{"changes": [
+            {"name": "tui-input-modes", "status": "proposed"},
+            {"name": "smdjad-service",  "status": "implementing"}
+        ]}"#;
+        let result = format_openspec_list(json);
+        assert!(
+            result.contains("tui-input-modes"),
+            "must contain first change name"
+        );
+        assert!(
+            result.contains("smdjad-service"),
+            "must contain second change name"
+        );
+        assert!(result.contains("proposed"), "must contain status");
+    }
+
+    #[test]
+    fn format_openspec_list_invalid_json_returns_error() {
+        let result = format_openspec_list("not json");
+        assert!(
+            result.contains("parse error"),
+            "invalid JSON must produce a parse error message; got: {result}"
+        );
+    }
+
+    #[test]
+    fn format_openspec_status_renders_key_value_lines() {
+        let json = r#"{"name": "my-change", "state": "implementing", "progress": "3/7"}"#;
+        let result = format_openspec_status(json);
+        assert!(
+            result.contains("name: my-change"),
+            "must contain name field"
+        );
+        assert!(
+            result.contains("state: implementing"),
+            "must contain state field"
+        );
+        assert!(
+            result.contains("progress: 3/7"),
+            "must contain progress field"
+        );
+    }
+
+    #[test]
+    fn format_openspec_status_invalid_json_returns_error() {
+        let result = format_openspec_status("{{bad}}");
+        assert!(result.contains("parse error"));
+    }
+}

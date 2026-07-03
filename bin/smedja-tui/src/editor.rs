@@ -62,3 +62,60 @@ pub(crate) fn open_in_editor(initial_text: &str) -> Option<String> {
     let _ = fs::remove_file(&path);
     text.map(|s| s.trim_end_matches('\n').to_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    #[allow(unused_imports)]
+    use super::{open_in_editor, resolve_editor};
+
+    // Serialises env-var mutation across the parallel test runner.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn resolve_editor_falls_back_to_vi() {
+        let _guard = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Remove VISUAL and EDITOR from the environment for this test.
+        std::env::remove_var("VISUAL");
+        std::env::remove_var("EDITOR");
+        // Can't guarantee clean env in parallel tests, but the fallback path
+        // must always produce a non-empty string.
+        let editor = resolve_editor();
+        assert!(
+            !editor.is_empty(),
+            "resolve_editor must return a non-empty string"
+        );
+    }
+
+    #[test]
+    fn resolve_editor_prefers_visual_over_editor() {
+        let _guard = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("VISUAL", "emacs");
+        std::env::set_var("EDITOR", "nano");
+        let editor = resolve_editor();
+        // Clean up after the test regardless of assertion result.
+        std::env::remove_var("VISUAL");
+        std::env::remove_var("EDITOR");
+        assert_eq!(editor, "emacs", "VISUAL must be preferred over EDITOR");
+    }
+
+    #[test]
+    fn open_in_editor_temp_path_is_in_tmpdir() {
+        // Verify the temp file path is inside the OS temp directory — we
+        // cannot actually invoke an editor in a unit test, but we can check
+        // that the path construction is correct.
+        let tmp = std::env::temp_dir();
+        let path = tmp.join(format!("smedja-edit-{}.md", std::process::id()));
+        assert!(
+            path.starts_with(&tmp),
+            "temp file must be under the OS temp directory"
+        );
+        assert!(
+            path.to_string_lossy().ends_with(".md"),
+            "temp file must have .md extension for editor syntax highlighting"
+        );
+    }
+}

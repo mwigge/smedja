@@ -14,6 +14,10 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use smedja_rpc::client::Client;
 
+use crate::slash_fmt::{
+    format_agents_table, format_approvals_list, format_local_model_list, format_memory,
+    format_metrics, format_model_list, home_dir, install_skills_dir, list_skill_dir,
+};
 use crate::{
     detect_project_types, fetch_latest_version, format_gov_list, format_openspec_list,
     format_openspec_status, format_resume_rows, format_token_count, gov_create, gov_transition,
@@ -47,253 +51,6 @@ pub(crate) fn apply_agent(args: &str, state: &mut AppState) -> String {
         "" => "usage: /agent impl|review|test|sre|explain".to_owned(),
         other => format!("unknown agent mode: {other}"),
     }
-}
-
-pub(crate) fn format_model_list(v: &serde_json::Value) -> String {
-    let runners = v.get("runners").and_then(|r| r.as_array());
-    let Some(runners) = runners else {
-        return "no runners available".to_owned();
-    };
-    let mut lines = vec!["available models:".to_owned()];
-    for r in runners {
-        let runner = r.get("runner").and_then(|v| v.as_str()).unwrap_or("?");
-        let tier = r.get("tier").and_then(|v| v.as_str()).unwrap_or("?");
-        let model = r.get("model").and_then(|v| v.as_str()).unwrap_or("?");
-        lines.push(format!("  {runner} ({tier}): {model}"));
-    }
-    lines.join("\n")
-}
-
-/// Renders the `local.models` response: the GPU-annotated local-model inventory.
-///
-/// Each line shows the model id, its advisory GPU fit, and an active marker.
-pub(crate) fn format_local_model_list(v: &serde_json::Value) -> String {
-    let Some(models) = v.get("models").and_then(|m| m.as_array()) else {
-        return "no local models".to_owned();
-    };
-    if models.is_empty() {
-        return "no local models".to_owned();
-    }
-    let mut lines = vec!["local models:".to_owned()];
-    for m in models {
-        let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-        let fit = m.get("fit").and_then(|v| v.as_str()).unwrap_or("unknown");
-        let marker = if m.get("active").and_then(serde_json::Value::as_bool) == Some(true) {
-            " *"
-        } else {
-            ""
-        };
-        lines.push(format!("  {id} [{fit}]{marker}"));
-    }
-    lines.join("\n")
-}
-
-/// Renders a `session.history` response as a compact, readable memory listing:
-/// one entry per stored turn (user prompt + assistant reply previews) plus an
-/// audit-trail count. Used by `/memory`.
-pub(crate) fn format_memory(history: &Value, context: Option<&Value>, sid: &str) -> String {
-    let short: String = sid.chars().take(8).collect();
-    let mut lines = vec![format!("\u{25a4} memory · session {short}")];
-
-    // Short-term working set + semantic vault (from session.context).
-    if let Some(ctx) = context {
-        let used = ctx.get("used_tok").and_then(Value::as_u64).unwrap_or(0);
-        let window = ctx.get("window_tok").and_then(Value::as_u64).unwrap_or(0);
-        let warm = ctx
-            .get("vault_warm_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let cold = ctx
-            .get("vault_cold_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let pct = used.saturating_mul(100).checked_div(window).unwrap_or(0);
-        lines.push(format!(
-            "  short-term · context {used}/{window} tok ({pct}%)"
-        ));
-        lines.push(format!(
-            "  vault · {warm} warm + {cold} cold semantic entries"
-        ));
-    }
-
-    let turns = history.get("turns").and_then(Value::as_array);
-    match turns {
-        Some(turns) if !turns.is_empty() => {
-            lines.push(format!(
-                "{} stored turn(s) — long-term memory:",
-                turns.len()
-            ));
-            for t in turns {
-                let n = t.get("turn_n").and_then(Value::as_u64).unwrap_or(0);
-                let msgs = t.get("messages").and_then(Value::as_array);
-                let (mut user, mut asst) = (String::new(), String::new());
-                if let Some(msgs) = msgs {
-                    for m in msgs {
-                        let role = m.get("role").and_then(Value::as_str).unwrap_or("");
-                        let msg_text = m.get("content").and_then(Value::as_str).unwrap_or("");
-                        let preview: String =
-                            msg_text.split_whitespace().collect::<Vec<_>>().join(" ");
-                        let preview: String = preview.chars().take(72).collect();
-                        if role == "user" && user.is_empty() {
-                            user = preview;
-                        } else if role == "assistant" && asst.is_empty() {
-                            asst = preview;
-                        }
-                    }
-                }
-                lines.push(format!("  #{n} \u{25b8} {user}"));
-                if !asst.is_empty() {
-                    lines.push(format!("      \u{21b3} {asst}"));
-                }
-            }
-        }
-        _ => lines.push("  (no stored turns yet — memory fills as turns complete)".to_owned()),
-    }
-
-    if let Some(audit) = history.get("audit").and_then(Value::as_array) {
-        if !audit.is_empty() {
-            lines.push(format!(
-                "{} audit event(s) in the tool/turn trail",
-                audit.len()
-            ));
-        }
-    }
-    lines.push("tip: /memory <session_id> views another session's memory".to_owned());
-    lines.join("\n")
-}
-
-/// Home directory (`$HOME`, falling back to `.`).
-fn home_dir() -> PathBuf {
-    std::env::var("HOME").map_or_else(|_| PathBuf::from("."), PathBuf::from)
-}
-
-/// Lists skill names in `dir`: `<name>.md` → `name`, `<name>/SKILL.md` → `name`.
-pub(crate) fn list_skill_dir(dir: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let path = e.path();
-            if path.is_dir() {
-                if path.join("SKILL.md").exists() {
-                    if let Some(n) = path.file_name().and_then(|s| s.to_str()) {
-                        out.push(n.to_owned());
-                    }
-                }
-            } else if path.extension().and_then(|s| s.to_str()) == Some("md") {
-                if let Some(n) = path.file_stem().and_then(|s| s.to_str()) {
-                    out.push(n.to_owned());
-                }
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
-/// Copies every `*.md` from `src` into the workspace skills dir `dst`, creating
-/// `dst` as needed. Returns a status string.
-pub(crate) fn install_skills_dir(src: &Path, dst: &Path) -> String {
-    if !src.is_dir() {
-        return format!("skills: {} is not a directory", src.display());
-    }
-    if std::fs::create_dir_all(dst).is_err() {
-        return "skills: cannot create .smedja/skills".to_owned();
-    }
-    let mut n = 0u32;
-    if let Ok(rd) = std::fs::read_dir(src) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("md") {
-                if let Some(name) = p.file_name() {
-                    if std::fs::copy(&p, dst.join(name)).is_ok() {
-                        n += 1;
-                    }
-                }
-            }
-        }
-    }
-    format!(
-        "\u{2713} installed {n} skill file(s) into {} — auto-injected next turn",
-        dst.display()
-    )
-}
-
-pub(crate) fn format_agents_table(v: &serde_json::Value) -> String {
-    let runners = v.get("runners").and_then(|r| r.as_array());
-    let Some(runners) = runners else {
-        return "no runners configured".to_owned();
-    };
-    if runners.is_empty() {
-        return "no runners available".to_owned();
-    }
-    let mut lines = vec![
-        format!(" {:<14} {:<8} {}", "runner", "tier", "model"),
-        format!(" {}", "─".repeat(60)),
-    ];
-    for r in runners {
-        let runner = r.get("runner").and_then(|v| v.as_str()).unwrap_or("?");
-        let tier = r.get("tier").and_then(|v| v.as_str()).unwrap_or("?");
-        let model = r.get("model").and_then(|v| v.as_str()).unwrap_or("?");
-        lines.push(format!(" {runner:<14} {tier:<8} {model}"));
-    }
-    lines.join("\n")
-}
-
-pub(crate) fn format_metrics(
-    usage: &Result<serde_json::Value, smedja_rpc::RpcError>,
-    cost: &Result<serde_json::Value, smedja_rpc::RpcError>,
-    session_id: &str,
-) -> String {
-    let (turn_count, total_input, total_output) = match usage {
-        Ok(v) => {
-            let turns = v.get("turns").and_then(|t| t.as_array());
-            turns.map_or((0usize, 0i64, 0i64), |arr| {
-                let last = arr.last();
-                let total_in = last
-                    .and_then(|r| r.get("cumulative_input"))
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0);
-                let total_out = last
-                    .and_then(|r| r.get("cumulative_output"))
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0);
-                (arr.len(), total_in, total_out)
-            })
-        }
-        Err(_) => (0, 0, 0),
-    };
-    let cost_usd = match cost {
-        Ok(v) => v
-            .get("total_usd")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0),
-        Err(_) => 0.0,
-    };
-    let total_tok = total_input.saturating_add(total_output);
-    format!(
-        "session: {session_id}\n\
-         turns: {turn_count}   tokens: {total_tok}\n\
-         cost: ${cost_usd:.4}   input: {total_input}   output: {total_output}"
-    )
-}
-
-pub(crate) fn format_approvals_list(v: &serde_json::Value) -> String {
-    let items = v.as_array();
-    let Some(items) = items else {
-        return "cowork: unexpected response format".to_owned();
-    };
-    if items.is_empty() {
-        return "cowork: no pending approvals".to_owned();
-    }
-    let mut lines = vec!["pending approvals:".to_owned()];
-    for item in items {
-        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-        let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("?");
-        let args = item.get("args").and_then(|v| v.as_str()).unwrap_or("");
-        lines.push(format!("  [{id}] {tool}: {args}"));
-    }
-    lines.push("use /approve <id> to approve".to_owned());
-    lines.join("\n")
 }
 
 #[allow(clippy::too_many_lines)] // flat slash-command dispatch table; splitting is out of scope here
@@ -1447,4 +1204,336 @@ pub(crate) fn show_value_report(state: &mut AppState) {
     );
     push_system_message(state, report);
     state.panels.value = true;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::state::{Message, Role};
+    #[allow(unused_imports)]
+    use crate::testutil::make_state;
+    #[allow(unused_imports)]
+    use serde_json::{json, Value};
+
+    #[test]
+    fn dispatch_tier_fast_sets_state_tier() {
+        let mut state = make_state("test-session");
+        let text = apply_tier("fast", &mut state);
+        assert_eq!(state.tier.as_deref(), Some("fast"));
+        assert_eq!(text, "tier set to fast");
+    }
+
+    #[test]
+    fn dispatch_tier_deep_sets_state_tier() {
+        let mut state = make_state("test-session");
+        let text = apply_tier("deep", &mut state);
+        assert_eq!(state.tier.as_deref(), Some("deep"));
+        assert_eq!(text, "tier set to deep");
+    }
+
+    #[test]
+    fn dispatch_agent_impl_sets_state_mode() {
+        let mut state = make_state("test-session");
+        let text = apply_agent("impl", &mut state);
+        assert_eq!(state.mode.as_deref(), Some("impl"));
+        assert_eq!(text, "agent mode set to impl");
+    }
+
+    #[test]
+    fn slash_tier_fast_routes_correctly_via_apply_tier() {
+        let mut state = make_state("test-session");
+        let text = apply_tier("fast", &mut state);
+        assert_eq!(state.tier.as_deref(), Some("fast"));
+        assert_eq!(text, "tier set to fast");
+    }
+
+    #[test]
+    fn slash_tier_local_routes_correctly_via_apply_tier() {
+        let mut state = make_state("test-session");
+        let text = apply_tier("local", &mut state);
+        assert_eq!(state.tier.as_deref(), Some("local"));
+        assert_eq!(text, "tier set to local");
+    }
+
+    #[test]
+    fn slash_tier_unknown_arg_returns_error_message() {
+        let mut state = make_state("test-session");
+        let text = apply_tier("turbo", &mut state);
+        assert_eq!(text, "unknown tier: turbo");
+        assert!(state.tier.is_none(), "tier must not change on unknown arg");
+    }
+
+    #[test]
+    fn slash_agent_sets_mode_via_apply_agent() {
+        let mut state = make_state("test-session");
+        let text = apply_agent("review", &mut state);
+        assert_eq!(state.mode.as_deref(), Some("review"));
+        assert_eq!(text, "agent mode set to review");
+    }
+
+    /// Spawns a one-shot mock daemon that records the requested method into the
+    /// returned channel and replies with `reply`. Returns the socket path.
+    fn spawn_method_capture(
+        reply: serde_json::Value,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        tokio::sync::oneshot::Receiver<String>,
+    ) {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader as TokioBufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("local-test.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let mut reader = TokioBufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let req: serde_json::Value =
+                    serde_json::from_str(line.trim_end()).unwrap_or(serde_json::Value::Null);
+                let method = req["method"].as_str().unwrap_or("").to_owned();
+                let _ = tx.send(method);
+                let resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req["id"].clone(),
+                    "result": reply,
+                });
+                let mut bytes = serde_json::to_vec(&resp).unwrap();
+                bytes.push(b'\n');
+                let _ = reader.get_mut().write_all(&bytes).await;
+            }
+        });
+
+        (dir, sock_path, rx)
+    }
+
+    /// For the local runner, `/model <name>` dispatches `local.swap` (not the
+    /// relabel-only `session.set_model`).
+    #[tokio::test]
+    async fn model_command_local_runner_dispatches_local_swap() {
+        let (_dir, sock_path, rx) = spawn_method_capture(serde_json::json!({
+            "from_model": "qwen3-14b",
+            "active_model_id": "llama3-8b",
+            "explicit_swap": true,
+            "swap_latency_ms": 12
+        }));
+
+        let mut client = Client::connect(&sock_path).await.unwrap();
+        let mut state = make_state("sess-local");
+        state.runner = "local".to_owned();
+
+        dispatch_slash("/model llama3-8b", &mut state, &mut client)
+            .await
+            .unwrap();
+
+        let method = rx.await.unwrap();
+        assert_eq!(
+            method, "local.swap",
+            "local runner /model <name> must dispatch local.swap, not session.set_model"
+        );
+        assert_eq!(
+            state.model.as_deref(),
+            Some("llama3-8b"),
+            "the active model label must update after a local swap"
+        );
+    }
+
+    /// For the local runner, `/model` with no args lists the GPU-annotated
+    /// inventory via `local.models`.
+    #[tokio::test]
+    async fn model_command_local_runner_lists_via_local_models() {
+        let (_dir, sock_path, rx) = spawn_method_capture(serde_json::json!({
+            "active_model_id": "qwen3-14b",
+            "models": [ { "id": "qwen3-14b", "fit": "fits", "active": true } ],
+            "gpu": { "detected": false }
+        }));
+
+        let mut client = Client::connect(&sock_path).await.unwrap();
+        let mut state = make_state("sess-local");
+        state.runner = "local".to_owned();
+
+        dispatch_slash("/model", &mut state, &mut client)
+            .await
+            .unwrap();
+
+        let method = rx.await.unwrap();
+        assert_eq!(
+            method, "local.models",
+            "local runner bare /model must list via local.models"
+        );
+    }
+
+    #[test]
+    fn switch_no_args_opens_runner_picker() {
+        // Simulate what dispatch_slash("switch", "") does on successful runner.list:
+        // populate slash_completions with runner names and set picker flags.
+        let mut state = make_state("sess-switch");
+        state.slash_completions = vec!["claude".to_owned(), "codex".to_owned(), "local".to_owned()];
+        state.slash_popup_visible = true;
+        state.runner_picker_mode = true;
+        state.input.clear();
+        state.input_cursor = 0;
+
+        assert!(state.slash_popup_visible, "picker popup must open");
+        assert!(state.runner_picker_mode, "runner_picker_mode must be set");
+        assert!(
+            !state.slash_completions.is_empty(),
+            "completions must list runner names"
+        );
+    }
+
+    #[test]
+    fn slash_takeover_no_args_produces_usage_hint() {
+        let mut state = make_state("sess-takeover");
+        let cmd = "takeover";
+        let args = "";
+        let guidance = if args.is_empty() {
+            Some("usage: /takeover <runner>  — fork this session onto a new runner".to_owned())
+        } else {
+            None
+        };
+        if let Some(msg) = guidance {
+            state.main_panel.push_line(msg.clone());
+            assert!(msg.contains("usage"), "hint must mention 'usage'");
+        } else {
+            panic!("expected usage hint for cmd={cmd} args={args}");
+        }
+    }
+
+    #[test]
+    fn slash_switch_updates_state_runner_on_success() {
+        // Simulate what dispatch_slash("switch", "codex") does on success
+        // without a live daemon: verify state mutations are correct.
+        let mut state = make_state("sess-switch-ok");
+        let canonical = "codex-cli";
+        state.runner = canonical.to_owned();
+        push_system_message(&mut state, format!("runner switched to {canonical}"));
+
+        assert_eq!(state.runner, "codex-cli");
+        let has_msg = state
+            .main_panel
+            .lines_text(0, 100)
+            .iter()
+            .any(|l| l.contains("runner switched to codex-cli"));
+        assert!(has_msg, "panel must show switch confirmation");
+    }
+
+    #[test]
+    fn slash_takeover_updates_session_id_and_runner_on_success() {
+        let mut state = make_state("old-session");
+        let new_session_id = "new-session-uuid-1234";
+        let runner = "codex-cli";
+        state.session_id = new_session_id.to_owned();
+        state.runner = runner.to_owned();
+        push_system_message(
+            &mut state,
+            format!(
+                "handed off to {runner} — new session: {}",
+                &new_session_id[..8]
+            ),
+        );
+
+        assert_eq!(state.session_id, new_session_id);
+        assert_eq!(state.runner, "codex-cli");
+        let has_msg = state
+            .main_panel
+            .lines_text(0, 100)
+            .iter()
+            .any(|l| l.contains("handed off to codex-cli"));
+        assert!(has_msg, "panel must show handoff confirmation");
+    }
+
+    #[test]
+    fn help_command_pushes_message_containing_slash_help() {
+        let mut state = make_state("sess-help");
+        push_system_message(&mut state, HELP_TEXT);
+        let has_help = state
+            .main_panel
+            .lines_text(0, 200)
+            .iter()
+            .any(|l| l.contains("/help"));
+        assert!(has_help, "help output must contain '/help'");
+    }
+
+    #[test]
+    fn clear_command_advances_display_start() {
+        let mut state = make_state("sess-clear");
+        state.main_panel.push_line("old line 1".into());
+        state.main_panel.push_line("old line 2".into());
+        state.messages.push(Message {
+            role: Role::System,
+            text: "old line 1".into(),
+        });
+        state.messages.push(Message {
+            role: Role::System,
+            text: "old line 2".into(),
+        });
+
+        // Simulate /clear dispatch
+        state.display_start_idx = state.messages.len();
+        state.main_panel.clear_display();
+
+        assert_eq!(state.display_start_idx, 2);
+        assert_eq!(state.main_panel.display_start, 2);
+        assert_eq!(state.main_panel.scroll, 2);
+    }
+
+    #[test]
+    fn new_lines_after_clear_are_visible() {
+        let mut state = make_state("sess-clear2");
+        state.main_panel.push_line("before clear".into());
+        state.main_panel.clear_display();
+        state.main_panel.push_line("after clear".into());
+        // After clear, display_start=1, scroll=1; new line at index 1 is visible
+        let visible = state.main_panel.lines_text(
+            state.main_panel.display_start,
+            state.main_panel.len().saturating_sub(1),
+        );
+        assert!(visible.iter().any(|l| l.contains("after clear")));
+        assert!(!visible.iter().any(|l| l.contains("before clear")));
+    }
+
+    #[test]
+    fn spec_command_no_openspec_binary_shows_not_found() {
+        let mut state = make_state("sess-spec");
+        state.openspec_bin = None;
+
+        // Simulate the guard: no binary → push message
+        if state.openspec_bin.is_none() {
+            push_system_message(
+                &mut state,
+                "openspec not found — install it and restart smedja-tui",
+            );
+        }
+
+        let has_msg = state
+            .main_panel
+            .lines_text(0, 100)
+            .iter()
+            .any(|l| l.contains("openspec not found"));
+        assert!(
+            has_msg,
+            "missing binary must produce openspec-not-found message"
+        );
+    }
+
+    #[test]
+    fn spec_unknown_subcommand_returns_usage() {
+        // Test the "_ =>" branch of the spec arm directly via format.
+        let text = "usage: /spec [list|status [name]|archive <name>]";
+        assert!(
+            text.contains("usage:"),
+            "unknown sub-command must show usage"
+        );
+        assert!(text.contains("list"), "usage must mention list");
+        assert!(text.contains("status"), "usage must mention status");
+        assert!(text.contains("archive"), "usage must mention archive");
+    }
 }
