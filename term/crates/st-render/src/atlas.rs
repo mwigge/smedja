@@ -1,4 +1,4 @@
-//! GPU glyph texture atlas: rasterisation, caching, and LRU eviction.
+//! GPU texture atlas for rasterised glyphs, plus atlas-selection helpers.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 
 use crate::shelf::ShelfPacker;
 
+/// Side length of the square glyph atlas textures, in pixels.
 pub(crate) const ATLAS_SIZE: u32 = 1024;
 
 /// First codepoint of the Unicode Private Use Area block (inclusive).

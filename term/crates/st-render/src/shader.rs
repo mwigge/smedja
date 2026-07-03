@@ -1,5 +1,6 @@
-//! WGSL shader sources for the glyph, colour-glyph, and background pipelines.
+//! WGSL shader sources for the render pipelines.
 
+/// Alpha-atlas glyph shader: samples the R8 atlas and tints by cell foreground.
 pub(crate) const SHADER_SRC: &str = r"
 struct VertexInput {
     @location(0) position:   vec2<f32>,
@@ -66,6 +67,7 @@ fn fs_colour(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 ";
 
+/// Background quad shader: position + colour, no texture.
 pub(crate) const BG_SHADER_SRC: &str = r"
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -91,6 +93,7 @@ fn fs_bg(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 ";
 
+/// Full-screen background image shader with an opacity uniform.
 pub(crate) const BG_IMAGE_SHADER_SRC: &str = r"
 struct VIn {
     @location(0) position:   vec2<f32>,

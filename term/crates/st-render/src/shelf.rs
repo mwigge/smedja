@@ -1,4 +1,4 @@
-//! Shelf bin-packer for the glyph atlas.
+//! A simple shelf bin-packer for the glyph atlas.
 
 /// A simple shelf bin-packer for the glyph atlas.
 ///
@@ -110,6 +110,8 @@ mod tests {
         assert_eq!(p.alloc(128, 1), None);
     }
 
+    // Simulates what `Renderer::update_scale_factor` does to the alpha atlas
+    // allocator: replacing it with a fresh instance resets state to the origin.
     #[cfg_attr(
         not(feature = "gpu-tests"),
         ignore = "requires a GPU device; enable the gpu-tests feature to run"

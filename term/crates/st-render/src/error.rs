@@ -1,4 +1,4 @@
-//! Renderer error types.
+//! Error types for the renderer.
 
 use thiserror::Error;
 

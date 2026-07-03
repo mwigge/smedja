@@ -1,4 +1,4 @@
-//! Vertex and uniform layouts for the render pipelines.
+//! Vertex types and uniform blocks for the render pipelines.
 
 use bytemuck::{Pod, Zeroable};
 

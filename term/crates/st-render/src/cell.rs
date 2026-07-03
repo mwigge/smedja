@@ -1,4 +1,4 @@
-//! Terminal cell and block overlay view types.
+//! Cell, block-decoration, and agent-block view types.
 
 /// A single terminal cell to be rendered.
 ///
