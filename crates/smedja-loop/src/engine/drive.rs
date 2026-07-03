@@ -1,136 +1,19 @@
-//! Engine — drives the bounded multi-role loop pipeline.
-//!
-//! The engine owns the deterministic control flow (state machine, retry bound,
-//! verification gate, policy/evaluator integrity checks, failure mining) and
-//! delegates the side-effecting work — running a role's agent session and
-//! persisting loop status — to caller-supplied implementations of [`RoleRunner`]
-//! and [`StatusSink`]. This keeps the daemon's provider/session/DB coupling out
-//! of the engine crate and makes the pipeline unit-testable with fakes.
+//! The [`drive`] entry point — the deterministic loop state machine — and its
+//! terminal telemetry.
 
-use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 use futures_util::StreamExt as _;
-use opentelemetry::trace::{Span as _, Tracer as _};
 
 use crate::config::LoopConfig;
-use crate::role::{DataAccess, LoopRole, Runner, Tier};
 use crate::state::LoopState;
-use crate::verify::{run_verification, verification_timeout};
+use crate::verify::verification_timeout;
 
-/// Executes a single loop role — the daemon spawns an agent session for it.
-pub trait RoleRunner {
-    /// Runs `role` for the slice at `slice_index` with text `slice`.
-    ///
-    /// Returns `Ok(())` when the role's session completed and `Err` when it
-    /// could not be executed. A review verdict is modelled as execution success;
-    /// the deterministic pass/fail signal comes from the verification gate.
-    fn run_role(
-        &self,
-        role: &LoopRole,
-        slice_index: usize,
-        slice: &str,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send;
-}
-
-/// Persists loop progression — status transitions and the slice counter.
-pub trait StatusSink {
-    /// Records the current [`LoopState`].
-    fn set_status(&self, state: &LoopState) -> impl Future<Output = ()> + Send;
-    /// Records the current 1-based slice counter.
-    fn set_slice(&self, slice: i64) -> impl Future<Output = ()> + Send;
-}
-
-/// Outcome of driving a loop to a terminal state.
-#[derive(Debug, Clone)]
-pub struct LoopOutcome {
-    /// The terminal [`LoopState`] reached.
-    pub final_state: LoopState,
-    /// Number of slices that passed verification.
-    pub slices_completed: u64,
-}
-
-/// Checkpoint persisted to `.smedja/loop-state.json` before each slice runs.
-///
-/// Used by `loop.resume` to re-enter the pipeline at the last started slice.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct LoopCheckpoint {
-    pub change_name: String,
-    pub policy_hash: String,
-    pub slice_index: usize,
-    pub slices_completed: u64,
-}
-
-/// Resolves a role by name from the config, falling back to the default table,
-/// then to a deny-all local role.
-fn resolve_role(config: &LoopConfig, name: &str) -> LoopRole {
-    if let Some(r) = config.roles.iter().find(|r| r.name == name) {
-        return r.clone();
-    }
-    LoopRole::defaults()
-        .into_iter()
-        .find(|r| r.name == name)
-        .unwrap_or_else(|| LoopRole {
-            name: name.to_owned(),
-            runner: Runner::Local,
-            tier: Tier::Local,
-            model: None,
-            read_only: false,
-            tools: vec![],
-            role_id: uuid::Uuid::nil(),
-            data_access: DataAccess::default(),
-            resume_session_id: None,
-        })
-}
-
-/// String label for a runner, for telemetry attributes.
-fn runner_label(runner: Runner) -> &'static str {
-    match runner {
-        Runner::Claude => "claude",
-        Runner::Codex => "codex",
-        Runner::Local => "local",
-        Runner::Copilot => "copilot",
-        Runner::Minimax => "minimax",
-        Runner::Berget => "berget",
-        Runner::Pool => "pool",
-    }
-}
-
-/// String label for a tier, for telemetry attributes.
-fn tier_label(tier: Tier) -> &'static str {
-    match tier {
-        Tier::Fast => "fast",
-        Tier::Local => "local",
-        Tier::Deep => "deep",
-    }
-}
-
-/// Runs a role with a per-role telemetry span carrying the standard attributes.
-async fn run_role_traced<R: RoleRunner>(
-    runner: &R,
-    role: &LoopRole,
-    slice_index: usize,
-    slice: &str,
-    attempt: u32,
-) -> anyhow::Result<()> {
-    let tracer = opentelemetry::global::tracer("smedja.loop");
-    let mut span = tracer.start("smedja.loop.role");
-    crate::telemetry::set_role_attributes(
-        &mut span,
-        &role.name,
-        runner_label(role.runner),
-        tier_label(role.tier),
-        attempt,
-    );
-    let result = runner.run_role(role, slice_index, slice).await;
-    if result.is_err() {
-        span.set_status(opentelemetry::trace::Status::error("role execution failed"));
-    }
-    span.end();
-    result
-}
+use super::roles::resolve_role;
+use super::slice::run_slice_parallel;
+use super::types::{LoopCheckpoint, LoopOutcome, RoleRunner, StatusSink};
 
 /// Drives the bounded loop pipeline over `slices` to a terminal state.
 ///
@@ -272,95 +155,6 @@ pub async fn drive<R: RoleRunner, S: StatusSink>(
     }
 }
 
-/// Result of running a single slice through the implement→verify→review pipeline.
-struct SliceResult {
-    passed: bool,
-}
-
-/// Runs the implement→verify→review pipeline for one slice, gated by `semaphore`.
-///
-/// The semaphore permit is acquired before any work begins, bounding the number
-/// of slices that run concurrently without preventing the futures from being
-/// created all at once.
-#[allow(clippy::too_many_arguments)]
-async fn run_slice_parallel<'a, R: RoleRunner, S: StatusSink>(
-    runner: &'a R,
-    sink: &'a S,
-    config: &'a LoopConfig,
-    workspace: &'a Path,
-    _change_name: &'a str,
-    implementer: &'a LoopRole,
-    fix: &'a LoopRole,
-    reviewer: &'a LoopRole,
-    timeout: std::time::Duration,
-    max_attempts: u32,
-    idx: usize,
-    slice: &'a str,
-    semaphore: Arc<tokio::sync::Semaphore>,
-) -> SliceResult {
-    // Acquire a concurrency slot; the permit is held for the slice's lifetime.
-    let _permit = semaphore.acquire_owned().await.ok();
-
-    #[allow(clippy::cast_possible_wrap)]
-    sink.set_slice((idx + 1) as i64).await;
-
-    let mut passed = false;
-    for attempt in 0..max_attempts {
-        let role = if attempt == 0 { implementer } else { fix };
-        if run_role_traced(runner, role, idx, slice, attempt)
-            .await
-            .is_err()
-        {
-            break;
-        }
-
-        sink.set_status(&LoopState::Verifying).await;
-        let verified = if config.verification.command.trim().is_empty() {
-            true
-        } else {
-            run_verification(&config.verification.command, timeout)
-                .await
-                .is_ok_and(|r| r.passed())
-        };
-
-        if verified {
-            if config.review.per_slice {
-                sink.set_status(&LoopState::Reviewing).await;
-                let review_ok = run_role_traced(runner, reviewer, idx, slice, attempt)
-                    .await
-                    .is_ok();
-                if config.review.required && !review_ok {
-                    let _ = crate::mining::write_failure_guide(
-                        "reviewer",
-                        &[format!(
-                            "slice {} (idx {idx}) rejected by reviewer",
-                            idx + 1
-                        )],
-                        workspace,
-                    );
-                    break;
-                }
-            }
-            passed = true;
-            break;
-        }
-        sink.set_status(&LoopState::Fixed).await;
-    }
-
-    if !passed {
-        let _ = crate::mining::write_failure_guide(
-            fix.name.as_str(),
-            &[format!(
-                "slice {} (idx {idx}) failed verification after {max_attempts} attempt(s)",
-                idx + 1
-            )],
-            workspace,
-        );
-    }
-
-    SliceResult { passed }
-}
-
 /// Emits terminal telemetry — slice counter and run duration — for the loop.
 fn finish(change_name: &str, state: &LoopState, slices: u64, started: Instant) {
     crate::telemetry::record_loop_metrics(change_name, state.as_str(), slices, 0, 0);
@@ -374,6 +168,7 @@ fn finish(change_name: &str, state: &LoopState, slices: u64, started: Instant) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::role::LoopRole;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
