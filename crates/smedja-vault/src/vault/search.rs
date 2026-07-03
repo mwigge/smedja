@@ -162,51 +162,7 @@ mod tests {
     use super::super::{entry, LEGACY_MODEL_ID};
     use super::*;
 
-    // ── query ────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn query_returns_most_similar() {
-        let mut vault = Vault::open_in_memory().unwrap();
-        // [1,0] is the query; [1,0] should score 1.0, [0,1] scores 0.0,
-        // [0.6, 0.8] is intermediate.
-        vault.upsert(&entry("exact", vec![1.0_f32, 0.0])).unwrap();
-        vault.upsert(&entry("ortho", vec![0.0_f32, 1.0])).unwrap();
-        vault.upsert(&entry("close", vec![0.6_f32, 0.8])).unwrap();
-
-        let results = vault.query(&[1.0_f32, 0.0], 3, LEGACY_MODEL_ID, 2).unwrap();
-        assert_eq!(results.len(), 3);
-        assert_eq!(
-            results[0].id, "exact",
-            "top result must be the identical vector"
-        );
-        assert!(
-            results[0].score > results[1].score,
-            "results must be sorted descending by score"
-        );
-    }
-
-    #[test]
-    fn query_k_larger_than_entries() {
-        let mut vault = Vault::open_in_memory().unwrap();
-        vault.upsert(&entry("a", vec![1.0, 0.0])).unwrap();
-        vault.upsert(&entry("b", vec![0.0, 1.0])).unwrap();
-        vault.upsert(&entry("c", vec![0.5, 0.5])).unwrap();
-
-        let results = vault
-            .query(&[1.0_f32, 0.0], 10, LEGACY_MODEL_ID, 2)
-            .unwrap();
-        assert_eq!(results.len(), 3, "must return all entries when k > count");
-    }
-
-    #[test]
-    fn query_empty_vault() {
-        let vault = Vault::open_in_memory().unwrap();
-        let results = vault.query(&[1.0_f32, 0.0], 5, LEGACY_MODEL_ID, 2).unwrap();
-        assert!(
-            results.is_empty(),
-            "query on empty vault must return empty vec"
-        );
-    }
+    // Pure-cosine `query()` tests live with the code in query.rs.
 
     // ── namespace ────────────────────────────────────────────────────────────
 
@@ -340,25 +296,6 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "learned");
-    }
-
-    #[test]
-    fn query_excludes_mismatched_dimension_without_error() {
-        let mut vault = Vault::open_in_memory().unwrap();
-
-        let mut a = entry("a", vec![1.0_f32, 0.0]);
-        a.dim = 2;
-        vault.upsert(&a).unwrap();
-
-        let mut b = entry("b", vec![1.0_f32, 0.0, 0.0]);
-        b.embedder_model_id = "other".to_string();
-        b.dim = 3;
-        vault.upsert(&b).unwrap();
-
-        // Querying with a dim-2 FNV vector must NOT raise DimensionMismatch.
-        let results = vault.query(&[1.0_f32, 0.0], 5, LEGACY_MODEL_ID, 2).unwrap();
-        assert_eq!(results.len(), 1, "only the same-model row is a candidate");
-        assert_eq!(results[0].id, "a");
     }
 
     #[test]
