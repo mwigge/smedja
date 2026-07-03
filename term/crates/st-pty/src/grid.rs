@@ -1,9 +1,9 @@
-//! The terminal cell grid: active screen, scrollback, scroll region, and the
-//! viewport window used for scroll-back rendering.
+//! The terminal [`CellGrid`]: struct definition, construction, resizing, and
+//! scroll-back viewport queries. Screen-mutating operations live in
+//! [`crate::grid_ops`].
 
 use crate::cell::Cell;
-use crate::color::DEFAULT_PALETTE;
-use crate::markers::BlockMarker;
+use crate::marker::BlockMarker;
 use crate::mouse::MouseMode;
 use crate::notification::Notification;
 use crate::sgr::SgrState;
@@ -147,7 +147,7 @@ impl CellGrid {
         self.pending_wrap = false;
     }
 
-    pub(crate) fn resize_cells(cells: &mut Vec<Vec<Cell>>, cols: u16, rows: u16) {
+    fn resize_cells(cells: &mut Vec<Vec<Cell>>, cols: u16, rows: u16) {
         cells.resize_with(rows as usize, Vec::new);
         for (r, row) in cells.iter_mut().enumerate() {
             row.resize_with(cols as usize, || Cell::blank(0, r as u16));
@@ -218,9 +218,30 @@ pub(crate) fn blank_grid(cols: u16, rows: u16) -> Vec<Vec<Cell>> {
     (0..rows).map(|r| blank_row(cols, r)).collect()
 }
 
+/// Default ANSI palette (forged_terminal).
+pub(crate) const DEFAULT_PALETTE: [[f32; 4]; 16] = [
+    [0.067, 0.075, 0.086, 1.0], // 0  #111316
+    [0.839, 0.373, 0.180, 1.0], // 1  #d65f2e
+    [0.365, 0.580, 0.420, 1.0], // 2  #5d946b
+    [0.851, 0.608, 0.333, 1.0], // 3  #d99b55
+    [0.561, 0.463, 0.357, 1.0], // 4  #8f765b
+    [0.663, 0.396, 0.184, 1.0], // 5  #a9652f
+    [0.969, 0.780, 0.494, 1.0], // 6  #f7c77e
+    [0.957, 0.843, 0.631, 1.0], // 7  #f4d7a1
+    [0.231, 0.165, 0.122, 1.0], // 8  #3b2a1f
+    [0.910, 0.459, 0.243, 1.0], // 9  #e8753e
+    [0.467, 0.667, 0.486, 1.0], // 10 #77aa7c
+    [1.000, 0.827, 0.478, 1.0], // 11 #ffd37a
+    [0.706, 0.518, 0.353, 1.0], // 12 #b4845a
+    [0.753, 0.478, 0.227, 1.0], // 13 #c07a3a
+    [1.000, 0.698, 0.290, 1.0], // 14 #ffb24a
+    [1.000, 0.945, 0.812, 1.0], // 15 #fff1cf
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cell::Cell;
 
     fn make_grid(cols: u16, rows: u16) -> CellGrid {
         CellGrid::new(cols, rows)

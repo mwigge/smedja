@@ -1,4 +1,4 @@
-//! Shell integration block markers (OSC 133 + heuristic).
+//! Shell-integration block markers (OSC 133 + heuristic).
 
 /// The kind of a block marker.
 #[derive(Debug, Clone, PartialEq, Eq)]

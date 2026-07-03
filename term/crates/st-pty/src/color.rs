@@ -1,4 +1,4 @@
-//! Terminal colour types, the default palette, and colour resolution.
+//! Terminal colour values and palette resolution.
 
 pub(crate) const DEFAULT_FG: [f32; 4] = [0.957, 0.843, 0.631, 1.0]; // #f4d7a1
 pub(crate) const DEFAULT_BG: [f32; 4] = [0.043, 0.051, 0.059, 1.0]; // #0b0d0f
@@ -73,29 +73,10 @@ fn ansi256_to_rgba(n: u8) -> [f32; 4] {
     }
 }
 
-/// Default ANSI palette (forged_terminal).
-pub(crate) const DEFAULT_PALETTE: [[f32; 4]; 16] = [
-    [0.067, 0.075, 0.086, 1.0], // 0  #111316
-    [0.839, 0.373, 0.180, 1.0], // 1  #d65f2e
-    [0.365, 0.580, 0.420, 1.0], // 2  #5d946b
-    [0.851, 0.608, 0.333, 1.0], // 3  #d99b55
-    [0.561, 0.463, 0.357, 1.0], // 4  #8f765b
-    [0.663, 0.396, 0.184, 1.0], // 5  #a9652f
-    [0.969, 0.780, 0.494, 1.0], // 6  #f7c77e
-    [0.957, 0.843, 0.631, 1.0], // 7  #f4d7a1
-    [0.231, 0.165, 0.122, 1.0], // 8  #3b2a1f
-    [0.910, 0.459, 0.243, 1.0], // 9  #e8753e
-    [0.467, 0.667, 0.486, 1.0], // 10 #77aa7c
-    [1.000, 0.827, 0.478, 1.0], // 11 #ffd37a
-    [0.706, 0.518, 0.353, 1.0], // 12 #b4845a
-    [0.753, 0.478, 0.227, 1.0], // 13 #c07a3a
-    [1.000, 0.698, 0.290, 1.0], // 14 #ffb24a
-    [1.000, 0.945, 0.812, 1.0], // 15 #fff1cf
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grid::DEFAULT_PALETTE;
 
     #[test]
     fn color_to_rgba_ansi_uses_palette() {

@@ -1,4 +1,4 @@
-//! Terminal cell representation and per-cell style/layout flags.
+//! Per-cell style flags and the terminal [`Cell`] type.
 
 use crate::color::{DEFAULT_BG, DEFAULT_FG};
 

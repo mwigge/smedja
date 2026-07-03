@@ -1,4 +1,4 @@
-//! Mouse-reporting protocol selection.
+//! Mouse-reporting protocol modes.
 
 /// Which mouse-reporting protocol the application has enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

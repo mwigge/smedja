@@ -1,4 +1,4 @@
-//! APC (`ESC _ … ESC \`) pre-scanner for the smedja Glyph Protocol.
+//! APC pre-scanner for `ESC _ … ESC \` (smedja Glyph Protocol) sequences.
 
 /// State machine that scans raw PTY bytes for `ESC _ … ESC \` (APC) sequences.
 ///

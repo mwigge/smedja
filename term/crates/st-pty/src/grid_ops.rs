@@ -1,25 +1,23 @@
-//! Screen-mutating operations on [`CellGrid`]: printing glyphs, scrolling,
-//! erasing, alt-screen switching, cursor movement, and prompt heuristics.
+//! Screen-mutating operations on [`CellGrid`]: character placement, scrolling,
+//! erasing, alternate-screen switching, and cursor movement.
 
 use unicode_width::UnicodeWidthChar;
 
 use crate::cell::{Cell, CellFlags};
 use crate::grid::{blank_grid, blank_row, CellGrid};
-use crate::markers::{BlockMarker, MarkerKind};
+use crate::marker::{BlockMarker, MarkerKind};
 
 impl CellGrid {
-    // ── internal screen mutations ─────────────────────────────────────────────
-
-    pub(crate) fn current_fg(&self) -> [f32; 4] {
+    fn current_fg(&self) -> [f32; 4] {
         self.sgr.fg.to_rgba(&self.palette, true)
     }
 
-    pub(crate) fn current_bg(&self) -> [f32; 4] {
+    fn current_bg(&self) -> [f32; 4] {
         self.sgr.bg.to_rgba(&self.palette, false)
     }
 
     #[allow(dead_code)] // reserved for future use in cursor rendering
-    pub(crate) fn cell_at_cursor_mut(&mut self) -> Option<&mut Cell> {
+    fn cell_at_cursor_mut(&mut self) -> Option<&mut Cell> {
         let (col, row) = self.cursor;
         self.cells
             .get_mut(row as usize)
@@ -311,6 +309,8 @@ impl CellGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cell::{Cell, CellFlags};
+    use crate::sgr::apply_sgr;
 
     fn make_grid(cols: u16, rows: u16) -> CellGrid {
         CellGrid::new(cols, rows)
@@ -506,6 +506,32 @@ mod tests {
         grid.put_char('字');
         assert_eq!(grid.cells[1][0].ch, '字', "wide glyph wrapped to next row");
         assert!(grid.cells[1][0].flags.contains(CellFlags::WIDE));
+    }
+
+    #[test]
+    fn sgr_attributes_carry_onto_cells() {
+        let mut grid = make_grid(8, 2);
+        // bold; dim; italic; underline; strikethrough; inverse via CSI ... m,
+        // then a char that should carry all of them.
+        for code in [1u16, 2, 3, 4, 9, 7] {
+            apply_sgr(&mut grid, &[code]);
+        }
+        grid.put_char('A');
+        let f = grid.cells[0][0].flags;
+        for flag in [
+            CellFlags::BOLD,
+            CellFlags::DIM,
+            CellFlags::ITALIC,
+            CellFlags::UNDERLINE,
+            CellFlags::STRIKETHROUGH,
+            CellFlags::INVERSE,
+        ] {
+            assert!(f.contains(flag), "missing flag {flag:?}");
+        }
+        // SGR 0 resets; the next char is plain.
+        apply_sgr(&mut grid, &[0]);
+        grid.put_char('B');
+        assert_eq!(grid.cells[0][1].flags, CellFlags::empty());
     }
 
     #[test]

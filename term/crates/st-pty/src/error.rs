@@ -1,4 +1,4 @@
-//! Error types for PTY operations.
+//! Error types produced by PTY operations.
 
 use thiserror::Error;
 
