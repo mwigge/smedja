@@ -207,4 +207,51 @@ mod tests {
         assert_eq!(len, Some(1));
         assert_eq!(strategy, CacheStrategy::AnthropicEphemeral);
     }
+
+    #[test]
+    fn fast_tier_prompt_no_larger_than_deep_with_hot_present() {
+        use smedja_adapter::types::Message;
+        use smedja_assayer::Tier;
+        use smedja_memory::WorkingMemory;
+
+        let build = |tier: Tier| {
+            let (strata, budget) = super::strata_for_tier(tier);
+            let mut m = WorkingMemory::new(budget);
+            m.set_strata(strata);
+            m.push(Message::user("stable context")); // prefix
+            m.seal_prefix();
+            for i in 0..40 {
+                m.push(Message::user(format!(
+                    "turn {i} with enough content to cost a few tokens each"
+                )));
+            }
+            m.build_prompt(budget)
+        };
+
+        let fast = build(Tier::Fast);
+        let deep = build(Tier::Deep);
+
+        // A shallower/cheaper tier must never assemble more messages than deep.
+        assert!(
+            fast.len() <= deep.len(),
+            "fast prompt ({}) must be ≤ deep prompt ({})",
+            fast.len(),
+            deep.len()
+        );
+        // The most recent hot turn must be present in both regardless of tier.
+        assert!(
+            fast.iter().any(|m| m.content.contains("turn 39")),
+            "fast must retain the latest hot turn"
+        );
+        assert!(
+            deep.iter().any(|m| m.content.contains("turn 39")),
+            "deep must retain the latest hot turn"
+        );
+    }
+
+    #[test]
+    fn model_context_window_known_and_default() {
+        assert_eq!(super::model_context_window("claude-sonnet-4-6"), 200_000);
+        assert_eq!(super::model_context_window("some-unknown-model"), 128_000);
+    }
 }
