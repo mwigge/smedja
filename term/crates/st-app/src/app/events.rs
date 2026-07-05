@@ -106,6 +106,9 @@ impl ApplicationHandler<UserEvent> for App {
         self.windows.insert(window.id(), window);
         self.renderer = Some(renderer);
         self.pty = Some(pty);
+        // Force the first frames to present so the window shows content as soon
+        // as it maps (before any PTY output marks the grid dirty).
+        self.forced_redraws = FORCED_REDRAWS;
         info!("smedja initialised (pane {pane_id})");
     }
 
@@ -141,6 +144,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::Resized(new_size) => {
+                // Force a few presents so the compositor is fed frames through
+                // the resize (Hyprland shows grey otherwise).
+                self.forced_redraws = FORCED_REDRAWS;
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(new_size);
                 }
@@ -189,6 +195,9 @@ impl ApplicationHandler<UserEvent> for App {
                 info!("Focused({}) occluded_before={}", focused, self.occluded);
                 if focused {
                     self.occluded = false;
+                    // Bridge the compositor's grey fallback with a few forced
+                    // presents after regaining focus.
+                    self.forced_redraws = FORCED_REDRAWS;
                     // Do NOT call renderer.resize() here — reconfiguring an
                     // already-visible Wayland surface briefly detaches the buffer,
                     // making the compositor show grey until the next present.
@@ -219,6 +228,9 @@ impl ApplicationHandler<UserEvent> for App {
                 info!("Occluded({})", occluded);
                 self.occluded = occluded;
                 if !occluded {
+                    // Window became visible — force a few presents so content
+                    // reappears through the compositor's grey fallback.
+                    self.forced_redraws = FORCED_REDRAWS;
                     // Window became visible — reconfigure surface and request a
                     // frame so content appears without waiting for the next vsync.
                     if let Some(renderer) = &mut self.renderer {
@@ -418,11 +430,45 @@ impl ApplicationHandler<UserEvent> for App {
             event_loop.exit();
             return;
         }
-        // Always request a redraw — stopping on occluded causes the compositor
-        // to show grey when the window is unfocused (it shows its fallback
-        // background when the app stops presenting frames).
-        for w in self.windows.values() {
-            w.request_redraw();
+
+        // Nothing to draw into yet (e.g. headless init failed): stay idle.
+        if self.renderer.is_none() {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+
+        let dirty = self
+            .pty
+            .as_ref()
+            .is_some_and(|p| p.dirty.load(Ordering::Acquire));
+        let forced = self.forced_redraws > 0;
+
+        // Fully occluded and nothing forced: present nothing and let the loop
+        // sleep — an Occluded(false)/Focused/input event re-arms presentation.
+        // This is what stops the invisible-window vsync spin.
+        if self.occluded && !forced {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+
+        // Present when there is PTY damage, a forced frame is owed, or the idle
+        // repaint cadence has elapsed (the latter keeps the status-bar clock
+        // current without redrawing every vsync).
+        let idle_present_due = self
+            .last_present
+            .is_none_or(|t| t.elapsed() >= IDLE_PRESENT_INTERVAL);
+
+        if dirty || forced || idle_present_due {
+            for w in self.windows.values() {
+                w.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::Wait);
+        } else {
+            // Idle: wake soon to poll the PTY dirty flag (the reader thread only
+            // flips an atomic and does not wake us) without a vsync spin.
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                std::time::Instant::now() + IDLE_POLL_INTERVAL,
+            ));
         }
     }
 }

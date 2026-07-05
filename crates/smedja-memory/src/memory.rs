@@ -350,6 +350,19 @@ impl WorkingMemory {
     }
 }
 
+/// Returns `true` when `name` is exactly one normal path component.
+///
+/// Rejects empty strings, `.`, `..`, absolute paths, and any name containing a
+/// path separator. Used to keep a caller-supplied `role` from escaping the
+/// roles directory when joined into a filesystem path.
+fn is_single_normal_component(name: &str) -> bool {
+    let mut components = std::path::Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
 /// Loads role-specific rules/skills for `role` from a workspace: the file
 /// `<dir>/.smedja/roles/<role>.md` and every `*.md` under
 /// `<dir>/.smedja/roles/<role>/`. Returns their contents (the single file first,
@@ -362,6 +375,16 @@ impl WorkingMemory {
 ///
 /// Returns an `io::Error` if a present file cannot be read.
 pub fn load_role_skills(dir: &std::path::Path, role: &str) -> Result<Vec<String>, std::io::Error> {
+    // Path-traversal guard: `role` is joined into filesystem paths below, so it
+    // must be a single normal path component. A crafted role such as
+    // `../../etc/foo`, `a/b`, or an absolute path could otherwise read files
+    // outside the roles directory. An invalid role has no pack by definition, so
+    // we fail closed by returning an empty Vec (matching the "empty when none
+    // exist" contract) rather than surfacing an error to callers.
+    if !is_single_normal_component(role) {
+        return Ok(Vec::new());
+    }
+
     let roles_dir = dir.join(".smedja").join("roles");
     let mut out = Vec::new();
 
@@ -676,6 +699,35 @@ mod tests {
             super::load_role_skills(tmp.path(), "plan").unwrap(),
             vec!["a plan rule".to_owned()]
         );
+    }
+
+    #[test]
+    fn load_role_skills_rejects_traversal_roles() {
+        // A sibling file outside the roles dir that a `../` role could reach.
+        let tmp = tempfile::tempdir().unwrap();
+        let roles = tmp.path().join(".smedja").join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        // Plant a readable file one level above the roles dir.
+        std::fs::write(tmp.path().join(".smedja").join("secret.md"), b"secret").unwrap();
+
+        for role in ["../etc", "a/b", "/abs", "..", ".", ""] {
+            let result = super::load_role_skills(tmp.path(), role).unwrap();
+            assert!(
+                result.is_empty(),
+                "traversal role {role:?} must yield an empty result"
+            );
+        }
+    }
+
+    #[test]
+    fn load_role_skills_accepts_normal_role() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roles = tmp.path().join(".smedja").join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("myskill.md"), b"role rule").unwrap();
+
+        let result = super::load_role_skills(tmp.path(), "myskill").unwrap();
+        assert_eq!(result, vec!["role rule".to_owned()]);
     }
 
     #[test]

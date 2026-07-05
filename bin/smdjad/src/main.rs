@@ -48,6 +48,46 @@ use tracing::{error, info, warn};
 
 use crate::cowork::CoworkGate;
 
+/// Spawns a long-lived background subsystem, logging if it ever panics or exits.
+///
+/// The subsystem futures wrapped here (`serve` loops, GC loops, subscriber
+/// loops) are meant to run for the daemon's whole lifetime, so *either* a panic
+/// *or* a normal return means that subsystem silently died. A bare
+/// `tokio::spawn` swallows both; this wrapper makes the death visible in the
+/// logs. Behaviour is otherwise identical to `tokio::spawn`.
+fn spawn_supervised<F>(name: &'static str, fut: F) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    use futures_util::future::FutureExt as _;
+    tokio::spawn(async move {
+        match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+            Ok(()) => tracing::error!(task = name, "supervised subsystem exited unexpectedly"),
+            Err(_) => tracing::error!(task = name, "supervised subsystem panicked"),
+        }
+    })
+}
+
+/// Runs `job` on the blocking pool, but only after acquiring a permit from
+/// `sem`, so at most `sem`'s permit-count jobs run concurrently. Awaiting the
+/// permit provides backpressure: an unbounded fan-out of `spawn_blocking` can
+/// otherwise saturate the blocking pool and starve DB writes.
+async fn spawn_blocking_bounded<F>(sem: &Arc<tokio::sync::Semaphore>, job: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    // The semaphore is never closed, so acquire only fails if it is — treat that
+    // defensively as "skip" rather than unwrapping.
+    let Ok(permit) = Arc::clone(sem).acquire_owned().await else {
+        return;
+    };
+    tokio::task::spawn_blocking(move || {
+        // Held for the job's duration; dropped (releasing the permit) on return.
+        let _permit = permit;
+        job();
+    });
+}
+
 fn socket_path() -> PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
         tracing::warn!("XDG_RUNTIME_DIR not set; using /tmp for socket — set XDG_RUNTIME_DIR for a secure socket location");
@@ -1243,7 +1283,7 @@ async fn main() -> anyhow::Result<()> {
         const SESSION_CAP: usize = 10_000;
         let idle = std::time::Duration::from_secs(30 * 60);
         let ps = Arc::clone(&provider_sessions);
-        tokio::spawn(async move {
+        spawn_supervised("provider_sessions_gc", async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_mins(5)).await;
                 let mut map = ps.lock().await;
@@ -1333,7 +1373,7 @@ async fn main() -> anyhow::Result<()> {
     // Background daily maintenance: prune old sessions and VACUUM both databases.
     {
         let ingot_for_vacuum = ingot.clone();
-        tokio::spawn(async move {
+        spawn_supervised("daily_maintenance", async move {
             // First run after 1 hour so startup I/O is not affected.
             tokio::time::sleep(std::time::Duration::from_hours(1)).await;
             loop {
@@ -1359,7 +1399,10 @@ async fn main() -> anyhow::Result<()> {
         let quality_workspace = workspace_root.clone();
         let session_skills = quality_hook::discover_session_skills(&workspace_root);
         let file_size_threshold = quality_hook::load_file_size_threshold(&workspace_root);
-        tokio::spawn(async move {
+        // Cap concurrent quality runs so a burst of completions cannot saturate
+        // the blocking pool and starve DB writes.
+        let quality_limit = Arc::new(tokio::sync::Semaphore::new(4));
+        spawn_supervised("quality_hook", async move {
             loop {
                 let events = smedja_bellows::drain_ready(&mut quality_rx);
                 for ev in events {
@@ -1367,7 +1410,7 @@ async fn main() -> anyhow::Result<()> {
                         let disp = Arc::clone(&quality_dispatcher);
                         let ws = quality_workspace.clone();
                         let skills = session_skills.clone();
-                        tokio::task::spawn_blocking(move || {
+                        spawn_blocking_bounded(&quality_limit, move || {
                             quality_hook::run_after_turn(
                                 Some(turn_id),
                                 ws,
@@ -1375,7 +1418,8 @@ async fn main() -> anyhow::Result<()> {
                                 file_size_threshold,
                                 disp,
                             );
-                        });
+                        })
+                        .await;
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1404,7 +1448,7 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("ACP bind failed on {addr}: {e}"))?;
             info!(%addr, "ACP HTTP server listening");
-            tokio::spawn(async move {
+            spawn_supervised("acp_server", async move {
                 if let Err(e) = axum::serve(tcp_listener, acp_router).await {
                     tracing::error!(error = %e, "ACP server error");
                 }
@@ -1443,7 +1487,7 @@ async fn main() -> anyhow::Result<()> {
             info!(path = %stream_sock_path.display(), "turn stream server listening");
             let ds = Arc::clone(&delta_store);
             let dp = Arc::clone(&dispatcher);
-            tokio::spawn(async move {
+            spawn_supervised("stream_server", async move {
                 stream_server::serve(stream_listener, ds, dp).await;
             });
         }
@@ -1482,7 +1526,7 @@ async fn main() -> anyhow::Result<()> {
             info!(path = %agent_sock_path.display(), "agent event server listening");
             let dp = Arc::clone(&dispatcher);
             let agent_ingot = ingot.clone();
-            tokio::spawn(async move {
+            spawn_supervised("agent_server", async move {
                 agent_server::serve(agent_listener, dp, agent_ingot).await;
             });
         }
@@ -2399,5 +2443,49 @@ mod tests {
 
         assert_eq!(warm_count, 1);
         assert_eq!(cold_count, 2);
+    }
+
+    // ── quality-hook fan-out concurrency cap ──────────────────────────────────
+
+    #[tokio::test]
+    async fn spawn_blocking_bounded_caps_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const CAP: usize = 3;
+        const TOTAL: usize = 20;
+
+        let sem = Arc::new(tokio::sync::Semaphore::new(CAP));
+        let current = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..TOTAL {
+            let cur = Arc::clone(&current);
+            let pk = Arc::clone(&peak);
+            let dn = Arc::clone(&done);
+            super::spawn_blocking_bounded(&sem, move || {
+                let now = cur.fetch_add(1, Ordering::SeqCst) + 1;
+                pk.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                cur.fetch_sub(1, Ordering::SeqCst);
+                dn.fetch_add(1, Ordering::SeqCst);
+            })
+            .await;
+        }
+
+        // Wait for every job to complete.
+        while done.load(Ordering::SeqCst) < TOTAL {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let observed_peak = peak.load(Ordering::SeqCst);
+        assert!(
+            observed_peak >= 1,
+            "jobs must have actually run; peak was {observed_peak}"
+        );
+        assert!(
+            observed_peak <= CAP,
+            "bounded fan-out must never exceed the cap of {CAP}; observed {observed_peak}"
+        );
     }
 }

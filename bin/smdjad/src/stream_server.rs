@@ -40,11 +40,50 @@ const STREAM_TIMEOUT_SECS: u64 = 600;
 /// This window allows late-connecting stream clients to still replay the turn.
 const DELTA_TTL_SECS: u64 = 60;
 
-/// Per-turn event buffer — keyed by `turn_id` (= `task_id` in smdjad).
+/// Seconds of inactivity after which a *non-terminal* turn buffer is considered
+/// stranded and evicted by the background sweeper. A turn whose orchestrator
+/// panics mid-flight never emits a terminal event, so its buffer would otherwise
+/// leak forever. Kept comfortably larger than [`DELTA_TTL_SECS`] so a merely slow
+/// turn is never mistaken for a stranded one.
+const STRANDED_TTL_SECS: u64 = 300;
+
+/// How often the stranded-turn sweeper wakes to reclaim idle buffers.
+const STRANDED_SWEEP_INTERVAL_SECS: u64 = 60;
+
+/// A per-turn event buffer plus the bookkeeping the stranded-turn sweeper needs.
+///
+/// Public only because it appears in the [`DeltaStore`] type alias; its fields
+/// are an internal implementation detail of this module.
+pub struct TurnBuffer {
+    /// Buffered NDJSON lines, drained by each streaming connection before it
+    /// switches to live Bellows events.
+    lines: VecDeque<String>,
+    /// Updated on every buffered event; drives stranded-turn eviction. Uses the
+    /// Tokio clock so it advances with `tokio::time` (and paused-clock tests).
+    last_activity: tokio::time::Instant,
+}
+
+impl TurnBuffer {
+    fn new() -> Self {
+        Self {
+            lines: VecDeque::new(),
+            last_activity: tokio::time::Instant::now(),
+        }
+    }
+
+    /// Marks activity and returns the mutable line buffer, so call sites keep
+    /// operating on the `VecDeque` exactly as before.
+    fn touch(&mut self) -> &mut VecDeque<String> {
+        self.last_activity = tokio::time::Instant::now();
+        &mut self.lines
+    }
+}
+
+/// Per-turn event buffer store — keyed by `turn_id` (= `task_id` in smdjad).
 ///
 /// Populated by a background subscriber task; drained by each streaming
 /// connection for that turn before it switches to live Bellows events.
-pub type DeltaStore = Arc<Mutex<HashMap<String, VecDeque<String>>>>;
+pub type DeltaStore = Arc<Mutex<HashMap<String, TurnBuffer>>>;
 
 /// Appends `line` to `buf`, enforcing `MAX_BUFFER_PER_TURN`.
 ///
@@ -110,10 +149,10 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                         ref correlation,
                         ..
                     } => {
-                        store.insert(turn_id.clone(), VecDeque::new());
+                        store.insert(turn_id.clone(), TurnBuffer::new());
                         // Emit a started event so the TUI can capture agent_name.
                         if let Some(ref name) = correlation.agent_name {
-                            if let Some(buf) = store.get_mut(turn_id) {
+                            if let Some(buf) = store.get_mut(turn_id).map(TurnBuffer::touch) {
                                 let line =
                                     json!({"type": "started", "agent_name": name}).to_string();
                                 buf.push_back(line);
@@ -126,7 +165,7 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                         ..
                     } => {
                         let Some(tid) = turn_id else { continue };
-                        if let Some(buf) = store.get_mut(tid) {
+                        if let Some(buf) = store.get_mut(tid).map(TurnBuffer::touch) {
                             let line = json!({"type": "delta", "text": content}).to_string();
                             evict_and_push(buf, line);
                         }
@@ -137,7 +176,7 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                         ..
                     } => {
                         let Some(tid) = turn_id else { continue };
-                        if let Some(buf) = store.get_mut(tid) {
+                        if let Some(buf) = store.get_mut(tid).map(TurnBuffer::touch) {
                             let line = json!({"type": "thinking", "text": content}).to_string();
                             evict_and_push(buf, line);
                         }
@@ -150,7 +189,7 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                         ..
                     } => {
                         let Some(tid) = turn_id else { continue };
-                        if let Some(buf) = store.get_mut(tid) {
+                        if let Some(buf) = store.get_mut(tid).map(TurnBuffer::touch) {
                             let line = json!({"type": "tool_call", "name": tool_name, "input": input_summary, "full": full_input})
                                 .to_string();
                             evict_and_push(buf, line);
@@ -163,7 +202,7 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                         ref traceparent,
                         ..
                     } => {
-                        if let Some(buf) = store.get_mut(turn_id) {
+                        if let Some(buf) = store.get_mut(turn_id).map(TurnBuffer::touch) {
                             let mut obj = serde_json::Map::new();
                             obj.insert("type".into(), json!("done"));
                             obj.insert("output_tok".into(), json!(output_tokens));
@@ -183,7 +222,7 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                         ref reason,
                         ..
                     } => {
-                        if let Some(buf) = store.get_mut(turn_id) {
+                        if let Some(buf) = store.get_mut(turn_id).map(TurnBuffer::touch) {
                             let line = json!({"type": "error", "message": reason}).to_string();
                             buf.push_back(line);
                         }
@@ -200,7 +239,7 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                         ..
                     } => {
                         let Some(tid) = turn_id else { continue };
-                        if let Some(buf) = store.get_mut(tid) {
+                        if let Some(buf) = store.get_mut(tid).map(TurnBuffer::touch) {
                             let line = json!({
                                 "type": "quality",
                                 "score": score,
@@ -224,7 +263,7 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                         ..
                     } => {
                         let Some(tid) = turn_id else { continue };
-                        if let Some(buf) = store.get_mut(tid) {
+                        if let Some(buf) = store.get_mut(tid).map(TurnBuffer::touch) {
                             let line = serde_json::to_string(&StreamEvent::CoworkRequest {
                                 approval_id: approval_id.clone(),
                                 tool: tool.clone(),
@@ -243,7 +282,7 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                         ..
                     } => {
                         let Some(tid) = turn_id else { continue };
-                        if let Some(buf) = store.get_mut(tid) {
+                        if let Some(buf) = store.get_mut(tid).map(TurnBuffer::touch) {
                             let line = json!({"type": "usage", "input_tok": input_tok, "output_tok": output_tok}).to_string();
                             evict_and_push(buf, line);
                         }
@@ -255,7 +294,7 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                         ..
                     } => {
                         let Some(tid) = turn_id else { continue };
-                        if let Some(buf) = store.get_mut(tid) {
+                        if let Some(buf) = store.get_mut(tid).map(TurnBuffer::touch) {
                             let line = json!({"type": "tool_call_chunk", "name": name, "partial_input": partial_input}).to_string();
                             evict_and_push(buf, line);
                         }
@@ -265,7 +304,7 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                         ref turn_id,
                         summary_tokens,
                     } => {
-                        if let Some(buf) = store.get_mut(turn_id) {
+                        if let Some(buf) = store.get_mut(turn_id).map(TurnBuffer::touch) {
                             let line = json!({"type": "history_replaced", "session_id": session_id, "summary_tokens": summary_tokens}).to_string();
                             evict_and_push(buf, line);
                         }
@@ -283,6 +322,33 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
             }
         }
     });
+
+    // Stranded-turn sweeper: a turn whose orchestrator panics mid-flight never
+    // emits a terminal event, so its buffer never gets a scheduled TTL GC and
+    // would leak forever. Periodically drop any buffer idle longer than
+    // STRANDED_TTL_SECS. Terminal turns are removed far sooner (DELTA_TTL_SECS)
+    // by the scheduled GC above, so this only ever reclaims genuinely stranded
+    // buffers.
+    let store_sweep = Arc::clone(&store);
+    tokio::spawn(async move {
+        let ttl = std::time::Duration::from_secs(STRANDED_TTL_SECS);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(STRANDED_SWEEP_INTERVAL_SECS)).await;
+            let now = tokio::time::Instant::now();
+            let mut map = store_sweep.lock().await;
+            let before = map.len();
+            map.retain(|_, b| now.saturating_duration_since(b.last_activity) < ttl);
+            let removed = before - map.len();
+            drop(map);
+            if removed > 0 {
+                tracing::warn!(
+                    removed,
+                    "stream_server: evicted stranded turn buffers (no activity within TTL)"
+                );
+            }
+        }
+    });
+
     store
 }
 
@@ -359,7 +425,9 @@ async fn handle_stream_connection(
     // event if the turn completed before this connection was established.
     let buffered: VecDeque<String> = {
         let s = store.lock().await;
-        s.get(&task_id).cloned().unwrap_or_default()
+        s.get(&task_id)
+            .map(|b| b.lines.clone())
+            .unwrap_or_default()
     };
 
     let mut saw_terminal = false;
@@ -376,7 +444,10 @@ async fn handle_stream_connection(
     }
 
     if saw_terminal {
-        cleanup_turn(&store, &task_id).await;
+        // Do NOT evict the buffer here. Other clients may still connect and
+        // replay this completed turn within DELTA_TTL_SECS; removing it now would
+        // defeat that window. The scheduled TTL GC (armed when the terminal event
+        // was buffered) is the single owner of terminal-buffer removal.
         return;
     }
 
@@ -430,7 +501,11 @@ async fn handle_stream_connection(
         }
     }
 
-    cleanup_turn(&store, &task_id).await;
+    // Do NOT evict the buffer on connection close. For a completed turn the
+    // scheduled TTL GC owns removal (and other clients may still replay within
+    // DELTA_TTL_SECS); for a turn that ended without a terminal event the
+    // stranded-turn sweeper reclaims it after STRANDED_TTL_SECS. Removing it here
+    // would either defeat the replay window or drop a still-running turn's buffer.
 }
 
 /// Convert a [`TurnEvent`] to `(turn_id, ndjson_line, is_terminal)`.
@@ -616,7 +691,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let s = store.lock().await;
-        let buf = s.get("t1").expect("buffer entry for t1");
+        let buf = &s.get("t1").expect("buffer entry for t1").lines;
         assert_eq!(buf.len(), 1);
         assert!(
             buf[0].contains("hello"),
@@ -649,7 +724,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let s = store.lock().await;
-        let buf = s.get("t2").expect("buffer for t2");
+        let buf = &s.get("t2").expect("buffer for t2").lines;
         assert!(
             buf.len() <= MAX_BUFFER_PER_TURN,
             "buffer must not exceed cap; got {}",
@@ -808,5 +883,123 @@ mod tests {
             "thinking content must appear in NDJSON; got: {line}"
         );
         assert!(!terminal, "thinking delta must not be a terminal event");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stranded_turn_evicted_by_sweeper() {
+        // A turn that emits Started + deltas but never a terminal event (its
+        // orchestrator panicked) must not leak its buffer forever: the stranded
+        // sweeper evicts it once it has been idle past STRANDED_TTL_SECS.
+        let dispatcher = Arc::new(Dispatcher::new(64));
+        let store = spawn_delta_buffer(&dispatcher);
+
+        dispatcher.publish(TurnEvent::Started {
+            session_id: "sess".into(),
+            turn_id: "t-stranded".into(),
+            correlation: CorrelationCtx::default(),
+        });
+        dispatcher.publish(TurnEvent::AssistantDelta {
+            content: "partial".into(),
+            turn_id: Some("t-stranded".into()),
+            correlation: CorrelationCtx::default(),
+        });
+        // NB: no Completed/Failed event is ever published.
+
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            store.lock().await.contains_key("t-stranded"),
+            "stranded buffer must exist before the sweep TTL elapses"
+        );
+
+        // Advance past the stranded TTL plus one sweep interval so the sweeper
+        // runs at least once with the buffer fully aged out.
+        tokio::time::advance(std::time::Duration::from_secs(
+            STRANDED_TTL_SECS + STRANDED_SWEEP_INTERVAL_SECS + 5,
+        ))
+        .await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            !store.lock().await.contains_key("t-stranded"),
+            "stranded turn buffer must be evicted by the sweeper"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_client_can_replay_completed_turn_within_ttl() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let dispatcher = Arc::new(Dispatcher::new(64));
+        let store = spawn_delta_buffer(&dispatcher);
+
+        // Build a completed turn buffer (Started + delta + Completed).
+        dispatcher.publish(TurnEvent::Started {
+            session_id: "sess".into(),
+            turn_id: "t-replay".into(),
+            correlation: CorrelationCtx::default(),
+        });
+        dispatcher.publish(TurnEvent::AssistantDelta {
+            content: "hi".into(),
+            turn_id: Some("t-replay".into()),
+            correlation: CorrelationCtx::default(),
+        });
+        dispatcher.publish(TurnEvent::Completed {
+            session_id: "sess".into(),
+            turn_id: "t-replay".into(),
+            output_tokens: 3,
+            input_tokens: None,
+            traceparent: None,
+            correlation: CorrelationCtx::default(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            store.lock().await.contains_key("t-replay"),
+            "completed buffer must persist within TTL"
+        );
+
+        // Drive one full stream connection and collect its output until EOF.
+        async fn replay(store: &DeltaStore, dispatcher: &Arc<Dispatcher>) -> String {
+            let (mut client, server) = UnixStream::pair().expect("socketpair");
+            let store = Arc::clone(store);
+            let dispatcher = Arc::clone(dispatcher);
+            let handle =
+                tokio::spawn(
+                    async move { handle_stream_connection(server, store, dispatcher).await },
+                );
+            client
+                .write_all(b"{\"task_id\":\"t-replay\"}\n")
+                .await
+                .expect("write request");
+            let mut out = String::new();
+            client
+                .read_to_string(&mut out)
+                .await
+                .expect("read response");
+            handle.await.expect("handler task");
+            out
+        }
+
+        // First client replays the completed turn.
+        let out1 = replay(&store, &dispatcher).await;
+        assert!(
+            out1.contains(r#""type":"done""#),
+            "first client must receive the done line; got: {out1}"
+        );
+
+        // The first client must NOT have evicted the buffer.
+        assert!(
+            store.lock().await.contains_key("t-replay"),
+            "first replay must not evict the buffer within the TTL"
+        );
+
+        // Second client, still within the TTL, must also be able to replay it.
+        let out2 = replay(&store, &dispatcher).await;
+        assert!(
+            out2.contains(r#""type":"done""#),
+            "second client must still replay the completed turn; got: {out2}"
+        );
     }
 }

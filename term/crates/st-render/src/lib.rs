@@ -307,8 +307,9 @@ pub struct GlyphEntry {
     /// Vertical offset from the baseline to the top edge of the bitmap
     /// (positive = above baseline). From `swash::Placement::top`.
     pub bearing_y: i32,
-    /// Alpha-atlas allocation handle (for deallocation on LRU eviction). `None`
-    /// for colour-atlas entries, which are bounded and never evicted.
+    /// Atlas allocation handle (for deallocation on LRU eviction). Used by both
+    /// the alpha and colour atlases; `None` only for entries built without a
+    /// backing allocator (e.g. in unit tests).
     pub id: Option<etagere::AllocId>,
     /// Frame index when this glyph was last used — the LRU key.
     pub last_used: u64,
@@ -339,8 +340,11 @@ pub struct GlyphAtlas {
     pub colour_texture: wgpu::Texture,
     /// View into [`Self::colour_texture`].
     pub colour_view: wgpu::TextureView,
-    /// Packer that tracks free regions in the colour atlas.
-    pub colour_packer: ShelfPacker,
+    /// Dynamic allocator for the colour atlas — mirrors [`Self::alpha_alloc`] so
+    /// a full colour atlas evicts the least-recently-used registered glyph rather
+    /// than growing RAM without bound when untrusted child output registers many
+    /// PUA/colour glyphs.
+    pub colour_alloc: etagere::AtlasAllocator,
     /// Maps a registered PUA codepoint → its entry in the colour atlas.
     pub colour_glyphs: HashMap<char, GlyphEntry>,
     /// Shared glyph registry used to resolve PUA codepoints to bitmaps.
@@ -400,7 +404,10 @@ impl GlyphAtlas {
             glyphs: HashMap::new(),
             colour_texture,
             colour_view,
-            colour_packer: ShelfPacker::new(ATLAS_SIZE),
+            colour_alloc: etagere::AtlasAllocator::new(etagere::size2(
+                i32::try_from(ATLAS_SIZE).expect("ATLAS_SIZE fits i32"),
+                i32::try_from(ATLAS_SIZE).expect("ATLAS_SIZE fits i32"),
+            )),
             colour_glyphs: HashMap::new(),
             glyph_registry: None,
             // Use an empty fontdb so init is non-blocking (< 5 ms).
@@ -612,8 +619,9 @@ impl GlyphAtlas {
     /// Returns `None` when no registry is attached, `ch` has no registered
     /// bitmap, or the colour atlas is full.
     fn get_or_insert_colour(&mut self, queue: &wgpu::Queue, ch: char) -> Option<GlyphEntry> {
-        if let Some(&entry) = self.colour_glyphs.get(&ch) {
-            return Some(entry);
+        if let Some(entry) = self.colour_glyphs.get_mut(&ch) {
+            entry.last_used = self.frame;
+            return Some(*entry);
         }
 
         // Copy the bitmap out of the registry under a short-lived lock so the
@@ -629,7 +637,39 @@ impl GlyphAtlas {
             return None;
         }
 
-        let [x, y] = self.colour_packer.alloc(width, height)?;
+        // Allocate a slot. When the colour atlas is full, evict the
+        // least-recently-used colour glyph that is NOT in use this frame and
+        // retry — the same incremental LRU the alpha atlas uses. touch_or_warm
+        // stamps every on-screen colour glyph's `last_used` to the current frame,
+        // so a visible glyph is never dropped. If nothing is evictable the glyph
+        // is skipped for this frame and re-warmed later once room frees up. This
+        // bounds RAM: untrusted child output can no longer fill the atlas without
+        // bound and leak.
+        let alloc = loop {
+            if let Some(a) = self.colour_alloc.allocate(etagere::size2(
+                i32::try_from(width).ok()?,
+                i32::try_from(height).ok()?,
+            )) {
+                break a;
+            }
+            let victim = self
+                .colour_glyphs
+                .iter()
+                .filter(|(_, e)| e.id.is_some() && e.last_used < self.frame)
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, e)| (*k, e.id));
+            if let Some((vkey, Some(vid))) = victim {
+                self.colour_alloc.deallocate(vid);
+                self.colour_glyphs.remove(&vkey);
+            } else {
+                tracing::debug!("colour atlas full and nothing evictable — skipping glyph");
+                return None;
+            }
+        };
+        #[allow(clippy::cast_sign_loss)]
+        let x = alloc.rectangle.min.x as u32;
+        #[allow(clippy::cast_sign_loss)]
+        let y = alloc.rectangle.min.y as u32;
 
         queue.write_texture(
             wgpu::ImageCopyTexture {
@@ -658,8 +698,8 @@ impl GlyphAtlas {
             h: height,
             bearing_x: 0,
             bearing_y: i32::try_from(height).unwrap_or(0),
-            id: None,
-            last_used: 0,
+            id: Some(alloc.id),
+            last_used: self.frame,
         };
         self.colour_glyphs.insert(ch, entry);
         Some(entry)
@@ -853,6 +893,60 @@ struct Params { opacity: f32, _p1: f32, _p2: f32, _p3: f32 }
 }
 ";
 
+// ── Dynamic vertex buffer ─────────────────────────────────────────────────────
+
+/// A persistent GPU vertex buffer that is re-uploaded each frame via
+/// [`wgpu::Queue::write_buffer`] and grows (reallocates) only when a frame needs
+/// more room than the current capacity.
+///
+/// Replaces the old per-frame `create_buffer_init` pattern, which allocated a
+/// fresh buffer for every vertex stream on every frame.
+struct DynamicVertexBuffer {
+    buffer: Option<wgpu::Buffer>,
+    /// Current capacity in bytes.
+    capacity: u64,
+    label: &'static str,
+}
+
+impl DynamicVertexBuffer {
+    const fn new(label: &'static str) -> Self {
+        Self {
+            buffer: None,
+            capacity: 0,
+            label,
+        }
+    }
+
+    /// Uploads `data` into the buffer, growing it when necessary. Does nothing
+    /// when `data` is empty. The buffer always carries `COPY_DST` so
+    /// [`wgpu::Queue::write_buffer`] is valid.
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let needed = data.len() as u64;
+        if needed > self.capacity {
+            // Round up to the next power of two to amortise growth across frames.
+            let new_cap = needed.next_power_of_two().max(256);
+            self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(self.label),
+                size: new_cap,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.capacity = new_cap;
+        }
+        if let Some(buf) = &self.buffer {
+            queue.write_buffer(buf, 0, data);
+        }
+    }
+
+    /// Returns the current backing buffer, if one has been allocated.
+    fn buffer(&self) -> Option<&wgpu::Buffer> {
+        self.buffer.as_ref()
+    }
+}
+
 // ── Renderer ──────────────────────────────────────────────────────────────────
 
 /// The primary renderer: owns the wgpu surface, pipelines, and glyph atlas.
@@ -880,6 +974,12 @@ pub struct Renderer {
     colour_pipeline: wgpu::RenderPipeline,
     /// Bind group binding the colour atlas texture + sampler.
     colour_bind_group: wgpu::BindGroup,
+    /// Persistent, grow-on-demand vertex buffers uploaded each frame via
+    /// `queue.write_buffer` (replace per-frame `create_buffer_init`).
+    bg_image_vbuf: DynamicVertexBuffer,
+    bg_vbuf: DynamicVertexBuffer,
+    glyph_vbuf: DynamicVertexBuffer,
+    colour_vbuf: DynamicVertexBuffer,
     /// Current cell grid snapshot.
     cells: Vec<Cell>,
     /// Block decorations to draw.
@@ -1305,6 +1405,10 @@ impl Renderer {
             bind_group,
             colour_pipeline,
             colour_bind_group,
+            bg_image_vbuf: DynamicVertexBuffer::new("bg_image_vbuf"),
+            bg_vbuf: DynamicVertexBuffer::new("bg_vbuf"),
+            glyph_vbuf: DynamicVertexBuffer::new("glyph_vbuf"),
+            colour_vbuf: DynamicVertexBuffer::new("colour_vbuf"),
             cells: initial_cells,
             block_decorations: Vec::new(),
             agent_blocks: Vec::new(),
@@ -1392,8 +1496,9 @@ impl Renderer {
     }
 
     /// Stamps an on-screen glyph's `last_used` to the current frame, rasterising
-    /// and uploading it on first sight. Spaces and registered PUA colour glyphs
-    /// are no-ops (the latter live in the bounded, never-evicted colour atlas).
+    /// and uploading it on first sight. Spaces are a no-op. Registered PUA colour
+    /// glyphs are stamped too so the colour atlas's LRU eviction never drops a
+    /// glyph that is visible this frame.
     fn touch_or_warm(&mut self, ch: char, font_size: f32, bold: bool, italic: bool) {
         if ch == ' ' {
             return;
@@ -1403,7 +1508,8 @@ impl Renderer {
             entry.last_used = self.atlas.frame;
             return;
         }
-        if self.atlas.colour_glyphs.contains_key(&ch) {
+        if let Some(entry) = self.atlas.colour_glyphs.get_mut(&ch) {
+            entry.last_used = self.atlas.frame;
             return;
         }
         let _ = self
@@ -1546,6 +1652,67 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Build per-frame vertex data and upload it into the persistent, growable
+        // buffers BEFORE opening the render pass. Doing the uploads here keeps the
+        // buffers' mutable borrow disjoint from the immutable borrows the pass
+        // holds, and — unlike the old per-frame `create_buffer_init` — reuses the
+        // same GPU allocations across frames, growing only when a frame needs more
+        // room than before.
+        let bg_image_verts: Option<[BgImageVertex; 6]> = if self.bg_image_bind_group.is_some() {
+            Some([
+                BgImageVertex {
+                    position: [-1.0, 1.0],
+                    tex_coords: [0.0, 0.0],
+                },
+                BgImageVertex {
+                    position: [1.0, 1.0],
+                    tex_coords: [1.0, 0.0],
+                },
+                BgImageVertex {
+                    position: [-1.0, -1.0],
+                    tex_coords: [0.0, 1.0],
+                },
+                BgImageVertex {
+                    position: [1.0, 1.0],
+                    tex_coords: [1.0, 0.0],
+                },
+                BgImageVertex {
+                    position: [1.0, -1.0],
+                    tex_coords: [1.0, 1.0],
+                },
+                BgImageVertex {
+                    position: [-1.0, -1.0],
+                    tex_coords: [0.0, 1.0],
+                },
+            ])
+        } else {
+            None
+        };
+        let bg_verts = self.build_bg_vertices();
+        let glyph_verts = self.build_glyph_vertices();
+        let colour_verts = self.build_colour_glyph_vertices();
+
+        if let Some(verts) = &bg_image_verts {
+            self.bg_image_vbuf
+                .upload(&self.device, &self.queue, bytemuck::cast_slice(verts));
+        }
+        self.bg_vbuf
+            .upload(&self.device, &self.queue, bytemuck::cast_slice(&bg_verts));
+        self.glyph_vbuf
+            .upload(&self.device, &self.queue, bytemuck::cast_slice(&glyph_verts));
+        self.colour_vbuf
+            .upload(&self.device, &self.queue, bytemuck::cast_slice(&colour_verts));
+
+        // The persistent buffers may be larger than this frame's data (they only
+        // grow); slice each to exactly this frame's byte length so the vertex
+        // stream never reads stale bytes left by a previous, larger frame.
+        let bg_slice_len =
+            (bg_verts.len() * std::mem::size_of::<BgVertex>()) as wgpu::BufferAddress;
+        let glyph_slice_len =
+            (glyph_verts.len() * std::mem::size_of::<GlyphVertex>()) as wgpu::BufferAddress;
+        let colour_slice_len =
+            (colour_verts.len() * std::mem::size_of::<GlyphVertex>()) as wgpu::BufferAddress;
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1577,40 +1744,9 @@ impl Renderer {
 
             // Fullscreen background image (drawn before solid cell quads so
             // that cell backgrounds at opacity < 1.0 blend with it).
-            if let Some(bg_img_group) = &self.bg_image_bind_group {
-                let verts = [
-                    BgImageVertex {
-                        position: [-1.0, 1.0],
-                        tex_coords: [0.0, 0.0],
-                    },
-                    BgImageVertex {
-                        position: [1.0, 1.0],
-                        tex_coords: [1.0, 0.0],
-                    },
-                    BgImageVertex {
-                        position: [-1.0, -1.0],
-                        tex_coords: [0.0, 1.0],
-                    },
-                    BgImageVertex {
-                        position: [1.0, 1.0],
-                        tex_coords: [1.0, 0.0],
-                    },
-                    BgImageVertex {
-                        position: [1.0, -1.0],
-                        tex_coords: [1.0, 1.0],
-                    },
-                    BgImageVertex {
-                        position: [-1.0, -1.0],
-                        tex_coords: [0.0, 1.0],
-                    },
-                ];
-                let buf = self
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("bg_image_vbuf"),
-                        contents: bytemuck::cast_slice(&verts),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });
+            if let (Some(bg_img_group), Some(buf)) =
+                (&self.bg_image_bind_group, self.bg_image_vbuf.buffer())
+            {
                 render_pass.set_pipeline(&self.bg_image_pipeline);
                 render_pass.set_bind_group(0, bg_img_group, &[]);
                 render_pass.set_bind_group(1, &self.bg_image_params_bind_group, &[]);
@@ -1619,50 +1755,34 @@ impl Renderer {
             }
 
             // Background quads.
-            let bg_verts = self.build_bg_vertices();
-            if !bg_verts.is_empty() {
-                let buf = self
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("bg_vbuf"),
-                        contents: bytemuck::cast_slice(&bg_verts),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });
+            if let Some(buf) = self.bg_vbuf.buffer().filter(|_| !bg_verts.is_empty()) {
                 render_pass.set_pipeline(&self.bg_pipeline);
-                render_pass.set_vertex_buffer(0, buf.slice(..));
+                render_pass.set_vertex_buffer(0, buf.slice(..bg_slice_len));
                 render_pass.draw(0..bg_verts.len() as u32, 0..1);
             }
 
             // Glyph quads.
-            let glyph_verts = self.build_glyph_vertices();
-            if !glyph_verts.is_empty() {
-                let buf = self
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("glyph_vbuf"),
-                        contents: bytemuck::cast_slice(&glyph_verts),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });
+            if let Some(buf) = self
+                .glyph_vbuf
+                .buffer()
+                .filter(|_| !glyph_verts.is_empty())
+            {
                 render_pass.set_pipeline(&self.glyph_pipeline);
                 render_pass.set_bind_group(0, &self.bind_group, &[]);
-                render_pass.set_vertex_buffer(0, buf.slice(..));
+                render_pass.set_vertex_buffer(0, buf.slice(..glyph_slice_len));
                 render_pass.draw(0..glyph_verts.len() as u32, 0..1);
             }
 
             // Registered colour glyphs (PUA codepoints) — sampled from the RGBA
             // colour atlas via the colour pipeline.
-            let colour_verts = self.build_colour_glyph_vertices();
-            if !colour_verts.is_empty() {
-                let buf = self
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("colour_glyph_vbuf"),
-                        contents: bytemuck::cast_slice(&colour_verts),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });
+            if let Some(buf) = self
+                .colour_vbuf
+                .buffer()
+                .filter(|_| !colour_verts.is_empty())
+            {
                 render_pass.set_pipeline(&self.colour_pipeline);
                 render_pass.set_bind_group(0, &self.colour_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, buf.slice(..));
+                render_pass.set_vertex_buffer(0, buf.slice(..colour_slice_len));
                 render_pass.draw(0..colour_verts.len() as u32, 0..1);
             }
 
@@ -2937,6 +3057,65 @@ mod tests {
             ..BackgroundConfig::default()
         };
         assert!(bg.load_image().is_err(), "loading a missing file must fail");
+    }
+
+    #[test]
+    fn colour_atlas_lru_evicts_oldest_not_current_frame() {
+        // Mirrors the colour-atlas eviction bookkeeping (CPU-only, no GPU): a
+        // full atlas must drop the least-recently-used glyph whose `last_used` is
+        // older than the current frame, and must never drop a glyph stamped with
+        // the current frame (i.e. visible this frame). This is the same selection
+        // expression used in GlyphAtlas::get_or_insert_colour.
+        use etagere::{size2, AtlasAllocator};
+        let mut alloc = AtlasAllocator::new(size2(32, 32));
+        let mut glyphs: HashMap<char, GlyphEntry> = HashMap::new();
+
+        // Fill the atlas with 16×16 slots, each stamped with an increasing
+        // `last_used` so the eviction order is deterministic.
+        let mut frame = 0u64;
+        let mut ch = '\u{E000}';
+        while let Some(a) = alloc.allocate(size2(16, 16)) {
+            glyphs.insert(
+                ch,
+                GlyphEntry {
+                    x: 0,
+                    y: 0,
+                    w: 16,
+                    h: 16,
+                    bearing_x: 0,
+                    bearing_y: 16,
+                    id: Some(a.id),
+                    last_used: frame,
+                },
+            );
+            frame += 1;
+            ch = char::from_u32(ch as u32 + 1).expect("valid PUA codepoint");
+        }
+        assert!(glyphs.len() >= 2, "atlas should hold at least two 16×16 slots");
+
+        // Current frame stamps the newest glyph as visible now → protected.
+        let current_frame = frame;
+        let newest = char::from_u32('\u{E000}' as u32 + (glyphs.len() as u32 - 1))
+            .expect("valid PUA codepoint");
+        glyphs.get_mut(&newest).unwrap().last_used = current_frame;
+
+        // Victim selection: oldest `last_used` strictly below the current frame.
+        let victim = glyphs
+            .iter()
+            .filter(|(_, e)| e.id.is_some() && e.last_used < current_frame)
+            .min_by_key(|(_, e)| e.last_used)
+            .map(|(k, e)| (*k, e.id));
+        let (vkey, vid) = victim.expect("an evictable glyph must exist");
+        assert_eq!(vkey, '\u{E000}', "the oldest glyph must be chosen");
+        assert_ne!(vkey, newest, "the current-frame glyph must never be evicted");
+
+        // Deallocating the victim must free room for a new glyph.
+        alloc.deallocate(vid.expect("victim carries an alloc id"));
+        glyphs.remove(&vkey);
+        assert!(
+            alloc.allocate(size2(16, 16)).is_some(),
+            "evicting the LRU glyph must free a slot"
+        );
     }
 
     #[test]

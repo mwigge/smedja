@@ -4,15 +4,32 @@ mod redraw;
 
 use std::collections::HashMap;
 use std::sync::{atomic::Ordering, Arc};
+use std::time::{Duration, Instant};
 
 use tracing::{debug, error, info};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::ActiveEventLoop,
+    event_loop::{ActiveEventLoop, ControlFlow},
     keyboard::{Key, NamedKey},
     window::{Window, WindowId},
 };
+
+/// Extra frames presented after a resize, map, or unocclusion even when the PTY
+/// is idle. Bridges the window through the compositor's grey fallback (observed
+/// on Hyprland when an app stops presenting) without re-arming a redraw forever.
+const FORCED_REDRAWS: u8 = 3;
+
+/// While visible and idle, re-present at least this often so the status-bar
+/// clock stays current without rendering every vsync.
+const IDLE_PRESENT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// While visible and idle, wake this often to poll the PTY dirty flag so child
+/// output appears promptly. The reader thread only flips an atomic (it does not
+/// wake the event loop), so a short poll replaces the old unconditional
+/// vsync-locked redraw. Each wake is an atomic load — no GPU work happens unless
+/// something is actually dirty.
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(8);
 
 #[cfg(target_os = "linux")]
 use winit::platform::wayland::WindowAttributesExtWayland;
@@ -89,6 +106,12 @@ pub(crate) struct App {
     /// Prevents the compositor showing grey during the terminal's clear+redraw
     /// cycle that ratatui emits on resize.
     suppress_clear_until: Option<std::time::Instant>,
+    /// Remaining forced presents for the compositor grey-flash workaround. Set
+    /// after resize / map / unocclusion and spent one per presented frame.
+    forced_redraws: u8,
+    /// Instant of the last presented frame; drives the idle repaint cadence so
+    /// the loop no longer redraws unconditionally at vsync.
+    last_present: Option<Instant>,
 }
 
 impl App {
@@ -129,6 +152,8 @@ impl App {
             mouse_buttons: 0,
             occluded: false,
             suppress_clear_until: None,
+            forced_redraws: FORCED_REDRAWS,
+            last_present: None,
         }
     }
 
