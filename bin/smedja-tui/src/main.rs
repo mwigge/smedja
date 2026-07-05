@@ -1,12 +1,15 @@
 pub mod action_log;
+mod alerts;
 mod blocks;
 mod clipboard;
 mod context_rail;
 mod cowork_widget;
 mod diff_viewer;
 mod editor;
+mod fleet_panel;
 mod formatting;
 mod governance;
+mod live_line;
 mod lsp_panel;
 pub mod main_panel;
 mod metrics_view;
@@ -21,8 +24,10 @@ mod terminal_guard;
 pub mod theme;
 mod thoughts_panel;
 mod tool_call;
+mod trace_waterfall;
 mod upgrade;
 mod value_panel;
+mod viz;
 
 // Re-export slash module items so that `use super::*` in the test module
 // continues to find them without change.  The `#[allow(unused_imports)]` is
@@ -50,7 +55,7 @@ pub(crate) use governance::{
 #[allow(unused_imports)]
 pub(crate) use terminal_guard::TerminalGuard;
 #[allow(unused_imports)]
-pub(crate) use tool_call::{tool_call_card, tool_glyph_label};
+pub(crate) use tool_call::tool_call_card;
 #[allow(unused_imports)]
 pub(crate) use upgrade::{
     fetch_latest_version, format_openspec_list, format_openspec_status, is_newer, run_openspec,
@@ -330,11 +335,13 @@ keybindings (scroll/normal mode):
   gg                 — scroll to top
   Ctrl-A             — toggle role cockpit panel (active role/tier/turn status)
   Ctrl-F             — toggle context rail
+  Ctrl-G             — toggle multi-agent fleet roster panel
   Ctrl-L             — toggle LSP diagnostic panel
-  Ctrl-O             — toggle observability panel
+  Ctrl-O             — toggle observability panel (with the turn trace waterfall)
   Ctrl-Q             — toggle quality gate panel
   Ctrl-V             — toggle value / ROI panel (Ctrl-V in input mode pastes)
   Ctrl-W             — toggle session browser (left rail)
+  x                  — inspect trace-waterfall spans (scroll mode)
   Alt+↑ / Alt+↓     — move cursor up / down in session rail (input mode)
   [ / ]              — move cursor up / down in session rail (scroll mode)
   mouse drag         — mark lines in the messages panel; release copies them
@@ -402,6 +409,8 @@ struct PanelVisibility {
     quality: bool,
     /// Value / ROI panel (right rail, Ctrl-V).
     value: bool,
+    /// Multi-agent fleet roster panel (right rail, Ctrl-G).
+    fleet: bool,
 }
 
 #[allow(clippy::struct_excessive_bools)] // AppState is a TUI dispatch table; enum-splitting would add indirection without clarity
@@ -628,6 +637,30 @@ pub(crate) struct AppState {
     quality_score_count: u64,
     /// True while the session config peek overlay is visible (toggled by Ctrl+P in scroll mode).
     show_session_peek: bool,
+    /// Detected terminal glyph richness (Braille/Block/ASCII); set once at startup.
+    render_mode: viz::RenderMode,
+    /// Trace spans for the current/most-recent turn (turn root + tool children),
+    /// laid out by the obs-panel trace waterfall.
+    current_trace: trace_waterfall::TurnTrace,
+    /// Index of the selected span in the trace waterfall (for the detail expand).
+    trace_selected: usize,
+    /// Whether the selected span's detail is expanded in the trace panel.
+    trace_expanded: bool,
+    /// Per-agent fleet state, keyed by agent id (multi-agent roster).
+    fleet: fleet_panel::FleetState,
+    /// Streamed token estimate for the current turn (the live line's moving
+    /// counter while thinking); reset at turn start.
+    live_tokens: u32,
+    /// Timestamp of the last stream output for the current turn (stall detection).
+    last_stream_activity: Option<std::time::Instant>,
+    /// When the currently-running tool started (per-tool elapsed + trace span).
+    tool_started_at: Option<std::time::Instant>,
+    /// Index of the current plan step (steps before are done, after are pending).
+    plan_current: usize,
+    /// Previous model/tier/context values for change-detection dividers.
+    prev_model: Option<String>,
+    prev_tier: Option<String>,
+    prev_context_used: u64,
 }
 
 impl AppState {
@@ -877,6 +910,14 @@ pub(crate) async fn submit(input: &str, state: &mut AppState, client: &mut Clien
             state.thinking_expanded = false;
             state.active_agent_name = None;
             state.plan_steps.clear();
+            // Reset the live line / trace / plan tracking for the new turn.
+            state.current_trace.start_turn();
+            state.trace_selected = 0;
+            state.trace_expanded = false;
+            state.live_tokens = 0;
+            state.last_stream_activity = Some(std::time::Instant::now());
+            state.tool_started_at = None;
+            state.plan_current = 0;
 
             // Start streaming reader; events arrive via unbounded channel.
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2139,6 +2180,24 @@ async fn handle_key(
                 }
                 return Ok(());
             }
+            // x: step through the trace waterfall's spans, expanding the selected
+            // span's detail (the in-terminal OTel span inspector).
+            KeyCode::Char('x') => {
+                let n = state.current_trace.spans.len();
+                if n > 0 {
+                    if state.trace_expanded {
+                        state.trace_selected = (state.trace_selected + 1) % n;
+                        if state.trace_selected == 0 {
+                            // Wrapped past the last span → collapse.
+                            state.trace_expanded = false;
+                        }
+                    } else {
+                        state.trace_expanded = true;
+                        state.trace_selected = 0;
+                    }
+                }
+                return Ok(());
+            }
             // A (Shift-A): collapse / expand the action log. Uppercase so it does
             // not collide with lowercase 'a' (exit scroll mode) or Ctrl-A (role
             // cockpit).
@@ -2317,6 +2376,11 @@ async fn handle_key(
         // Ctrl-O: toggle observability panel in the right rail.
         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.panels.obs = !state.panels.obs;
+        }
+
+        // Ctrl-G: toggle the multi-agent fleet roster in the right rail.
+        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.panels.fleet = !state.panels.fleet;
         }
 
         // Ctrl-Q: tap toggles the quality panel; hold ≥ 500ms triggers Tier-2 review.
@@ -2751,6 +2815,52 @@ async fn handle_key(
 // Render
 // ---------------------------------------------------------------------------
 
+/// Detects model / tier / context-compaction transitions since the last turn
+/// and pushes a highlighted transcript divider for each, dolphie-style. Silent
+/// on the first observation (it only seeds the baseline).
+fn check_transitions(state: &mut AppState) {
+    const W: usize = 60;
+    // Model change.
+    let model = state.model.clone();
+    if state.prev_model.is_some() && state.prev_model != model {
+        let from = state.prev_model.as_deref().unwrap_or("?");
+        let to = model.as_deref().unwrap_or("?");
+        let line = alerts::model_change_line(from, to, W, state.no_color);
+        state.main_panel.push_styled_line(line);
+    }
+    state.prev_model = model;
+
+    // Tier change.
+    let tier = state.tier.clone();
+    if state.prev_tier.is_some() && state.prev_tier != tier {
+        let from = state.prev_tier.as_deref().unwrap_or("?");
+        let to = tier.as_deref().unwrap_or("?");
+        let line = alerts::tier_change_line(from, to, W, state.no_color);
+        state.main_panel.push_styled_line(line);
+    }
+    state.prev_tier = tier;
+
+    // Context compaction — a drop of more than 30 % from the prior turn.
+    let now = state.context_used;
+    #[allow(clippy::cast_precision_loss)]
+    if state.prev_context_used > 0 && (now as f64) < (state.prev_context_used as f64) * 0.7 {
+        let line = alerts::compaction_line(state.prev_context_used, now, W, state.no_color);
+        state.main_panel.push_styled_line(line);
+    }
+    state.prev_context_used = now;
+}
+
+/// Compact count formatter for the live line's moving token counter
+/// (`1.2k`, `18.4k`, `512`).
+#[allow(clippy::cast_precision_loss)]
+fn fmt_count(n: u32) -> String {
+    if n >= 1_000 {
+        format!("{:.1}k", f64::from(n) / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 #[allow(clippy::too_many_lines)] // single-pass frame layout; splitting is out of scope here
 fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     let area = frame.area();
@@ -2918,15 +3028,22 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     } else {
         Some(state.panel_search_query.as_str())
     };
-    // Animate the in-flight tool card's status glyph so a running tool shows
-    // liveness: cycle the braille spinner each render tick until its result
-    // settles the card to ✓/✗. Re-rendered every tick so the glyph visibly spins.
+    // Animate the in-flight tool card so a running tool shows liveness: the
+    // running card is drawn full-width with a right-aligned RUNNING pill, its
+    // molten star spinner cycling each render tick until the result settles the
+    // card to the compact ✓/✗ collapse.
     if state.turn_in_flight {
         if let Some((idx, name, input)) = state.pending_tool.clone() {
-            const TOOL_SPINNER: [char; 10] =
-                ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            const TOOL_SPINNER: [char; 6] = ['·', '✻', '✽', '✶', '✳', '✢'];
             let frame_char = TOOL_SPINNER[state.spinner_tick as usize % TOOL_SPINNER.len()];
-            let card = tool_call_card(&name, &input, state.no_color, frame_char);
+            let card_w = (main_area.width as usize).saturating_sub(1).max(12);
+            let card = tool_call::card_header(
+                &name,
+                &input,
+                card_w,
+                state.no_color,
+                tool_call::CardStatus::Running(frame_char),
+            );
             state.main_panel.replace_styled_line(idx, card);
         }
     }
@@ -2935,15 +3052,57 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         .main_panel
         .render(main_area, frame, selection, search_q, state.no_color);
 
-    thoughts_panel::render_indicator(
-        main_area,
-        state.turn_in_flight,
-        &mut state.spinner_tick,
-        &state.current_thinking,
-        state.pending_tool.as_ref(),
-        state.no_color,
-        frame,
-    );
+    // -- Live line: the dedicated bottom row while a turn is active -----------
+    if state.turn_in_flight {
+        // Advance the shared spinner tick once per frame (drives the live line,
+        // the running tool card, and the plan's current-step spinner).
+        state.spinner_tick = state.spinner_tick.wrapping_add(1);
+        let running = state.pending_tool.is_some();
+        let live_state = if running {
+            live_line::LiveState::RunningTool
+        } else {
+            live_line::LiveState::Thinking
+        };
+        let elapsed_s = state
+            .turn_submitted_at
+            .map_or(0.0, |t| t.elapsed().as_secs_f32());
+        let stalled_secs = state
+            .last_stream_activity
+            .map_or(0, |t| t.elapsed().as_secs());
+        let (verb, counter) = if running {
+            let name = state
+                .pending_tool
+                .as_ref()
+                .map_or("tool", |(_, n, _)| n.as_str());
+            let kind = tool_call::tool_kind_of(name);
+            let tool_s = state
+                .tool_started_at
+                .map_or(0.0, |t| t.elapsed().as_secs_f32());
+            (
+                format!("running {}", kind.label()),
+                live_line::fmt_secs(tool_s),
+            )
+        } else {
+            let verb = if state.current_thinking.is_empty() {
+                "streaming".to_owned()
+            } else {
+                "thinking".to_owned()
+            };
+            (verb, format!("{} tok", fmt_count(state.live_tokens)))
+        };
+        live_line::render(
+            main_area,
+            true,
+            live_state,
+            &verb,
+            elapsed_s,
+            &counter,
+            stalled_secs,
+            state.spinner_tick,
+            state.no_color,
+            frame,
+        );
+    }
     thoughts_panel::render_step_overlay(
         main_area,
         state.thinking_expanded,
@@ -3052,6 +3211,10 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         let show_quality = state.panels.quality;
         let show_value = state.panels.value;
         let show_plan = state.plan_steps.len() >= 2;
+        let show_fleet = state.panels.fleet && !state.fleet.is_empty();
+        // The trace waterfall rides with the obs panel (smedja's OTel moat) once
+        // the current turn has recorded any spans.
+        let show_trace = show_obs && !state.current_trace.is_empty();
 
         // Build constraint list dynamically so Layout never gets zero-length.
         let mut constraints: Vec<Constraint> = vec![];
@@ -3072,7 +3235,7 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         }
         constraints.push(Length(1)); // context row
         if show_cockpit {
-            constraints.push(Length(5));
+            constraints.push(Length(7));
         }
         // LSP gets flexible space; fixed-height panels slot directly below it.
         if show_lsp {
@@ -3080,6 +3243,19 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         }
         if show_obs {
             constraints.push(Length(6));
+        }
+        if show_trace {
+            // Border (2) + one row per span + up to 3 detail rows when expanded.
+            #[allow(clippy::cast_possible_truncation)]
+            let span_rows = state.current_trace.spans.len() as u16;
+            let detail = if state.trace_expanded { 3 } else { 0 };
+            let h = (span_rows + 2 + detail).min(rail_rect.height / 3).max(3);
+            constraints.push(Length(h));
+        }
+        if show_fleet {
+            #[allow(clippy::cast_possible_truncation)]
+            let rows = state.fleet.len() as u16;
+            constraints.push(Length((rows + 3).min(rail_rect.height / 3).max(4)));
         }
         if show_plan {
             constraints.push(Length(plan_panel::panel_height(state.plan_steps.len())));
@@ -3136,9 +3312,49 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
             ci += 1;
         }
 
+        // ── Turn trace waterfall (the in-terminal OTel viewer) ────────────
+        if show_trace && ci < rail_chunks.len() {
+            let sel = Some(state.trace_selected.min(state.current_trace.spans.len().saturating_sub(1)));
+            trace_waterfall::render(rail_chunks[ci], frame, &state.current_trace, sel, state.no_color);
+            if state.trace_expanded {
+                // Overlay the selected span's detail on the panel's lower rows.
+                let detail_lines = trace_waterfall::span_detail_lines(
+                    &state.current_trace,
+                    state.trace_selected,
+                    state.no_color,
+                );
+                let chunk = rail_chunks[ci];
+                if chunk.height > 4 {
+                    let dh = u16::try_from(detail_lines.len()).unwrap_or(3).min(3);
+                    let drect = ratatui::layout::Rect::new(
+                        chunk.x + 1,
+                        chunk.y + chunk.height.saturating_sub(dh + 1),
+                        chunk.width.saturating_sub(2),
+                        dh,
+                    );
+                    frame.render_widget(Paragraph::new(detail_lines), drect);
+                }
+            }
+            ci += 1;
+        }
+
+        // ── Multi-agent fleet roster ──────────────────────────────────────
+        if show_fleet && ci < rail_chunks.len() {
+            fleet_panel::FleetPanel {
+                fleet: &state.fleet,
+                mode: state.render_mode,
+                no_color: state.no_color,
+            }
+            .render(rail_chunks[ci], frame);
+            ci += 1;
+        }
+
         // ── Plan step tracker ─────────────────────────────────────────────
         if show_plan && ci < rail_chunks.len() {
-            plan_panel::PlanPanel::new(&state.plan_steps).render(rail_chunks[ci], frame);
+            let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧']
+                [state.spinner_tick as usize % 8];
+            plan_panel::PlanPanel::new(&state.plan_steps, state.plan_current, spinner)
+                .render(rail_chunks[ci], frame);
             ci += 1;
         }
 
@@ -3482,6 +3698,18 @@ fn render_role_cockpit(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, 
             Span::styled("turn  ", Style::default().fg(p.text_dim)),
             Span::styled(status_symbol.to_owned(), status_style),
         ]),
+        Line::from(vec![Span::styled("gate  ", Style::default().fg(p.text_dim)), {
+            // Awaiting a human decision at the cowork gate takes priority; then
+            // in-flight (running); otherwise idle/skip.
+            let kind = if !state.pending_cowork.is_empty() {
+                viz::PillKind::Await
+            } else if in_flight {
+                viz::PillKind::Running
+            } else {
+                viz::PillKind::Skip
+            };
+            viz::pill(kind, state.no_color)
+        }]),
     ];
 
     let block = Block::default()
@@ -3776,6 +4004,7 @@ async fn main() -> Result<()> {
             role_cockpit: true,
             quality: true,
             value: true,
+            fleet: false,
         },
         metrics_snapshot: Vec::new(),
         savings_snapshot: metrics_view::SavingsSnapshot::default(),
@@ -3851,6 +4080,18 @@ async fn main() -> Result<()> {
         quality_score_sum: 0,
         quality_score_count: 0,
         show_session_peek: false,
+        render_mode: viz::detect_render_mode(),
+        current_trace: trace_waterfall::TurnTrace::default(),
+        trace_selected: 0,
+        trace_expanded: false,
+        fleet: fleet_panel::FleetState::default(),
+        live_tokens: 0,
+        last_stream_activity: None,
+        tool_started_at: None,
+        plan_current: 0,
+        prev_model: None,
+        prev_tier: None,
+        prev_context_used: 0,
     };
 
     // Connect banner — shown on every startup so the user knows what's connected.
@@ -4085,12 +4326,25 @@ async fn main() -> Result<()> {
                 };
                 match event {
                     StreamEvent::Delta { text } => {
+                        // Live-line liveness: bump the moving token counter and
+                        // mark fresh output so the stall detector stays quiet.
+                        state.last_stream_activity = Some(std::time::Instant::now());
+                        #[allow(clippy::cast_possible_truncation)]
+                        let est = (text.chars().count() / 4) as u32;
+                        state.live_tokens = state.live_tokens.saturating_add(est);
                         // First delta of the turn: emit the assistant author
                         // chip on its own line so the response never merges
                         // into the preceding line (which broke ```fences →
                         // syntax highlighting), and start a fresh body line.
                         if !state.assistant_open {
-                            let color = theme::runner_color(&state.runner);
+                            // Tint the chip with the active agent's stable colour so
+                            // interleaved multi-agent output is attributable; fall
+                            // back to the runner brand colour for a solo turn.
+                            let color = state
+                                .active_agent_name
+                                .as_deref()
+                                .and_then(|a| state.fleet.color_for(a))
+                                .unwrap_or_else(|| theme::runner_color(&state.runner));
                             let label = theme::runner_label(&state.runner).to_lowercase();
                             push_author_chip(&mut state.main_panel, &label, color, state.no_color);
                             state.main_panel.push_line(String::new());
@@ -4101,9 +4355,28 @@ async fn main() -> Result<()> {
                         if text.contains('\u{21b3}') {
                             if let Some((idx, name, inp)) = state.pending_tool.take() {
                                 let ok = !text.contains("error");
-                                let glyph = if ok { '\u{2713}' } else { '\u{2717}' };
-                                let card = tool_call_card(&name, &inp, state.no_color, glyph);
+                                let status = if ok {
+                                    tool_call::CardStatus::Ok
+                                } else {
+                                    tool_call::CardStatus::Failed
+                                };
+                                let elapsed_s = state
+                                    .tool_started_at
+                                    .map(|t| t.elapsed().as_secs_f32());
+                                let card = tool_call::tool_card_line(
+                                    &name,
+                                    &inp,
+                                    state.no_color,
+                                    status,
+                                    elapsed_s,
+                                );
                                 state.main_panel.replace_styled_line(idx, card);
+                                // Close the tool's trace span at the current turn offset.
+                                let end_ms = state.turn_submitted_at.map_or(0, |t| {
+                                    u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+                                });
+                                state.current_trace.settle_last_tool(end_ms, ok);
+                                state.tool_started_at = None;
                             }
                         }
                         // Split on newlines so each line is a separate panel entry.
@@ -4145,10 +4418,17 @@ async fn main() -> Result<()> {
                     }
                     StreamEvent::Started { agent_name } => {
                         if let Some(name) = agent_name {
+                            // Register the agent in the fleet roster (id keyed by
+                            // name today; the roster supports many agents).
+                            state.fleet.upsert(&name, &name);
                             state.active_agent_name = Some(name);
                         }
                     }
                     StreamEvent::Thinking { text } => {
+                        state.last_stream_activity = Some(std::time::Instant::now());
+                        #[allow(clippy::cast_possible_truncation)]
+                        let est = (text.chars().count() / 4) as u32;
+                        state.live_tokens = state.live_tokens.saturating_add(est);
                         state.current_thinking.push_str(&text);
                         let elapsed_s = state
                             .turn_submitted_at
@@ -4171,9 +4451,30 @@ async fn main() -> Result<()> {
                     }
                     StreamEvent::ToolCall { name, input, full } => {
                         let full_str = full.as_deref().unwrap_or(&input);
+                        state.last_stream_activity = Some(std::time::Instant::now());
+                        state.tool_started_at = Some(std::time::Instant::now());
                         let elapsed_s = state
                             .turn_submitted_at
                             .map_or(0.0, |t| t.elapsed().as_secs_f32());
+                        // Open a trace span for this tool at the current turn offset.
+                        let start_ms = state.turn_submitted_at.map_or(0, |t| {
+                            u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+                        });
+                        state.current_trace.push_tool(name.clone(), start_ms);
+                        // Reflect the activity on the active agent's roster row and
+                        // advance the plan step tracker as tool progress moves on.
+                        if !state.plan_steps.is_empty() {
+                            state.plan_current =
+                                (state.plan_current + 1).min(state.plan_steps.len().saturating_sub(1));
+                        }
+                        if let Some(agent) = state.active_agent_name.clone() {
+                            state.fleet.set_activity(&agent, &name, &input);
+                            #[allow(clippy::cast_possible_truncation)]
+                            let total = state.plan_steps.len() as u16;
+                            #[allow(clippy::cast_possible_truncation)]
+                            let cur = (state.plan_current as u16).saturating_add(1).min(total);
+                            state.fleet.set_step(&agent, cur, total);
+                        }
                         state
                             .thinking_steps
                             .push(thoughts_panel::ThinkingStep::Tool {
@@ -4219,8 +4520,16 @@ async fn main() -> Result<()> {
                             .push(thoughts_panel::ThinkingStep::Answer { elapsed_s });
                         // Any tool still marked "running" at turn end is settled.
                         if let Some((idx, name, inp)) = state.pending_tool.take() {
-                            let card = tool_call_card(&name, &inp, state.no_color, '\u{2713}');
+                            let elapsed = state.tool_started_at.map(|t| t.elapsed().as_secs_f32());
+                            let card = tool_call::tool_card_line(
+                                &name,
+                                &inp,
+                                state.no_color,
+                                tool_call::CardStatus::Ok,
+                                elapsed,
+                            );
                             state.main_panel.replace_styled_line(idx, card);
+                            state.tool_started_at = None;
                         }
                         let output_tok = u64::from(output_tok);
                         let input_tok = u64::from(input_tok.unwrap_or(0));
@@ -4229,6 +4538,15 @@ async fn main() -> Result<()> {
                         });
                         state.turn_submitted_at = None;
                         state.last_traceparent.clone_from(&traceparent);
+                        // Close the trace waterfall, mark the plan complete, and
+                        // flip the active agent's roster row to done.
+                        state.current_trace.finish(turn_ms, true);
+                        state.plan_current = state.plan_steps.len();
+                        if let Some(ref agent) = state.active_agent_name {
+                            state
+                                .fleet
+                                .set_status(agent, fleet_panel::AgentStatus::Done);
+                        }
 
                         // Track latency samples for p95/p99 in the obs panel.
                         if turn_ms > 0 {
@@ -4309,6 +4627,16 @@ async fn main() -> Result<()> {
                             block.fail();
                             state.block_store.push(block);
                         }
+                        // Close the trace and roster as failed.
+                        let turn_ms = state.turn_submitted_at.map_or(0, |inst| {
+                            u64::try_from(inst.elapsed().as_millis()).unwrap_or(u64::MAX)
+                        });
+                        state.current_trace.finish(turn_ms, false);
+                        if let Some(ref agent) = state.active_agent_name {
+                            state
+                                .fleet
+                                .set_status(agent, fleet_panel::AgentStatus::Failed);
+                        }
                         turn_done = true;
                     }
                     StreamEvent::Quality {
@@ -4382,9 +4710,12 @@ async fn main() -> Result<()> {
                             });
                         }
                     }
-                    StreamEvent::Unknown
-                    | StreamEvent::Usage { .. }
-                    | StreamEvent::ToolCallChunk { .. } => {}
+                    StreamEvent::Usage { output_tok, .. } => {
+                        // Authoritative running token count for the live line.
+                        state.last_stream_activity = Some(std::time::Instant::now());
+                        state.live_tokens = state.live_tokens.max(output_tok);
+                    }
+                    StreamEvent::Unknown | StreamEvent::ToolCallChunk { .. } => {}
                 }
             }
 
@@ -4424,6 +4755,8 @@ async fn main() -> Result<()> {
                     state.obs_snapshot.context_used = state.context_used;
                     state.obs_snapshot.context_window = state.context_window;
                 }
+                // Surface model/tier/compaction transitions as transcript dividers.
+                check_transitions(&mut state);
             }
         } else if let Some(task_id) = state.pending_task_id.clone() {
             // Fallback: blocking poll via turn.subscribe (no stream socket available).
@@ -5083,18 +5416,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_glyph_label_compacts_verbose_names() {
-        let (g, l) = tool_glyph_label("ToolSearch");
-        assert_eq!((g, l.as_str()), ("⌕", "search"));
-        let (_, bash) = tool_glyph_label("Bash");
-        assert_eq!(bash, "bash");
-        // Unknown tool → lowercased, capped.
-        let (g2, l2) = tool_glyph_label("SomeReallyLongToolName");
-        assert_eq!(g2, "▶");
-        assert!(l2.chars().count() <= 14);
-    }
-
-    #[test]
     fn status_bar_line_segments_runner_tier_session() {
         let ctx = ModuleCtx {
             session_id: "abcd1234ef",
@@ -5226,7 +5547,7 @@ mod tests {
     fn tool_call_card_shows_glyph_label_and_summary() {
         let line = tool_call_card("Bash", "find . -type f", true, '\u{2713}');
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("bash"), "{text}");
+        assert!(text.contains("execute"), "{text}"); // ACP kind label
         assert!(text.contains("find . -type f"), "{text}");
         assert!(text.contains('\u{2713}'), "{text}"); // status glyph present
                                                       // No raw JSON braces leak into the card.
@@ -6144,6 +6465,7 @@ mod tests {
                 role_cockpit: false,
                 quality: false,
                 value: false,
+                fleet: false,
             },
             metrics_snapshot: Vec::new(),
             savings_snapshot: metrics_view::SavingsSnapshot::default(),
@@ -6218,6 +6540,18 @@ mod tests {
             file_picker_entries: Vec::new(),
             file_picker_cursor: 0,
             show_session_peek: false,
+            render_mode: viz::RenderMode::Block,
+            current_trace: trace_waterfall::TurnTrace::default(),
+            trace_selected: 0,
+            trace_expanded: false,
+            fleet: fleet_panel::FleetState::default(),
+            live_tokens: 0,
+            last_stream_activity: None,
+            tool_started_at: None,
+            plan_current: 0,
+            prev_model: None,
+            prev_tier: None,
+            prev_context_used: 0,
         }
     }
 
@@ -6447,8 +6781,10 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(
-            content.contains("thinking") || content.contains("working"),
-            "buffer should contain spinner indicator when turn_in_flight is true"
+            content.contains("thinking")
+                || content.contains("streaming")
+                || content.contains("cancel"),
+            "buffer should contain the live line when turn_in_flight is true"
         );
     }
 

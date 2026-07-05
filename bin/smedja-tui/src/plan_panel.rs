@@ -87,15 +87,49 @@ pub fn panel_height(step_count: usize) -> u16 {
     u16::try_from(step_count + 2).unwrap_or(14).min(14)
 }
 
+/// Completion state of a single plan step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepStatus {
+    /// Completed (before the current step).
+    Done,
+    /// The step in progress.
+    Current,
+    /// Not yet started.
+    Pending,
+}
+
+/// Derives a step's status from the current step index: everything before
+/// `current` is done, `current` itself is current, everything after is pending.
+/// A `current` at/after `total` marks every step done.
+#[must_use]
+pub fn status_for(i: usize, current: usize, total: usize) -> StepStatus {
+    if current >= total {
+        return StepStatus::Done;
+    }
+    match i.cmp(&current) {
+        std::cmp::Ordering::Less => StepStatus::Done,
+        std::cmp::Ordering::Equal => StepStatus::Current,
+        std::cmp::Ordering::Greater => StepStatus::Pending,
+    }
+}
+
 /// Plan tracker panel widget.
 pub struct PlanPanel<'a> {
     pub steps: &'a [String],
+    /// Index of the current step (steps before are done, after are pending).
+    pub current: usize,
+    /// Spinner frame drawn beside the current step.
+    pub spinner: char,
 }
 
 impl<'a> PlanPanel<'a> {
     #[must_use]
-    pub fn new(steps: &'a [String]) -> Self {
-        Self { steps }
+    pub fn new(steps: &'a [String], current: usize, spinner: char) -> Self {
+        Self {
+            steps,
+            current,
+            spinner,
+        }
     }
 
     pub fn render(&self, area: Rect, frame: &mut Frame) {
@@ -103,13 +137,32 @@ impl<'a> PlanPanel<'a> {
             return;
         }
         let p = palette();
+        let total = self.steps.len();
         let inner_w = (area.width as usize).saturating_sub(2).max(1);
         let mut lines: Vec<Line<'_>> = Vec::new();
 
         for (i, step) in self.steps.iter().enumerate() {
-            let n = i + 1;
-            let label = format!("{n}. ");
-            let text_budget = inner_w.saturating_sub(label.len());
+            let status = status_for(i, self.current, total);
+            let (glyph, glyph_style, text_style) = match status {
+                StepStatus::Done => (
+                    "✔ ".to_owned(),
+                    Style::default().fg(p.success),
+                    Style::default().fg(p.text_dim),
+                ),
+                StepStatus::Current => (
+                    format!("{} ", self.spinner),
+                    Style::default().fg(p.molten).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(p.text_bright)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                StepStatus::Pending => (
+                    "○ ".to_owned(),
+                    Style::default().fg(p.text_dim),
+                    Style::default().fg(p.text_dim),
+                ),
+            };
+            let text_budget = inner_w.saturating_sub(glyph.chars().count());
             let display = if step.len() > text_budget {
                 let end = crate::floor_char_boundary(step, text_budget.saturating_sub(1));
                 format!("{}…", &step[..end])
@@ -117,16 +170,15 @@ impl<'a> PlanPanel<'a> {
                 step.clone()
             };
             lines.push(Line::from(vec![
-                Span::styled(
-                    label,
-                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(display),
+                Span::styled(glyph, glyph_style),
+                Span::styled(display, text_style),
             ]));
         }
 
+        let shown = self.current.min(total);
+        let title = format!(" plan · step {shown}/{total} ");
         let block = Block::default()
-            .title(" plan ")
+            .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(p.border));
 
@@ -213,9 +265,43 @@ mod tests {
             "café_αβγ_日本語_ελληνικά_привет_мир_こんにちは_世界".to_owned(),
             "second_αβγ_日本語_step".to_owned(),
         ];
-        let panel = PlanPanel::new(&steps);
+        let panel = PlanPanel::new(&steps, 0, '⠋');
         let backend = TestBackend::new(20, 8);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| panel.render(f.area(), f)).unwrap();
+    }
+
+    #[test]
+    fn status_for_partitions_done_current_pending() {
+        assert_eq!(status_for(0, 2, 5), StepStatus::Done);
+        assert_eq!(status_for(1, 2, 5), StepStatus::Done);
+        assert_eq!(status_for(2, 2, 5), StepStatus::Current);
+        assert_eq!(status_for(3, 2, 5), StepStatus::Pending);
+    }
+
+    #[test]
+    fn status_for_all_done_when_current_past_end() {
+        assert_eq!(status_for(0, 5, 5), StepStatus::Done);
+        assert_eq!(status_for(4, 5, 5), StepStatus::Done);
+    }
+
+    #[test]
+    fn render_shows_step_counter_and_glyphs() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let steps = vec!["first".to_owned(), "second".to_owned(), "third".to_owned()];
+        let panel = PlanPanel::new(&steps, 1, '⠙');
+        let backend = TestBackend::new(30, 6);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| panel.render(f.area(), f)).unwrap();
+        let rendered: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(rendered.contains("step 1/3"), "counter: {rendered}");
+        assert!(rendered.contains('✔'), "done glyph: {rendered}");
+        assert!(rendered.contains('○'), "pending glyph: {rendered}");
     }
 }

@@ -4,6 +4,7 @@
 //! [`QualitySnapshot`]; the widget never fetches or blocks.
 
 use crate::theme::palette;
+use crate::viz::{pill, PillKind};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -41,6 +42,17 @@ impl QualitySnapshot {
         }
     }
 
+    /// Overall verdict pill kind: green ≥ 90, amber ≥ 70, red below.
+    fn verdict_pill(&self) -> PillKind {
+        if self.score >= 90 {
+            PillKind::Pass
+        } else if self.score >= 70 {
+            PillKind::Warn
+        } else {
+            PillKind::Fail
+        }
+    }
+
     fn file_size_pass(&self) -> bool {
         self.file_advisories.is_empty()
     }
@@ -71,7 +83,7 @@ impl<'a> QualityPanel<'a> {
         let inner_w = (area.width as usize).saturating_sub(2).max(1);
         let mut lines: Vec<Line<'_>> = Vec::new();
 
-        // ── Score line ───────────────────────────────────────────────────────
+        // ── Score line + overall verdict pill ─────────────────────────────────
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{}", snap.score),
@@ -79,7 +91,8 @@ impl<'a> QualityPanel<'a> {
                     .fg(snap.score_color())
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" / 100", Style::default().fg(p.text_dim)),
+            Span::styled(" / 100  ", Style::default().fg(p.text_dim)),
+            pill(snap.verdict_pill(), false),
         ]));
 
         // ── Gate lines ───────────────────────────────────────────────────────
