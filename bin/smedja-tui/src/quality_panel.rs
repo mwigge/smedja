@@ -28,6 +28,12 @@ pub struct QualitySnapshot {
     pub skill_advisories: Vec<String>,
     /// Slash command suggested by the LLM reviewer, if any.
     pub suggested_command: Option<String>,
+    /// Composite scores from recent turns (oldest → newest) for the trend
+    /// sparkline. The current `score` is the last element.
+    pub trend: Vec<u8>,
+    /// Whether any turn has been scored yet. `false` renders an explicit
+    /// "awaiting first turn" empty state rather than a broken-looking `0`.
+    pub scored: bool,
 }
 
 impl QualitySnapshot {
@@ -42,7 +48,8 @@ impl QualitySnapshot {
         }
     }
 
-    /// Overall verdict pill kind: green ≥ 90, amber ≥ 70, red below.
+    /// Overall verdict pill kind: green ≥ 90, amber ≥ 70, red below — the
+    /// no-color-safe complement to the coloured letter-grade badge.
     fn verdict_pill(&self) -> PillKind {
         if self.score >= 90 {
             PillKind::Pass
@@ -50,6 +57,17 @@ impl QualitySnapshot {
             PillKind::Warn
         } else {
             PillKind::Fail
+        }
+    }
+
+    /// Letter grade A–F over the 0–100 composite (codeburn-style badge).
+    fn grade_letter(&self) -> &'static str {
+        match self.score {
+            90..=u8::MAX => "A",
+            80..=89 => "B",
+            70..=79 => "C",
+            60..=69 => "D",
+            _ => "F",
         }
     }
 
@@ -83,75 +101,121 @@ impl<'a> QualityPanel<'a> {
         let inner_w = (area.width as usize).saturating_sub(2).max(1);
         let mut lines: Vec<Line<'_>> = Vec::new();
 
-        // ── Score line + overall verdict pill ─────────────────────────────────
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{}", snap.score),
-                Style::default()
-                    .fg(snap.score_color())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" / 100  ", Style::default().fg(p.text_dim)),
-            pill(snap.verdict_pill(), false),
-        ]));
-
-        // ── Gate lines ───────────────────────────────────────────────────────
-        lines.push(gate_line("tdd", snap.tdd_pass, None, inner_w));
-        lines.push(gate_line("clean", snap.clean_pass, None, inner_w));
-        lines.push(gate_line(
-            "size",
-            snap.file_size_pass(),
-            snap.file_advisories.first().map(String::as_str),
-            inner_w,
-        ));
-        lines.push(gate_line(
-            "skill",
-            snap.skill_inject_pass(),
-            snap.skill_advisories.first().map(String::as_str),
-            inner_w,
-        ));
-
-        // ── Suggested command hint (dim, LLM-reviewed only) ──────────────────
-        if let Some(ref cmd) = snap.suggested_command {
-            let hint: String = cmd.chars().take(inner_w).collect();
-            lines.push(Line::from(vec![Span::styled(
-                hint,
-                Style::default().fg(p.text_dim),
-            )]));
-        }
-
         let title = if snap.llm_reviewed {
             " quality [llm] "
         } else {
             " quality "
         };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(p.border))
+            .title(title);
 
-        frame.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(p.border))
-                    .title(title),
-            ),
-            area,
+        // ── Empty state: no turn scored yet ──────────────────────────────────
+        // A bare `0` reads as "broken"; say plainly that scoring runs after the
+        // first turn so an idle panel is self-explanatory.
+        if !snap.scored {
+            lines.push(Line::from(Span::styled(
+                "awaiting first turn",
+                Style::default().fg(p.text_dim),
+            )));
+            lines.push(Line::from(Span::styled(
+                "gates score after a turn",
+                Style::default().fg(p.text_dim),
+            )));
+            frame.render_widget(Paragraph::new(lines).block(block), area);
+            return;
+        }
+
+        // ── Grade badge + score + gauge ──────────────────────────────────────
+        // `[ A ] 92  ██████░░` — codeburn-style letter badge, the numeric score,
+        // and a meter filled to score/100 in the zone colour (green→amber→red).
+        let color = snap.score_color();
+        let badge = Span::styled(
+            format!(" {} ", snap.grade_letter()),
+            Style::default()
+                .bg(color)
+                .fg(crate::theme::contrast_fg(color))
+                .add_modifier(Modifier::BOLD),
         );
+        // Reserve: badge (3) + space + "NNN" (3) + space.
+        let gauge_w = inner_w.saturating_sub(8).clamp(3, 12);
+        let gauge = crate::viz::microbar(f64::from(snap.score), 100.0, gauge_w);
+        lines.push(Line::from(vec![
+            badge,
+            Span::styled(
+                format!(" {:>3} ", snap.score),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(gauge, Style::default().fg(color)),
+        ]));
+
+        // ── Verdict pill + trend sparkline (quality over recent turns) ───────
+        // The pill restates the verdict as text (`✔ PASS`) so the panel still
+        // reads under `no_color`; the sparkline shows the score's recent history.
+        let mut row: Vec<Span<'_>> = vec![pill(snap.verdict_pill(), false), Span::raw(" ")];
+        if snap.trend.len() >= 2 {
+            let keep = inner_w.saturating_sub(8).max(1);
+            let recent: Vec<u8> = snap
+                .trend
+                .iter()
+                .rev()
+                .take(keep)
+                .rev()
+                .copied()
+                .collect();
+            row.push(Span::styled(
+                crate::viz::sparkline(&recent, 100),
+                Style::default().fg(p.accent),
+            ));
+        }
+        lines.push(Line::from(row));
+
+        // ── Gate breakdown as filled/empty pips ──────────────────────────────
+        lines.push(Line::from(vec![
+            gate_pip("tdd", snap.tdd_pass),
+            Span::raw(" "),
+            gate_pip("clean", snap.clean_pass),
+        ]));
+        lines.push(Line::from(vec![
+            gate_pip("size", snap.file_size_pass()),
+            Span::raw(" "),
+            gate_pip("skill", snap.skill_inject_pass()),
+        ]));
+
+        // ── First failing advisory, then any suggested command ───────────────
+        let advisory = snap
+            .file_advisories
+            .first()
+            .or_else(|| snap.skill_advisories.first());
+        if let Some(text) = advisory {
+            let full = format!("! {text}");
+            let truncated: String = full.chars().take(inner_w).collect();
+            lines.push(Line::from(Span::styled(
+                truncated,
+                Style::default().fg(p.warn),
+            )));
+        }
+        if let Some(ref cmd) = snap.suggested_command {
+            let hint: String = cmd.chars().take(inner_w).collect();
+            lines.push(Line::from(Span::styled(
+                hint,
+                Style::default().fg(p.text_dim),
+            )));
+        }
+
+        frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 }
 
-/// Renders one gate status line: `✓ label` or `! label: advisory`.
-fn gate_line<'a>(label: &str, pass: bool, advisory: Option<&str>, max_w: usize) -> Line<'a> {
+/// Renders one gate as a labelled pip: `● tdd` (filled/success when passing) or
+/// `○ size` (hollow/dim when failing), so all four gates read at a glance.
+fn gate_pip<'a>(label: &str, pass: bool) -> Span<'a> {
     let p = palette();
     if pass {
-        Line::from(vec![
-            Span::styled("✓ ", Style::default().fg(p.success)),
-            Span::styled(label.to_owned(), Style::default().fg(p.text_dim)),
-        ])
+        Span::styled(format!("● {label}"), Style::default().fg(p.success))
     } else {
-        let detail = advisory.unwrap_or("advisory");
-        let full = format!("! {label}: {detail}");
-        // Truncate to panel width to avoid overflow.
-        let truncated: String = full.chars().take(max_w).collect();
-        Line::from(vec![Span::styled(truncated, Style::default().fg(p.warn))])
+        Span::styled(format!("○ {label}"), Style::default().fg(p.error))
     }
 }
 
@@ -179,6 +243,7 @@ mod tests {
     fn panel_renders_without_panic() {
         let snap = QualitySnapshot {
             score: 75,
+            scored: true,
             tdd_pass: true,
             clean_pass: true,
             file_advisories: vec!["main.rs 7880 L (threshold 600)".into()],
@@ -186,6 +251,30 @@ mod tests {
         };
         let rendered = render_snapshot(&snap, 30, 10);
         assert!(rendered.contains("quality"), "title present: {rendered}");
+    }
+
+    #[test]
+    fn unscored_panel_shows_awaiting_state() {
+        let snap = QualitySnapshot::default();
+        let rendered = render_snapshot(&snap, 30, 10);
+        assert!(
+            rendered.contains("awaiting"),
+            "empty state is explicit, not a bare 0: {rendered}"
+        );
+    }
+
+    #[test]
+    fn scored_panel_shows_grade_badge() {
+        let snap = QualitySnapshot {
+            score: 100,
+            scored: true,
+            tdd_pass: true,
+            clean_pass: true,
+            trend: vec![50, 75, 100],
+            ..QualitySnapshot::default()
+        };
+        let rendered = render_snapshot(&snap, 30, 10);
+        assert!(rendered.contains('A'), "A-grade badge present: {rendered}");
     }
 
     #[test]
@@ -247,6 +336,7 @@ mod tests {
     fn panel_renders_score_value() {
         let snap = QualitySnapshot {
             score: 75,
+            scored: true,
             tdd_pass: true,
             clean_pass: true,
             ..QualitySnapshot::default()

@@ -129,6 +129,17 @@ impl MetricsView {
     /// savings data the section shows an empty placeholder (not a stale value).
     fn savings_lines(&self) -> Vec<String> {
         let s = &self.savings;
+        // No accrual yet: cache savings need provider cache-reads and compression
+        // needs filtered tool output, so a fresh window is legitimately empty.
+        // Say why rather than showing a wall of zeros that reads as broken.
+        if s.rows.is_empty() && s.compression_saved == 0 && s.cache_saved == 0 {
+            return vec![
+                String::new(),
+                "SAVINGS".to_owned(),
+                "  none yet — accrues on".to_owned(),
+                "  cache hits & filtering".to_owned(),
+            ];
+        }
         let mut out = vec![
             String::new(),
             format!("SAVINGS  eff {:.0}%", s.efficiency_ratio * 100.0),
@@ -196,8 +207,9 @@ mod tests {
         let joined = lines.join("\n");
         assert!(lines[0].contains("RUNNER") && lines[0].contains("ERR"));
         assert!(joined.contains("(no metrics)"));
-        // The savings section shows its own empty placeholder, not a stale value.
-        assert!(joined.contains("(no savings)"));
+        // The savings section explains why it is empty rather than showing a wall
+        // of zeros that reads as broken.
+        assert!(joined.contains("none yet"));
     }
 
     // Regression: multibyte runner / source names once panicked in `&s[..7]` and
@@ -313,7 +325,7 @@ mod tests {
             SavingsSnapshot::default(),
         );
         let joined = view.lines().join("\n");
-        assert!(joined.contains("(no savings)"));
+        assert!(joined.contains("none yet"), "explicit empty state: {joined}");
     }
 
     #[test]

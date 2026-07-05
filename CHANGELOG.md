@@ -6,6 +6,22 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.24.1] — 2026-07-05
+
+### Fixed
+- **Quality/value panels never populated:** the post-turn `QualitySnapshot` is
+  emitted just after `Completed`, but both stream ends closed on `done`, so the
+  trailing quality event was always dropped — leaving the quality score (and the
+  value ROI derived from it) stuck at zero. Added a bounded grace window that
+  holds the stream open for the trailing snapshot on both server and client.
+
+### Changed
+- Quality panel: A–F grade badge + score gauge + verdict pill + a quality trend
+  sparkline over recent turns + per-gate pips (tdd/clean/size/skill). Value panel:
+  ROI gauge + cost-vs-value micro-bar. Clear empty states for LSP ("no server for
+  <lang>"), savings ("accrues on cache hits & filtering"), and value ("no active
+  change") instead of bare zeros.
+
 ## [0.24.0] — 2026-07-05
 
 A major hardening + terminal-UX release: closed the security holes and crash/leak

@@ -77,6 +77,29 @@ impl ValueSnapshot {
             _ => 1,
         }
     }
+
+    /// Colour for the ROI / value figure: green "high", amber "medium", red
+    /// "low" — the same green→amber→red reading used across the rail.
+    fn value_color(&self) -> ratatui::style::Color {
+        let p = palette();
+        match self.estimated_value {
+            "high" => p.success,
+            "medium" => p.warn,
+            _ => p.error,
+        }
+    }
+}
+
+/// Compact token count: `1.2k`, `3.4M`, or the raw number below 1000.
+#[allow(clippy::cast_precision_loss)]
+fn fmt_tok(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 /// The value rail panel.
@@ -99,81 +122,74 @@ impl<'a> ValuePanel<'a> {
         let snap = self.snapshot;
         let inner_w = (area.width as usize).saturating_sub(2).max(1);
         let mut lines: Vec<Line<'_>> = Vec::new();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(p.border))
+            .title(" value ");
 
+        // ── Empty state ──────────────────────────────────────────────────────
+        // ROI is scoped to an openspec change; without one there is nothing to
+        // attribute spend to. Say so plainly rather than showing an empty meter.
         let Some(ref change) = snap.change_name else {
-            lines.push(Line::from(vec![Span::styled(
-                "no active change".to_owned(),
+            lines.push(Line::from(Span::styled(
+                "no active change",
                 Style::default().fg(p.text_dim),
-            )]));
-            frame.render_widget(
-                Paragraph::new(lines).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(p.border))
-                        .title(" value "),
-                ),
-                area,
-            );
+            )));
+            lines.push(Line::from(Span::styled(
+                "ROI tracks openspec/changes",
+                Style::default().fg(p.text_dim),
+            )));
+            frame.render_widget(Paragraph::new(lines).block(block), area);
             return;
         };
 
-        // Change name (truncated).
+        // Change name (dim italic, truncated).
         let name: String = change.chars().take(inner_w).collect();
-        lines.push(Line::from(vec![Span::styled(
+        lines.push(Line::from(Span::styled(
             name,
             Style::default()
                 .fg(p.text_dim)
                 .add_modifier(Modifier::ITALIC),
-        )]));
+        )));
 
-        // Token cost.
-        let tok_line = format!("{} tok", snap.token_cost);
-        let tok_truncated: String = tok_line.chars().take(inner_w).collect();
-        lines.push(Line::from(vec![Span::styled(
-            tok_truncated,
-            Style::default().fg(p.text),
-        )]));
-
-        // USD cost.
-        let usd_line = format!("${:.4}", snap.cost_dollars());
-        let usd_truncated: String = usd_line.chars().take(inner_w).collect();
-        lines.push(Line::from(vec![Span::styled(
-            usd_truncated,
-            Style::default().fg(p.text),
-        )]));
-
-        // Average quality.
-        let q_line = format!("q avg: {}/100", snap.quality_avg);
-        let q_truncated: String = q_line.chars().take(inner_w).collect();
-        lines.push(Line::from(vec![Span::styled(
-            q_truncated,
-            Style::default().fg(p.text_dim),
-        )]));
-
-        // ROI bar: ▓ filled, ░ empty — 3 segments max.
-        let filled = snap.roi_fill() as usize;
-        let empty = 3usize.saturating_sub(filled);
-        let bar = format!(
-            "roi: {}{}  ~{}",
-            "▓".repeat(filled),
-            "░".repeat(empty),
-            snap.estimated_value
-        );
-        let bar_truncated: String = bar.chars().take(inner_w).collect();
-        lines.push(Line::from(vec![Span::styled(
-            bar_truncated,
-            Style::default().fg(p.success),
-        )]));
-
-        frame.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(p.border))
-                    .title(" value "),
+        // ── ROI figure + gauge (molten-accent meter, 3 segments) ─────────────
+        let roi_color = snap.value_color();
+        let roi_w = inner_w.saturating_sub(10).clamp(3, 10);
+        let roi_gauge = crate::viz::microbar(f64::from(snap.roi_fill()), 3.0, roi_w);
+        lines.push(Line::from(vec![
+            Span::styled("ROI ", Style::default().fg(p.text_dim)),
+            Span::styled(roi_gauge, Style::default().fg(p.molten)),
+            Span::styled(
+                format!(" {}", snap.estimated_value),
+                Style::default().fg(roi_color).add_modifier(Modifier::BOLD),
             ),
-            area,
-        );
+        ]));
+
+        // ── Cost-vs-value micro-bar: quality-avg as the value delivered ──────
+        let val_w = inner_w.saturating_sub(8).clamp(3, 10);
+        let val_gauge = crate::viz::microbar(f64::from(snap.quality_avg), 100.0, val_w);
+        lines.push(Line::from(vec![
+            Span::styled("val ", Style::default().fg(p.text_dim)),
+            Span::styled(val_gauge, Style::default().fg(roi_color)),
+            Span::styled(
+                format!(" q{}", snap.quality_avg),
+                Style::default().fg(p.text_dim),
+            ),
+        ]));
+
+        // ── Cost + tokens ────────────────────────────────────────────────────
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("${:.4}", snap.cost_dollars()),
+                Style::default().fg(p.text),
+            ),
+            Span::styled(
+                format!("  {} tok", fmt_tok(snap.token_cost)),
+                Style::default().fg(p.text_dim),
+            ),
+        ]));
+
+        frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 }
 
