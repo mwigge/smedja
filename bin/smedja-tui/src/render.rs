@@ -418,7 +418,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
             constraints.push(Length(8));
         }
         if show_value {
-            constraints.push(Length(4));
+            constraints.push(Length(7));
         }
 
         let rail_chunks = Layout::vertical(constraints).split(rail_rect);

@@ -40,6 +40,14 @@ const STREAM_TIMEOUT_SECS: u64 = 600;
 /// This window allows late-connecting stream clients to still replay the turn.
 const DELTA_TTL_SECS: u64 = 60;
 
+/// Seconds to hold a stream connection open after a successful `done` so the
+/// trailing Tier-1 quality snapshot — which the post-turn gate publishes a beat
+/// *after* the turn completes — is delivered instead of being cut off by the
+/// terminal `done`. A failed turn (`error`) has no trailing snapshot, so its
+/// stream closes at once. In practice the snapshot arrives well under a second;
+/// this is only the ceiling for a turn that never produces one.
+const QUALITY_GRACE_SECS: u64 = 8;
+
 /// Seconds of inactivity after which a *non-terminal* turn buffer is considered
 /// stranded and evicted by the background sweeper. A turn whose orchestrator
 /// panics mid-flight never emits a terminal event, so its buffer would otherwise
@@ -422,32 +430,55 @@ async fn handle_stream_connection(
     let mut rx = dispatcher.subscribe();
 
     // Replay buffered events.  The buffer may already contain the terminal
-    // event if the turn completed before this connection was established.
-    let buffered: VecDeque<String> = {
+    // event if the turn completed before this connection was established. Capture
+    // the buffer's age too: it bounds how long we wait for a trailing quality
+    // snapshot on the replay path (see below).
+    let (buffered, buf_age): (VecDeque<String>, std::time::Duration) = {
         let s = store.lock().await;
-        s.get(&task_id).map(|b| b.lines.clone()).unwrap_or_default()
+        match s.get(&task_id) {
+            Some(b) => (
+                b.lines.clone(),
+                tokio::time::Instant::now().saturating_duration_since(b.last_activity),
+            ),
+            None => (VecDeque::new(), std::time::Duration::ZERO),
+        }
     };
 
-    let mut saw_terminal = false;
+    // Replay every buffered line. A successful turn's buffer ends with `done`
+    // followed a beat later by its Tier-1 `quality` snapshot, so replaying past
+    // the terminal `done` (rather than stopping at it) is what delivers that
+    // snapshot to a client that connected after the turn ended.
+    let mut saw_done = false;
+    let mut saw_error = false;
+    let mut saw_quality = false;
     for event_line in &buffered {
-        let is_terminal =
-            event_line.contains(r#""type":"done""#) || event_line.contains(r#""type":"error""#);
         if write_line(&mut writer, event_line).await.is_err() {
             return;
         }
-        if is_terminal {
-            saw_terminal = true;
-            break;
+        if event_line.contains(r#""type":"quality""#) {
+            saw_quality = true;
+        } else if event_line.contains(r#""type":"done""#) {
+            saw_done = true;
+        } else if event_line.contains(r#""type":"error""#) {
+            saw_error = true;
         }
     }
 
-    if saw_terminal {
-        // Do NOT evict the buffer here. Other clients may still connect and
-        // replay this completed turn within DELTA_TTL_SECS; removing it now would
-        // defeat that window. The scheduled TTL GC (armed when the terminal event
-        // was buffered) is the single owner of terminal-buffer removal.
+    // The turn is fully reported once its terminal event (and, for a success, the
+    // trailing quality snapshot) has been sent. When `done` was buffered but the
+    // quality snapshot has not landed in the buffer yet, fall through to the live
+    // loop and wait for it within a bounded grace window instead of closing now
+    // and dropping it. Do NOT evict the buffer here — the scheduled TTL GC owns
+    // terminal-buffer removal so other clients can still replay within the window.
+    if saw_error || (saw_done && saw_quality) {
         return;
     }
+    // Only wait for a trailing quality snapshot when `done` is *recent* — a fresh
+    // completion whose snapshot is still in flight. A stale buffer (the turn ended
+    // long ago and no snapshot ever landed) closes at once instead of idling for
+    // the whole grace window.
+    let grace = std::time::Duration::from_secs(QUALITY_GRACE_SECS);
+    let mut grace_until = (saw_done && buf_age < grace).then(|| tokio::time::Instant::now() + grace);
 
     // Forward live events filtered to this turn's task_id.
     //
@@ -457,8 +488,13 @@ async fn handle_stream_connection(
     // event for STREAM_TIMEOUT_SECS) should error out. The overall turn budget is
     // enforced separately by the orchestrator's wall-clock cap.
     loop {
-        let idle = std::time::Duration::from_secs(STREAM_TIMEOUT_SECS);
-        let event = match tokio::time::timeout(idle, rx.recv()).await {
+        // Normally an idle cap; after a successful `done` it is the remaining
+        // grace window we hold open for the trailing quality snapshot.
+        let wait = match grace_until {
+            Some(dl) => dl.saturating_duration_since(tokio::time::Instant::now()),
+            None => std::time::Duration::from_secs(STREAM_TIMEOUT_SECS),
+        };
+        let event = match tokio::time::timeout(wait, rx.recv()).await {
             Ok(Ok(ev)) => ev,
             Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
                 tracing::warn!(
@@ -470,12 +506,17 @@ async fn handle_stream_connection(
             }
             Ok(Err(broadcast::error::RecvError::Closed)) => break,
             Err(_elapsed) => {
-                let msg = json!({
-                    "type": "error",
-                    "message": format!("stream stalled: no events for {STREAM_TIMEOUT_SECS}s")
-                })
-                .to_string();
-                let _ = write_line(&mut writer, &msg).await;
+                // A grace deadline lapsing just means no quality snapshot followed
+                // this turn's `done` — close quietly. A genuine idle stall (no
+                // grace armed) is a transport failure worth surfacing.
+                if grace_until.is_none() {
+                    let msg = json!({
+                        "type": "error",
+                        "message": format!("stream stalled: no events for {STREAM_TIMEOUT_SECS}s")
+                    })
+                    .to_string();
+                    let _ = write_line(&mut writer, &msg).await;
+                }
                 break;
             }
         };
@@ -494,7 +535,23 @@ async fn handle_stream_connection(
         if write_line(&mut writer, &ndjson_line).await.is_err() {
             break;
         }
+
+        // The quality snapshot is the trailing event held open for after `done`;
+        // once it is delivered the turn is fully reported.
+        if ndjson_line.contains(r#""type":"quality""#) {
+            break;
+        }
         if is_terminal {
+            // A successful `done` may be followed by a Tier-1 quality snapshot the
+            // post-turn hook publishes a beat later — arm the grace window and keep
+            // the stream open for it. `error` turns get no snapshot, so close now.
+            if ndjson_line.contains(r#""type":"done""#) {
+                grace_until = Some(
+                    tokio::time::Instant::now()
+                        + std::time::Duration::from_secs(QUALITY_GRACE_SECS),
+                );
+                continue;
+            }
             break;
         }
     }
@@ -952,6 +1009,18 @@ mod tests {
             traceparent: None,
             correlation: CorrelationCtx::default(),
         });
+        // The post-turn gate publishes a trailing quality snapshot a beat after
+        // `done`; it lands in the same buffer.
+        dispatcher.publish(TurnEvent::QualitySnapshot {
+            score: 75,
+            tdd_pass: true,
+            clean_pass: true,
+            file_advisories: vec![],
+            skill_advisories: vec![],
+            llm_reviewed: false,
+            turn_id: Some("t-replay".into()),
+            correlation: CorrelationCtx::default(),
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
             store.lock().await.contains_key("t-replay"),
@@ -980,11 +1049,16 @@ mod tests {
             out
         }
 
-        // First client replays the completed turn.
+        // First client replays the completed turn — including the trailing
+        // quality snapshot that follows `done`.
         let out1 = replay(&store, &dispatcher).await;
         assert!(
             out1.contains(r#""type":"done""#),
             "first client must receive the done line; got: {out1}"
+        );
+        assert!(
+            out1.contains(r#""type":"quality""#),
+            "replay past `done` must also deliver the trailing quality snapshot; got: {out1}"
         );
 
         // The first client must NOT have evicted the buffer.
@@ -998,6 +1072,69 @@ mod tests {
         assert!(
             out2.contains(r#""type":"done""#),
             "second client must still replay the completed turn; got: {out2}"
+        );
+    }
+
+    // Regression: the Tier-1 quality snapshot is published a beat *after* the
+    // turn's `done`. `done` is terminal, so before the grace window the stream
+    // closed on `done` and the trailing snapshot was lost — leaving the quality
+    // and value panels perpetually empty. A live connection must stay open long
+    // enough to forward the snapshot that arrives after `done`.
+    #[tokio::test]
+    async fn live_stream_delivers_quality_snapshot_after_done() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let dispatcher = Arc::new(Dispatcher::new(64));
+        let store = spawn_delta_buffer(&dispatcher);
+
+        let (mut client, server) = UnixStream::pair().expect("socketpair");
+        let store_c = Arc::clone(&store);
+        let dispatcher_c = Arc::clone(&dispatcher);
+        let handle = tokio::spawn(async move {
+            handle_stream_connection(server, store_c, dispatcher_c).await;
+        });
+        client
+            .write_all(b"{\"task_id\":\"t-live\"}\n")
+            .await
+            .expect("write request");
+
+        // Give the handler a moment to subscribe before events are published.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        dispatcher.publish(TurnEvent::Completed {
+            session_id: "sess".into(),
+            turn_id: "t-live".into(),
+            output_tokens: 3,
+            input_tokens: None,
+            traceparent: None,
+            correlation: CorrelationCtx::default(),
+        });
+        // The snapshot arrives a beat after `done`, mirroring the async hook.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        dispatcher.publish(TurnEvent::QualitySnapshot {
+            score: 100,
+            tdd_pass: true,
+            clean_pass: true,
+            file_advisories: vec![],
+            skill_advisories: vec![],
+            llm_reviewed: false,
+            turn_id: Some("t-live".into()),
+            correlation: CorrelationCtx::default(),
+        });
+
+        let mut out = String::new();
+        client
+            .read_to_string(&mut out)
+            .await
+            .expect("read response");
+        handle.await.expect("handler task");
+
+        assert!(
+            out.contains(r#""type":"done""#),
+            "must forward the terminal done; got: {out}"
+        );
+        assert!(
+            out.contains(r#""type":"quality""#),
+            "must forward the quality snapshot published after done; got: {out}"
         );
     }
 }

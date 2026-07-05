@@ -36,10 +36,28 @@ pub(crate) async fn start_stream_reader(
         return;
     }
 
+    // After a successful `done` the daemon emits one trailing Tier-1 quality
+    // snapshot a beat later (the post-turn gate runs once the turn completes).
+    // Keep reading within a bounded grace window so that snapshot arrives instead
+    // of being cut off by the terminal `done`; a failed turn (`error`) has no
+    // trailing snapshot, so stop at once. The window matches the daemon's
+    // `QUALITY_GRACE_SECS`.
+    const QUALITY_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
     let mut line = String::new();
+    let mut grace_until: Option<tokio::time::Instant> = None;
     loop {
         line.clear();
-        match reader.read_line(&mut line).await {
+        let read = reader.read_line(&mut line);
+        let outcome = if let Some(dl) = grace_until {
+            let remaining = dl.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, read).await {
+                Ok(r) => r,
+                Err(_) => break, // grace elapsed with no trailing snapshot
+            }
+        } else {
+            read.await
+        };
+        match outcome {
             Ok(0) | Err(_) => break,
             Ok(_) => {
                 let trimmed = line.trim();
@@ -47,10 +65,16 @@ pub(crate) async fn start_stream_reader(
                     continue;
                 }
                 if let Ok(ev) = serde_json::from_str::<StreamEvent>(trimmed) {
-                    let terminal = ev.is_terminal();
+                    let is_quality = matches!(ev, StreamEvent::Quality { .. });
+                    let is_error = matches!(ev, StreamEvent::Error { .. });
+                    let is_done = matches!(ev, StreamEvent::Done { .. });
                     let _ = tx.send(ev);
-                    if terminal {
+                    if is_quality || is_error {
                         break;
+                    }
+                    if is_done {
+                        // Hold open briefly for the trailing quality snapshot.
+                        grace_until = Some(tokio::time::Instant::now() + QUALITY_GRACE);
                     }
                 }
             }
@@ -381,15 +405,26 @@ pub(crate) fn apply_stream_event(
             llm_reviewed,
             suggested_command,
         } => {
+            // Carry the trend history across snapshots (each Quality event
+            // replaces the whole snapshot) and append this turn's score, capped so
+            // the sparkline shows a rolling recent window.
+            const TREND_CAP: usize = 32;
+            let mut trend = std::mem::take(&mut state.quality_snapshot.trend);
+            trend.push(score);
+            if trend.len() > TREND_CAP {
+                trend.drain(0..trend.len() - TREND_CAP);
+            }
             // Update quality panel snapshot from the post-turn gate evaluation.
             state.quality_snapshot = quality_panel::QualitySnapshot {
                 score,
+                scored: true,
                 tdd_pass,
                 clean_pass,
                 llm_reviewed,
                 file_advisories,
                 skill_advisories,
                 suggested_command,
+                trend,
             };
             // Feed the real running average consumed by the value panel.
             state.quality_score_sum = state.quality_score_sum.saturating_add(u64::from(score));

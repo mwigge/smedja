@@ -149,6 +149,38 @@ pub fn microbar_mode(value: f64, max: f64, width: usize, mode: RenderMode) -> St
 }
 
 // ---------------------------------------------------------------------------
+// Sparklines
+// ---------------------------------------------------------------------------
+
+/// Eighth-block ramp, low → high, for inline trend sparklines.
+const SPARK_RAMP: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// Renders `values` as an inline block sparkline against a fixed `max`, one
+/// glyph per value. Empty input yields an empty string; a zero `max` floors to
+/// 1 so the ramp never divides by zero. Values above `max` clamp to the top
+/// block. The fixed scale (vs. per-window min/max) keeps a quality trend
+/// comparable across turns — a run of 100s always reads full-height.
+#[must_use]
+pub fn sparkline(values: &[u8], max: u8) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    let max = f64::from(max.max(1));
+    values
+        .iter()
+        .map(|&v| {
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let idx = ((f64::from(v) / max) * 7.0).round() as usize;
+            SPARK_RAMP[idx.min(7)]
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Zone colours
 // ---------------------------------------------------------------------------
 
@@ -288,6 +320,20 @@ mod tests {
         assert_eq!(microbar_mode(5.0, 10.0, 4, RenderMode::Ascii), "##--");
         assert!(microbar_mode(10.0, 10.0, 4, RenderMode::Block).contains('█'));
         assert!(microbar_mode(10.0, 10.0, 4, RenderMode::Braille).contains('█'));
+    }
+
+    #[test]
+    fn sparkline_maps_fixed_scale_and_len() {
+        // One glyph per value; fixed 0..=100 scale.
+        let s = sparkline(&[0, 50, 100], 100);
+        let chars: Vec<char> = s.chars().collect();
+        assert_eq!(chars.len(), 3);
+        assert_eq!(chars[0], '▁', "0 → lowest block");
+        assert_eq!(chars[2], '█', "max → highest block");
+        assert!(sparkline(&[], 100).is_empty());
+        // Over-max clamps to the top block; zero max does not panic.
+        assert_eq!(sparkline(&[200], 100), "█");
+        assert_eq!(sparkline(&[5], 0).chars().count(), 1);
     }
 
     #[test]
