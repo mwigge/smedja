@@ -28,6 +28,9 @@ pub struct SkillManifest {
     pub tags: Vec<String>,
     /// Extra files the skill depends on (relative to its directory).
     pub supporting_files: Vec<String>,
+    /// Glob patterns describing the files this skill is relevant to. Matched
+    /// against the turn's touched files by the auto-activation selector.
+    pub paths: Vec<String>,
 }
 
 /// A fully loaded skill: its parsed manifest, filesystem path, and body text.

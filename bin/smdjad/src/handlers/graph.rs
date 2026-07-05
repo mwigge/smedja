@@ -15,16 +15,18 @@ use crate::handlers::HandlerState;
 /// Default symbol cap for `graph.query` when `limit` is not supplied.
 const DEFAULT_QUERY_LIMIT: usize = 50;
 
-/// Resolves the workspace root: the `workspace` param if present and non-empty,
-/// else `SMEDJA_WORKSPACE`, else the daemon's current directory.
+/// Resolves the active repository root for a request: the `workspace` param if
+/// present and non-empty, else `SMEDJA_WORKSPACE`, else the daemon's current
+/// directory — then walked up to the enclosing git root.
 ///
-/// The result is canonicalised (with a fall-back to the raw path when it cannot
-/// be resolved) so that `index`, `query`, and `status` all key the graph DB off
-/// **one** canonical spelling. Without this, a relative path resolved against
-/// the daemon's cwd and the session's absolute root can hash to different DBs.
+/// Routing through [`crate::common::resolve_active_repo`] gives one canonical,
+/// absolute spelling so that `index`, `query`, and `status` all key the graph DB
+/// off the same path, and so a subdirectory passed to `graph.index` indexes the
+/// repository root rather than the subdir. When the start path is not inside a
+/// repo it resolves to the canonicalised start; when it cannot be resolved at
+/// all it is preserved verbatim (the index handler rejects a bad raw path).
 fn resolve_workspace(params: &Value) -> PathBuf {
-    let raw = resolve_workspace_raw(params);
-    raw.canonicalize().unwrap_or(raw)
+    crate::common::resolve_active_repo(&resolve_workspace_raw(params))
 }
 
 /// The un-canonicalised workspace root (param → `SMEDJA_WORKSPACE` → cwd).
@@ -126,7 +128,7 @@ pub(crate) async fn index(_state: HandlerState, params: Value) -> Result<Value, 
         }
         let mut store = GraphStore::open(&db_path).map_err(|e| graph_err(&e))?;
         store
-            .index_workspace_incremental(&index_root, "workspace", None)
+            .index_workspace_incremental(&index_root, "workspace")
             .map_err(|e| graph_err(&e))
     })
     .await
@@ -308,5 +310,21 @@ mod tests {
     fn resolve_workspace_falls_back_to_raw_when_unresolvable() {
         let ws = resolve_workspace(&json!({ "workspace": "definitely/not/a/real/path/xyzzy" }));
         assert_eq!(ws, PathBuf::from("definitely/not/a/real/path/xyzzy"));
+    }
+
+    // A `workspace` param pointing at a *subdirectory* of a repo must resolve to
+    // the repo's git root, so `graph.index` launched from a subdir indexes the
+    // whole repository (and keys the same DB as query/injection), not the subdir.
+    #[test]
+    fn resolve_workspace_walks_subdir_up_to_git_root() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        let sub = repo.path().join("crates").join("inner");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let resolved = resolve_workspace(&json!({ "workspace": sub.to_string_lossy() }));
+        assert_eq!(resolved, repo.path().canonicalize().unwrap());
+        // Index and query would therefore hash one and the same DB path.
+        assert_eq!(graph_db_path(&resolved), graph_db_path(repo.path()));
     }
 }

@@ -54,6 +54,71 @@ fn input_schema(tool_name: &str) -> Value {
     }
 }
 
+/// Builds the `prompts/list` result from the workspace bundle.
+///
+/// Every bundle skill and rule is advertised as an MCP *prompt*, so any external
+/// MCP client (Cursor, Claude Desktop, …) sees the identical one-folder skills
+/// smedja injects internally. Agents are omitted — they are routing targets, not
+/// prompts.
+fn prompts_list_result(workspace: &std::path::Path) -> Value {
+    let bundle = crate::bundle_config::load_bundle(workspace);
+    let prompts: Vec<Value> = bundle
+        .items
+        .iter()
+        .filter(|i| i.kind != smedja_plugins::BundleKind::Agent)
+        .map(|i| {
+            json!({
+                "name": i.name,
+                "description": i.description.lines().next().unwrap_or("").trim(),
+            })
+        })
+        .collect();
+    json!({ "prompts": prompts })
+}
+
+/// Builds a `prompts/get` result for a named bundle skill/rule, returning its
+/// body as a single user-role prompt message. Returns `Err` with a client-facing
+/// message when the name is unknown.
+fn prompts_get_result(workspace: &std::path::Path, params: &Value) -> Result<Value, String> {
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing prompt name".to_owned())?;
+    let bundle = crate::bundle_config::load_bundle(workspace);
+    let item = bundle
+        .find(name)
+        .filter(|i| i.kind != smedja_plugins::BundleKind::Agent)
+        .ok_or_else(|| format!("prompt not found: {name}"))?;
+    Ok(json!({
+        "description": item.description.lines().next().unwrap_or("").trim(),
+        "messages": [{
+            "role": "user",
+            "content": { "type": "text", "text": item.body },
+        }],
+    }))
+}
+
+/// Builds the `resources/list` result: every bundle item's supporting files,
+/// exposed as `file://` resources so a client can fetch a skill's helper assets.
+fn resources_list_result(workspace: &std::path::Path) -> Value {
+    let bundle = crate::bundle_config::load_bundle(workspace);
+    let mut resources: Vec<Value> = Vec::new();
+    for item in &bundle.items {
+        for (rel, abs) in item
+            .supporting_files
+            .iter()
+            .zip(item.supporting_file_paths())
+        {
+            resources.push(json!({
+                "uri": format!("file://{}", abs.display()),
+                "name": format!("{}/{rel}", item.name),
+                "mimeType": "text/plain",
+            }));
+        }
+    }
+    json!({ "resources": resources })
+}
+
 /// Builds the `tools/list` result advertising the read-safe subset.
 fn tools_list_result() -> Value {
     let tools: Vec<Value> = MCP_SERVER_TOOLS
@@ -111,13 +176,19 @@ pub(crate) async fn handle_request(
             json!({
                 "protocolVersion": "2024-11-05",
                 "serverInfo": { "name": "smedja", "version": env!("CARGO_PKG_VERSION") },
-                "capabilities": { "tools": {} }
+                "capabilities": { "tools": {}, "prompts": {}, "resources": {} }
             }),
         ),
         "tools/list" => Response::ok(id, tools_list_result()),
         "tools/call" => {
             handle_tools_call(id, &request.params, workspace, ingot, vault, embedder).await
         }
+        "prompts/list" => Response::ok(id, prompts_list_result(workspace)),
+        "prompts/get" => match prompts_get_result(workspace, &request.params) {
+            Ok(result) => Response::ok(id, result),
+            Err(msg) => Response::err(id, RpcError::new(codes::INVALID_PARAMS, msg)),
+        },
+        "resources/list" => Response::ok(id, resources_list_result(workspace)),
         other => Response::err(
             id,
             RpcError::new(
@@ -335,9 +406,129 @@ mod tests {
         );
     }
 
+    /// Writes a minimal one-folder bundle into `ws/.smedja` for the MCP prompt
+    /// tests: one skill with a supporting file, one rule, and one agent.
+    fn seed_bundle(ws: &std::path::Path) {
+        let smedja = ws.join(".smedja");
+        let skill_dir = smedja.join("skills/postgres-patterns");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: postgres-patterns\ndescription: Parameterised query patterns.\nmetadata:\n  supporting_files:\n    - helpers/schema.sql\n---\nUse $1 placeholders.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(smedja.join("rules")).unwrap();
+        std::fs::write(
+            smedja.join("rules/no-unwrap.md"),
+            "---\nname: no-unwrap\ndescription: No unwrap in library code.\n---\nrule body\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(smedja.join("agents")).unwrap();
+        std::fs::write(
+            smedja.join("agents/reviewer.md"),
+            "---\nname: reviewer\ndescription: Reviews diffs.\ntools: read_file\n---\nagent body\n",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn prompts_list_returns_bundle_skills_and_rules_not_agents() {
+        let (ingot, vault) = deps();
+        let ws = tempfile::tempdir().unwrap();
+        seed_bundle(ws.path());
+
+        let req = Request::new(20, "prompts/list", json!({}));
+        let resp = handle_request(&req, ws.path(), &ingot, &vault, &embedder()).await;
+
+        assert!(resp.error.is_none(), "prompts/list must succeed");
+        let result = resp.result.expect("result present");
+        let names: Vec<&str> = result["prompts"]
+            .as_array()
+            .expect("prompts array")
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"postgres-patterns"), "skill listed");
+        assert!(names.contains(&"no-unwrap"), "rule listed");
+        assert!(!names.contains(&"reviewer"), "agent not listed as a prompt");
+    }
+
+    #[tokio::test]
+    async fn prompts_get_returns_skill_body() {
+        let (ingot, vault) = deps();
+        let ws = tempfile::tempdir().unwrap();
+        seed_bundle(ws.path());
+
+        let req = Request::new(21, "prompts/get", json!({ "name": "postgres-patterns" }));
+        let resp = handle_request(&req, ws.path(), &ingot, &vault, &embedder()).await;
+
+        assert!(resp.error.is_none(), "prompts/get must succeed");
+        let result = resp.result.expect("result present");
+        let text = result["messages"][0]["content"]["text"].as_str().unwrap();
+        assert!(
+            text.contains("$1 placeholders"),
+            "skill body returned; got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompts_get_unknown_name_is_invalid_params() {
+        let (ingot, vault) = deps();
+        let ws = tempfile::tempdir().unwrap();
+        seed_bundle(ws.path());
+
+        let req = Request::new(22, "prompts/get", json!({ "name": "does-not-exist" }));
+        let resp = handle_request(&req, ws.path(), &ingot, &vault, &embedder()).await;
+        let err = resp.error.expect("unknown prompt must error");
+        assert_eq!(err.code, smedja_rpc::codes::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn resources_list_exposes_supporting_files() {
+        let (ingot, vault) = deps();
+        let ws = tempfile::tempdir().unwrap();
+        seed_bundle(ws.path());
+
+        let req = Request::new(23, "resources/list", json!({}));
+        let resp = handle_request(&req, ws.path(), &ingot, &vault, &embedder()).await;
+
+        assert!(resp.error.is_none(), "resources/list must succeed");
+        let result = resp.result.expect("result present");
+        let resources = result["resources"].as_array().expect("resources array");
+        assert!(
+            resources
+                .iter()
+                .any(|r| r["name"].as_str() == Some("postgres-patterns/helpers/schema.sql")),
+            "supporting file exposed as a resource; got: {resources:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_prompts_and_resources_capabilities() {
+        let (ingot, vault) = deps();
+        let req = Request::new(24, "initialize", json!({}));
+        let resp = handle_request(
+            &req,
+            std::path::Path::new("/tmp"),
+            &ingot,
+            &vault,
+            &embedder(),
+        )
+        .await;
+        let caps = &resp.result.expect("result")["capabilities"];
+        assert!(
+            caps.get("prompts").is_some(),
+            "prompts capability advertised"
+        );
+        assert!(
+            caps.get("resources").is_some(),
+            "resources capability advertised"
+        );
+    }
+
     #[test]
     fn unsupported_method_is_method_not_found() {
-        let req = Request::new(1, "resources/list", Value::Null);
+        let req = Request::new(1, "completion/complete", Value::Null);
         // Build minimal deps synchronously is awkward; assert via the matcher in
         // handle_request through a runtime.
         let rt = tokio::runtime::Runtime::new().unwrap();

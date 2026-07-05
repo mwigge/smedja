@@ -93,6 +93,21 @@ pub(crate) fn build_base_system(
             with_skills
         }
     };
+    // Runner-agnostic bundle: inject the cheap L1 index (name + description for
+    // every skill and rule) into the stable prefix so the model knows what is
+    // available without paying for full bodies. Full bodies are activated
+    // per-turn by the selector (see [`build_selected_skills_block`]) or pulled on
+    // demand via the `load_skill` tool. This rides the cacheable block because
+    // the index is stable across a session.
+    let bundle = crate::bundle_config::load_bundle(workspace_root);
+    let with_skills = match bundle.l1_index() {
+        Some(index) => format!(
+            "{with_skills}\n\n<available_skills>\nThe following skills and rules are available. \
+             Their full text is injected when relevant, or can be loaded on demand with the \
+             `load_skill` tool by name.\n{index}\n</available_skills>"
+        ),
+        None => with_skills,
+    };
     // Always-on, steer-first foundational discipline: the directive is
     // folded into the same cacheable system block as workspace skills so
     // it is sealed into the stable prefix before `seal_prefix()` and the
@@ -155,6 +170,33 @@ pub(crate) fn methodology_directive_for(
     Some(format!(
         "<methodology_discipline>\n{body}\n</methodology_discipline>"
     ))
+}
+
+/// Builds the per-turn `<selected_skills>` block by auto-activating bundle
+/// skills whose triggers/description match `turn_text` or whose `paths` globs
+/// match `touched_files`.
+///
+/// This is the L2 half of the two-tier delivery: the L1 index (name +
+/// description) already rode the stable prefix in [`build_base_system`]; here
+/// the *full bodies* of the relevant skills are inlined for this turn only, so
+/// the model gets the detail exactly when it is needed without bloating the
+/// cacheable prefix. Returns `None` when nothing is selected.
+pub(crate) fn build_selected_skills_block(
+    workspace_root: &std::path::Path,
+    turn_text: &str,
+    touched_files: &[String],
+) -> Option<String> {
+    let bundle = crate::bundle_config::load_bundle(workspace_root);
+    let selected = smedja_plugins::select(&bundle.items, turn_text, touched_files);
+    if selected.is_empty() {
+        return None;
+    }
+    let bodies = selected
+        .iter()
+        .map(|item| smedja_plugins::wrap_skill_body(&item.name, &item.body))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Some(format!("<selected_skills>\n{bodies}\n</selected_skills>"))
 }
 
 /// Derives a short title (≤10 words) from raw user turn content.
@@ -339,6 +381,65 @@ mod tests {
         let ws = temp_ws("no-agents");
         let out = build_base_system(&ws, "", AgentRole::Impl);
         assert!(!out.contains("<agents_md>"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn build_base_system_injects_bundle_l1_index() {
+        let ws = temp_ws("bundle-index");
+        let skills = ws.join(".smedja/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(
+            skills.join("postgres-patterns.md"),
+            "---\nname: postgres-patterns\ndescription: Parameterised query patterns.\n---\nbody\n",
+        )
+        .unwrap();
+        let out = build_base_system(&ws, "", AgentRole::Impl);
+        assert!(
+            out.contains("<available_skills>"),
+            "L1 index block present; got:\n{out}"
+        );
+        assert!(
+            out.contains("postgres-patterns"),
+            "skill listed in L1 index"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn build_selected_skills_block_activates_on_trigger() {
+        let ws = temp_ws("selected");
+        let skills = ws.join(".smedja/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(
+            skills.join("pg.md"),
+            "---\nname: pg\ndescription: Postgres patterns.\nmetadata:\n  trigger_phrases:\n    - postgres\n---\nUse $1 placeholders.\n",
+        )
+        .unwrap();
+        // Matching turn text activates the skill body.
+        let block = super::build_selected_skills_block(&ws, "write a postgres migration", &[])
+            .expect("skill selected");
+        assert!(block.contains("<selected_skills>"));
+        assert!(block.contains("Use $1 placeholders."), "full body inlined");
+        // Unrelated turn text selects nothing.
+        assert!(super::build_selected_skills_block(&ws, "write a rust struct", &[]).is_none());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn build_selected_skills_block_activates_on_touched_path() {
+        let ws = temp_ws("selected-path");
+        let skills = ws.join(".smedja/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(
+            skills.join("sql.md"),
+            "---\nname: sql\ndescription: SQL.\nmetadata:\n  paths:\n    - \"**/*.sql\"\n---\nSQL rules.\n",
+        )
+        .unwrap();
+        let touched = vec!["db/migrations/001.sql".to_owned()];
+        let block = super::build_selected_skills_block(&ws, "unrelated", &touched)
+            .expect("skill selected by touched path");
+        assert!(block.contains("SQL rules."));
         let _ = std::fs::remove_dir_all(&ws);
     }
 }

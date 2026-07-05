@@ -92,6 +92,14 @@ pub struct EmbedderIdentity {
 /// [`tokio::task::spawn_blocking`] to avoid blocking the executor thread.
 pub struct Vault {
     pub(crate) conn: rusqlite::Connection,
+    /// Lazily-built ANN indices, one per `(embedder_model_id, dim)` group.
+    ///
+    /// Behind a `RefCell` so the read paths ([`Vault::search`]/[`Vault::query`])
+    /// can build and cache an index through `&self`. Invalidated on every write
+    /// via [`Vault::invalidate_index`]. `Vault` is already `!Sync` (it owns a
+    /// `rusqlite::Connection`) and runs behind a mutex at every call site, so the
+    /// interior mutability adds no new sharing hazard.
+    pub(crate) index_cache: std::cell::RefCell<crate::ann::IndexCache>,
 }
 
 /// A fully-hydrated row read during [`Vault::search`].
@@ -170,7 +178,10 @@ impl Vault {
     #[must_use = "check the Result; a failed open means the vault is unavailable"]
     pub fn open(path: &std::path::Path) -> Result<Self, VaultError> {
         let conn = rusqlite::Connection::open(path)?;
-        let vault = Self { conn };
+        let vault = Self {
+            conn,
+            index_cache: std::cell::RefCell::new(crate::ann::IndexCache::default()),
+        };
         vault.migrate()?;
         Ok(vault)
     }
@@ -186,7 +197,10 @@ impl Vault {
     #[must_use = "check the Result; a failed open means the in-memory vault is unavailable"]
     pub fn open_in_memory() -> Result<Self, VaultError> {
         let conn = rusqlite::Connection::open_in_memory()?;
-        let vault = Self { conn };
+        let vault = Self {
+            conn,
+            index_cache: std::cell::RefCell::new(crate::ann::IndexCache::default()),
+        };
         vault.migrate()?;
         Ok(vault)
     }
@@ -254,6 +268,16 @@ impl Vault {
         }
 
         Ok(())
+    }
+
+    /// Drops every cached ANN index.
+    ///
+    /// Called after any mutation of `vault_entries` so the next read rebuilds the
+    /// index from the current table state. The vault is read-mostly, so a full
+    /// rebuild on the next read is cheaper to reason about than incrementally
+    /// maintaining inverted lists and cannot drift from the table.
+    pub(crate) fn invalidate_index(&mut self) {
+        self.index_cache.borrow_mut().clear();
     }
 }
 

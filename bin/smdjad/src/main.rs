@@ -1,6 +1,7 @@
 pub mod acp;
 pub mod agent_server;
 pub mod alert;
+pub mod bundle_config;
 pub mod common;
 pub mod cowork;
 pub mod embedder;
@@ -27,6 +28,7 @@ pub mod quality_runner;
 pub mod sandbox;
 pub mod security;
 pub mod stream_server;
+pub mod subagents;
 
 mod exec;
 pub(crate) use exec::{exec_bash, exec_bash_ext};
@@ -372,6 +374,24 @@ async fn main() -> anyhow::Result<()> {
     // resolves to the FNV default; this never blocks startup.
     let embedder_config = embedder_config::load_embedder_config(&workspace_root);
     let embedder = embedder_config::resolve_embedder(&embedder_config).await;
+    // Surface recall quality at startup so lexical-only recall is never a silent
+    // surprise: a semantic backend logs at INFO, while the FNV default (keyword
+    // overlap, not semantic) is called out at WARN with the config that upgrades it.
+    {
+        let status = embedder.status();
+        if status.semantic {
+            tracing::info!(
+                model = %status.model_id,
+                dim = status.dim,
+                "vault recall: semantic embedder active"
+            );
+        } else {
+            tracing::warn!(
+                model = %status.model_id,
+                "vault recall is LEXICAL (FNV keyword overlap), not semantic — set [embedder] backend = \"learned\" with a local /v1/embeddings endpoint in .smedja/config.toml for semantic recall"
+            );
+        }
+    }
     // Record the active model as the vault's coarse identity marker so a future
     // open knows what the database mostly holds.
     {

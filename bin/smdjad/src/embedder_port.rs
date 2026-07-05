@@ -11,6 +11,7 @@
 //! for network I/O, degrading to the synchronous core on any failure so a
 //! missing or unreachable model never hard-fails a turn.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,13 +26,41 @@ pub const FNV_MODEL_ID: &str = "fnv-bow-128";
 /// stall the turn, so the live call is bounded.
 const EMBED_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Observable recall-quality state of the resolved [`Embedder`].
+///
+/// This is the "no silent degrade" surface: a caller (and the operator, via a
+/// startup log) can see whether vault recall is genuinely *semantic* or has
+/// fallen back to lexical FNV keyword overlap. Without this, a learned endpoint
+/// going down would quietly turn semantic recall into keyword search with no
+/// signal anywhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedderStatus {
+    /// Model id tagged on rows this backend produces.
+    pub model_id: String,
+    /// Vector dimension produced.
+    pub dim: usize,
+    /// `true` when the backend is a real semantic model; `false` for the lexical
+    /// FNV bag-of-words backend.
+    pub semantic: bool,
+    /// `true` when a semantic backend is currently serving the FNV fallback
+    /// because its endpoint is unreachable — recall is lexical *right now*
+    /// despite `semantic == true`. Always `false` for the FNV backend, whose FNV
+    /// output is intentional rather than a degradation.
+    pub degraded: bool,
+    /// Count of live embeds that have fallen back to FNV over this process's
+    /// lifetime. Non-zero on a semantic backend means recall has been lexical for
+    /// at least some queries.
+    pub fallback_count: u64,
+}
+
 /// Port for producing embedding vectors for vault text.
 ///
 /// Implementors expose a deterministic, offline [`embed`](Embedder::embed) core,
 /// a stable [`model_id`](Embedder::model_id), and the [`dim`](Embedder::dim) of
 /// the vectors they produce. The async [`embed_query`](Embedder::embed_query)
 /// drives the live (possibly networked) path and MUST NOT panic or abort on
-/// backend failure — it degrades to a usable vector instead.
+/// backend failure — it degrades to a usable vector instead, and records that
+/// degradation on [`status`](Embedder::status) rather than swallowing it.
 #[async_trait]
 pub trait Embedder: Send + Sync {
     /// Embeds `text` synchronously into a [`dim`](Embedder::dim)-length vector.
@@ -58,6 +87,22 @@ pub trait Embedder: Send + Sync {
     /// the turn.
     async fn embed_query(&self, text: &str) -> Vec<f32> {
         self.embed(text)
+    }
+
+    /// Returns the backend's current recall-quality [`EmbedderStatus`].
+    ///
+    /// The default reports a non-semantic, non-degraded backend (the FNV core):
+    /// its FNV output is the intended behaviour, not a fallback. A semantic
+    /// backend overrides this to report `semantic = true` and whether it is
+    /// currently [`degraded`](EmbedderStatus::degraded) to the FNV fallback.
+    fn status(&self) -> EmbedderStatus {
+        EmbedderStatus {
+            model_id: self.model_id().to_owned(),
+            dim: self.dim(),
+            semantic: false,
+            degraded: false,
+            fallback_count: 0,
+        }
     }
 }
 
@@ -114,6 +159,12 @@ pub struct LearnedEmbedder {
     dim: usize,
     /// Offline fallback used by `embed` and whenever the endpoint fails.
     fallback: FnvEmbedder,
+    /// `true` while the endpoint is unreachable and live embeds are serving the
+    /// FNV fallback. Flipped on the first failure and cleared on recovery so the
+    /// degrade/recover transitions are logged exactly once each, not per query.
+    degraded: AtomicBool,
+    /// Total live embeds that have fallen back to FNV over this process lifetime.
+    fallback_count: AtomicU64,
 }
 
 impl LearnedEmbedder {
@@ -131,7 +182,44 @@ impl LearnedEmbedder {
             model_id: model_id.into(),
             dim,
             fallback: FnvEmbedder::new(),
+            degraded: AtomicBool::new(false),
+            fallback_count: AtomicU64::new(0),
         }
+    }
+
+    /// Records a live fallback to FNV and surfaces the *transition* into a
+    /// degraded state exactly once (a per-query warning would flood the log while
+    /// the endpoint stays down). Recall is lexical until [`note_success`] clears
+    /// the flag.
+    ///
+    /// [`note_success`]: LearnedEmbedder::note_success
+    fn note_fallback(&self) {
+        self.fallback_count.fetch_add(1, Ordering::Relaxed);
+        if !self.degraded.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                model = %self.model_id,
+                "embedder DEGRADED: learned endpoint unreachable, vault recall has fallen back to lexical FNV keyword overlap until it recovers"
+            );
+        } else {
+            tracing::debug!(model = %self.model_id, "learned endpoint still degraded; FNV fallback");
+        }
+    }
+
+    /// Clears the degraded flag on a successful live embed, logging the recovery
+    /// once (only when transitioning out of a degraded episode).
+    fn note_success(&self) {
+        if self.degraded.swap(false, Ordering::Relaxed) {
+            tracing::info!(
+                model = %self.model_id,
+                "embedder recovered: learned endpoint reachable again, semantic recall restored"
+            );
+        }
+    }
+
+    /// Current fallback count — the number of live embeds served by FNV.
+    #[must_use]
+    pub fn fallback_count(&self) -> u64 {
+        self.fallback_count.load(Ordering::Relaxed)
     }
 
     /// Requests an embedding from the endpoint, returning `None` on any failure.
@@ -173,10 +261,23 @@ impl Embedder for LearnedEmbedder {
 
     async fn embed_query(&self, text: &str) -> Vec<f32> {
         if let Some(vec) = self.request_embedding(text).await {
+            self.note_success();
             vec
         } else {
-            tracing::debug!("learned endpoint unavailable; using FNV fallback for this embed");
+            // No longer a silent debug line: fallback is tracked and the
+            // degrade transition is surfaced at WARN via `note_fallback`.
+            self.note_fallback();
             self.fallback.embed(text)
+        }
+    }
+
+    fn status(&self) -> EmbedderStatus {
+        EmbedderStatus {
+            model_id: self.model_id.clone(),
+            dim: self.dim,
+            semantic: true,
+            degraded: self.degraded.load(Ordering::Relaxed),
+            fallback_count: self.fallback_count.load(Ordering::Relaxed),
         }
     }
 }
@@ -286,6 +387,74 @@ mod tests {
         let e = LearnedEmbedder::new(server.base_url(), "minilm-l6-v2", 4);
         let v = e.embed_query("hello").await;
         assert_eq!(v, crate::embedder::embed("hello"));
+    }
+
+    // ── status / no silent degrade ────────────────────────────────────────────
+
+    #[test]
+    fn fnv_status_is_semantic_false_and_never_degraded() {
+        let s = FnvEmbedder::new().status();
+        assert!(!s.semantic, "FNV is a lexical backend");
+        assert!(!s.degraded, "FNV output is intended, never a degradation");
+        assert_eq!(s.fallback_count, 0);
+        assert_eq!(s.model_id, FNV_MODEL_ID);
+        assert_eq!(s.dim, 128);
+    }
+
+    #[tokio::test]
+    async fn learned_status_reports_healthy_before_any_failure() {
+        let e = LearnedEmbedder::new("http://127.0.0.1:9", "minilm-l6-v2", 4);
+        let s = e.status();
+        assert!(s.semantic, "a learned backend is semantic");
+        assert!(!s.degraded, "no live embed has failed yet");
+        assert_eq!(s.fallback_count, 0);
+    }
+
+    #[tokio::test]
+    async fn learned_fallback_is_surfaced_not_silent() {
+        // Unreachable endpoint → the live embed degrades, and that degradation is
+        // observable on the status surface (a status field + counter), never
+        // silently swallowed.
+        let e = LearnedEmbedder::new("http://127.0.0.1:1", "minilm-l6-v2", 4);
+        assert!(!e.status().degraded, "starts healthy");
+
+        let _ = e.embed_query("auth token refresh").await;
+        let s = e.status();
+        assert!(
+            s.degraded,
+            "after a failed live embed the backend must report degraded"
+        );
+        assert_eq!(s.fallback_count, 1, "the fallback must be counted");
+        assert!(
+            s.semantic,
+            "still a semantic backend, just degraded right now"
+        );
+
+        // A second failure keeps it degraded and increments the counter.
+        let _ = e.embed_query("second query").await;
+        assert_eq!(e.fallback_count(), 2);
+        assert!(e.status().degraded);
+    }
+
+    #[tokio::test]
+    async fn learned_status_clears_after_recovery() {
+        // Degrade against a dead port, then point a fresh call at a live server
+        // by constructing a new embedder — here we assert the recovery path clears
+        // the flag when a live embed succeeds.
+        let server = MockEmbeddingsServer::spawn(200, vec![0.1, 0.2, 0.3, 0.4]).await;
+        let e = LearnedEmbedder::new(server.base_url(), "minilm-l6-v2", 4);
+        // Force a degraded state first via the internal transition.
+        e.note_fallback();
+        assert!(e.status().degraded);
+        // A successful live embed must clear the degraded flag (note_success).
+        let v = e.embed_query("hello").await;
+        assert_eq!(v, vec![0.1_f32, 0.2, 0.3, 0.4]);
+        assert!(
+            !e.status().degraded,
+            "a successful live embed must clear the degraded flag"
+        );
+        // The historical fallback is still counted for observability.
+        assert_eq!(e.status().fallback_count, 1);
     }
 
     /// Minimal one-shot HTTP server returning a fixed `/v1/embeddings` response.

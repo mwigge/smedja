@@ -142,6 +142,7 @@ impl Vault {
             ],
         )?;
         tx.commit()?;
+        self.invalidate_index();
         Ok(())
     }
 
@@ -182,6 +183,7 @@ impl Vault {
                 i64::try_from(entry.dim).unwrap_or(i64::MAX),
             ],
         )?;
+        self.invalidate_index();
         Ok(())
     }
 
@@ -291,6 +293,7 @@ impl Vault {
             "DELETE FROM vault_entries WHERE id = ?1",
             rusqlite::params![id],
         )?;
+        self.invalidate_index();
         Ok(())
     }
 
