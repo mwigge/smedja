@@ -98,6 +98,12 @@ fn render_verification(result: &VerifyResult) -> String {
         result.exit_code
     ));
 
+    // Reuse the shared testkit parser to normalise the verification output into
+    // a structured pass/fail tally when it recognises a known test format.
+    if let Some(summary) = normalized_test_summary(stdout, stderr) {
+        section.push_str(&format!("\nNormalised test report: {summary}\n"));
+    }
+
     let failing = failing_test_names(stdout, stderr);
     if !failing.is_empty() {
         section.push_str("\n### Failing tests\n\n");
@@ -146,6 +152,29 @@ fn tail_truncate(text: &str) -> String {
     } else {
         kept
     }
+}
+
+/// Normalises verification output into a one-line pass/fail summary using the
+/// shared [`smedja_testkit`] parsers, picking whichever known format recognised
+/// the most tests. Returns `None` when no format matched (e.g. a build error),
+/// leaving the raw-output sections to carry the detail.
+fn normalized_test_summary(stdout: &str, stderr: &str) -> Option<String> {
+    let combined = format!("{stdout}\n{stderr}");
+    let candidates = [
+        smedja_testkit::parse::parse_cargo_text(&combined),
+        smedja_testkit::parse::parse_go_json(&combined),
+        smedja_testkit::parse::parse_junit_xml(&combined),
+    ];
+    let best = candidates
+        .into_iter()
+        .max_by_key(|p| p.passed + p.failed + p.skipped)?;
+    if best.passed + best.failed + best.skipped == 0 {
+        return None;
+    }
+    Some(format!(
+        "{} passed, {} failed, {} skipped",
+        best.passed, best.failed, best.skipped
+    ))
 }
 
 /// Extracts recognisable failing test names from verification output.
@@ -212,6 +241,29 @@ mod tests {
             stderr: stderr.to_owned(),
             timed_out: false,
         }
+    }
+
+    #[test]
+    fn normalized_summary_uses_testkit_cargo_parse() {
+        let stdout = "test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s";
+        let summary = normalized_test_summary(stdout, "").unwrap();
+        assert_eq!(summary, "2 passed, 1 failed, 0 skipped");
+    }
+
+    #[test]
+    fn normalized_summary_none_for_build_error() {
+        let stderr = "error[E0432]: unresolved import `foo`";
+        assert!(normalized_test_summary("", stderr).is_none());
+    }
+
+    #[test]
+    fn verification_section_includes_normalized_report() {
+        let result = failing(
+            "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s",
+            "",
+        );
+        let section = render_verification(&result);
+        assert!(section.contains("Normalised test report: 5 passed, 0 failed, 0 skipped"));
     }
 
     #[test]

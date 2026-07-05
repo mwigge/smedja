@@ -26,29 +26,6 @@ pub(crate) struct GovArtifact {
     pub(crate) status: String,
 }
 
-/// Returns the manifest file names present in `workspace`, in detection order:
-/// Cargo.toml, package.json, go.mod, pyproject.toml.
-pub(crate) fn detect_project_types(workspace: &std::path::Path) -> Vec<&'static str> {
-    [
-        workspace
-            .join("Cargo.toml")
-            .exists()
-            .then_some("Cargo.toml"),
-        workspace
-            .join("package.json")
-            .exists()
-            .then_some("package.json"),
-        workspace.join("go.mod").exists().then_some("go.mod"),
-        workspace
-            .join("pyproject.toml")
-            .exists()
-            .then_some("pyproject.toml"),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
-}
-
 /// Scans `<workspace>/gov/` for TOML files and parses them as govctl artifacts.
 ///
 /// Expected TOML fields: `id`, `title`, `status` (required), `type`/`kind` (optional).

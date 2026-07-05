@@ -2741,32 +2741,6 @@ fn lsp_snapshot_from_rpc_empty_inputs_yield_empty_snapshot() {
     assert!(snap.diagnostics.is_empty());
 }
 
-// --- detect_project_types ------------------------------------------------
-
-#[test]
-fn detect_project_types_returns_cargo_when_only_cargo_toml_present() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
-    assert_eq!(detect_project_types(dir.path()), vec!["Cargo.toml"]);
-}
-
-#[test]
-fn detect_project_types_returns_all_present_manifests() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
-    std::fs::write(dir.path().join("package.json"), "{}").unwrap();
-    let types = detect_project_types(dir.path());
-    assert_eq!(types.len(), 2);
-    assert!(types.contains(&"Cargo.toml"));
-    assert!(types.contains(&"package.json"));
-}
-
-#[test]
-fn detect_project_types_returns_empty_for_no_manifests() {
-    let dir = tempfile::tempdir().unwrap();
-    assert!(detect_project_types(dir.path()).is_empty());
-}
-
 // --- poll backoff --------------------------------------------------------
 
 #[test]

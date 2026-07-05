@@ -156,6 +156,42 @@ pub(crate) fn builtin_tools(is_sre_mode: bool) -> Vec<serde_json::Value> {
                 "required": ["file", "line", "new_name"]
             }
         }),
+        serde_json::json!({
+            "name": "test_run",
+            "description": "Discover and run the workspace's tests across every language, \
+                returning one normalised report. Recursively detects suites (Cargo, npm \
+                scripts.test, pytest, Go, Maven, Gradle, .NET) and delegates to a monorepo \
+                meta-runner (nx/turbo/moon/just/task) when present. Each suite is run with a \
+                machine-readable format and normalised to \
+                { suites: [{ runner, dir, passed, failed, skipped, duration_ms, failures }] }. \
+                suite: optional runner-label filter (e.g. 'cargo', 'go'). scope: 'all' (default) \
+                or 'affected' (native change-selectors, safe fallback to full). changed_since: \
+                git ref for affected mode.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "suite": { "type": "string", "description": "optional runner label to run just one suite" },
+                    "scope": { "type": "string", "description": "'all' (default) or 'affected'" },
+                    "changed_since": { "type": "string", "description": "git ref for affected-mode selectors" }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "review_run",
+            "description": "Run the deterministic, polyglot review layer over the changed files \
+                and grade against seven uniform dimensions (tdd/coverage, format, import-sort, \
+                solid, clean, size, maintainable). Detects the languages touched, runs each \
+                language's canonical format/import-sort/lint tools on changed files only \
+                (skipping any tool that is not installed), normalises every result to a \
+                SARIF-shaped finding, and returns a composite A-F grade with pass/fail plus a \
+                SARIF log. scope: 'all' (diff vs HEAD~1, default) or 'staged' (the index).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "description": "'all' (default, vs HEAD~1) or 'staged'" }
+                }
+            }
+        }),
     ];
     if is_sre_mode {
         builtin_tools.push(serde_json::json!({

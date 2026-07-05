@@ -15,9 +15,9 @@ use serde_json::{json, Value};
 use smedja_rpc::client::Client;
 
 use crate::{
-    detect_project_types, fetch_latest_version, format_gov_list, format_openspec_list,
-    format_openspec_status, format_resume_rows, format_token_count, gov_create, gov_transition,
-    is_newer, parse_resume_args, parse_review_scope, push_system_message, render_findings_summary,
+    fetch_latest_version, format_gov_list, format_openspec_list, format_openspec_status,
+    format_resume_rows, format_token_count, gov_create, gov_transition, is_newer,
+    parse_resume_args, parse_review_scope, push_system_message, render_findings_summary,
     resume_blocked_by_pending_turn, resume_into_view, resume_plan, run_openspec, run_upgrade,
     scan_gov_artifacts, slugify, submit, AppState, OutputType, HELP_TEXT, VERSION,
 };
@@ -783,71 +783,58 @@ pub(crate) async fn dispatch_slash(
         }
         "test" => {
             let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let detected = detect_project_types(&workspace);
-            let has_cargo = detected.contains(&"Cargo.toml");
-            let has_npm = detected.contains(&"package.json");
-            let has_go = detected.contains(&"go.mod");
-            let has_py = detected.contains(&"pyproject.toml");
-            if detected.len() > 1 {
-                push_system_message(
-                    state,
-                    format!(
-                        "note: multiple manifests ({}) — using {} (pass /test cargo|npm|go|py to override)",
-                        detected.join(", "),
-                        detected[0]
-                    ),
-                );
-            }
-            let (cmd, cmd_args): (&str, &[&str]) = match args {
-                "cargo" => ("cargo", &["test", "--", "--test-output=immediate"]),
-                "npm" => ("npm", &["test"]),
-                "go" => ("go", &["test", "./..."]),
-                "py" | "pytest" => ("python", &["-m", "pytest"]),
-                _ => {
-                    if has_cargo {
-                        ("cargo", &["test", "--", "--test-output=immediate"])
-                    } else if has_npm {
-                        ("npm", &["test"])
-                    } else if has_go {
-                        ("go", &["test", "./..."])
-                    } else if has_py {
-                        ("python", &["-m", "pytest"])
-                    } else {
-                        ("cargo", &["test", "--", "--test-output=immediate"])
-                    }
-                }
+            // Thin caller of the shared testkit: detect every suite, run each
+            // requesting a machine format, and render the normalised report —
+            // the same detection + parsing the `test_run` agent tool uses, so
+            // the TUI and the daemon agree on results.
+            let scope = if args.trim() == "affected" {
+                smedja_testkit::Scope::Affected
+            } else {
+                smedja_testkit::Scope::All
             };
+            let suite_filter = match args.trim() {
+                "" | "affected" => None,
+                other => Some(other.to_owned()),
+            };
+            let mut suites = smedja_testkit::detect_suites(&workspace);
+            if let Some(filter) = suite_filter.as_deref() {
+                suites.retain(|s| s.runner.label().eq_ignore_ascii_case(filter));
+            }
+            if suites.is_empty() {
+                push_system_message(state, "test: no test suites detected".to_owned());
+                return Ok(true);
+            }
+            let labels: Vec<&str> = suites.iter().map(|s| s.runner.label()).collect();
             push_system_message(
                 state,
-                format!("running {cmd} {}\u{2026}", cmd_args.join(" ")),
+                format!(
+                    "running {} suite(s): {}\u{2026}",
+                    suites.len(),
+                    labels.join(", ")
+                ),
             );
-            let text = match tokio::process::Command::new(cmd)
-                .args(cmd_args)
-                .current_dir(&workspace)
-                .output()
-                .await
-            {
-                Err(e) => format!("{cmd} failed to start: {e}"),
-                Ok(out) => {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let combined = format!("{stdout}{stderr}");
-                    let passed = combined.matches("test result: ok").count()
-                        + combined.matches("PASSED").count()
-                        + combined.matches(" passed").count();
-                    let failed =
-                        combined.matches("FAILED").count() + combined.matches(" failed").count();
-                    let mut summary = format!("test: {passed} passed, {failed} failed");
-                    // Show last 20 lines of output for context.
-                    let tail: Vec<&str> = combined.lines().rev().take(20).collect();
-                    let tail_text: Vec<&str> = tail.into_iter().rev().collect();
-                    if !tail_text.is_empty() {
-                        summary.push('\n');
-                        summary.push_str(&tail_text.join("\n"));
-                    }
-                    summary
+
+            let mut report = smedja_testkit::TestReport::default();
+            for suite in &suites {
+                report
+                    .suites
+                    .push(smedja_testkit::run_suite(&workspace, suite, scope, None).await);
+            }
+
+            let mut text = format!("test: {}", report.summary());
+            for s in &report.suites {
+                text.push('\n');
+                text.push_str(&format!(
+                    "  [{}] {} passed, {} failed, {} skipped ({} ms)",
+                    s.runner, s.passed, s.failed, s.skipped, s.duration_ms
+                ));
+                if let Some(note) = &s.note {
+                    text.push_str(&format!(" — {note}"));
                 }
-            };
+                for f in s.failures.iter().take(10) {
+                    text.push_str(&format!("\n      FAIL {} — {}", f.name, f.message));
+                }
+            }
             push_system_message(state, text);
             Ok(true)
         }

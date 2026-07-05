@@ -58,8 +58,7 @@ pub(crate) use editor::{open_in_editor, resolve_editor};
 pub(crate) use events::{apply_stream_event, start_stream_reader};
 #[allow(unused_imports)]
 pub(crate) use governance::{
-    detect_project_types, format_gov_list, gov_create, gov_transition, scan_gov_artifacts,
-    GovArtifact,
+    format_gov_list, gov_create, gov_transition, scan_gov_artifacts, GovArtifact,
 };
 #[allow(unused_imports)]
 pub(crate) use input::{
