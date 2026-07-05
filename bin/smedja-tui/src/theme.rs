@@ -257,7 +257,99 @@ pub fn init_palette(cfg: Option<&TuiColorConfig>) {
         apply!(code_added);
         apply!(code_removed);
     }
+    // On terminals without advertised truecolor, degrade the RGB palette to the
+    // 16 named ANSI colours so accents survive tmux / remote sessions.
+    if !truecolor_supported() {
+        p = degrade_to_ansi(&p);
+    }
     let _ = PALETTE.set(p);
+}
+
+/// True when the terminal advertises 24-bit colour via `COLORTERM`
+/// (`truecolor` / `24bit`). Remote shells, bare `tmux`, and legacy emulators
+/// leave it unset — there we degrade the RGB palette to the 16 named ANSI
+/// colours so the accents map through the terminal's own scheme instead of
+/// washing out to an approximate truecolor SGR the host may clamp.
+#[must_use]
+pub fn truecolor_supported() -> bool {
+    std::env::var("COLORTERM").is_ok_and(|v| {
+        let v = v.to_ascii_lowercase();
+        v.contains("truecolor") || v.contains("24bit")
+    })
+}
+
+/// Maps an RGB colour to the nearest of the 16 named ANSI colours by squared
+/// Euclidean distance in RGB space. Named ANSI colours (`Color::Red`, …) are
+/// resolved by the terminal's palette, so they stay legible on 16-colour hosts
+/// where a raw truecolor SGR would be clamped or ignored. Non-RGB inputs pass
+/// through unchanged. Pure — unit-tested.
+#[must_use]
+pub fn nearest_ansi(color: Color) -> Color {
+    let Color::Rgb(r, g, b) = color else {
+        return color;
+    };
+    // (name, r, g, b) for the standard + bright ANSI set.
+    const ANSI: [(Color, u8, u8, u8); 16] = [
+        (Color::Black, 0, 0, 0),
+        (Color::Red, 205, 0, 0),
+        (Color::Green, 0, 205, 0),
+        (Color::Yellow, 205, 205, 0),
+        (Color::Blue, 0, 0, 238),
+        (Color::Magenta, 205, 0, 205),
+        (Color::Cyan, 0, 205, 205),
+        (Color::Gray, 229, 229, 229),
+        (Color::DarkGray, 127, 127, 127),
+        (Color::LightRed, 255, 0, 0),
+        (Color::LightGreen, 0, 255, 0),
+        (Color::LightYellow, 255, 255, 0),
+        (Color::LightBlue, 92, 92, 255),
+        (Color::LightMagenta, 255, 0, 255),
+        (Color::LightCyan, 0, 255, 255),
+        (Color::White, 255, 255, 255),
+    ];
+    let (r, g, b) = (i32::from(r), i32::from(g), i32::from(b));
+    ANSI.iter()
+        .min_by_key(|(_, ar, ag, ab)| {
+            let dr = r - i32::from(*ar);
+            let dg = g - i32::from(*ag);
+            let db = b - i32::from(*ab);
+            dr * dr + dg * dg + db * db
+        })
+        .map_or(color, |(c, ..)| *c)
+}
+
+/// Degrades every slot of `p` to its nearest named ANSI colour. Applied at
+/// startup when [`truecolor_supported`] is false. Pure — unit-tested.
+#[must_use]
+pub fn degrade_to_ansi(p: &Palette) -> Palette {
+    let d = nearest_ansi;
+    Palette {
+        bg: d(p.bg),
+        panel: d(p.panel),
+        header: d(p.header),
+        border: d(p.border),
+        border_dim: d(p.border_dim),
+        text: d(p.text),
+        text_bright: d(p.text_bright),
+        text_dim: d(p.text_dim),
+        accent: d(p.accent),
+        molten: d(p.molten),
+        error: d(p.error),
+        success: d(p.success),
+        warn: d(p.warn),
+        local: d(p.local),
+        fast: d(p.fast),
+        deep: d(p.deep),
+        code_default: d(p.code_default),
+        code_keyword: d(p.code_keyword),
+        code_string: d(p.code_string),
+        code_number: d(p.code_number),
+        code_comment: d(p.code_comment),
+        code_type: d(p.code_type),
+        code_macro: d(p.code_macro),
+        code_added: d(p.code_added),
+        code_removed: d(p.code_removed),
+    }
 }
 
 /// Parses a `#rrggbb` hex string into a `Color::Rgb`.
@@ -481,6 +573,42 @@ mod tests {
         }
         assert_eq!(p.molten, Color::Rgb(0x12, 0x34, 0x56));
         assert_eq!(p.accent, FORGE_ACCENT, "unset accent keeps default");
+    }
+
+    #[test]
+    fn nearest_ansi_maps_rgb_to_named_colours() {
+        // Molten orange lands on a warm named colour (red/yellow family), never
+        // an RGB triple — that is the whole point of the degrade.
+        let molten = nearest_ansi(FORGE_MOLTEN);
+        assert!(
+            !matches!(molten, Color::Rgb(_, _, _)),
+            "must be a named ANSI"
+        );
+        // Pure primaries snap to their obvious names.
+        assert_eq!(nearest_ansi(Color::Rgb(250, 0, 0)), Color::LightRed);
+        assert_eq!(nearest_ansi(Color::Rgb(0, 250, 0)), Color::LightGreen);
+        assert_eq!(nearest_ansi(Color::Rgb(5, 5, 5)), Color::Black);
+        // Non-RGB inputs pass through untouched.
+        assert_eq!(nearest_ansi(Color::Cyan), Color::Cyan);
+    }
+
+    #[test]
+    fn degrade_to_ansi_replaces_every_rgb_slot() {
+        let degraded = degrade_to_ansi(&Palette::default());
+        for c in [
+            degraded.accent,
+            degraded.molten,
+            degraded.error,
+            degraded.success,
+            degraded.warn,
+            degraded.code_keyword,
+            degraded.text,
+        ] {
+            assert!(
+                !matches!(c, Color::Rgb(_, _, _)),
+                "degraded slot must be a named ANSI colour, got {c:?}"
+            );
+        }
     }
 
     #[test]

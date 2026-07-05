@@ -14,8 +14,8 @@ mod highlight;
 #[cfg(test)]
 use blocks::table_cells;
 use blocks::{
-    diff_line_spans, inline_markdown_spans, is_diff_marker, is_table_row, render_math,
-    table_row_spans,
+    block_markdown_spans, diff_line_spans, inline_markdown_spans, is_diff_marker, is_table_row,
+    render_math, table_row_spans,
 };
 pub(crate) use highlight::highlight_code;
 #[cfg(test)]
@@ -272,6 +272,16 @@ impl MainPanel {
                 text,
                 style: LineStyle::Normal,
                 spans: Some(spans),
+            });
+        } else if let Some(line) = block_markdown_spans(&text) {
+            // Block-level markdown: heading, blockquote, thematic break, or list
+            // item. Keep the displayed (marker-normalised) text as the backing
+            // string so copy yields the rendered form.
+            let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            self.lines.push(StyledLine {
+                text: flat,
+                style: LineStyle::Normal,
+                spans: Some(line),
             });
         } else {
             // Outside code blocks: classify by prefix and apply math rendering.

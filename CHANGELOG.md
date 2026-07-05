@@ -6,6 +6,27 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.24.3] — 2026-07-05
+
+### Changed
+- **Transcript readability overhaul** — the main message window now guides the
+  eye instead of reading as uniform monochrome:
+  - Tool calls collapse to one dim line (`⏵ execute · <cmd> · ✓ 0.4s`, only the
+    status glyph colored); consecutive successes coalesce, expand on failure —
+    the wall of `✓ execute … ok` becomes quiet chrome.
+  - Role differentiation: molten-orange bold `you` + heavy gutter bar; the
+    assistant kept quietest so its prose is the main content; thinking dim/italic;
+    tools dim gray.
+  - The dim-the-chrome rule enforced (no echoed path / ok / timestamp brighter
+    than content), with a test as the invariant.
+  - Full markdown rendering (headings, inline-code tint, bold/italic, lists,
+    blockquotes, thematic-break rules) — and `- item` no longer mis-renders as a
+    red diff removal.
+  - Diff `@@` hunk headers dimmed, bold file-path labels; a guard test ensures
+    syntax highlighting yields distinct token colors.
+  - Disciplined semantic palette with a truecolor→16-color ANSI fallback so
+    tmux/remote sessions stay legible.
+
 ## [0.24.2] — 2026-07-05
 
 ### Fixed

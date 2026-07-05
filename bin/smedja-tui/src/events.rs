@@ -113,7 +113,15 @@ pub(crate) fn apply_stream_event(
                     .and_then(|a| state.fleet.color_for(a))
                     .unwrap_or_else(|| theme::runner_color(&state.runner));
                 let label = theme::runner_label(&state.runner).to_lowercase();
-                push_author_chip(&mut state.main_panel, &label, color, state.no_color);
+                // Thin `▏` bar: the assistant owns the content width, so its
+                // boundary marker stays quiet next to the user's heavy `▌`.
+                push_author_chip(
+                    &mut state.main_panel,
+                    "\u{258f}",
+                    &label,
+                    color,
+                    state.no_color,
+                );
                 state.main_panel.push_line(String::new());
                 state.assistant_open = true;
             }
@@ -353,9 +361,11 @@ pub(crate) fn apply_stream_event(
                 } else {
                     "trace"
                 };
-                state.main_panel.push_line(format!(
-                    "\u{254c} {label} ({n_steps} steps) [T to expand] \u{254c}"
-                ));
+                // Chrome, not content — keep the trace badge dim.
+                crate::push_chrome_line(
+                    &mut state.main_panel,
+                    format!("\u{254c} {label} ({n_steps} steps) [T to expand] \u{254c}"),
+                );
             }
 
             if let Some(output_type) = state.pending_output_type.take() {

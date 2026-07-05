@@ -59,7 +59,11 @@ pub(crate) fn inline_markdown_spans(text: &str) -> Option<Line<'static>> {
                         spans.push(Span::raw(std::mem::take(&mut buf)));
                     }
                     let code: String = chars[i + 1..close].iter().collect();
-                    spans.push(Span::styled(code, Style::default().fg(p.code_default)));
+                    // Subtle warm bg tint so inline code pops out of prose.
+                    spans.push(Span::styled(
+                        code,
+                        Style::default().fg(p.text_bright).bg(p.header),
+                    ));
                     i = close + 1;
                     found = true;
                     continue;
@@ -122,6 +126,116 @@ pub(crate) fn inline_markdown_spans(text: &str) -> Option<Line<'static>> {
     }
 }
 
+/// Renders a block-level markdown construct — ATX heading, blockquote,
+/// thematic break (horizontal rule), or list item — into styled spans, or
+/// `None` when the line is ordinary prose (so the cheap plain/inline path runs).
+///
+/// The returned line's flattened text is the *display* text (heading `#`
+/// markers and list bullets normalised), matching what is copied. Inline markup
+/// inside a heading/quote/list is expanded via [`inline_markdown_spans`] so
+/// `**bold**` still styles inside a `> quote`.
+///
+/// - `# … ######` heading → bold accent, marker stripped (deeper levels dimmer).
+/// - `> quote` → dim italic body behind a coloured `▍` gutter bar.
+/// - `---` / `***` / `___` rule → a full-width-ish dim `─` thematic break.
+/// - `- ` / `* ` / `+ ` bullet → aligned `•`; `N.` ordered → accent number.
+pub(crate) fn block_markdown_spans(text: &str) -> Option<Line<'static>> {
+    let p = palette();
+    let trimmed = text.trim_start();
+    let indent = &text[..text.len() - trimmed.len()];
+
+    // Thematic break: a line of only -, *, or _ (>= 3), optionally spaced.
+    let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.len() >= 3
+        && (compact.chars().all(|c| c == '-')
+            || compact.chars().all(|c| c == '*')
+            || compact.chars().all(|c| c == '_'))
+    {
+        let rule = "\u{2500}".repeat(24);
+        return Some(Line::from(Span::styled(
+            rule,
+            Style::default()
+                .fg(p.border_dim)
+                .add_modifier(Modifier::DIM),
+        )));
+    }
+
+    // ATX heading: 1–6 leading '#', then a space.
+    let level = trimmed.bytes().take_while(|&b| b == b'#').count();
+    if (1..=6).contains(&level) {
+        let after = &trimmed[level..];
+        if after.starts_with(' ') || after.is_empty() {
+            let body = after.trim_start();
+            // H1/H2 bright accent + bold; deeper headings step down to plain
+            // accent so the outline reads as a hierarchy, not a shout.
+            let color = if level <= 2 { p.text_bright } else { p.accent };
+            return Some(Line::from(Span::styled(
+                body.to_owned(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )));
+        }
+    }
+
+    // Blockquote: '> ' possibly nested. Dim italic behind a coloured gutter.
+    if let Some(rest) = trimmed.strip_prefix('>') {
+        let body = rest.strip_prefix(' ').unwrap_or(rest);
+        let mut spans = vec![Span::styled("\u{258d} ", Style::default().fg(p.accent))];
+        let inner =
+            inline_markdown_spans(body).unwrap_or_else(|| Line::from(Span::raw(body.to_owned())));
+        for s in inner.spans {
+            let style = s.style.fg.map_or_else(
+                || {
+                    Style::default()
+                        .fg(p.text_dim)
+                        .add_modifier(Modifier::ITALIC)
+                },
+                |_| s.style,
+            );
+            spans.push(Span::styled(s.content, style));
+        }
+        return Some(Line::from(spans));
+    }
+
+    // Unordered list item: '- ', '* ', or '+ ' after optional indent.
+    for marker in ['-', '*', '+'] {
+        let pre = format!("{marker} ");
+        if let Some(rest) = trimmed.strip_prefix(&pre) {
+            let mut spans = vec![
+                Span::raw(indent.to_owned()),
+                Span::styled("\u{2022} ", Style::default().fg(p.accent)),
+            ];
+            let inner = inline_markdown_spans(rest)
+                .unwrap_or_else(|| Line::from(Span::raw(rest.to_owned())));
+            spans.extend(inner.spans);
+            return Some(Line::from(spans));
+        }
+    }
+
+    // Ordered list item: 'N.' or 'N)' then a space.
+    let digits: String = trimmed.chars().take_while(char::is_ascii_digit).collect();
+    if !digits.is_empty() && digits.len() <= 3 {
+        let after = &trimmed[digits.len()..];
+        if let Some(rest) = after
+            .strip_prefix(". ")
+            .or_else(|| after.strip_prefix(") "))
+        {
+            let mut spans = vec![
+                Span::raw(indent.to_owned()),
+                Span::styled(
+                    format!("{digits}. "),
+                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            let inner = inline_markdown_spans(rest)
+                .unwrap_or_else(|| Line::from(Span::raw(rest.to_owned())));
+            spans.extend(inner.spans);
+            return Some(Line::from(spans));
+        }
+    }
+
+    None
+}
+
 /// True for a markdown table row — a trimmed line that starts with `|` and has
 /// at least one more `|`. Requiring a leading pipe avoids false-positiving on
 /// prose that merely contains a pipe.
@@ -176,8 +290,10 @@ pub(crate) fn table_row_spans(text: &str) -> Line<'static> {
 /// selection/copy, so the gutter never pollutes yanked content.
 pub(crate) fn diff_line_spans(text: &str) -> Line<'static> {
     let p = palette();
+    // A file-path header is a bold dim label; the hunk locator and context are
+    // dim so the eye lands on the +/- content, not the diff chrome.
     let header = Style::default().fg(p.text_dim).add_modifier(Modifier::BOLD);
-    let hunk = Style::default().fg(p.accent).add_modifier(Modifier::BOLD);
+    let hunk = Style::default().fg(p.text_dim).add_modifier(Modifier::DIM);
 
     if text.starts_with("@@") {
         return Line::from(Span::styled(text.to_owned(), hunk));
