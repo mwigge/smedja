@@ -1228,11 +1228,11 @@ fn ts_language(l: TsLang) -> tree_sitter::Language {
 fn node_color(l: TsLang, kind: &str, p: &Palette) -> Option<Color> {
     match l {
         TsLang::Rust => match kind {
-            "fn" | "let" | "mut" | "pub" | "use" | "mod" | "struct" | "enum" | "impl"
-            | "trait" | "return" | "if" | "else" | "match" | "loop" | "while" | "for" | "in"
-            | "break" | "continue" | "async" | "await" | "type" | "where" | "const"
-            | "static" | "unsafe" | "extern" | "crate" | "self" | "super" | "true" | "false"
-            | "move" | "ref" | "dyn" | "as" => Some(p.code_keyword),
+            "fn" | "let" | "mut" | "pub" | "use" | "mod" | "struct" | "enum" | "impl" | "trait"
+            | "return" | "if" | "else" | "match" | "loop" | "while" | "for" | "in" | "break"
+            | "continue" | "async" | "await" | "type" | "where" | "const" | "static" | "unsafe"
+            | "extern" | "crate" | "self" | "super" | "true" | "false" | "move" | "ref" | "dyn"
+            | "as" => Some(p.code_keyword),
             "string_literal" | "raw_string_literal" | "char_literal" => Some(p.code_string),
             "integer_literal" | "float_literal" => Some(p.code_number),
             "line_comment" | "block_comment" => Some(p.code_comment),
@@ -1241,10 +1241,10 @@ fn node_color(l: TsLang, kind: &str, p: &Palette) -> Option<Color> {
             _ => None,
         },
         TsLang::Go => match kind {
-            "func" | "package" | "import" | "return" | "type" | "struct" | "interface"
-            | "if" | "else" | "for" | "range" | "var" | "const" | "map" | "go" | "defer"
-            | "chan" | "select" | "switch" | "case" | "default" | "break" | "continue"
-            | "fallthrough" | "goto" | "true" | "false" | "nil" | "iota" => Some(p.code_keyword),
+            "func" | "package" | "import" | "return" | "type" | "struct" | "interface" | "if"
+            | "else" | "for" | "range" | "var" | "const" | "map" | "go" | "defer" | "chan"
+            | "select" | "switch" | "case" | "default" | "break" | "continue" | "fallthrough"
+            | "goto" | "true" | "false" | "nil" | "iota" => Some(p.code_keyword),
             "interpreted_string_literal" | "raw_string_literal" | "rune_literal" => {
                 Some(p.code_string)
             }
@@ -1257,20 +1257,21 @@ fn node_color(l: TsLang, kind: &str, p: &Palette) -> Option<Color> {
             "def" | "class" | "return" | "if" | "elif" | "else" | "for" | "while" | "import"
             | "from" | "as" | "with" | "try" | "except" | "finally" | "raise" | "pass"
             | "break" | "continue" | "lambda" | "yield" | "global" | "nonlocal" | "assert"
-            | "del" | "in" | "is" | "not" | "and" | "or" | "async" | "await" | "true"
-            | "false" | "none" => Some(p.code_keyword),
+            | "del" | "in" | "is" | "not" | "and" | "or" | "async" | "await" | "true" | "false"
+            | "none" => Some(p.code_keyword),
             "string" | "concatenated_string" => Some(p.code_string),
             "integer" | "float" => Some(p.code_number),
             "comment" => Some(p.code_comment),
             _ => None,
         },
         TsLang::TypeScript => match kind {
-            "function" | "const" | "let" | "var" | "class" | "interface" | "return"
-            | "import" | "export" | "type" | "if" | "else" | "for" | "while" | "new"
-            | "extends" | "implements" | "public" | "private" | "protected" | "readonly"
-            | "static" | "async" | "await" | "yield" | "enum" | "namespace" | "declare"
-            | "as" | "from" | "of" | "in" | "instanceof" | "typeof" | "true" | "false"
-            | "null" | "undefined" => Some(p.code_keyword),
+            "function" | "const" | "let" | "var" | "class" | "interface" | "return" | "import"
+            | "export" | "type" | "if" | "else" | "for" | "while" | "new" | "extends"
+            | "implements" | "public" | "private" | "protected" | "readonly" | "static"
+            | "async" | "await" | "yield" | "enum" | "namespace" | "declare" | "as" | "from"
+            | "of" | "in" | "instanceof" | "typeof" | "true" | "false" | "null" | "undefined" => {
+                Some(p.code_keyword)
+            }
             "string" | "template_string" => Some(p.code_string),
             "number" => Some(p.code_number),
             "comment" => Some(p.code_comment),

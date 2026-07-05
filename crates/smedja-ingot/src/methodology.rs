@@ -7,6 +7,7 @@
 //! the all-false default (nothing recorded, gate engaged).
 
 use crate::error::IngotError;
+use crate::{Ingot, IngotHandle};
 
 /// Spec-first lifecycle state for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -105,6 +106,107 @@ pub(crate) fn set_no_spec_gate(
         rusqlite::params![session_id, i64::from(value)],
     )?;
     Ok(())
+}
+
+impl Ingot {
+    /// Returns the spec-first methodology state for `session_id`, or the
+    /// all-false default when no row exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned methodology state"]
+    pub fn get_methodology_state(&self, session_id: &str) -> Result<MethodologyState, IngotError> {
+        get(&self.conn, session_id)
+    }
+
+    /// Sets the `spec_recorded` flag for `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPSERT fails.
+    #[must_use = "check the Result to confirm the flag was set"]
+    pub fn set_spec_recorded(&self, session_id: &str, value: bool) -> Result<(), IngotError> {
+        set_spec_recorded(&self.conn, session_id, value)
+    }
+
+    /// Sets the `approval_recorded` flag for `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPSERT fails.
+    #[must_use = "check the Result to confirm the flag was set"]
+    pub fn set_approval_recorded(&self, session_id: &str, value: bool) -> Result<(), IngotError> {
+        set_approval_recorded(&self.conn, session_id, value)
+    }
+
+    /// Sets the per-session `no_spec_gate` escape-hatch flag for `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPSERT fails.
+    #[must_use = "check the Result to confirm the flag was set"]
+    pub fn set_no_spec_gate(&self, session_id: &str, value: bool) -> Result<(), IngotError> {
+        set_no_spec_gate(&self.conn, session_id, value)
+    }
+}
+
+impl IngotHandle {
+    /// Returns the spec-first methodology state for `session_id`, or the
+    /// all-false default when no row exists.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn get_methodology_state(
+        &self,
+        session_id: &str,
+    ) -> Result<MethodologyState, IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.get_methodology_state(&session_id))
+            .await
+    }
+
+    /// Sets the `spec_recorded` flag for `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPSERT, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn set_spec_recorded(&self, session_id: &str, value: bool) -> Result<(), IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.set_spec_recorded(&session_id, value))
+            .await
+    }
+
+    /// Sets the `approval_recorded` flag for `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPSERT, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn set_approval_recorded(
+        &self,
+        session_id: &str,
+        value: bool,
+    ) -> Result<(), IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.set_approval_recorded(&session_id, value))
+            .await
+    }
+
+    /// Sets the per-session `no_spec_gate` escape-hatch flag for `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPSERT, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn set_no_spec_gate(&self, session_id: &str, value: bool) -> Result<(), IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.set_no_spec_gate(&session_id, value))
+            .await
+    }
 }
 
 #[cfg(test)]

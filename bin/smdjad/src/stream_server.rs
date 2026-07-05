@@ -425,9 +425,7 @@ async fn handle_stream_connection(
     // event if the turn completed before this connection was established.
     let buffered: VecDeque<String> = {
         let s = store.lock().await;
-        s.get(&task_id)
-            .map(|b| b.lines.clone())
-            .unwrap_or_default()
+        s.get(&task_id).map(|b| b.lines.clone()).unwrap_or_default()
     };
 
     let mut saw_terminal = false;

@@ -109,8 +109,8 @@ impl MetricsView {
             out.push("(no metrics)".to_owned());
         } else {
             for row in &self.rows {
-                let runner = &row.runner
-                    [..crate::floor_char_boundary(&row.runner, row.runner.len().min(7))];
+                let runner =
+                    &row.runner[..crate::floor_char_boundary(&row.runner, row.runner.len().min(7))];
                 out.push(format!(
                     "{:<7} {:>4} {:>8} {:>3}",
                     runner,
@@ -140,8 +140,8 @@ impl MetricsView {
             return out;
         }
         for row in &s.rows {
-            let source = &row.source
-                [..crate::floor_char_boundary(&row.source, row.source.len().min(12))];
+            let source =
+                &row.source[..crate::floor_char_boundary(&row.source, row.source.len().min(12))];
             out.push(format!("  {:<12} {:>7}", source, row.tokens_saved));
         }
         out

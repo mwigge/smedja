@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::IngotError;
+use crate::{Ingot, IngotHandle};
 
 /// A recorded prompt hash for a specific change and role.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +93,98 @@ pub(crate) fn list_by_change(
         })?
         .collect();
     Ok(rows?)
+}
+
+impl Ingot {
+    /// Records a prompt content hash for `(change, role)` at the current time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the INSERT fails.
+    #[must_use = "check the Result to confirm the hash was saved"]
+    pub fn save_prompt_hash(&self, change: &str, role: &str, hash: &str) -> Result<(), IngotError> {
+        save(
+            &self.conn,
+            change,
+            role,
+            hash,
+            crate::migrations::now_epoch(),
+        )
+    }
+
+    /// Returns the most recent prompt hash for `(change, role)`, or `None` when
+    /// no record exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned hash"]
+    pub fn get_prompt_hash(&self, change: &str, role: &str) -> Result<Option<String>, IngotError> {
+        get_latest(&self.conn, change, role)
+    }
+
+    /// Returns all prompt hash records for `change`, ordered by `ts` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned records"]
+    pub fn list_prompt_hashes(&self, change: &str) -> Result<Vec<PromptHashRecord>, IngotError> {
+        list_by_change(&self.conn, change)
+    }
+}
+
+impl IngotHandle {
+    /// Records a prompt content hash for `(change, role)`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying INSERT, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn save_prompt_hash(
+        &self,
+        change: &str,
+        role: &str,
+        hash: &str,
+    ) -> Result<(), IngotError> {
+        let change = change.to_owned();
+        let role = role.to_owned();
+        let hash = hash.to_owned();
+        self.run_blocking(move |ig| ig.save_prompt_hash(&change, &role, &hash))
+            .await
+    }
+
+    /// Returns the most recent prompt hash for `(change, role)`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn get_prompt_hash(
+        &self,
+        change: &str,
+        role: &str,
+    ) -> Result<Option<String>, IngotError> {
+        let change = change.to_owned();
+        let role = role.to_owned();
+        self.run_blocking(move |ig| ig.get_prompt_hash(&change, &role))
+            .await
+    }
+
+    /// Returns all prompt hash records for `change`, ordered by `ts` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn list_prompt_hashes(
+        &self,
+        change: &str,
+    ) -> Result<Vec<PromptHashRecord>, IngotError> {
+        let change = change.to_owned();
+        self.run_blocking(move |ig| ig.list_prompt_hashes(&change))
+            .await
+    }
 }
 
 #[cfg(test)]

@@ -142,10 +142,7 @@ pub(crate) async fn gate_tool(state: HandlerState, params: Value) -> Result<Valu
 /// the hook has no interactive path to request approval from the user, so
 /// resolving `Ask` to allow — as the old code did — silently defeated the
 /// approval gate. Kept pure so the fail-closed contract is unit-testable.
-fn gate_tool_decision(
-    mode: crate::cowork::PermissionMode,
-    tool: &str,
-) -> (&'static str, String) {
+fn gate_tool_decision(mode: crate::cowork::PermissionMode, tool: &str) -> (&'static str, String) {
     match crate::cowork::evaluate(mode, tool) {
         crate::cowork::PermissionDecision::Deny => {
             ("deny", format!("blocked by {} mode", mode.as_str()))

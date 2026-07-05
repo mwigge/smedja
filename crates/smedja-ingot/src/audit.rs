@@ -3,6 +3,7 @@ use smedja_types::Timestamp;
 use uuid::Uuid;
 
 use crate::error::IngotError;
+use crate::{Ingot, IngotHandle};
 
 /// An immutable audit record capturing a single agent action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +251,73 @@ pub(crate) fn list_failed_by_conversation(
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![conversation_id], row_to_event)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(IngotError::Db)
+}
+
+impl Ingot {
+    /// Appends an [`AuditEvent`] to the immutable audit log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the INSERT fails.
+    #[must_use = "check the Result to confirm the event was persisted"]
+    pub fn insert_audit_event(&self, event: &AuditEvent) -> Result<(), IngotError> {
+        insert(&self.conn, event)
+    }
+
+    /// Returns all [`AuditEvent`]s for `session_id`, ordered by `ts` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned events"]
+    pub fn list_audit_events(&self, session_id: &str) -> Result<Vec<AuditEvent>, IngotError> {
+        list_by_session(&self.conn, session_id)
+    }
+
+    /// Returns all [`AuditEvent`]s ordered by `ts` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned events"]
+    pub fn list_all_audit_events(&self) -> Result<Vec<AuditEvent>, IngotError> {
+        list_all(&self.conn)
+    }
+}
+
+impl IngotHandle {
+    /// Appends an [`AuditEvent`] to the audit log.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying INSERT, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn insert_audit_event(&self, event: AuditEvent) -> Result<(), IngotError> {
+        self.run_blocking(move |ig| ig.insert_audit_event(&event))
+            .await
+    }
+
+    /// Returns all [`AuditEvent`]s for `session_id`, ordered by `ts` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn list_audit_events(&self, session_id: &str) -> Result<Vec<AuditEvent>, IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.list_audit_events(&session_id))
+            .await
+    }
+
+    /// Returns all [`AuditEvent`]s, ordered by `ts` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn list_all_audit_events(&self) -> Result<Vec<AuditEvent>, IngotError> {
+        self.run_blocking(Ingot::list_all_audit_events).await
+    }
 }
 
 #[cfg(test)]

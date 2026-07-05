@@ -4,6 +4,7 @@ use smedja_types::{Microdollars, Timestamp};
 use uuid::Uuid;
 
 use crate::error::IngotError;
+use crate::{Ingot, IngotHandle};
 
 /// A per-model/runner aggregate row returned by [`session_cost_entries`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,6 +243,217 @@ pub(crate) fn session_tokens_saved_by_source(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+impl Ingot {
+    /// Returns the sum of `input_tok + output_tok` across all audit events with
+    /// the given `change_name`. Returns `Ok(0)` when no matching rows exist or when
+    /// the `change_name` column is absent on a pre-migration database.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned token total"]
+    pub fn cost_for_change(&self, change_name: &str) -> Result<u64, IngotError> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(input_tok + output_tok), 0) \
+             FROM audit_events WHERE change_name = ?1",
+            rusqlite::params![change_name],
+            |row| row.get(0),
+        )?;
+        Ok(total.max(0).cast_unsigned())
+    }
+
+    /// Appends a [`CostEntry`] to the cost ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the INSERT fails.
+    #[must_use = "check the Result to confirm the cost entry was recorded"]
+    pub fn insert_cost(&self, entry: &CostEntry) -> Result<(), IngotError> {
+        insert(&self.conn, entry)
+    }
+
+    /// Returns the exact total cost (microdollars) for all entries in
+    /// `session_id`.
+    ///
+    /// Returns `Microdollars::from_micros(0)` when no entries exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned sum"]
+    pub fn session_cost(&self, session_id: &str) -> Result<smedja_types::Microdollars, IngotError> {
+        session_total(&self.conn, session_id)
+    }
+
+    /// Returns per-model/runner aggregate rows for `session_id`, sorted by descending cost.
+    ///
+    /// Returns an empty vec when no entries exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned rows"]
+    pub fn session_cost_entries(&self, session_id: &str) -> Result<Vec<CostRow>, IngotError> {
+        session_cost_entries(&self.conn, session_id)
+    }
+
+    /// Returns the model name from the most recent cost entry for `session_id`.
+    ///
+    /// Returns `None` when no cost entries exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result to determine the active model"]
+    pub fn session_last_model(&self, session_id: &str) -> Result<Option<String>, IngotError> {
+        last_model(&self.conn, session_id)
+    }
+
+    /// Records a [`TokensSavedEntry`] on the tokens-saved ledger.
+    ///
+    /// Savings are kept separate from the billed `cost_ledger` so billed totals
+    /// stay exact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the INSERT fails.
+    #[must_use = "check the Result to confirm the tokens-saved entry was recorded"]
+    pub fn insert_tokens_saved(&self, entry: &TokensSavedEntry) -> Result<(), IngotError> {
+        insert_tokens_saved(&self.conn, entry)
+    }
+
+    /// Returns the total tokens saved by filtering for `session_id`.
+    ///
+    /// Returns `0` when no entries exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned total"]
+    pub fn session_tokens_saved(&self, session_id: &str) -> Result<i64, IngotError> {
+        session_tokens_saved(&self.conn, session_id)
+    }
+
+    /// Returns the sum of `tokens_saved` grouped by `source` for `session_id`,
+    /// ordered by `source`.
+    ///
+    /// Each tuple is `(source, summed_tokens_saved)`. Cache savings
+    /// (`source = 'cache'`) stay distinct from compression savings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned per-source sums"]
+    pub fn session_tokens_saved_by_source(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(String, i64)>, IngotError> {
+        session_tokens_saved_by_source(&self.conn, session_id)
+    }
+}
+
+impl IngotHandle {
+    /// Appends a [`CostEntry`] to the cost ledger.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying INSERT, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn insert_cost(&self, entry: CostEntry) -> Result<(), IngotError> {
+        self.run_blocking(move |ig| ig.insert_cost(&entry)).await
+    }
+
+    /// Returns the exact total cost (microdollars) for all entries in `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn session_cost(
+        &self,
+        session_id: &str,
+    ) -> Result<smedja_types::Microdollars, IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.session_cost(&session_id))
+            .await
+    }
+
+    /// Returns per-model/runner aggregate cost rows for `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn session_cost_entries(&self, session_id: &str) -> Result<Vec<CostRow>, IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.session_cost_entries(&session_id))
+            .await
+    }
+
+    /// Returns the total token count (input + output) attributed to `change_name`
+    /// across all audit events. Returns `Ok(0)` when no matching rows exist.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn cost_for_change(&self, change_name: &str) -> Result<u64, IngotError> {
+        let change_name = change_name.to_owned();
+        self.run_blocking(move |ig| ig.cost_for_change(&change_name))
+            .await
+    }
+
+    /// Returns the model name from the most recent cost entry for `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn session_last_model(&self, session_id: &str) -> Result<Option<String>, IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.session_last_model(&session_id))
+            .await
+    }
+
+    /// Records a [`TokensSavedEntry`] on the tokens-saved ledger.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying INSERT, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn insert_tokens_saved(&self, entry: TokensSavedEntry) -> Result<(), IngotError> {
+        self.run_blocking(move |ig| ig.insert_tokens_saved(&entry))
+            .await
+    }
+
+    /// Returns the total tokens saved by filtering for `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn session_tokens_saved(&self, session_id: &str) -> Result<i64, IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.session_tokens_saved(&session_id))
+            .await
+    }
+
+    /// Returns the sum of `tokens_saved` grouped by `source` for `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn session_tokens_saved_by_source(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(String, i64)>, IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.session_tokens_saved_by_source(&session_id))
+            .await
+    }
 }
 
 #[cfg(test)]

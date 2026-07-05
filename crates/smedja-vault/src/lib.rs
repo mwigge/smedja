@@ -6,9 +6,13 @@
 //! This is the "cold" stratum: turns older than the working window are stored
 //! here and retrieved on demand by semantic similarity search.
 
+mod diary;
+mod embedder;
+mod entries;
 pub mod error;
 pub mod similarity;
 pub mod vault;
+mod vector_search;
 
 pub use error::VaultError;
 pub use vault::{DiaryEntry, EmbedderIdentity, QueryResult, Vault, VaultEntry, LEGACY_MODEL_ID};

@@ -133,8 +133,21 @@ pub fn render(
     if !turn_in_flight || area.height < 1 {
         return;
     }
-    let row = Rect::new(area.x, area.y + area.height.saturating_sub(1), area.width, 1);
-    let line = live_line(state, verb, elapsed_s, counter, stalled_secs, tick, no_color);
+    let row = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(1),
+        area.width,
+        1,
+    );
+    let line = live_line(
+        state,
+        verb,
+        elapsed_s,
+        counter,
+        stalled_secs,
+        tick,
+        no_color,
+    );
     frame.render_widget(Paragraph::new(line), row);
 }
 
@@ -173,15 +186,7 @@ mod tests {
 
     #[test]
     fn live_line_pairs_timer_and_counter() {
-        let line = live_line(
-            LiveState::Thinking,
-            "thinking",
-            3.4,
-            "1.2k tok",
-            0,
-            0,
-            true,
-        );
+        let line = live_line(LiveState::Thinking, "thinking", 3.4, "1.2k tok", 0, 0, true);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("thinking"));
         assert!(text.contains("3.4s"), "ticking timer: {text}");

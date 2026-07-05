@@ -115,7 +115,11 @@ pub fn microbar_ascii(value: f64, max: f64, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let frac = if max <= 0.0 { 0.0 } else { (value / max).clamp(0.0, 1.0) };
+    let frac = if max <= 0.0 {
+        0.0
+    } else {
+        (value / max).clamp(0.0, 1.0)
+    };
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
