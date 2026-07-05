@@ -365,7 +365,13 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     // The rail is split vertically into 1–6 sections. Context (1 row) is always
     // present; role cockpit, LSP, obs, quality, and value panels are individually toggled.
     if let Some(rail_rect) = rail_area {
-        use Constraint::{Fill, Length};
+        use Constraint::{Length, Min};
+
+        // Minimum rows the LSP panel keeps even when the trace waterfall, obs,
+        // and other fixed-height panels are all enabled below it. Using `Min`
+        // rather than `Fill` gives LSP a floor so turning on the trace can never
+        // starve it to zero height (it still grows to absorb any rail slack).
+        const LSP_MIN_H: u16 = 6;
 
         let show_cockpit = state.panels.role_cockpit;
         let show_lsp = state.panels.lsp;
@@ -399,9 +405,10 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         if show_cockpit {
             constraints.push(Length(7));
         }
-        // LSP gets flexible space; fixed-height panels slot directly below it.
+        // LSP gets flexible space with a guaranteed floor; fixed-height panels
+        // (obs, trace, fleet, …) slot directly below it without starving it.
         if show_lsp {
-            constraints.push(Fill(1));
+            constraints.push(Min(LSP_MIN_H));
         }
         if show_obs {
             constraints.push(Length(6));
@@ -486,6 +493,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
                 frame,
                 &state.current_trace,
                 sel,
+                state.trace_expanded,
                 state.no_color,
             );
             if state.trace_expanded {

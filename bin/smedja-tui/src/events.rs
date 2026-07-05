@@ -474,10 +474,25 @@ pub(crate) fn apply_stream_event(
                 });
             }
         }
-        StreamEvent::Usage { output_tok, .. } => {
+        StreamEvent::Usage {
+            input_tok,
+            output_tok,
+        } => {
             // Authoritative running token count for the live line.
             state.last_stream_activity = Some(std::time::Instant::now());
             state.live_tokens = state.live_tokens.max(output_tok);
+            // Feed the obs panel's throughput bar live, before `Done` commits
+            // the turn into the session totals. Providers split usage across
+            // several events (input on message_start, output on message_delta),
+            // so track a per-field high-water mark and add it on top of the
+            // already-committed session totals. `Done` later sets the obs totals
+            // absolutely from the session counters, so there is no double count.
+            state.turn_tokens_in = state.turn_tokens_in.max(u64::from(input_tok));
+            state.turn_tokens_out = state.turn_tokens_out.max(u64::from(output_tok));
+            state.obs_snapshot.tokens_input =
+                state.session_tokens_in.saturating_add(state.turn_tokens_in);
+            state.obs_snapshot.tokens_output =
+                state.session_tokens_out.saturating_add(state.turn_tokens_out);
         }
         StreamEvent::Unknown | StreamEvent::ToolCallChunk { .. } => {}
     }

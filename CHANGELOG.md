@@ -6,6 +6,21 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.24.2] — 2026-07-05
+
+### Fixed
+- **LSP panel overwritten by the trace-waterfall:** the LSP rail slot used an
+  unbounded `Fill` so enabling the trace starved it to zero height. It now has a
+  minimum-height floor and both panels coexist.
+- **Trace "x to inspect" did nothing:** the keybind was trapped inside scroll
+  mode; it now fires when the trace panel is visible in normal mode (steps + expands
+  spans with name/kind/duration/status), with an accurate state-aware hint, and
+  never steals a typed `x` mid-message.
+- **Obs panel throughput stuck at zero:** the mid-stream Usage events updated the
+  live token counters but not the obs snapshot, so the throughput bar stayed at
+  zero during a turn. Usage now feeds obs throughput live (per-turn high-water
+  mark over committed totals).
+
 ## [0.24.1] — 2026-07-05
 
 ### Fixed

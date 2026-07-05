@@ -284,7 +284,12 @@ pub fn span_detail_lines(trace: &TurnTrace, selected: usize, no_color: bool) -> 
         SpanStatus::Failed => "failed",
     };
     vec![
-        Line::from(vec![key("span"), val(s.name.clone())]),
+        Line::from(vec![
+            key("span"),
+            val(s.name.clone()),
+            key("  kind"),
+            val(s.kind().label().to_owned()),
+        ]),
         Line::from(vec![
             key("start"),
             val(format!("+{}ms", s.start_ms)),
@@ -301,6 +306,7 @@ pub fn render(
     frame: &mut Frame,
     trace: &TurnTrace,
     selected: Option<usize>,
+    expanded: bool,
     no_color: bool,
 ) {
     if area.height < 3 || trace.is_empty() {
@@ -314,12 +320,19 @@ pub fn render(
     } else {
         Style::default().fg(p.border)
     };
+    // Keep the hint accurate to what `x` actually does in the current state:
+    // open the inspector when collapsed, step to the next span when expanded.
+    let title = if expanded {
+        " trace [x: next span] "
+    } else {
+        " trace [x: inspect] "
+    };
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .title(" trace [x to inspect] "),
+                .title(title),
         ),
         area,
     );
@@ -428,7 +441,7 @@ mod tests {
         let t = sample();
         let backend = TestBackend::new(50, 8);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| render(f.area(), f, &t, Some(0), false))
+        term.draw(|f| render(f.area(), f, &t, Some(0), false, false))
             .unwrap();
         let rendered: String = term
             .backend()

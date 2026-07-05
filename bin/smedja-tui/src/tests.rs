@@ -1002,6 +1002,48 @@ fn replay_history_seeds_latency_samples_from_audit() {
     );
 }
 
+// Bug regression: mid-stream `Usage` events must update the obs panel's
+// throughput bar live, before the turn's `Done` commits the totals. Providers
+// split usage across events (input on message_start, output on message_delta),
+// so a per-field high-water mark is added on top of the committed session totals.
+#[test]
+fn usage_event_feeds_obs_throughput_live() {
+    let mut state = make_state("usage-obs");
+    // Two prior turns already committed into the session counters.
+    state.session_tokens_in = 100;
+    state.session_tokens_out = 200;
+    let mut save = None;
+
+    // message_start-style event: input known, output still zero.
+    apply_stream_event(
+        &mut state,
+        StreamEvent::Usage {
+            input_tok: 40,
+            output_tok: 0,
+        },
+        &mut save,
+    );
+    // message_delta-style event: output known, input reported zero. The zero
+    // must not clobber the earlier non-zero input.
+    apply_stream_event(
+        &mut state,
+        StreamEvent::Usage {
+            input_tok: 0,
+            output_tok: 55,
+        },
+        &mut save,
+    );
+
+    assert_eq!(
+        state.obs_snapshot.tokens_input, 140,
+        "obs input = committed 100 + live 40"
+    );
+    assert_eq!(
+        state.obs_snapshot.tokens_output, 255,
+        "obs output = committed 200 + live 55 (zero input event must not reset)"
+    );
+}
+
 #[test]
 fn resume_list_formats_session_rows() {
     let list = serde_json::json!([
@@ -1202,6 +1244,8 @@ fn make_state(session_id: &str) -> AppState {
         latency_samples: VecDeque::new(),
         session_tokens_in: 0,
         session_tokens_out: 0,
+        turn_tokens_in: 0,
+        turn_tokens_out: 0,
         quality_score_sum: 0,
         quality_score_count: 0,
         file_picker_open: false,
@@ -1553,6 +1597,70 @@ async fn health_command_handle_key_shows_latency_in_panel() {
     assert!(
         content.contains("health"),
         "main panel should contain health output after /health command; got: {content:?}"
+    );
+}
+
+// Bug regression: `x` inspects the trace waterfall whenever the panel is
+// visible — including in input mode, where the owner actually watches the
+// trace. It must not require scroll mode, but must never steal a typed 'x'
+// while composing a message.
+#[tokio::test]
+async fn x_inspects_trace_in_input_mode_when_panel_visible() {
+    use tokio::net::UnixListener;
+
+    // A socket the client can connect to; the `x` handler returns before any
+    // RPC, so the mock never needs to respond.
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("trace-x.sock");
+    let listener = UnixListener::bind(&sock_path).unwrap();
+    tokio::spawn(async move {
+        let _ = listener.accept().await;
+    });
+
+    let mut client = Client::connect(&sock_path).await.unwrap();
+    let mut editor = rustyline::DefaultEditor::new().unwrap();
+    let mut state = make_state("trace-x");
+    // Trace panel visible (obs on + spans recorded); input mode, empty buffer.
+    state.panels.obs = true;
+    state.scroll_focus = false;
+    state.input.clear();
+    state.current_trace.start_turn();
+    state.current_trace.push_tool("Read", 100);
+    state.current_trace.settle_last_tool(300, true);
+
+    let x = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('x'),
+        crossterm::event::KeyModifiers::empty(),
+    );
+
+    // First `x`: open the inspector on the first span.
+    handle_key(x, &mut state, &mut client, &mut editor)
+        .await
+        .unwrap();
+    assert!(state.trace_expanded, "x must expand the trace in input mode");
+    assert_eq!(state.trace_selected, 0);
+    assert!(
+        state.input.is_empty(),
+        "x must be consumed as inspect, not typed into the input"
+    );
+
+    // Second `x`: step to the next span.
+    handle_key(x, &mut state, &mut client, &mut editor)
+        .await
+        .unwrap();
+    assert_eq!(state.trace_selected, 1, "x steps to the next span");
+
+    // While composing (non-empty buffer), `x` types normally instead of inspecting.
+    state.trace_expanded = false;
+    state.input = "fi".into();
+    state.input_cursor = state.input.len();
+    handle_key(x, &mut state, &mut client, &mut editor)
+        .await
+        .unwrap();
+    assert_eq!(state.input, "fix", "x must type normally while composing");
+    assert!(
+        !state.trace_expanded,
+        "x must not trigger the inspector mid-compose"
     );
 }
 
@@ -2250,6 +2358,47 @@ fn metrics_view_panel_renders_per_runner_snapshot() {
     assert!(content.contains("local"), "local runner must render");
     assert!(content.contains("$0.0600"), "claude cost must render");
     assert!(content.contains("780"), "claude tokens must render");
+}
+
+// Bug regression: enabling the trace waterfall must not clobber the LSP panel.
+// Both get their own rail slot, and LSP keeps a minimum height (Min, not Fill)
+// so the fixed-height trace panel can never starve it to zero rows.
+#[test]
+fn trace_and_lsp_coexist_in_rail() {
+    let mut state = make_state("rail-coexist");
+    state.panels.context_rail = true;
+    state.panels.lsp = true;
+    state.panels.obs = true;
+    // A recorded turn trace makes the waterfall visible alongside LSP/obs.
+    state.current_trace.start_turn();
+    state.current_trace.push_tool("Read", 100);
+    state.current_trace.settle_last_tool(300, true);
+    state.current_trace.finish(400, true);
+
+    // Wide + tall enough that the rail renders and every panel has room.
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(frame, &mut state)).unwrap();
+    let content: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect();
+
+    assert!(
+        content.contains("lsp"),
+        "LSP panel must still render when the trace is enabled; got: {content:?}"
+    );
+    assert!(
+        content.contains("trace"),
+        "trace panel must render alongside LSP; got: {content:?}"
+    );
+    assert!(
+        content.contains("obs"),
+        "obs panel must render alongside LSP and trace; got: {content:?}"
+    );
 }
 
 #[test]
