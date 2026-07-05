@@ -36,8 +36,8 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use landlock::{
-    Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
-    ABI,
+    Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
+    RulesetStatus, ABI,
 };
 
 use super::{
@@ -142,13 +142,21 @@ impl LandlockBackend {
             .unwrap_or(false)
     }
 
-    /// Applies the filesystem ruleset confining writes to `root` in the current
-    /// process. Intended to be called from `pre_exec` in the child.
+    /// Builds — but does NOT enforce — the filesystem ruleset confining writes
+    /// to `root`, opening every `PathFd` and adding every rule.
+    ///
+    /// This runs in the PARENT before `fork`, so all heap allocation, path
+    /// resolution and error formatting happen here. The forked child then only
+    /// calls [`RulesetCreated::restrict_self`], which issues the async-signal-safe
+    /// `prctl(PR_SET_NO_NEW_PRIVS)` and `landlock_restrict_self(2)` syscalls with
+    /// no allocation — avoiding a deadlock on the allocator lock that a peer
+    /// thread may hold across the fork in this multi-threaded runtime.
     ///
     /// # Errors
     ///
-    /// Returns `std::io::Error` when the ruleset cannot be created or applied.
-    fn apply(root: &Path) -> std::io::Result<()> {
+    /// Returns `std::io::Error` when the ruleset cannot be created or a rule
+    /// cannot be added.
+    fn build_ruleset(root: &Path) -> std::io::Result<RulesetCreated> {
         let abi = ABI::V1;
         let map_err = |e: landlock::RulesetError| std::io::Error::other(format!("landlock: {e}"));
         // PathFd::new's error type is landlock-internal; map it to io::Error by
@@ -180,13 +188,7 @@ impl LandlockBackend {
                 .map_err(map_err)?;
         }
 
-        let status = created.restrict_self().map_err(map_err)?;
-        if matches!(status.ruleset, RulesetStatus::NotEnforced) {
-            return Err(std::io::Error::other(
-                "landlock: ruleset not enforced by the kernel",
-            ));
-        }
-        Ok(())
+        Ok(created)
     }
 }
 
@@ -231,13 +233,39 @@ impl SandboxBackend for LandlockBackend {
 
         let (program, args) = build_child_argv(cmd, plan);
         let mut command = tokio::process::Command::new(program);
-        command.args(&args).current_dir(&root);
+        command
+            .args(&args)
+            .current_dir(&root)
+            // Ensure a command that hits EXEC_TIMEOUT_SECS is reaped rather than
+            // orphaned when the timed-out `output()` future is dropped.
+            .kill_on_drop(true);
 
-        // SAFETY: the closure runs in the forked child before `exec`; it only
-        // calls async-signal-safe Landlock syscalls, and allocations performed
-        // before fork are not freed here. Any error aborts the exec.
+        // Build the whole ruleset (all allocation + PathFd opens) in the PARENT,
+        // before fork. The child's `pre_exec` closure then only enforces it.
+        let ruleset = Self::build_ruleset(&root_for_child).map_err(|e| e.to_string())?;
+        let mut ruleset = Some(ruleset);
+
+        // SAFETY: the closure runs in the forked child between `fork` and `exec`.
+        // The ruleset — including every `PathFd` and all heap allocation — was
+        // built above in the parent; the child performs NO allocation, locking,
+        // or formatting. It only calls `restrict_self()`, which issues the
+        // async-signal-safe `prctl(PR_SET_NO_NEW_PRIVS)` and
+        // `landlock_restrict_self(2)` syscalls. On the not-enforced/error paths it
+        // returns an errno-only `io::Error` (no allocation). Any error aborts the
+        // exec, so an unconfined command is never run.
         unsafe {
-            command.pre_exec(move || Self::apply(&root_for_child));
+            command.pre_exec(move || {
+                let created = ruleset
+                    .take()
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::Other))?;
+                let status = created
+                    .restrict_self()
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::PermissionDenied))?;
+                if matches!(status.ruleset, RulesetStatus::NotEnforced) {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
+                Ok(())
+            });
         }
 
         match tokio::time::timeout(

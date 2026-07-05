@@ -132,6 +132,9 @@ impl SandboxBackend for SeatbeltBackend {
             tokio::process::Command::new("sandbox-exec")
                 .args(["-p", &profile, "sh", "-c", cmd])
                 .current_dir(&root_str)
+                // Reap the sandboxed child on EXEC_TIMEOUT_SECS instead of
+                // orphaning it when the timed-out `output()` future is dropped.
+                .kill_on_drop(true)
                 .output(),
         )
         .await

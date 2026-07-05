@@ -97,8 +97,9 @@ pub(crate) async fn set_mode(state: HandlerState, params: Value) -> Result<Value
 
 /// Handles `cowork.gate_tool`: the `PreToolUse` hook entry point for external CLIs
 /// (claude via `smj tool-gate`). Evaluates the session's permission policy and
-/// blocks on the user when it says "ask". Returns `{decision, reason}` where
-/// `decision` is `"allow"` or `"deny"`.
+/// returns `{decision, reason}` where `decision` is `"allow"` or `"deny"`. An
+/// unresolved "ask" is denied by default (fail-closed) because the hook has no
+/// interactive path to request approval from the user.
 ///
 /// # Errors
 ///
@@ -123,23 +124,41 @@ pub(crate) async fn gate_tool(state: HandlerState, params: Value) -> Result<Valu
                 .or_insert_with(|| Arc::new(CoworkGate::default())),
         )
     };
-    // Evaluate the policy synchronously — the hook cannot block waiting for
-    // a TUI approval dialog (no push path). Ask → fail-open: the CLI's own
-    // sandbox (codex --sandbox, claude's permissions model) provides the
-    // outer guard. Plan remains a hard deny so the user can restrict a session
-    // to read-only analysis even from external CLIs.
+    // Evaluate the policy synchronously — the hook cannot block waiting for a
+    // TUI approval dialog (no push path). `Allow` (read-only tools, auto-mode
+    // allowlists, accept-edits edits) resolves to allow; `Plan` is a hard deny.
+    // `Ask` MUST fail CLOSED: with no interactive approval path from an external
+    // CLI, auto-allowing it defeats the approval gate entirely, so an unresolved
+    // "ask" is denied by default rather than silently permitted.
     let mode = gate.mode().await;
-    let (decision, reason) = match crate::cowork::evaluate(mode, &tool_name) {
+    let (decision, reason) = gate_tool_decision(mode, &tool_name);
+    Ok(json!({ "decision": decision, "reason": reason }))
+}
+
+/// Resolves the external-CLI `PreToolUse` decision for a `(mode, tool)` pair.
+///
+/// `Allow` (read-only tools, auto-mode allowlists, accept-edits edits) permits;
+/// `Plan` is a hard deny. Crucially, `Ask` is DENIED by default (fail-closed):
+/// the hook has no interactive path to request approval from the user, so
+/// resolving `Ask` to allow — as the old code did — silently defeated the
+/// approval gate. Kept pure so the fail-closed contract is unit-testable.
+fn gate_tool_decision(
+    mode: crate::cowork::PermissionMode,
+    tool: &str,
+) -> (&'static str, String) {
+    match crate::cowork::evaluate(mode, tool) {
         crate::cowork::PermissionDecision::Deny => {
             ("deny", format!("blocked by {} mode", mode.as_str()))
         }
-        // Allow and Ask both resolve to allow: the external CLI's own sandbox
-        // provides the outer guard; we cannot block on a TUI approval dialog.
-        crate::cowork::PermissionDecision::Allow | crate::cowork::PermissionDecision::Ask => {
-            ("allow", String::new())
-        }
-    };
-    Ok(json!({ "decision": decision, "reason": reason }))
+        crate::cowork::PermissionDecision::Allow => ("allow", String::new()),
+        crate::cowork::PermissionDecision::Ask => (
+            "deny",
+            format!(
+                "{} mode requires approval and no interactive approval path is available from an external CLI; denied by default",
+                mode.as_str()
+            ),
+        ),
+    }
 }
 
 /// Looks up the cowork gate for `session_id`, erroring when none is registered.
@@ -242,4 +261,54 @@ pub(crate) async fn pending(state: HandlerState, params: Value) -> Result<Value,
         })
         .collect();
     Ok(Value::Array(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gate_tool_decision;
+    use crate::cowork::PermissionMode;
+
+    #[test]
+    fn ask_mode_denies_by_default_not_allows() {
+        // Regression for the fail-open gate: an unresolved "ask" must deny.
+        for tool in ["bash", "write_file", "edit_file"] {
+            let (decision, _) = gate_tool_decision(PermissionMode::Ask, tool);
+            assert_eq!(
+                decision, "deny",
+                "ask mode must fail closed for {tool}, not auto-allow"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_edits_denies_exec_but_allows_edits() {
+        // accept_edits -> Exec resolves to Ask -> must now deny (was fail-open).
+        let (exec_decision, _) = gate_tool_decision(PermissionMode::AcceptEdits, "bash");
+        assert_eq!(exec_decision, "deny", "accept_edits must deny exec tools");
+        // Edits are explicitly allowed under accept_edits.
+        let (edit_decision, _) = gate_tool_decision(PermissionMode::AcceptEdits, "write_file");
+        assert_eq!(edit_decision, "allow", "accept_edits must allow edits");
+    }
+
+    #[test]
+    fn auto_mode_allowlist_still_allows() {
+        // auto-mode explicit allowlists are preserved (not broken by the fix).
+        let (decision, _) = gate_tool_decision(PermissionMode::Auto, "bash");
+        assert_eq!(decision, "allow", "auto mode must still allow");
+    }
+
+    #[test]
+    fn read_only_tools_always_allowed() {
+        let (decision, _) = gate_tool_decision(PermissionMode::Ask, "read_file");
+        assert_eq!(
+            decision, "allow",
+            "read-only tools stay allowed even under ask"
+        );
+    }
+
+    #[test]
+    fn plan_mode_hard_denies() {
+        let (decision, _) = gate_tool_decision(PermissionMode::Plan, "write_file");
+        assert_eq!(decision, "deny", "plan mode is a hard deny");
+    }
 }

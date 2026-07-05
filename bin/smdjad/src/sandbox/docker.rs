@@ -180,7 +180,13 @@ impl SandboxBackend for DockerBackend {
 
         match tokio::time::timeout(
             std::time::Duration::from_secs(EXEC_TIMEOUT_SECS),
-            tokio::process::Command::new("docker").args(&args).output(),
+            // `kill_on_drop` reaps the `docker run` client when the timed-out
+            // `output()` future is dropped instead of orphaning it (and, via the
+            // client teardown of a `--rm` container, its container too).
+            tokio::process::Command::new("docker")
+                .args(&args)
+                .kill_on_drop(true)
+                .output(),
         )
         .await
         {
