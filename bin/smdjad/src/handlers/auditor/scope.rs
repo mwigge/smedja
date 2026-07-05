@@ -189,6 +189,7 @@ async fn build_path_seed(
         ingot,
         vault,
         embedder,
+        None,
     )
     .await;
 
@@ -201,6 +202,7 @@ async fn build_path_seed(
         ingot,
         vault,
         embedder,
+        None,
     )
     .await;
 

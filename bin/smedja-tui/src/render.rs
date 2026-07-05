@@ -389,9 +389,10 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         // Metrics panel sits at the very top of the rail when visible.
         let show_metrics = state.panels.metrics;
         if show_metrics {
-            let metrics_lines = metrics_view::MetricsView::with_savings(
+            let metrics_lines = metrics_view::MetricsView::with_savings_and_tiers(
                 state.metrics_snapshot.clone(),
                 state.savings_snapshot.clone(),
+                state.tier_snapshot.clone(),
             )
             .lines()
             .len();
@@ -442,9 +443,10 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         // ── Metrics / runner panel ────────────────────────────────────────
         if show_metrics && ci < rail_chunks.len() {
             frame.render_widget(
-                metrics_view::MetricsView::with_savings(
+                metrics_view::MetricsView::with_savings_and_tiers(
                     state.metrics_snapshot.clone(),
                     state.savings_snapshot.clone(),
+                    state.tier_snapshot.clone(),
                 ),
                 rail_chunks[ci],
             );

@@ -494,6 +494,7 @@ pub(crate) async fn run(session: bootstrap::Session) -> Result<()> {
                 .await
             {
                 state.metrics_snapshot = metrics_rows_from_summary(&resp);
+                state.tier_snapshot = tier_rows_from_summary(&resp);
                 // Extract 24h token total for the daily quota bar (buckets array).
                 if let Some(buckets) = resp["buckets"].as_array() {
                     let total_24h: u64 = buckets

@@ -138,6 +138,7 @@ impl TurnOrchestrator {
         let price_table = &self.price_table;
         let vault = &self.vault;
         let embedder = &self.embedder;
+        let lsp_manager = &self.lsp_manager;
         let provider_sessions = &self.provider_sessions;
         let cache_aligners = &self.cache_aligners;
 
@@ -926,10 +927,19 @@ impl TurnOrchestrator {
                                 let ig = ingot.clone();
                                 let vt = vault.clone();
                                 let em = Arc::clone(embedder);
+                                let lm = Arc::clone(lsp_manager);
                                 futs.push(async move {
-                                    let result =
-                                        execute_tool(&name, &input, &wsr, None, &ig, &vt, &em)
-                                            .await;
+                                    let result = execute_tool(
+                                        &name,
+                                        &input,
+                                        &wsr,
+                                        None,
+                                        &ig,
+                                        &vt,
+                                        &em,
+                                        Some(&lm),
+                                    )
+                                    .await;
                                     (i, result)
                                 });
                             }
@@ -971,6 +981,7 @@ impl TurnOrchestrator {
                                             ingot,
                                             vault,
                                             embedder,
+                                            Some(lsp_manager),
                                         )
                                         .await
                                     }
@@ -984,11 +995,20 @@ impl TurnOrchestrator {
                                             ingot,
                                             vault,
                                             embedder,
+                                            Some(lsp_manager),
                                         )
                                         .await
                                     }
                                 }
                             };
+                            // Post-edit diagnostics feedback for batched writes.
+                            ordered_results[i] = append_edit_diagnostics(
+                                name,
+                                input,
+                                std::mem::take(&mut ordered_results[i]),
+                                lsp_manager,
+                            )
+                            .await;
                         }
 
                         ordered_results
@@ -1218,6 +1238,7 @@ impl TurnOrchestrator {
                         ingot,
                         vault,
                         embedder,
+                        Some(lsp_manager),
                     )
                     .await;
                     tool_span.set_attribute(KeyValue::new(
@@ -1241,6 +1262,13 @@ impl TurnOrchestrator {
                     tool_span.end();
                     result
                 };
+
+                // Post-edit diagnostics feedback loop: after a successful edit,
+                // append fresh language-server errors/warnings for the touched
+                // files so the agent sees them without a separate build step.
+                let tool_result =
+                    append_edit_diagnostics(&tool_name, &tool_input, tool_result, lsp_manager)
+                        .await;
 
                 // Persist tool execution as a timeline event.
                 {
@@ -1683,6 +1711,106 @@ impl TurnOrchestrator {
         });
     }
 }
+
+/// Bounded wait for post-edit diagnostics before giving up (server lag no-op).
+const POST_EDIT_DIAG_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// After a successful edit tool (`write_file` / `edit_file` / `move_file`),
+/// nudges the language server to re-check the touched files and appends any
+/// fresh errors/warnings to the tool result the agent sees.
+///
+/// Because this lives on the tool-result path it reaches every runner. It is a
+/// silent no-op unless: the tool is an edit tool, it succeeded, a language
+/// server serves the touched file, and diagnostics arrive within
+/// [`POST_EDIT_DIAG_WAIT`]. On timeout it returns `result` unchanged.
+async fn append_edit_diagnostics(
+    tool_name: &str,
+    tool_input: &str,
+    result: String,
+    lsp_manager: &Arc<smedja_lsp::LspManager>,
+) -> String {
+    if !matches!(tool_name, "write_file" | "edit_file" | "move_file") {
+        return result;
+    }
+    // Edit tools surface failures as `error:` / `denied:` / `permission denied`.
+    let head = result.trim_start();
+    if head.starts_with("error")
+        || head.starts_with("denied")
+        || head.starts_with("permission denied")
+    {
+        return result;
+    }
+
+    let input: serde_json::Value =
+        serde_json::from_str(tool_input).unwrap_or(serde_json::Value::Null);
+    // Edited paths: `path` (write/edit) and `destination` (move).
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for key in ["path", "destination"] {
+        if let Some(p) = input.get(key).and_then(serde_json::Value::as_str) {
+            files.push(std::path::PathBuf::from(p));
+        }
+    }
+    if files.is_empty() {
+        return result;
+    }
+
+    let mut blocks = Vec::new();
+    for file in files {
+        let diags = lsp_manager
+            .refresh_and_wait(&file, POST_EDIT_DIAG_WAIT)
+            .await;
+        if let Some(block) = format_edit_diagnostics(&file, &diags) {
+            blocks.push(block);
+        }
+    }
+    if blocks.is_empty() {
+        result
+    } else {
+        format!("{result}\n{}", blocks.join("\n"))
+    }
+}
+
+/// Formats the error/warning diagnostics for one edited file into a compact
+/// block appended to the tool result. Returns `None` when there is nothing to
+/// report (hints/info are dropped as noise for the feedback loop).
+fn format_edit_diagnostics(
+    file: &std::path::Path,
+    diags: &[smedja_lsp::Diagnostic],
+) -> Option<String> {
+    use smedja_lsp::Severity;
+    let relevant: Vec<&smedja_lsp::Diagnostic> = diags
+        .iter()
+        .filter(|d| matches!(d.severity, Severity::Error | Severity::Warning))
+        .collect();
+    if relevant.is_empty() {
+        return None;
+    }
+    let mut s = format!("<lsp_diagnostics file=\"{}\">", file.display());
+    for d in relevant {
+        let sev = match d.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Info => "info",
+            Severity::Hint => "hint",
+        };
+        let code = d
+            .code
+            .as_deref()
+            .map(|c| format!(" [{c}]"))
+            .unwrap_or_default();
+        let _ = write!(
+            s,
+            "\n{}:{}:{}: {sev}{code}: {}",
+            file.display(),
+            d.line,
+            d.col,
+            d.message
+        );
+    }
+    s.push_str("\n</lsp_diagnostics>");
+    Some(s)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2931,5 +3059,76 @@ mod tests {
             a, b,
             "same inputs must produce identical output for cache stability"
         );
+    }
+
+    // ── post-edit diagnostics feedback loop ────────────────────────────────
+
+    fn diag(sev: smedja_lsp::Severity, msg: &str) -> smedja_lsp::Diagnostic {
+        smedja_lsp::Diagnostic {
+            file: std::path::PathBuf::from("src/lib.rs"),
+            line: 7,
+            col: 3,
+            severity: sev,
+            code: Some("E0001".to_owned()),
+            message: msg.to_owned(),
+        }
+    }
+
+    #[test]
+    fn format_edit_diagnostics_reports_errors_and_warnings() {
+        use smedja_lsp::Severity;
+        let file = std::path::Path::new("src/lib.rs");
+        let block =
+            super::format_edit_diagnostics(file, &[diag(Severity::Error, "mismatched types")])
+                .expect("an error must produce a block");
+        assert!(block.contains("<lsp_diagnostics file=\"src/lib.rs\">"));
+        assert!(block.contains("src/lib.rs:7:3: error [E0001]: mismatched types"));
+        assert!(block.trim_end().ends_with("</lsp_diagnostics>"));
+    }
+
+    #[test]
+    fn format_edit_diagnostics_ignores_hints_and_empty() {
+        use smedja_lsp::Severity;
+        let file = std::path::Path::new("src/lib.rs");
+        assert!(super::format_edit_diagnostics(file, &[]).is_none());
+        assert!(
+            super::format_edit_diagnostics(file, &[diag(Severity::Hint, "unused")]).is_none(),
+            "hint-only diagnostics are dropped as feedback noise"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_edit_diagnostics_is_noop_for_non_edit_and_errors() {
+        let mgr = Arc::new(smedja_lsp::LspManager::new());
+        // Non-edit tool: returned unchanged.
+        let out = super::append_edit_diagnostics(
+            "read_file",
+            r#"{"path":"a.rs"}"#,
+            "file body".to_owned(),
+            &mgr,
+        )
+        .await;
+        assert_eq!(out, "file body");
+
+        // Edit tool but a failed result: returned unchanged (never queries LSP).
+        let out = super::append_edit_diagnostics(
+            "write_file",
+            r#"{"path":"a.rs","content":"x"}"#,
+            "error: disk full".to_owned(),
+            &mgr,
+        )
+        .await;
+        assert_eq!(out, "error: disk full");
+
+        // Edit success but no language server serves the file: no append, and
+        // the bounded wait returns promptly rather than hanging.
+        let out = super::append_edit_diagnostics(
+            "write_file",
+            r#"{"path":"a.txt","content":"x"}"#,
+            "wrote 1 byte".to_owned(),
+            &mgr,
+        )
+        .await;
+        assert_eq!(out, "wrote 1 byte");
     }
 }

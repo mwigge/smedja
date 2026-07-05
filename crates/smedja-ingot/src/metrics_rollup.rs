@@ -1,11 +1,17 @@
 //! Time-tiered metrics rollups over the cost ledger and audit log.
 //!
-//! Aggregates tokens, cost, turns, and error counts **per runner** into one of
-//! five fixed time tiers (`raw` / `hourly` / `daily` / `weekly` / `monthly`).
+//! Aggregates tokens, cost, turns, and error counts **per (runner, model)** into
+//! one of five fixed time tiers (`raw` / `hourly` / `daily` / `weekly` /
+//! `monthly`). The `model` dimension surfaces per-tier usage/cost (fable-plan vs
+//! sonnet/haiku-implement vs opus-review) — the cost ledger records `model` per
+//! turn, and the rollup carries it through instead of dropping it.
+//!
 //! Tokens, cost, and turns come from `cost_ledger`; error counts come from
-//! `audit_events` rows with `status = 'error'`. The two grouped result sets are
-//! merged in Rust on `(bucket_start, runner)` so a runner that errored without a
-//! cost row — or spent without erroring — still appears.
+//! `audit_events` rows with `status = 'error'`. The audit log has no model
+//! dimension, so error rows land under the empty-string model (`""`). The two
+//! grouped result sets are merged in Rust on `(bucket_start, runner, model)` so a
+//! runner that errored without a cost row — or spent without erroring — still
+//! appears.
 //!
 //! Aggregation is computed on read from source rows by default; an optional
 //! idempotent [`materialise`] upserts the same computed buckets into the
@@ -120,7 +126,7 @@ fn start_of_day(dt: DateTime<Utc>) -> DateTime<Utc> {
         .unwrap_or(dt)
 }
 
-/// One aggregated `(tier, bucket_start, runner)` row.
+/// One aggregated `(tier, bucket_start, runner, model)` row.
 ///
 /// Cost is kept as exact integer [`Microdollars`]; conversion to USD happens
 /// only at the display boundary.
@@ -132,6 +138,9 @@ pub struct MetricsBucket {
     pub bucket_start: Timestamp,
     /// Runner name (e.g. `"claude"`, `"local"`).
     pub runner: String,
+    /// Model id (e.g. `"claude-opus-4-8"`). Empty for error-only rows, which come
+    /// from the audit log and carry no model dimension.
+    pub model: String,
     /// Number of turns (cost-ledger rows) in this bucket.
     pub turns: i64,
     /// Sum of input tokens.
@@ -144,8 +153,8 @@ pub struct MetricsBucket {
     pub error_count: i64,
 }
 
-/// A mutable per-`(bucket_start, runner)` accumulator used while merging the two
-/// grouped result sets.
+/// A mutable per-`(bucket_start, runner, model)` accumulator used while merging
+/// the two grouped result sets.
 #[derive(Default)]
 struct Accumulator {
     turns: i64,
@@ -161,8 +170,9 @@ struct Accumulator {
 /// counted from `audit_events` with `status = 'error'`. Both source timestamps
 /// (`cost_ledger.created_at`, `audit_events.ts`) are bucketed with the same
 /// [`RollupTier::bucket_start`], so identical instants land in identical
-/// buckets. The merge is keyed on `(bucket_start, runner)`; results are ordered
-/// by `bucket_start` then `runner`.
+/// buckets. The merge is keyed on `(bucket_start, runner, model)`; results are
+/// ordered by `bucket_start`, then `runner`, then `model`. Audit errors carry no
+/// model dimension and land under the empty-string model (`""`).
 ///
 /// The `until` bound is exclusive. The `runner` dimension for audit errors is
 /// taken from `agent_name` when present, falling back to `actor`, mirroring how
@@ -177,11 +187,11 @@ pub(crate) fn compute(
     since: Timestamp,
     until: Timestamp,
 ) -> Result<Vec<MetricsBucket>, IngotError> {
-    let mut acc: BTreeMap<(i64, String), Accumulator> = BTreeMap::new();
+    let mut acc: BTreeMap<(i64, String, String), Accumulator> = BTreeMap::new();
 
-    // ── cost_ledger: tokens / cost / turns per (bucket, runner) ──────────────
+    // ── cost_ledger: tokens / cost / turns per (bucket, runner, model) ───────
     let mut cost_stmt = conn.prepare(
-        "SELECT runner, input_tok, output_tok, cost_usd, created_at \
+        "SELECT runner, model, input_tok, output_tok, cost_usd, created_at \
          FROM cost_ledger \
          WHERE created_at >= ?1 AND created_at < ?2",
     )?;
@@ -189,24 +199,32 @@ pub(crate) fn compute(
         rusqlite::params![since.as_micros(), until.as_micros()],
         |row| {
             let runner: String = row.get(0)?;
-            let input_tok: i64 = row.get(1)?;
-            let output_tok: i64 = row.get(2)?;
-            let cost_micros = crate::read_micros(row, 3)?;
-            let created_at = crate::read_micros(row, 4)?;
-            Ok((runner, input_tok, output_tok, cost_micros, created_at))
+            let model: String = row.get(1)?;
+            let input_tok: i64 = row.get(2)?;
+            let output_tok: i64 = row.get(3)?;
+            let cost_micros = crate::read_micros(row, 4)?;
+            let created_at = crate::read_micros(row, 5)?;
+            Ok((
+                runner,
+                model,
+                input_tok,
+                output_tok,
+                cost_micros,
+                created_at,
+            ))
         },
     )?;
     for row in cost_rows {
-        let (runner, input_tok, output_tok, cost_micros, created_at) = row?;
+        let (runner, model, input_tok, output_tok, cost_micros, created_at) = row?;
         let bucket = tier.bucket_start(created_at);
-        let entry = acc.entry((bucket, runner)).or_default();
+        let entry = acc.entry((bucket, runner, model)).or_default();
         entry.turns += 1;
         entry.input_tok += input_tok;
         entry.output_tok += output_tok;
         entry.cost_micros = entry.cost_micros.saturating_add(cost_micros);
     }
 
-    // ── audit_events: error counts per (bucket, runner) ──────────────────────
+    // ── audit_events: error counts per (bucket, runner) — no model dimension ─
     let mut err_stmt = conn.prepare(
         "SELECT COALESCE(agent_name, actor) AS runner, ts \
          FROM audit_events \
@@ -223,17 +241,19 @@ pub(crate) fn compute(
     for row in err_rows {
         let (runner, ts) = row?;
         let bucket = tier.bucket_start(ts);
-        let entry = acc.entry((bucket, runner)).or_default();
+        // Errors have no model — key them under the empty-string model.
+        let entry = acc.entry((bucket, runner, String::new())).or_default();
         entry.error_count += 1;
     }
 
-    // BTreeMap iteration is ordered by (bucket_start, runner) — the required order.
+    // BTreeMap iteration is ordered by (bucket_start, runner, model) — the order.
     let buckets = acc
         .into_iter()
-        .map(|((bucket_start, runner), a)| MetricsBucket {
+        .map(|((bucket_start, runner, model), a)| MetricsBucket {
             tier,
             bucket_start: Timestamp::from_micros(bucket_start),
             runner,
+            model,
             turns: a.turns,
             input_tok: a.input_tok,
             output_tok: a.output_tok,
@@ -245,7 +265,7 @@ pub(crate) fn compute(
 }
 
 /// Upserts the computed buckets for `tier` over `[since, until)` into
-/// `metrics_rollups`, keyed on `(tier, bucket_start, runner)`.
+/// `metrics_rollups`, keyed on `(tier, bucket_start, runner, model)`.
 ///
 /// Re-running with the same inputs reproduces identical rows (idempotent): the
 /// `ON CONFLICT … DO UPDATE` overwrites every aggregate column with the freshly
@@ -264,9 +284,9 @@ pub(crate) fn materialise(
     for b in &buckets {
         conn.execute(
             "INSERT INTO metrics_rollups \
-             (tier, bucket_start, runner, turns, input_tok, output_tok, cost_usd, error_count) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-             ON CONFLICT(tier, bucket_start, runner) DO UPDATE SET \
+             (tier, bucket_start, runner, model, turns, input_tok, output_tok, cost_usd, error_count) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+             ON CONFLICT(tier, bucket_start, runner, model) DO UPDATE SET \
                turns       = excluded.turns, \
                input_tok   = excluded.input_tok, \
                output_tok  = excluded.output_tok, \
@@ -276,6 +296,7 @@ pub(crate) fn materialise(
                 b.tier.as_str(),
                 b.bucket_start.as_micros(),
                 b.runner,
+                b.model,
                 b.turns,
                 b.input_tok,
                 b.output_tok,
@@ -585,7 +606,10 @@ mod tests {
     }
 
     #[test]
-    fn cost_and_error_at_same_instant_share_one_bucket() {
+    fn cost_and_error_split_by_model_dimension() {
+        // With `model` in the key, a cost row (model "m") and an error row (no
+        // model → "") no longer merge: the cost lands under its model, the error
+        // under the empty-string model. Ordered by model, "" sorts before "m".
         let ingot = Ingot::open_in_memory().unwrap();
         let at = micros(2026, 1, 1, 9, 0, 0);
         ingot
@@ -600,10 +624,50 @@ mod tests {
         let buckets = ingot
             .metrics_rollup(RollupTier::Daily, since, until)
             .unwrap();
-        assert_eq!(buckets.len(), 1, "one merged (bucket, runner) row");
-        assert_eq!(buckets[0].turns, 1);
-        assert_eq!(buckets[0].cost_usd, Microdollars::from_micros(50_000));
+        assert_eq!(buckets.len(), 2, "cost and error split by model dimension");
+        // (claude, "") — the error-only row.
+        assert_eq!(buckets[0].runner, "claude");
+        assert_eq!(buckets[0].model, "");
         assert_eq!(buckets[0].error_count, 1);
+        assert_eq!(buckets[0].turns, 0);
+        // (claude, "m") — the cost row.
+        assert_eq!(buckets[1].model, "m");
+        assert_eq!(buckets[1].turns, 1);
+        assert_eq!(buckets[1].cost_usd, Microdollars::from_micros(50_000));
+        assert_eq!(buckets[1].error_count, 0);
+    }
+
+    #[test]
+    fn buckets_split_per_model_for_the_same_runner() {
+        // Per-tier accounting: two models on the same runner produce two rows so
+        // fable-plan / sonnet-implement / opus-review are separable.
+        let ingot = Ingot::open_in_memory().unwrap();
+        let day = micros(2026, 1, 1, 9, 0, 0);
+        let entry = |model: &str, cost: f64| CostEntry {
+            id: Uuid::new_v4(),
+            session_id: "s1".to_owned(),
+            turn_n: 0,
+            runner: "claude".to_owned(),
+            model: model.to_owned(),
+            input_tok: 100,
+            output_tok: 50,
+            cost_usd: Microdollars::from_usd_f64(cost),
+            created_at: Timestamp::from_micros(day),
+        };
+        ingot.insert_cost(&entry("claude-fable-5", 0.01)).unwrap();
+        ingot.insert_cost(&entry("claude-opus-4-8", 0.02)).unwrap();
+
+        let since = Timestamp::from_micros(micros(2026, 1, 1, 0, 0, 0));
+        let until = Timestamp::from_micros(micros(2026, 1, 2, 0, 0, 0));
+        let buckets = ingot
+            .metrics_rollup(RollupTier::Daily, since, until)
+            .unwrap();
+        assert_eq!(buckets.len(), 2, "one row per model");
+        // Ordered by model: "claude-fable-5" < "claude-opus-4-8".
+        assert_eq!(buckets[0].model, "claude-fable-5");
+        assert_eq!(buckets[0].cost_usd, Microdollars::from_micros(10_000));
+        assert_eq!(buckets[1].model, "claude-opus-4-8");
+        assert_eq!(buckets[1].cost_usd, Microdollars::from_micros(20_000));
     }
 
     #[test]
@@ -644,9 +708,9 @@ mod tests {
         let mut stmt = ingot
             .conn
             .prepare(
-                "SELECT bucket_start, runner, turns, input_tok, output_tok, cost_usd, error_count \
+                "SELECT bucket_start, runner, model, turns, input_tok, output_tok, cost_usd, error_count \
                  FROM metrics_rollups WHERE tier = 'daily' \
-                 ORDER BY bucket_start, runner",
+                 ORDER BY bucket_start, runner, model",
             )
             .unwrap();
         let stored: Vec<MetricsBucket> = stmt
@@ -655,11 +719,12 @@ mod tests {
                     tier: RollupTier::Daily,
                     bucket_start: Timestamp::from_micros(crate::read_micros(row, 0)?),
                     runner: row.get(1)?,
-                    turns: row.get(2)?,
-                    input_tok: row.get(3)?,
-                    output_tok: row.get(4)?,
-                    cost_usd: Microdollars::from_micros(crate::read_micros(row, 5)?),
-                    error_count: row.get(6)?,
+                    model: row.get(2)?,
+                    turns: row.get(3)?,
+                    input_tok: row.get(4)?,
+                    output_tok: row.get(5)?,
+                    cost_usd: Microdollars::from_micros(crate::read_micros(row, 6)?),
+                    error_count: row.get(7)?,
                 })
             })
             .unwrap()

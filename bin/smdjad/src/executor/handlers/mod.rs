@@ -12,6 +12,7 @@
 
 pub(crate) mod fs;
 pub(crate) mod graph;
+pub(crate) mod lsp;
 pub(crate) mod sre;
 pub(crate) mod vault;
 pub(crate) mod web;

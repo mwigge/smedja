@@ -18,6 +18,26 @@ pub trait RoleRunner {
         slice_index: usize,
         slice: &str,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    /// Runs the executed plan phase at the plan tier, returning the slice list.
+    ///
+    /// The planner decomposes the umbrella intent into a slice list (writing or
+    /// refreshing `tasks.md`) so the pipeline is *plan → implement → verify →
+    /// review* rather than slices handed in. `existing` is the slice list already
+    /// read from `tasks.md`; an implementation that has nothing to plan (a
+    /// pre-existing `tasks.md`, or a fake runner in tests) returns it unchanged.
+    ///
+    /// The default implementation is a behavior-compatible no-op: it returns
+    /// `existing` without running any turn, so a `RoleRunner` that predates the
+    /// plan phase keeps its old behavior.
+    fn run_plan(
+        &self,
+        _role: &LoopRole,
+        existing: &[String],
+    ) -> impl Future<Output = anyhow::Result<Vec<String>>> + Send {
+        let owned = existing.to_vec();
+        async move { Ok(owned) }
+    }
 }
 
 /// Persists loop progression — status transitions and the slice counter.

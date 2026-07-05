@@ -13,7 +13,7 @@ use std::sync::Arc;
 use smedja_assayer::Assayer;
 use smedja_bellows::Dispatcher;
 use smedja_ingot::{IngotHandle, Session, Task};
-use smedja_loop::{LoopConfig, LoopRole, LoopState, RoleRunner, StatusSink};
+use smedja_loop::{LoopConfig, LoopRole, LoopState, RoleRunner, StatusSink, Tier};
 use smedja_types::Timestamp;
 use smedja_vault::Vault;
 use tokio::sync::Mutex;
@@ -24,6 +24,68 @@ use crate::cowork::CoworkGate;
 use crate::orchestrator::TurnOrchestrator;
 use crate::price_table::PriceTable;
 use crate::provider_pool::ProviderPool;
+
+/// Live model ids for the owner's loop×tier mapping (confirmed against the
+/// current catalog): planner=Fable 5, implementer=Sonnet 5 (complex) /
+/// Haiku 4.5 (simple), reviewer=Opus 4.8.
+const MODEL_PLAN: &str = "claude-fable-5";
+const MODEL_IMPL_COMPLEX: &str = "claude-sonnet-5";
+const MODEL_IMPL_SIMPLE: &str = "claude-haiku-4-5";
+const MODEL_REVIEW: &str = "claude-opus-4-8";
+
+/// The directive the planner turn works from when no `tasks.md` exists yet.
+const PLAN_DIRECTIVE: &str =
+    "Decompose the umbrella intent into a coarse slice list and write it to \
+     tasks.md, one `- [ ] ` line per slice.";
+
+/// Built-in model for a loop phase, keyed by role name and routed tier.
+///
+/// This is the 4-slot tier→model binding of the owner's loop×tier vision:
+/// planner→Fable, implementer/fix→Sonnet (Deep/complex) or Haiku (cheaper/simple)
+/// keyed by the role's routed tier, reviewer→Opus. Roles outside the pipeline
+/// (orchestrator, proposer, tester) return `None` and keep the pool default.
+#[must_use]
+fn builtin_model_for(role_name: &str, tier: Tier) -> Option<&'static str> {
+    match role_name {
+        "plan" => Some(MODEL_PLAN),
+        "reviewer" => Some(MODEL_REVIEW),
+        "implementer" | "fix" => Some(match tier {
+            // Deep tier ⇒ a complex slice ⇒ the stronger Sonnet; a cheaper tier
+            // ⇒ a simple slice ⇒ Haiku. This is also the axis the failure-escalation
+            // ladder climbs, so an escalated fix turn upgrades Haiku → Sonnet.
+            Tier::Deep => MODEL_IMPL_COMPLEX,
+            _ => MODEL_IMPL_SIMPLE,
+        }),
+        _ => None,
+    }
+}
+
+/// Binds a phase role to the owner's model, returning a role whose `model` field
+/// carries the resolved id.
+///
+/// An explicit `model` in `loop.json` always wins. Otherwise the built-in
+/// mapping is resolved through the existing `SMEDJA_MODEL_<RUNNER>_<TIER>` env
+/// override ([`crate::provider_pool::model_default`]) so a newly released model
+/// can be swapped in without a recompile. The binding is via `LoopRole::model`
+/// and leaves `runner`/`tier` untouched, so evaluator separation (a runner-level
+/// check) is unaffected.
+#[must_use]
+fn bind_role_model(role: &LoopRole) -> LoopRole {
+    if role.model.is_some() {
+        return role.clone();
+    }
+    let Some(builtin) = builtin_model_for(&role.name, role.tier) else {
+        return role.clone();
+    };
+    let runner_name = crate::common::runner_session_key(role.runner);
+    let mut bound = role.clone();
+    bound.model = Some(crate::provider_pool::model_default(
+        runner_name,
+        role.tier,
+        builtin,
+    ));
+    bound
+}
 
 /// Persists loop progression through the ingot `loops` table.
 pub(crate) struct LoopStatusSink {
@@ -90,6 +152,11 @@ impl RoleRunner for LoopRoleRunner {
         slice_index: usize,
         slice: &str,
     ) -> anyhow::Result<()> {
+        // Bind the phase to the owner's model (env-overridable) before the turn
+        // runs, so the routed session carries the right model id (fable-plan /
+        // sonnet-or-haiku-implement / opus-review).
+        let bound = bind_role_model(role);
+        let role = &bound;
         let now = Timestamp::now();
         let session_id = Uuid::new_v4();
 
@@ -176,6 +243,19 @@ impl RoleRunner for LoopRoleRunner {
         self.record_slice_saving(slice_index, slice, session_id.to_string())
             .await;
         Ok(())
+    }
+
+    async fn run_plan(&self, role: &LoopRole, existing: &[String]) -> anyhow::Result<Vec<String>> {
+        // Behavior-compatible refresh: a tasks.md that already lists pending
+        // slices is kept as-is — the plan phase never overwrites an authored
+        // slice list. Only a fresh, empty tasks.md triggers a planner turn.
+        if !existing.is_empty() {
+            return Ok(existing.to_vec());
+        }
+        // Run the planner turn at the plan tier (bound to fable in run_role) to
+        // decompose the umbrella into tasks.md, then re-read the pending slices.
+        self.run_role(role, 0, PLAN_DIRECTIVE).await?;
+        Ok(read_pending_slices(&self.workspace_root, &self.change_name).await)
     }
 }
 
@@ -769,6 +849,82 @@ mod tests {
                 "each slice carries only its own thin delta in the mutable window"
             );
         }
+    }
+
+    // ── 4-slot tier→model binding ───────────────────────────────────────────
+
+    #[test]
+    fn builtin_model_maps_the_four_phase_slots() {
+        // planner=Fable, implementer=Sonnet(complex)/Haiku(simple), reviewer=Opus.
+        assert_eq!(
+            super::builtin_model_for("plan", Tier::Deep),
+            Some("claude-fable-5")
+        );
+        assert_eq!(
+            super::builtin_model_for("reviewer", Tier::Fast),
+            Some("claude-opus-4-8")
+        );
+        assert_eq!(
+            super::builtin_model_for("implementer", Tier::Deep),
+            Some("claude-sonnet-5")
+        );
+        assert_eq!(
+            super::builtin_model_for("implementer", Tier::Local),
+            Some("claude-haiku-4-5")
+        );
+        assert_eq!(
+            super::builtin_model_for("fix", Tier::Deep),
+            Some("claude-sonnet-5")
+        );
+        // Non-pipeline roles keep the pool default.
+        assert_eq!(super::builtin_model_for("orchestrator", Tier::Deep), None);
+    }
+
+    #[test]
+    fn bind_role_model_resolves_the_owner_mapping() {
+        let roles = LoopRole::defaults();
+        let plan = roles.iter().find(|r| r.name == "plan").unwrap();
+        assert_eq!(
+            super::bind_role_model(plan).model.as_deref(),
+            Some("claude-fable-5"),
+            "the plan phase binds to fable"
+        );
+        let reviewer = roles.iter().find(|r| r.name == "reviewer").unwrap();
+        assert_eq!(
+            super::bind_role_model(reviewer).model.as_deref(),
+            Some("claude-opus-4-8"),
+            "the review phase binds to opus"
+        );
+    }
+
+    #[test]
+    fn bind_role_model_respects_an_explicit_config_model() {
+        let mut plan = LoopRole::defaults()
+            .into_iter()
+            .find(|r| r.name == "plan")
+            .unwrap();
+        plan.model = Some("operator-pinned-model".to_owned());
+        assert_eq!(
+            super::bind_role_model(&plan).model.as_deref(),
+            Some("operator-pinned-model"),
+            "an explicit loop.json model always wins over the builtin binding"
+        );
+    }
+
+    #[test]
+    fn model_binding_preserves_evaluator_separation() {
+        // opus-review over haiku/sonnet-implement: the binding only touches
+        // `model`, so the runner-level reviewer≠implementer separation still holds.
+        let roles = LoopRole::defaults();
+        let implementer =
+            super::bind_role_model(roles.iter().find(|r| r.name == "implementer").unwrap());
+        let reviewer = super::bind_role_model(roles.iter().find(|r| r.name == "reviewer").unwrap());
+        assert!(
+            reviewer.runner_differs_from(&implementer),
+            "evaluator separation must survive model binding"
+        );
+        assert_eq!(reviewer.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(implementer.model.as_deref(), Some("claude-haiku-4-5"));
     }
 
     async fn deps() -> (

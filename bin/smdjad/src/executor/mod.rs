@@ -120,6 +120,12 @@ pub(crate) const LOCAL_TOOLS: &[&str] = &[
     "otel_query",
     "metric_query",
     "log_tail",
+    "lsp_definition",
+    "lsp_references",
+    "lsp_hover",
+    "lsp_document_symbols",
+    "lsp_workspace_symbols",
+    "lsp_rename_symbol",
 ];
 
 /// Read-safe subset of [`LOCAL_TOOLS`] exposed by MCP server mode.
@@ -142,6 +148,11 @@ pub(crate) const MCP_SERVER_TOOLS: &[&str] = &[
     "otel_query",
     "metric_query",
     "log_tail",
+    "lsp_definition",
+    "lsp_references",
+    "lsp_hover",
+    "lsp_document_symbols",
+    "lsp_workspace_symbols",
 ];
 
 /// Read-only tools that can run concurrently without cowork gate approval.
@@ -160,13 +171,22 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "log_tail",
     "smedja_vault_search",
     "smedja_retrieve",
+    "lsp_definition",
+    "lsp_references",
+    "lsp_hover",
+    "lsp_document_symbols",
+    "lsp_workspace_symbols",
 ];
 
 /// Executes the named tool with the given JSON input string.
 ///
 /// Supported tools: `bash`, `run_command`, `read_file`, `list_files`, vault tools,
 /// graph tools, SRE tools.  Unknown tools are forwarded to [`dispatch_mcp_tool`].
-#[allow(clippy::too_many_lines, clippy::items_after_statements)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::too_many_arguments
+)]
 pub(crate) async fn execute_tool(
     tool_name: &str,
     tool_input: &str,
@@ -175,6 +195,7 @@ pub(crate) async fn execute_tool(
     ingot: &IngotHandle,
     vault: &Arc<Mutex<Vault>>,
     embedder: &Arc<dyn crate::embedder_port::Embedder>,
+    lsp: Option<&Arc<smedja_lsp::LspManager>>,
 ) -> String {
     let input: Value = serde_json::from_str(tool_input).unwrap_or(Value::Null);
 
@@ -261,6 +282,16 @@ pub(crate) async fn execute_tool(
         "fetch_web" => match handlers::web::fetch_web(&input).await {
             Ok(r) => r,
             Err(e) => return e,
+        },
+        "lsp_definition"
+        | "lsp_references"
+        | "lsp_hover"
+        | "lsp_document_symbols"
+        | "lsp_workspace_symbols"
+        | "lsp_rename_symbol" => match lsp {
+            Some(mgr) => handlers::lsp::dispatch(tool_name, &input, mgr, workspace).await,
+            None => "error: LSP tools are unavailable in this context (no language-server manager)"
+                .to_owned(),
         },
         other => dispatch_mcp_tool(other, &input, ingot).await,
     };

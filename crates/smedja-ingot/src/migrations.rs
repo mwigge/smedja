@@ -173,6 +173,30 @@ pub(crate) const MIGRATIONS: &[(i64, &str)] = &[
         25,
         "ALTER TABLE audit_events ADD COLUMN change_name TEXT;",
     ),
+    // Per-tier token accounting: add the `model` dimension to the metrics rollup
+    // key so per-tier usage/cost (fable-plan vs sonnet/haiku-implement vs
+    // opus-review) can be surfaced. The cost ledger already records model per
+    // turn; the rollup previously dropped it. `metrics_rollups` is a derived
+    // cache (rebuilt by materialise), so it is dropped and recreated with the new
+    // primary key rather than migrated in place. Idempotent via IF NOT EXISTS on
+    // recreate; the DROP is unconditional because no source-of-truth data lives
+    // here.
+    (
+        26,
+        "DROP TABLE IF EXISTS metrics_rollups; \
+         CREATE TABLE IF NOT EXISTS metrics_rollups ( \
+             tier         TEXT NOT NULL, \
+             bucket_start INTEGER NOT NULL, \
+             runner       TEXT NOT NULL, \
+             model        TEXT NOT NULL DEFAULT '', \
+             turns        INTEGER NOT NULL DEFAULT 0, \
+             input_tok    INTEGER NOT NULL DEFAULT 0, \
+             output_tok   INTEGER NOT NULL DEFAULT 0, \
+             cost_usd     INTEGER NOT NULL DEFAULT 0, \
+             error_count  INTEGER NOT NULL DEFAULT 0, \
+             PRIMARY KEY (tier, bucket_start, runner, model) \
+         );",
+    ),
 ];
 
 impl Ingot {

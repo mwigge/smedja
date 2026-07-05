@@ -21,6 +21,7 @@ pub(crate) fn review_write_block(tool_name: &str, session: Option<&Session>) -> 
             "move_file",
             "copy_file",
             "delete_file",
+            "lsp_rename_symbol",
         ];
         if WRITE_TOOLS.contains(&tool_name) {
             tracing::warn!(

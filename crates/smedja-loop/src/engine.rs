@@ -28,6 +28,29 @@ use checkpoint::{resolve_role, runner_label, tier_label, write_checkpoint};
 
 pub use types::{LoopCheckpoint, LoopOutcome, RoleRunner, StatusSink};
 
+/// Runs the executed plan phase with a telemetry span, returning the slice list.
+async fn run_plan_traced<R: RoleRunner>(
+    runner: &R,
+    role: &LoopRole,
+    existing: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let tracer = opentelemetry::global::tracer("smedja.loop");
+    let mut span = tracer.start("smedja.loop.plan");
+    crate::telemetry::set_role_attributes(
+        &mut span,
+        &role.name,
+        runner_label(role.runner),
+        tier_label(role.tier),
+        0,
+    );
+    let result = runner.run_plan(role, existing).await;
+    if result.is_err() {
+        span.set_status(opentelemetry::trace::Status::error("plan phase failed"));
+    }
+    span.end();
+    result
+}
+
 /// Runs a role with a per-role telemetry span carrying the standard attributes.
 async fn run_role_traced<R: RoleRunner>(
     runner: &R,
@@ -93,6 +116,10 @@ pub async fn drive<R: RoleRunner, S: StatusSink>(
 ) -> LoopOutcome {
     let started = Instant::now();
 
+    // The slice list is mutable: the executed plan phase (below) may replace it
+    // with the planner's decomposition on a fresh run.
+    let mut slices: Vec<String> = slices.to_vec();
+
     // 1. Policy-hash tamper detection — fail closed.
     if config.verify_policy(policy_path).is_err() {
         sink.set_status(&LoopState::PolicyTampered).await;
@@ -120,6 +147,33 @@ pub async fn drive<R: RoleRunner, S: StatusSink>(
     }
 
     sink.set_status(&LoopState::Planning).await;
+
+    // Executed plan phase — runs FIRST at the plan tier and produces the slice
+    // list. Only a fresh run (`start_slice == 0`) with an explicitly configured
+    // `plan` role plans: a resume re-enters at the checkpoint with the slices
+    // already on disk, and a config without a plan role keeps the old
+    // "slices handed in" behavior (behavior-compatible). The pipeline is then
+    // plan → implement → verify → review.
+    if start_slice == 0 && config.roles.iter().any(|r| r.name == "plan") {
+        let plan = resolve_role(config, "plan");
+        match run_plan_traced(runner, &plan, &slices).await {
+            Ok(planned) => slices = planned,
+            Err(_) => {
+                let _ = crate::mining::write_failure_guide(
+                    "plan",
+                    &["plan phase failed to produce a slice list".to_owned()],
+                    None,
+                    workspace,
+                );
+                sink.set_status(&LoopState::Failed).await;
+                finish(change_name, &LoopState::Failed, 0, started);
+                return LoopOutcome {
+                    final_state: LoopState::Failed,
+                    slices_completed: 0,
+                };
+            }
+        }
+    }
 
     let implementer = resolve_role(config, "implementer");
     let fix = resolve_role(config, "fix");
@@ -309,7 +363,20 @@ async fn run_slice_parallel<'a, R: RoleRunner, S: StatusSink>(
     // "slice failed" line.
     let mut last_verify: Option<VerifyResult> = None;
     for attempt in 0..max_attempts {
-        let role = if attempt == 0 { implementer } else { fix };
+        // On a retry, escalate the fix role to a stronger tier: a slice that
+        // failed its verification gate gets a more capable model on its next
+        // attempt. Bounded (capped at Deep) and deterministic via the assayer
+        // escalation ladder, so the retry budget stays finite.
+        let fix_escalated;
+        let role = if attempt == 0 {
+            implementer
+        } else {
+            fix_escalated = LoopRole {
+                tier: smedja_assayer::escalate_tier(fix.tier, attempt),
+                ..fix.clone()
+            };
+            &fix_escalated
+        };
         if run_role_traced(runner, role, idx, slice, attempt)
             .await
             .is_err()

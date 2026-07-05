@@ -28,6 +28,31 @@ pub fn cap_tier(tier: Tier, ceiling: Tier) -> Tier {
     }
 }
 
+/// Escalation ladder (failure → stronger): the tier to use for retry `attempt`
+/// of a slice that failed its verification gate. The inverse of
+/// [`descending_tier`] — where the descent ladder starts strong and cheapens
+/// over *successful* steps, a slice that *fails* climbs one capability rank per
+/// retry toward `Deep` so a harder-than-expected slice gets a stronger model on
+/// its next attempt.
+///
+/// `attempt` is 0-based: attempt `0` is `base` unchanged, and each subsequent
+/// attempt steps up one rank. The result is bounded at `Deep` via [`cap_tier`],
+/// so the ladder is finite and deterministic regardless of how large `attempt`
+/// grows.
+#[must_use]
+pub fn escalate_tier(base: Tier, attempt: u32) -> Tier {
+    let raised_rank = base
+        .capability_rank()
+        .saturating_add(u8::try_from(attempt).unwrap_or(u8::MAX));
+    let raised = match raised_rank {
+        0 => Tier::Local,
+        1 => Tier::Fast,
+        _ => Tier::Deep,
+    };
+    // Bound the climb at Deep — the ladder never escalates past the strongest tier.
+    cap_tier(raised, Tier::Deep)
+}
+
 /// Capability rank for tier ordering (Local < Fast < Deep).
 ///
 /// Delegates to [`Tier::capability_rank`] — the single source of truth shared
@@ -315,6 +340,26 @@ mod tests {
         assert_eq!(super::cap_tier(Tier::Deep, Tier::Fast), Tier::Fast);
         assert_eq!(super::cap_tier(Tier::Local, Tier::Deep), Tier::Local);
         assert_eq!(super::cap_tier(Tier::Fast, Tier::Fast), Tier::Fast);
+    }
+
+    #[test]
+    fn escalate_tier_climbs_toward_deep_on_failure() {
+        // attempt 0 leaves the base tier unchanged.
+        assert_eq!(super::escalate_tier(Tier::Local, 0), Tier::Local);
+        assert_eq!(super::escalate_tier(Tier::Fast, 0), Tier::Fast);
+        // Each retry steps up one capability rank.
+        assert_eq!(super::escalate_tier(Tier::Local, 1), Tier::Fast);
+        assert_eq!(super::escalate_tier(Tier::Local, 2), Tier::Deep);
+        assert_eq!(super::escalate_tier(Tier::Fast, 1), Tier::Deep);
+        // Bounded at Deep — never escalates past the strongest tier, for any attempt.
+        assert_eq!(super::escalate_tier(Tier::Local, 3), Tier::Deep);
+        assert_eq!(super::escalate_tier(Tier::Deep, 1), Tier::Deep);
+        assert_eq!(super::escalate_tier(Tier::Local, u32::MAX), Tier::Deep);
+        // Monotonic non-decreasing in capability across attempts.
+        assert!(
+            super::escalate_tier(Tier::Local, 0).capability_rank()
+                <= super::escalate_tier(Tier::Local, 1).capability_rank()
+        );
     }
 
     #[test]
