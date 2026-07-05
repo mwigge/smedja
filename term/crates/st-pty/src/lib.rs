@@ -1547,8 +1547,15 @@ impl CopyMode {
             let mut start = 0;
             while let Some(pos) = line[start..].find(query) {
                 let abs = start + pos;
-                self.search_matches.push((abs as u16, r as u16));
-                start = abs + 1;
+                // The match column is the number of cells (chars) before `abs`,
+                // not the raw byte offset — one grid cell holds exactly one char.
+                let col = line[..abs].chars().count();
+                self.search_matches.push((col as u16, r as u16));
+                // Advance past the first char of this match. Stepping a single
+                // byte could land mid-codepoint and panic the next `line[start..]`
+                // slice on multibyte content (emoji/CJK/accented text).
+                let step = line[abs..].chars().next().map_or(1, char::len_utf8);
+                start = abs + step;
             }
         }
     }
@@ -2225,6 +2232,41 @@ mod tests {
         cm.search_matches.push((0, 0));
         cm.search("", &grid);
         assert!(cm.search_matches.is_empty());
+    }
+
+    #[test]
+    fn copy_mode_search_multibyte_reports_cell_columns() {
+        let mut grid = make_grid(20, 5);
+        // Two 4-byte emoji then "AB". The match "A" sits at cell column 2 but at
+        // byte offset 8 — the old code pushed the byte offset as the column.
+        for (i, ch) in "\u{1f680}\u{1f680}AB".chars().enumerate() {
+            grid.cells[0][i].ch = ch;
+        }
+        let mut cm = CopyMode::new();
+        cm.search("A", &grid);
+        assert_eq!(
+            cm.search_matches,
+            vec![(2, 0)],
+            "column must be the cell index, not the raw byte offset"
+        );
+    }
+
+    #[test]
+    fn copy_mode_search_repeated_multibyte_query_does_not_panic() {
+        let mut grid = make_grid(20, 5);
+        // Three CJK codepoints. Searching for one of them must find all three.
+        // The old `start = abs + 1` stepped into the middle of the first 3-byte
+        // codepoint and panicked on the next slice. Fail-before.
+        for (i, ch) in "\u{4e2d}\u{4e2d}\u{4e2d}".chars().enumerate() {
+            grid.cells[0][i].ch = ch;
+        }
+        let mut cm = CopyMode::new();
+        cm.search("\u{4e2d}", &grid);
+        assert_eq!(
+            cm.search_matches,
+            vec![(0, 0), (1, 0), (2, 0)],
+            "each cell holding the query char is a distinct match at its column"
+        );
     }
 
     #[test]
