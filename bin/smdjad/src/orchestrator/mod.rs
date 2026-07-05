@@ -40,12 +40,54 @@ use cold::VaultColdStore;
 mod context;
 use context::{classify_tool_outcome, cold_k_for_tier, model_context_window, strata_for_tier};
 
+/// A provider-native resume identifier plus the last time it was read or written.
+///
+/// The `last_used` stamp lets the background GC evict only genuinely idle entries
+/// and never wipe a session whose turn is running right now.
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderSessionEntry {
+    /// The provider-native resume id.
+    pub id: String,
+    /// When this entry was last read or inserted.
+    pub last_used: std::time::Instant,
+}
+
+impl ProviderSessionEntry {
+    /// Wraps a resume `id`, stamping it as used now.
+    pub fn new(id: String) -> Self {
+        Self {
+            id,
+            last_used: std::time::Instant::now(),
+        }
+    }
+}
+
 /// Shared map from session-resume keys to provider-native resume identifiers.
 ///
 /// Constructed once in `main()` and threaded explicitly to every orchestrator
 /// (replacing the former process-static `OnceLock` singleton) so tests can
 /// supply their own map.
-pub(crate) type ProviderSessions = Arc<Mutex<HashMap<String, String>>>;
+pub(crate) type ProviderSessions = Arc<Mutex<HashMap<String, ProviderSessionEntry>>>;
+
+/// Evicts idle entries from the provider-session `map` once it exceeds `cap`.
+///
+/// Only entries not read or written within `idle` are removed; a session whose
+/// turn touched its entry more recently than `idle` is retained even over `cap`,
+/// so in-flight turns never lose their provider-native resume id. Returns the
+/// number of entries evicted.
+pub(crate) fn gc_provider_sessions(
+    map: &mut HashMap<String, ProviderSessionEntry>,
+    cap: usize,
+    idle: std::time::Duration,
+) -> usize {
+    if map.len() <= cap {
+        return 0;
+    }
+    let now = std::time::Instant::now();
+    let before = map.len();
+    map.retain(|_, entry| now.duration_since(entry.last_used) < idle);
+    before - map.len()
+}
 
 /// Key identifying a persisted [`smedja_memory::CacheAligner`]: `(session_id, runner_name)`.
 ///
@@ -938,6 +980,13 @@ impl TurnOrchestrator {
         // reason when the ring is exhausted.
         let mut last_kind: &'static str = "request";
         let mut rotations: u32 = 0;
+        // True once the model returns a tool-free reply (a genuine final answer).
+        // If the tool loop instead exhausts the tool-turn cap, the last assistant
+        // text is raw tool-call JSON and must not be persisted as the answer.
+        let mut reached_final_answer = false;
+        let turn_cap = self
+            .max_tool_turns
+            .map_or_else(crate::common::effective_max_tool_turns, |n| n as usize);
 
         // Wall-clock deadline shared across all provider rotations and tool-loop
         // iterations for this turn.  Using a single `Instant` deadline (rather
@@ -987,11 +1036,12 @@ impl TurnOrchestrator {
             // key; a resume id from a previously-failed runner is never carried
             // across providers.
             let provider_session_id = if matches!(runner_enum, Runner::Claude | Runner::Codex) {
-                provider_sessions
-                    .lock()
-                    .await
-                    .get(&session_store_key)
-                    .cloned()
+                // Refresh `last_used` on read so an active turn's entry is never
+                // treated as idle by the background GC.
+                provider_sessions.lock().await.get_mut(&session_store_key).map(|e| {
+                    e.last_used = std::time::Instant::now();
+                    e.id.clone()
+                })
             } else {
                 None
             };
@@ -1063,9 +1113,6 @@ impl TurnOrchestrator {
             // `None` means the attempt completed (success or fatal handled inline).
             let mut rotate: Option<(&'static str, String)> = None;
 
-            let turn_cap = self
-                .max_tool_turns
-                .map_or_else(crate::common::effective_max_tool_turns, |n| n as usize);
             'tool_loop: for _iteration in 0..turn_cap {
                 // 5a. Stream LLM response with rate-limit retry.
                 let (
@@ -1154,10 +1201,10 @@ impl TurnOrchestrator {
                 };
                 if matches!(runner_enum, Runner::Claude | Runner::Codex) {
                     if let Some(native_session_id) = native_session_id {
-                        provider_sessions
-                            .lock()
-                            .await
-                            .insert(session_store_key.clone(), native_session_id);
+                        provider_sessions.lock().await.insert(
+                            session_store_key.clone(),
+                            ProviderSessionEntry::new(native_session_id),
+                        );
                     }
                 }
                 total_input_tokens = total_input_tokens.saturating_add(input_tokens);
@@ -1170,6 +1217,7 @@ impl TurnOrchestrator {
                 if tool_calls.is_empty() {
                     // 5f. No tool call — this is the final response.
                     full_response = response_text;
+                    reached_final_answer = true;
                     break 'tool_loop;
                 }
 
@@ -1177,86 +1225,120 @@ impl TurnOrchestrator {
 
                 if tool_calls.len() > 1 {
                     // Multi-tool batch: read-only tools run concurrently; write/exec
-                    // tools run sequentially through a simplified cowork gate.
+                    // tools run sequentially through the cowork gate. The whole
+                    // batch is bounded by the shared turn deadline so a hung tool
+                    // or a never-answered approval can't block the turn forever.
                     let n = tool_calls.len();
-                    let mut ordered_results = vec![String::new(); n];
 
-                    // Partition into (original_index, name, input) for reads and writes.
-                    let (read_slots, write_slots): (Vec<_>, Vec<_>) =
-                        tool_calls.iter().enumerate().partition(|(_, (name, _))| {
-                            crate::executor::READ_ONLY_TOOLS.contains(&name.as_str())
-                        });
+                    let batch = async {
+                        let mut ordered_results = vec![String::new(); n];
 
-                    // (a) Parallel reads.
-                    {
-                        use futures_util::StreamExt as _;
-                        let mut futs = futures_util::stream::FuturesUnordered::new();
-                        for (i, (name, input)) in read_slots {
-                            let name = name.clone();
-                            let input = input.clone();
-                            let wsr = workspace_root.clone();
-                            let ig = ingot.clone();
-                            let vt = vault.clone();
-                            let em = Arc::clone(embedder);
-                            futs.push(async move {
-                                let result =
-                                    execute_tool(&name, &input, &wsr, None, &ig, &vt, &em).await;
-                                (i, result)
+                        // Partition into (original_index, name, input) for reads and writes.
+                        let (read_slots, write_slots): (Vec<_>, Vec<_>) =
+                            tool_calls.iter().enumerate().partition(|(_, (name, _))| {
+                                crate::executor::READ_ONLY_TOOLS.contains(&name.as_str())
                             });
-                        }
-                        while let Some((i, result)) = futs.next().await {
-                            ordered_results[i] = result;
-                        }
-                    }
 
-                    // (b) Sequential writes with simplified cowork gate.
-                    for (i, (name, input)) in write_slots {
-                        ordered_results[i] = if role.is_read_only() {
-                            format!(
-                                "denied: the {} role is read-only and cannot run {name}",
-                                role.label()
-                            )
-                        } else {
-                            let gate = {
-                                let mut g = gates.lock().await;
-                                Arc::clone(
-                                    g.entry(session_id.clone())
-                                        .or_insert_with(|| Arc::new(CoworkGate::default())),
+                        // (a) Parallel reads.
+                        {
+                            use futures_util::StreamExt as _;
+                            let mut futs = futures_util::stream::FuturesUnordered::new();
+                            for (i, (name, input)) in read_slots {
+                                let name = name.clone();
+                                let input = input.clone();
+                                let wsr = workspace_root.clone();
+                                let ig = ingot.clone();
+                                let vt = vault.clone();
+                                let em = Arc::clone(embedder);
+                                futs.push(async move {
+                                    let result =
+                                        execute_tool(&name, &input, &wsr, None, &ig, &vt, &em)
+                                            .await;
+                                    (i, result)
+                                });
+                            }
+                            while let Some((i, result)) = futs.next().await {
+                                ordered_results[i] = result;
+                            }
+                        }
+
+                        // (b) Sequential writes through the cowork gate.
+                        for (i, (name, input)) in write_slots {
+                            ordered_results[i] = if role.is_read_only() {
+                                format!(
+                                    "denied: the {} role is read-only and cannot run {name}",
+                                    role.label()
                                 )
+                            } else {
+                                let gate = {
+                                    let mut g = gates.lock().await;
+                                    Arc::clone(
+                                        g.entry(session_id.clone())
+                                            .or_insert_with(|| Arc::new(CoworkGate::default())),
+                                    )
+                                };
+                                let args_val = serde_json::from_str(input)
+                                    .unwrap_or(serde_json::Value::Null);
+                                // Thread `push` so a batch approval under Ask is
+                                // surfaced to the TUI (auto-approves in Auto mode);
+                                // passing `None` here left the approval invisible and
+                                // the turn hung on the gate.
+                                let push = Some((dispatcher.as_ref(), Some(turn_id.as_str())));
+                                let decision =
+                                    gate.gate_tool(0, name, args_val, "", push).await;
+                                match decision {
+                                    Decision::Approve => {
+                                        execute_tool(
+                                            name,
+                                            input,
+                                            &workspace_root,
+                                            session.as_ref(),
+                                            ingot,
+                                            vault,
+                                            embedder,
+                                        )
+                                        .await
+                                    }
+                                    Decision::Deny(reason) => format!("denied: {reason}"),
+                                    Decision::Modify(new_input) => {
+                                        execute_tool(
+                                            name,
+                                            &new_input,
+                                            &workspace_root,
+                                            session.as_ref(),
+                                            ingot,
+                                            vault,
+                                            embedder,
+                                        )
+                                        .await
+                                    }
+                                }
                             };
-                            let args_val =
-                                serde_json::from_str(input).unwrap_or(serde_json::Value::Null);
-                            // ponytail: batch gate — interactive intercept deferred; auto-approves in Auto mode
-                            let decision = gate.gate_tool(0, name, args_val, "", None).await;
-                            match decision {
-                                Decision::Approve => {
-                                    execute_tool(
-                                        name,
-                                        input,
-                                        &workspace_root,
-                                        session.as_ref(),
-                                        ingot,
-                                        vault,
-                                        embedder,
-                                    )
-                                    .await
-                                }
-                                Decision::Deny(reason) => format!("denied: {reason}"),
-                                Decision::Modify(new_input) => {
-                                    execute_tool(
-                                        name,
-                                        &new_input,
-                                        &workspace_root,
-                                        session.as_ref(),
-                                        ingot,
-                                        vault,
-                                        embedder,
-                                    )
-                                    .await
-                                }
+                        }
+
+                        ordered_results
+                    };
+
+                    let ordered_results =
+                        match tokio::time::timeout_at(turn_deadline, batch).await {
+                            Ok(r) => r,
+                            Err(_elapsed) => {
+                                let reason = format!(
+                                    "turn deadline exceeded after {}s",
+                                    crate::common::effective_agent_timeout_s()
+                                );
+                                warn!(turn_id = %turn_id, "turn wall-clock deadline exceeded during tool batch");
+                                let _ = ingot.update_task_status(&turn_id, "failed").await;
+                                dispatcher.publish(TurnEvent::fail(
+                                    &session_id,
+                                    &turn_id,
+                                    &reason,
+                                ));
+                                tel::set_span_error(&mut turn_span, "request", &reason, false);
+                                turn_span.end();
+                                return;
                             }
                         };
-                    }
 
                     // (c) Combine results in call order.
                     use std::fmt::Write as _;
@@ -1271,7 +1353,6 @@ impl TurnOrchestrator {
                         );
                     }
                     mem.push(AdapterMessage::user(combined.trim_end().to_owned()));
-                    full_response = response_text;
                     continue 'tool_loop;
                 }
 
@@ -1542,12 +1623,13 @@ impl TurnOrchestrator {
                 mem.push(AdapterMessage::user(format!(
                     "<tool_result tool=\"{tool_name}\">{escaped_result}</tool_result>"
                 )));
-
-                full_response = response_text;
+                // Note: `full_response` is deliberately NOT set here — a tool call
+                // is not the turn's answer. Only the tool-free branch above records
+                // the final response.
             }
 
-            // Attempt finished. If no rotation was requested the turn succeeded
-            // (or exhausted the tool-iteration cap) against this provider.
+            // Attempt finished. If no rotation was requested the turn either
+            // produced a final answer or exhausted the tool-iteration cap.
             let Some((kind, message)) = rotate else {
                 break 'ring;
             };
@@ -1586,6 +1668,20 @@ impl TurnOrchestrator {
             let _ = ingot.update_task_status(&turn_id, "failed").await;
             dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
             tel::set_span_error(&mut turn_span, last_kind, &reason, false);
+            turn_span.end();
+            return;
+        }
+
+        // The tool loop ran to its cap without the model ever returning a
+        // tool-free reply: the last assistant text was raw tool-call JSON, not an
+        // answer. Fail the turn (surfacing the exhaustion) instead of persisting
+        // that JSON as if it were the final response.
+        if !reached_final_answer {
+            let reason = format!("tool-turn cap ({turn_cap}) reached before a final answer");
+            warn!(turn_id = %turn_id, cap = turn_cap, "tool-turn cap exhausted without final answer");
+            let _ = ingot.update_task_status(&turn_id, "failed").await;
+            dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
+            tel::set_span_error(&mut turn_span, "tool_cap_exhausted", &reason, false);
             turn_span.end();
             return;
         }
@@ -1949,6 +2045,54 @@ mod tests {
     use crate::provider_pool::{build_provider_pool, ProviderEntry, ProviderPool};
 
     use smedja_methodology::MethodologyConfig;
+
+    #[test]
+    fn gc_retains_live_session_and_evicts_idle() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        let idle = Duration::from_secs(30 * 60);
+        let mut map: HashMap<String, super::ProviderSessionEntry> = HashMap::new();
+        // A live session touched "now" (an in-flight turn).
+        map.insert(
+            "live".to_owned(),
+            super::ProviderSessionEntry::new("resume-live".to_owned()),
+        );
+        // Fill past the cap so the GC engages, all stale (touched an hour ago).
+        let stale = Instant::now() - Duration::from_secs(60 * 60);
+        for i in 0..11_000 {
+            map.insert(
+                format!("stale-{i}"),
+                super::ProviderSessionEntry {
+                    id: format!("resume-{i}"),
+                    last_used: stale,
+                },
+            );
+        }
+
+        let evicted = super::gc_provider_sessions(&mut map, 10_000, idle);
+        assert_eq!(evicted, 11_000, "all idle entries are evicted");
+        assert!(
+            map.contains_key("live"),
+            "an in-flight session must survive GC"
+        );
+        assert_eq!(map.len(), 1, "only the live session remains");
+    }
+
+    #[test]
+    fn gc_noop_under_cap() {
+        use std::collections::HashMap;
+        use std::time::Duration;
+        let mut map: HashMap<String, super::ProviderSessionEntry> = HashMap::new();
+        map.insert(
+            "a".to_owned(),
+            super::ProviderSessionEntry::new("x".to_owned()),
+        );
+        // Under cap: nothing is evicted even though the entry is "old" by idle.
+        let evicted = super::gc_provider_sessions(&mut map, 10_000, Duration::from_secs(0));
+        assert_eq!(evicted, 0);
+        assert_eq!(map.len(), 1);
+    }
 
     #[test]
     fn directive_present_under_default_config() {
@@ -3006,6 +3150,93 @@ mod tests {
             call_count.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "exactly two model calls: one for batch tool calls, one for final response"
+        );
+    }
+
+    /// A provider that always emits a single tool call and never a tool-free
+    /// reply — it can never terminate the tool loop, so the loop exhausts its cap.
+    struct AlwaysToolProvider {
+        call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Provider for AlwaysToolProvider {
+        fn stream_chat(&self, _messages: &[AdapterMessage], _opts: &CallOptions) -> DeltaStream {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let text = r#"{"tool":"read_file","input":{"path":"a.txt"}}"#.to_owned();
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(Delta::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                }),
+                Ok(Delta::Text(text)),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_cap_exhaustion_fails_turn_not_persisted_as_answer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ws = tempfile::tempdir().unwrap();
+        let ws_path = ws.path().to_owned();
+        std::fs::write(ws_path.join("a.txt"), b"alpha").unwrap();
+
+        let ingot = IngotHandle::new(Ingot::open_in_memory().expect("in-memory Ingot must open"));
+        let (session_id, turn_id) =
+            make_ws_session_and_task(&ingot, ws_path.clone(), "loop without answering").await;
+
+        let call_count = std::sync::Arc::new(AtomicUsize::new(0));
+        let provider = AlwaysToolProvider {
+            call_count: std::sync::Arc::clone(&call_count),
+        };
+
+        let dispatcher = Arc::new(Dispatcher::new(64));
+        let mut rx = dispatcher.subscribe();
+        let pool = ProviderPool::from_entries_for_test(vec![entry(
+            (Runner::Claude, Tier::Fast),
+            "claude-cli",
+            Box::new(provider),
+        )]);
+
+        let cap: u32 = 3;
+        let orc = orchestrator_with_pool(ingot.clone(), Arc::clone(&dispatcher), pool)
+            .cap_tool_turns(cap);
+        orc.run(session_id.clone(), turn_id.clone()).await;
+
+        // The model never produced a tool-free answer, so the turn must fail rather
+        // than persist the last tool-call JSON as if it were the final response.
+        let task = ingot
+            .get_task(&turn_id)
+            .await
+            .unwrap()
+            .expect("task must exist");
+        assert_eq!(
+            task.status, "failed",
+            "a cap-exhausted turn must be marked failed"
+        );
+        assert!(
+            task.response.as_deref().unwrap_or("").is_empty(),
+            "raw tool-call JSON must not be persisted as the answer; got: {:?}",
+            task.response
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            cap as usize,
+            "the model is called exactly `cap` times before exhaustion"
+        );
+
+        let mut saw_cap_fail = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let TurnEvent::Failed { reason, .. } = ev {
+                if reason.contains("tool-turn cap") {
+                    saw_cap_fail = true;
+                }
+            }
+        }
+        assert!(
+            saw_cap_fail,
+            "a fail event must surface the tool-turn cap exhaustion"
         );
     }
 

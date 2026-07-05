@@ -403,6 +403,9 @@ pub(crate) async fn run(
         &runner,
         &sink,
         0,
+        // All slices share this one workspace tree (no per-slice worktree), so the
+        // engine must run them serially and checkpoint per slice.
+        true,
     )
     .await;
 }
@@ -559,6 +562,8 @@ pub(crate) async fn resume(
         &runner,
         &sink,
         start_slice,
+        // Shared workspace tree — serial, per-slice-checkpointed execution.
+        true,
     )
     .await;
 }
@@ -706,6 +711,7 @@ mod tests {
             &runner,
             &sink,
             0,
+            true,
         )
         .await;
 

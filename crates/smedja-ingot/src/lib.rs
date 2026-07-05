@@ -456,29 +456,11 @@ impl Ingot {
             if version <= applied {
                 continue;
             }
-            // Each ALTER TABLE may fail on a fresh database where the column was
-            // already present in the base CREATE TABLE DDL above.  Run the DDL
-            // inside a savepoint so idempotent errors (duplicate column, table
-            // already exists) are silently ignored, but real failures are
-            // propagated rather than silently recording the migration as applied.
-            let sp_name = format!("migration_{version}");
-            self.conn
-                .execute_batch(&format!("SAVEPOINT \"{sp_name}\""))?;
-            let ddl_result = self.conn.execute_batch(sql);
-            match ddl_result {
-                Ok(()) => {
-                    self.conn.execute_batch(&format!("RELEASE \"{sp_name}\""))?;
-                }
-                Err(ref e) if is_idempotent_ddl_error(e) => {
-                    self.conn.execute_batch(&format!("RELEASE \"{sp_name}\""))?;
-                }
-                Err(e) => {
-                    self.conn
-                        .execute_batch(&format!("ROLLBACK TO \"{sp_name}\""))?;
-                    self.conn.execute_batch(&format!("RELEASE \"{sp_name}\""))?;
-                    return Err(IngotError::Db(e));
-                }
-            }
+            // Apply the whole migration batch inside a savepoint. Only after
+            // every statement has been applied (or has failed with an ignorable
+            // idempotent error) do we record the version, so a migration whose
+            // later statements were skipped is never marked complete.
+            apply_migration_batch(&self.conn, version, sql)?;
             self.conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                 rusqlite::params![version, now],
@@ -563,7 +545,10 @@ impl Ingot {
              (conversation_id, started_at, last_seen_at, agent_count, \
               llm_call_count, tool_call_count, failure_count, \
               input_token_total, output_token_total) \
-             VALUES (?1, ?2, ?2, 0, ?3, ?4, ?5, ?6, ?7) \
+             VALUES (?1, ?2, ?2, \
+                     (SELECT COUNT(DISTINCT COALESCE(agent_name, actor)) \
+                      FROM audit_events WHERE conversation_id = ?1), \
+                     ?3, ?4, ?5, ?6, ?7) \
              ON CONFLICT(conversation_id) DO UPDATE SET \
                last_seen_at       = excluded.last_seen_at, \
                agent_count        = (SELECT COUNT(DISTINCT COALESCE(agent_name, actor)) \
@@ -706,8 +691,16 @@ impl Ingot {
     /// Returns [`IngotError`] on database failure.
     pub fn prune_old_sessions(&self, older_than_days: u64) -> Result<usize, IngotError> {
         let micros_per_day: i64 = 86_400 * 1_000_000;
-        let cutoff = smedja_types::Timestamp::now().as_micros()
-            - i64::try_from(older_than_days).unwrap_or(i64::MAX) * micros_per_day;
+        // Saturating arithmetic: a huge `older_than_days` clamps the offset (and
+        // the resulting cutoff) instead of overflowing i64 and wrapping to a
+        // wrong/negative cutoff. A clamped cutoff prunes nothing rather than
+        // silently deleting rows.
+        let offset = i64::try_from(older_than_days)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(micros_per_day);
+        let cutoff = smedja_types::Timestamp::now()
+            .as_micros()
+            .saturating_sub(offset);
 
         let deleted = {
             let tx = self.conn.unchecked_transaction()?;
@@ -1659,6 +1652,44 @@ pub(crate) fn read_micros(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Resu
 /// Returns `true` for DDL errors that are safe to ignore for idempotency
 /// (duplicate column, table already exists). Real failures (wrong syntax,
 /// constraint violations, etc.) return `false` and must be propagated.
+/// Applies a single migration's SQL batch inside a savepoint, executing it one
+/// statement at a time.
+///
+/// Running statement-by-statement means an idempotent error (duplicate column,
+/// table already exists) in one statement is ignored **without** skipping the
+/// statements that follow it — a whole-batch `execute_batch` would abort at the
+/// first error and leave later statements unapplied. Any genuine error rolls the
+/// savepoint back and is returned, so the caller never records a half-applied
+/// migration as complete. The savepoint is released only when the entire batch
+/// has been applied.
+fn apply_migration_batch(
+    conn: &rusqlite::Connection,
+    version: i64,
+    sql: &str,
+) -> Result<(), IngotError> {
+    let sp_name = format!("migration_{version}");
+    conn.execute_batch(&format!("SAVEPOINT \"{sp_name}\""))?;
+    for stmt in sql.split(';') {
+        if stmt.trim().is_empty() {
+            continue;
+        }
+        match conn.execute_batch(stmt) {
+            Ok(()) => {}
+            // Ignorable: the statement's effect already exists. Nothing was
+            // modified (these are prepare-time errors) so the savepoint stays
+            // valid and the remaining statements still run.
+            Err(ref e) if is_idempotent_ddl_error(e) => {}
+            Err(e) => {
+                conn.execute_batch(&format!("ROLLBACK TO \"{sp_name}\""))?;
+                conn.execute_batch(&format!("RELEASE \"{sp_name}\""))?;
+                return Err(IngotError::Db(e));
+            }
+        }
+    }
+    conn.execute_batch(&format!("RELEASE \"{sp_name}\""))?;
+    Ok(())
+}
+
 fn is_idempotent_ddl_error(e: &rusqlite::Error) -> bool {
     let msg = e.to_string().to_lowercase();
     msg.contains("duplicate column name")
@@ -2069,6 +2100,84 @@ mod tests {
         assert_eq!(r.failure_count, 1);
         assert_eq!(r.input_token_total, 130);
         assert_eq!(r.output_token_total, 55);
+    }
+
+    #[test]
+    fn single_event_conversation_has_agent_count_one() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        let ev = AuditEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: "sess-agent".into(),
+            conversation_id: Some("conv-agent".into()),
+            action_type: "llm".into(),
+            actor: "coder".into(),
+            ..AuditEvent::default()
+        };
+        // A single-event conversation never hits the ON CONFLICT path, so the
+        // initial INSERT must record the correct distinct-agent count.
+        ingot.record_timeline_event(&ev).unwrap();
+        let rollups = ingot.recent_conversations(10).unwrap();
+        assert_eq!(rollups.len(), 1);
+        assert_eq!(rollups[0].agent_count, 1);
+    }
+
+    #[test]
+    fn prune_old_sessions_with_huge_days_does_not_overflow() {
+        let ingot = Ingot::open_in_memory().unwrap();
+        // A gigantic retention window must not overflow the day->micros
+        // multiply (which would panic in debug or wrap to a bogus cutoff);
+        // it should clamp and prune nothing.
+        let deleted = ingot.prune_old_sessions(u64::MAX).unwrap();
+        assert_eq!(deleted, 0);
+        let deleted_large = ingot.prune_old_sessions(1_000_000_000_000_000).unwrap();
+        assert_eq!(deleted_large, 0);
+    }
+
+    #[test]
+    fn apply_migration_batch_runs_all_statements_after_idempotent_error() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // Pre-create `demo` so the first statement of the batch fails with an
+        // ignorable "already exists" error.
+        conn.execute_batch("CREATE TABLE demo (a INTEGER);").unwrap();
+
+        // First statement errors idempotently; the second one matters and must
+        // still run. A whole-batch execute would abort at the first error and
+        // leave column `b` unapplied.
+        let sql = "CREATE TABLE demo (a INTEGER); ALTER TABLE demo ADD COLUMN b INTEGER;";
+        apply_migration_batch(&conn, 999, sql).unwrap();
+
+        let has_b: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('demo') WHERE name = 'b'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            has_b, 1,
+            "later statement must run even after an earlier idempotent error"
+        );
+    }
+
+    #[test]
+    fn apply_migration_batch_rolls_back_on_genuine_error() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE demo (a INTEGER);").unwrap();
+
+        // Second statement is a genuine error (unknown table): the batch must
+        // roll back and return Err rather than half-apply the first statement.
+        let sql = "ALTER TABLE demo ADD COLUMN b INTEGER; ALTER TABLE nope ADD COLUMN c INTEGER;";
+        let res = apply_migration_batch(&conn, 998, sql);
+        assert!(res.is_err(), "genuine error must propagate");
+
+        let has_b: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('demo') WHERE name = 'b'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_b, 0, "the whole batch must roll back on a genuine error");
     }
 
     #[test]

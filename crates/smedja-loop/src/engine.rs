@@ -63,6 +63,28 @@ pub struct LoopCheckpoint {
     pub slices_completed: u64,
 }
 
+/// Persists the loop checkpoint to `.smedja/loop-state.json` (best-effort).
+///
+/// A missing `.smedja` directory or a write error is ignored: the checkpoint is
+/// a resume optimisation, not a correctness dependency of the current run.
+fn write_checkpoint(
+    path: &Path,
+    change_name: &str,
+    policy_hash: &str,
+    slice_index: usize,
+    slices_completed: u64,
+) {
+    let ckpt = LoopCheckpoint {
+        change_name: change_name.to_owned(),
+        policy_hash: policy_hash.to_owned(),
+        slice_index,
+        slices_completed,
+    };
+    if let Ok(json) = serde_json::to_string(&ckpt) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
 /// Resolves a role by name from the config, falling back to the default table,
 /// then to a deny-all local role.
 fn resolve_role(config: &LoopConfig, name: &str) -> LoopRole {
@@ -147,8 +169,15 @@ async fn run_role_traced<R: RoleRunner>(
 /// for a fresh run and the checkpointed index for a `loop.resume` call.
 /// Slices before `start_slice` count toward `slices_completed` immediately.
 ///
-/// Before executing each slice the engine writes a checkpoint to
-/// `.smedja/loop-state.json`; `loop.resume` reads it to re-enter here.
+/// The engine writes an initial checkpoint to `.smedja/loop-state.json` and then
+/// advances it after each slice passes, so `loop.resume` re-enters at the first
+/// uncompleted slice rather than re-running the whole batch.
+///
+/// `shared_workspace` guards against concurrent slices corrupting a single tree:
+/// the engine has no per-slice worktree isolation, so when the slices operate on
+/// one shared workspace (`true`) execution is forced serial regardless of
+/// `max_parallel_slices`. A caller that gives each slice its own worktree passes
+/// `false` to honour the configured parallelism.
 ///
 /// Returns the terminal [`LoopOutcome`]; it never panics.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -161,6 +190,7 @@ pub async fn drive<R: RoleRunner, S: StatusSink>(
     runner: &R,
     sink: &S,
     start_slice: usize,
+    shared_workspace: bool,
 ) -> LoopOutcome {
     let started = Instant::now();
 
@@ -200,58 +230,127 @@ pub async fn drive<R: RoleRunner, S: StatusSink>(
     // Pre-completed slices from a prior run (resume path).
     let pre_completed = start_slice as u64;
 
-    // Bounded concurrency: default min(4, remaining slice count).
+    // Bounded concurrency: default min(4, remaining slice count). A shared
+    // workspace has no per-slice worktree isolation, so concurrent slices would
+    // edit the same tree and run the verification command against each other's
+    // half-finished changes — force serial in that case.
     let remaining = slices.len().saturating_sub(start_slice);
-    let max_parallel = config.limits.max_parallel_slices.map_or_else(
+    let configured_parallel = config.limits.max_parallel_slices.map_or_else(
         || u32::try_from(remaining).unwrap_or(u32::MAX).min(4),
         |n| n.max(1),
     ) as usize;
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallel));
-
-    // Checkpoint: record the batch start so loop.resume can re-enter here.
-    let checkpoint_path = workspace.join(".smedja").join("loop-state.json");
-    let ckpt = LoopCheckpoint {
-        change_name: change_name.to_owned(),
-        policy_hash: config.policy_hash.clone(),
-        slice_index: start_slice,
-        slices_completed: pre_completed,
+    let max_parallel = if shared_workspace {
+        1
+    } else {
+        configured_parallel.max(1)
     };
-    if let Ok(json) = serde_json::to_string(&ckpt) {
-        let _ = std::fs::write(&checkpoint_path, json);
-    }
+
+    // Initial checkpoint: a resume before any slice completes re-enters at
+    // `start_slice`. The checkpoint then advances after each slice passes.
+    let checkpoint_path = workspace.join(".smedja").join("loop-state.json");
+    write_checkpoint(
+        &checkpoint_path,
+        change_name,
+        &config.policy_hash,
+        start_slice,
+        pre_completed,
+    );
 
     sink.set_status(&LoopState::Slicing).await;
 
-    // Dispatch all remaining slices concurrently, bounded by semaphore.
-    let mut futures: futures_util::stream::FuturesUnordered<_> =
-        futures_util::stream::FuturesUnordered::new();
-    for (idx, slice) in slices.iter().enumerate().skip(start_slice) {
-        let sem = Arc::clone(&semaphore);
-        futures.push(run_slice_parallel(
-            runner,
-            sink,
-            config,
-            workspace,
-            change_name,
-            &implementer,
-            &fix,
-            &reviewer,
-            timeout,
-            max_attempts,
-            idx,
-            slice,
-            sem,
-        ));
-    }
-
     let mut passed_count: u64 = 0;
     let mut any_failed = false;
-    while let Some(result) = futures.next().await {
-        if result.passed {
-            passed_count += 1;
-        } else {
-            any_failed = true;
+
+    if max_parallel <= 1 {
+        // Serial: run slices in order, advancing the checkpoint after each pass
+        // so `loop.resume` skips completed slices and re-enters at the first
+        // uncompleted one. Stop at the first failure so resume retries it.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        for (idx, slice) in slices.iter().enumerate().skip(start_slice) {
+            let result = run_slice_parallel(
+                runner,
+                sink,
+                config,
+                workspace,
+                change_name,
+                &implementer,
+                &fix,
+                &reviewer,
+                timeout,
+                max_attempts,
+                idx,
+                slice,
+                Arc::clone(&semaphore),
+            )
+            .await;
+            if result.passed {
+                passed_count += 1;
+                write_checkpoint(
+                    &checkpoint_path,
+                    change_name,
+                    &config.policy_hash,
+                    idx + 1,
+                    pre_completed + passed_count,
+                );
+            } else {
+                any_failed = true;
+                break;
+            }
         }
+    } else {
+        // Parallel: each slice owns an isolated worktree. Dispatch all remaining
+        // slices concurrently, bounded by the semaphore, then advance the
+        // checkpoint over the contiguous run of completed slices.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallel));
+        // `async move` would move the owned role values; bind Copy references so
+        // each per-slice future borrows the shared roles instead.
+        let (impl_ref, fix_ref, rev_ref) = (&implementer, &fix, &reviewer);
+        let mut futures: futures_util::stream::FuturesUnordered<_> =
+            futures_util::stream::FuturesUnordered::new();
+        for (idx, slice) in slices.iter().enumerate().skip(start_slice) {
+            let sem = Arc::clone(&semaphore);
+            futures.push(async move {
+                let r = run_slice_parallel(
+                    runner,
+                    sink,
+                    config,
+                    workspace,
+                    change_name,
+                    impl_ref,
+                    fix_ref,
+                    rev_ref,
+                    timeout,
+                    max_attempts,
+                    idx,
+                    slice,
+                    sem,
+                )
+                .await;
+                (idx, r.passed)
+            });
+        }
+
+        let mut passed_indices = std::collections::BTreeSet::new();
+        while let Some((idx, passed)) = futures.next().await {
+            if passed {
+                passed_count += 1;
+                passed_indices.insert(idx);
+            } else {
+                any_failed = true;
+            }
+        }
+
+        let mut next = start_slice;
+        while passed_indices.contains(&next) {
+            next += 1;
+        }
+        write_checkpoint(
+            &checkpoint_path,
+            change_name,
+            &config.policy_hash,
+            next,
+            pre_completed + passed_count,
+        );
     }
 
     let slices_completed = pre_completed + passed_count;
@@ -442,6 +541,7 @@ mod tests {
             &rec,
             &rec,
             0,
+            true,
         )
         .await;
         assert_eq!(out.final_state, LoopState::Complete);
@@ -467,6 +567,7 @@ mod tests {
             &rec,
             &rec,
             0,
+            true,
         )
         .await;
         assert_eq!(out.final_state, LoopState::Failed);
@@ -525,6 +626,7 @@ mod tests {
             &rec,
             &rec,
             0,
+            true,
         )
         .await;
         assert_eq!(out.final_state, LoopState::Failed);
@@ -552,6 +654,7 @@ mod tests {
             &rec,
             &rec,
             0,
+            true,
         )
         .await;
         assert_eq!(out.final_state, LoopState::Failed);
@@ -577,6 +680,7 @@ mod tests {
             &rec,
             &rec,
             0,
+            true,
         )
         .await;
         assert_eq!(out.final_state, LoopState::PolicyTampered);
@@ -644,6 +748,7 @@ mod tests {
             &rec,
             &rec,
             0,
+            true,
         )
         .await;
         assert_eq!(out.final_state, LoopState::Failed);
@@ -681,6 +786,7 @@ mod tests {
             &rec,
             &rec,
             0,
+            true,
         )
         .await;
         assert_eq!(out.final_state, LoopState::Complete);
@@ -692,22 +798,140 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_written_at_batch_start() {
+    async fn checkpoint_advances_per_completed_slice() {
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join(".smedja")).unwrap();
         let (cfg, path) = config_with(&dir, "true", "[]");
         let rec = Recorder::default();
         let slices = vec!["s0".to_owned(), "s1".to_owned()];
-        let _ = drive(&cfg, dir.path(), &path, "mychange", &slices, &rec, &rec, 0).await;
+        let _ = drive(&cfg, dir.path(), &path, "mychange", &slices, &rec, &rec, 0, true).await;
 
         let ckpt_path = dir.path().join(".smedja").join("loop-state.json");
         assert!(ckpt_path.exists(), "checkpoint file must be written");
         let raw = std::fs::read_to_string(&ckpt_path).unwrap();
         let ckpt: LoopCheckpoint = serde_json::from_str(&raw).unwrap();
-        // Checkpoint is written at batch start (start_slice=0, pre_completed=0).
+        // After both slices pass, the checkpoint has advanced past the batch so a
+        // resume re-enters after the last completed slice instead of at 0.
         assert_eq!(ckpt.change_name, "mychange");
-        assert_eq!(ckpt.slice_index, 0, "checkpoint records batch start index");
-        assert_eq!(ckpt.slices_completed, 0);
+        assert_eq!(
+            ckpt.slice_index, 2,
+            "checkpoint advances to the next uncompleted slice"
+        );
+        assert_eq!(ckpt.slices_completed, 2);
+    }
+
+    /// A resume after N completed slices must re-enter at slice N+1, running only
+    /// the remaining slices — never restarting the whole batch from 0.
+    #[tokio::test]
+    async fn resume_after_n_completed_starts_at_n_plus_one() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".smedja")).unwrap();
+        let (cfg, path) = config_with(&dir, "true", "[]");
+        let slices = vec!["s0".to_owned(), "s1".to_owned(), "s2".to_owned()];
+
+        // First pass: complete slice 0 only (drive a single-slice batch), which
+        // advances the checkpoint to 1.
+        let rec1 = Recorder::default();
+        let _ = drive(&cfg, dir.path(), &path, "mychange", &slices[..1], &rec1, &rec1, 0, true)
+            .await;
+        let ckpt_path = dir.path().join(".smedja").join("loop-state.json");
+        let ckpt: LoopCheckpoint =
+            serde_json::from_str(&std::fs::read_to_string(&ckpt_path).unwrap()).unwrap();
+        assert_eq!(ckpt.slice_index, 1, "one slice completed → checkpoint at 1");
+
+        // Resume from the checkpoint over the full slice list.
+        let rec2 = Recorder::default();
+        let out = drive(
+            &cfg,
+            dir.path(),
+            &path,
+            "mychange",
+            &slices,
+            &rec2,
+            &rec2,
+            ckpt.slice_index,
+            true,
+        )
+        .await;
+        assert_eq!(out.final_state, LoopState::Complete);
+        assert_eq!(out.slices_completed, 3);
+        // Only s1 and s2 run on resume — s0 is not re-run.
+        assert_eq!(
+            *rec2.roles_run.lock().unwrap(),
+            vec!["implementer".to_owned(), "implementer".to_owned()],
+            "resume runs only slices from the checkpoint onward"
+        );
+    }
+
+    /// A shared workspace has no per-slice worktree isolation, so even with
+    /// `max_parallel_slices > 1` the engine must run slices one at a time.
+    #[tokio::test]
+    async fn shared_workspace_forces_serial_execution() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ConcurrencyProbe {
+            current: AtomicUsize,
+            max_seen: AtomicUsize,
+        }
+        impl RoleRunner for ConcurrencyProbe {
+            async fn run_role(
+                &self,
+                _role: &LoopRole,
+                _idx: usize,
+                _slice: &str,
+            ) -> anyhow::Result<()> {
+                let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_seen.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                self.current.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        impl StatusSink for ConcurrencyProbe {
+            async fn set_status(&self, _state: &LoopState) {}
+            async fn set_slice(&self, _slice: i64) {}
+        }
+
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".smedja")).unwrap();
+        // max_parallel_slices = 3 requests parallelism the shared workspace must veto.
+        let json = r#"{
+                "version": 1,
+                "limits": {"max_attempts": 1, "agent_timeout_s": 60, "max_parallel_slices": 3},
+                "roles": [],
+                "verification": {"command": "true"},
+                "review": {"per_slice": false, "required": false},
+                "publication": {"max_pr_lines": 400}
+            }"#;
+        let path = dir.path().join(".smedja").join("loop.json");
+        std::fs::write(&path, json).unwrap();
+        let cfg = LoopConfig::from_file(&path).unwrap();
+        let slices = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+
+        let probe = ConcurrencyProbe {
+            current: AtomicUsize::new(0),
+            max_seen: AtomicUsize::new(0),
+        };
+        let out = drive(&cfg, dir.path(), &path, "demo", &slices, &probe, &probe, 0, true).await;
+        assert_eq!(out.final_state, LoopState::Complete);
+        assert_eq!(out.slices_completed, 3);
+        assert_eq!(
+            probe.max_seen.load(Ordering::SeqCst),
+            1,
+            "shared workspace must never run two slices concurrently"
+        );
+
+        // With an isolated workspace (shared_workspace = false) the same config
+        // is allowed to overlap slices.
+        let probe2 = ConcurrencyProbe {
+            current: AtomicUsize::new(0),
+            max_seen: AtomicUsize::new(0),
+        };
+        let _ = drive(&cfg, dir.path(), &path, "demo", &slices, &probe2, &probe2, 0, false).await;
+        assert!(
+            probe2.max_seen.load(Ordering::SeqCst) > 1,
+            "an isolated workspace may run slices concurrently"
+        );
     }
 
     #[tokio::test]
@@ -718,7 +942,7 @@ mod tests {
         let rec = Recorder::default();
         // Three slices, resume from index 1 (slice "s0" was already done).
         let slices = vec!["s0".to_owned(), "s1".to_owned(), "s2".to_owned()];
-        let out = drive(&cfg, dir.path(), &path, "mychange", &slices, &rec, &rec, 1).await;
+        let out = drive(&cfg, dir.path(), &path, "mychange", &slices, &rec, &rec, 1, true).await;
 
         assert_eq!(out.final_state, LoopState::Complete);
         // slices_completed = start_slice(1) + run_count(2) = 3
@@ -751,7 +975,7 @@ mod tests {
         let rec = Recorder::default();
         let slices = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
 
-        let out = drive(&cfg, dir.path(), &path, "demo", &slices, &rec, &rec, 0).await;
+        let out = drive(&cfg, dir.path(), &path, "demo", &slices, &rec, &rec, 0, true).await;
 
         assert_eq!(out.final_state, LoopState::Complete);
         assert_eq!(out.slices_completed, 3);
@@ -805,7 +1029,7 @@ mod tests {
             statuses: Mutex::new(Vec::new()),
         };
         let slices = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
-        let out = drive(&cfg, dir.path(), &path, "demo", &slices, &rec, &rec, 0).await;
+        let out = drive(&cfg, dir.path(), &path, "demo", &slices, &rec, &rec, 0, true).await;
         // All fail because verification command is "false".
         assert_eq!(out.final_state, LoopState::Failed);
         assert_eq!(
@@ -831,7 +1055,7 @@ mod tests {
         let cfg = LoopConfig::from_file(&path).unwrap();
         let rec = Recorder::default();
         let slices = vec!["x".to_owned(), "y".to_owned(), "z".to_owned()];
-        let out = drive(&cfg, dir.path(), &path, "serial", &slices, &rec, &rec, 0).await;
+        let out = drive(&cfg, dir.path(), &path, "serial", &slices, &rec, &rec, 0, true).await;
         assert_eq!(out.final_state, LoopState::Complete);
         assert_eq!(out.slices_completed, 3);
         // All 3 implementer runs executed.
