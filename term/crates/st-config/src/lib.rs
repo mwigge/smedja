@@ -413,7 +413,11 @@ fn config_path() -> PathBuf {
 /// hex colour.
 pub fn hex_to_rgba(hex: &str) -> Result<[f32; 4], ConfigError> {
     let s = hex.trim_start_matches('#');
-    if s.len() != 6 {
+    // Validate ASCII hex *before* slicing: the byte-length guard alone lets a
+    // 6-byte multibyte string (e.g. "€€") through, and `&s[0..2]` would then
+    // panic mid-codepoint. ASCII hex digits are one byte each, so a passing
+    // check guarantees the fixed byte offsets below fall on char boundaries.
+    if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(ConfigError::InvalidColor(hex.to_owned()));
     }
     let r =
@@ -491,6 +495,16 @@ mod tests {
         assert!(hex_to_rgba("gg0000").is_err());
         assert!(hex_to_rgba("#fff").is_err());
         assert!(hex_to_rgba("").is_err());
+    }
+
+    #[test]
+    fn hex_to_rgba_rejects_multibyte_without_panicking() {
+        // "€€" is 6 bytes but only 2 codepoints. The old byte-length guard let
+        // it pass, then `&s[0..2]` sliced mid-codepoint and panicked. It must
+        // now be rejected cleanly. (Fail-before: this call panicked.)
+        assert!(hex_to_rgba("\u{20ac}\u{20ac}").is_err());
+        // A 2-byte-char + ASCII mix that also totals 6 bytes.
+        assert!(hex_to_rgba("\u{e9}\u{e9}00").is_err());
     }
 
     #[test]

@@ -380,11 +380,9 @@ pub fn tier_compatible(routed: Tier, candidate: Tier, kind: &str) -> bool {
 /// the pool default is the highest-priority available provider.  An empty pool
 /// (all probes failed) is valid; callers handle `None` from `get()`.
 ///
-/// # Panics
-///
-/// Panics if a provider binary that was just confirmed available via its
-/// `available()` probe fails to re-detect immediately afterwards, which would
-/// indicate the binary vanished mid-probe.
+/// A provider binary that passes its `available()` probe but fails to re-detect
+/// immediately afterwards (a mid-probe TOCTOU where the binary vanished) is
+/// logged and skipped rather than aborting pool construction.
 #[allow(clippy::too_many_lines)] // sequential provider probes kept inline; each branch logs a distinct readiness signal
 pub async fn build_provider_pool() -> ProviderPool {
     let mut entries: HashMap<(Runner, Tier), ProviderEntry> = HashMap::new();
@@ -440,25 +438,33 @@ pub async fn build_provider_pool() -> ProviderPool {
         );
         info!(runner = "anthropic", "provider ready");
     } else if SubprocessProvider::available("claude") {
-        let p = ClaudeCliProvider::detect(None).expect("claude binary just confirmed available");
-        let p_deep = ClaudeCliProvider::detect(None);
-        add!(
-            Runner::Claude,
-            Tier::Fast,
-            p,
-            "claude-cli",
-            "claude-haiku-4-5-20251001"
-        );
-        if let Some(pd) = p_deep {
+        // TOCTOU: `available()` and `detect()` are separate probes, so a binary
+        // that just passed `available()` can vanish before `detect()`. Skip the
+        // provider on a `None` instead of panicking the daemon.
+        if let Some(p) = ClaudeCliProvider::detect(None) {
             add!(
                 Runner::Claude,
-                Tier::Deep,
-                pd,
+                Tier::Fast,
+                p,
                 "claude-cli",
-                "claude-opus-4-8"
+                "claude-haiku-4-5-20251001"
+            );
+            if let Some(pd) = ClaudeCliProvider::detect(None) {
+                add!(
+                    Runner::Claude,
+                    Tier::Deep,
+                    pd,
+                    "claude-cli",
+                    "claude-opus-4-8"
+                );
+            }
+            info!(runner = "claude-cli", "provider ready");
+        } else {
+            warn!(
+                runner = "claude-cli",
+                "UNAVAILABLE — claude binary detected then vanished before probe"
             );
         }
-        info!(runner = "claude-cli", "provider ready");
     } else {
         warn!(
             runner = "claude",
@@ -472,9 +478,16 @@ pub async fn build_provider_pool() -> ProviderPool {
         add!(Runner::Codex, Tier::Fast, p, "openai", "gpt-5.5");
         info!(runner = "openai", "provider ready");
     } else if SubprocessProvider::available("codex") {
-        let p_fast = CodexCliProvider::detect(None).expect("codex binary just confirmed available");
-        add!(Runner::Codex, Tier::Fast, p_fast, "codex-cli", "gpt-5.5");
-        info!(runner = "codex-cli", "provider ready");
+        // Same detect TOCTOU as the claude branch: skip on `None`, never panic.
+        if let Some(p_fast) = CodexCliProvider::detect(None) {
+            add!(Runner::Codex, Tier::Fast, p_fast, "codex-cli", "gpt-5.5");
+            info!(runner = "codex-cli", "provider ready");
+        } else {
+            warn!(
+                runner = "codex-cli",
+                "UNAVAILABLE — codex binary detected then vanished before probe"
+            );
+        }
     } else {
         warn!(
             runner = "codex",

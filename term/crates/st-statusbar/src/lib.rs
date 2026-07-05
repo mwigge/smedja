@@ -10,6 +10,26 @@ use std::time::Duration;
 
 use chrono::Local;
 
+// ── UTF-8 helpers ──────────────────────────────────────────────────────────────
+
+/// Returns the largest byte index `<= max` that lies on a UTF-8 char boundary.
+///
+/// Status text (`trace_id`, `session_id`, …) can carry multibyte codepoints, so
+/// slicing a raw byte offset like `&s[..8]` may land mid-codepoint and panic the
+/// renderer. Flooring to the nearest boundary makes `&s[..floor_char_boundary(s,
+/// max)]` always safe without exceeding the requested byte budget.
+#[must_use]
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut i = max;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// A 24-bit RGB colour value.
@@ -512,7 +532,7 @@ impl StatusModule for TraceModule {
     fn evaluate(&self, ctx: &ModuleContext) -> Option<Segment> {
         let tp = ctx.traceparent.as_deref()?;
         let trace_id = tp.split('-').nth(1).unwrap_or(tp);
-        let short = &trace_id[..trace_id.len().min(8)];
+        let short = &trace_id[..floor_char_boundary(trace_id, 8)];
         Some(plain_segment("trace", format!("trace:{short}")))
     }
 }
@@ -538,7 +558,7 @@ impl StatusModule for SessionIdModule {
 
     fn evaluate(&self, ctx: &ModuleContext) -> Option<Segment> {
         let sid = ctx.session_id.as_deref()?;
-        let short = &sid[..sid.len().min(8)];
+        let short = &sid[..floor_char_boundary(sid, 8)];
         Some(plain_segment("session_id", short.to_owned()))
     }
 }
@@ -552,10 +572,15 @@ impl StatusModule for CwdModule {
 
     fn evaluate(&self, ctx: &ModuleContext) -> Option<Segment> {
         let cwd = ctx.cwd.as_deref()?;
-        let short = if cwd.len() <= 40 {
+        // Keep the trailing 40 *characters*, not bytes: slicing `&cwd[len-40..]`
+        // at a raw byte offset can start mid-codepoint (accented/CJK paths) and
+        // panic the renderer.
+        let char_count = cwd.chars().count();
+        let short = if char_count <= 40 {
             cwd.to_owned()
         } else {
-            format!("\u{2026}{}", &cwd[cwd.len() - 40..])
+            let tail: String = cwd.chars().skip(char_count - 40).collect();
+            format!("\u{2026}{tail}")
         };
         Some(plain_segment("cwd", short))
     }
@@ -576,31 +601,11 @@ impl StatusModule for InterfaceModule {
 
 // ── Parallel render ───────────────────────────────────────────────────────────
 
-/// Fat-pointer (data + vtable) to a `StatusModule` packed into two `usize` words.
-///
-/// Storing the raw pointer as a pair of `usize` values avoids the `!Send`
-/// restriction that the compiler imposes on `*const dyn Trait` values, while
-/// preserving the full fat-pointer identity needed to reconstruct a trait-object
-/// reference.
-///
-/// # Safety
-///
-/// The caller must ensure the pointed-to value outlives any thread that holds
-/// a `ModulePtr`. In `render_status_bar_parallel` this is enforced because the
-/// rayon closure blocks on `recv_timeout` until the spawned thread finishes (or
-/// times out), keeping the `Box<dyn StatusModule>` alive for the thread's full
-/// duration.
-#[allow(dead_code)] // fields are read via std::mem::transmute, not by name
-struct ModulePtr {
-    data: usize,
-    vtable: usize,
-}
-
 /// Renders all modules in parallel using rayon + per-module thread timeout.
 ///
-/// Each module is evaluated in a dedicated `std::thread`. If the thread does
-/// not complete within [`StatusModule::timeout_ms`], a `"?"` placeholder
-/// segment is emitted instead. Modules that return `None` are omitted.
+/// Each module is evaluated in a scoped `std::thread` so that `recv_timeout` can
+/// emit a `"?"` placeholder when a module does not answer within
+/// [`StatusModule::timeout_ms`]. Modules that return `None` are omitted.
 ///
 /// The `budget_ms` parameter is accepted for API compatibility; per-module
 /// timeouts are the primary enforcement mechanism.
@@ -621,45 +626,28 @@ pub fn render_status_bar_parallel(
             let timeout = Duration::from_millis(module.timeout_ms());
             let (tx, rx) = mpsc::channel::<Option<Segment>>();
             let ctx_clone = Arc::clone(&ctx);
+            let module_ref: &dyn StatusModule = module.as_ref();
 
-            // The actual evaluation must happen inside a `std::thread` so that
-            // `recv_timeout` can cut it off if the module is slow. The rayon
-            // closure holds the borrow on `module` and does not return until
-            // `recv_timeout` completes. Therefore the `Box<dyn StatusModule>`
-            // behind the raw pointer remains alive for the entire duration the
-            // spawned thread could possibly access it.
-            //
-            // We pack the fat pointer into two `usize` words because raw
-            // `*const dyn Trait` is `!Send` even when the trait bounds include
-            // `Send + Sync`. The data+vtable encoding preserves full trait-object
-            // identity and is reconstructed with `std::mem::transmute` inside
-            // the spawned thread.
-            //
-            // SAFETY: `module.as_ref()` is a `&dyn StatusModule` (Send + Sync).
-            // Transmuting a `*const dyn StatusModule` to `(usize, usize)` and
-            // back is defined behaviour: a fat pointer to a `dyn Trait` is
-            // exactly two pointer-sized words (data pointer + vtable pointer).
-            // The pointer is valid for the duration of the spawned thread
-            // because the rayon closure blocks on `recv_timeout`.
-            let raw: *const dyn StatusModule = module.as_ref();
-            let ptr = unsafe { std::mem::transmute::<*const dyn StatusModule, ModulePtr>(raw) };
-            std::thread::spawn(move || {
-                // SAFETY: see above — the fat pointer is valid and the
-                // referent outlives this thread.
-                let raw = unsafe { std::mem::transmute::<ModulePtr, *const dyn StatusModule>(ptr) };
-                let module_ref = unsafe { &*raw };
-                let _ = tx.send(module_ref.evaluate(&ctx_clone));
-            });
+            // A scoped thread borrows `module_ref` safely: the scope does not
+            // exit until the spawned thread is joined, so the borrowed module can
+            // never be observed after it is dropped (no use-after-free) and the
+            // thread cannot outlive this call (no per-timeout thread leak). On a
+            // slow module, `recv_timeout` yields the `"?"` placeholder while the
+            // scope still joins the worker before returning.
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    let _ = tx.send(module_ref.evaluate(&ctx_clone));
+                });
 
-            match rx.recv_timeout(timeout) {
-                Ok(Some(seg)) => Some(seg),
-                Ok(None) => None,
-                Err(_) => Some(Segment {
-                    name: "?".to_owned(),
-                    text: "?".to_owned(),
-                    style: SegmentStyle::default(),
-                }),
-            }
+                match rx.recv_timeout(timeout) {
+                    Ok(seg) => seg,
+                    Err(_) => Some(Segment {
+                        name: "?".to_owned(),
+                        text: "?".to_owned(),
+                        style: SegmentStyle::default(),
+                    }),
+                }
+            })
         })
         .collect()
 }
@@ -1212,5 +1200,91 @@ mod tests {
             segments[0].text, "?",
             "timed-out module must emit '?' placeholder"
         );
+    }
+
+    #[test]
+    fn slow_module_is_joined_not_leaked_on_timeout() {
+        // Regression for the use-after-free: the old implementation transmuted a
+        // borrow of `module` into a detached raw-pointer thread and returned on
+        // timeout while that thread could still dereference the (possibly dropped)
+        // slice — and leaked one thread per slow module. The scoped-thread fix
+        // JOINS the worker before returning, so its evaluate() must have finished
+        // by the time the render call returns.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static FINISHED: AtomicBool = AtomicBool::new(false);
+
+        struct BlockingModule;
+        impl StatusModule for BlockingModule {
+            fn name(&self) -> &'static str {
+                "blocking"
+            }
+            fn evaluate(&self, _ctx: &ModuleContext) -> Option<Segment> {
+                std::thread::sleep(Duration::from_millis(80));
+                FINISHED.store(true, Ordering::SeqCst);
+                Some(plain_segment("blocking", "done"))
+            }
+            fn timeout_ms(&self) -> u64 {
+                5
+            }
+        }
+
+        FINISHED.store(false, Ordering::SeqCst);
+        let modules: Vec<Box<dyn StatusModule>> = vec![Box::new(BlockingModule)];
+        let ctx = make_ctx();
+        let segments = render_status_bar_parallel(&modules, &ctx, 500);
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].text, "?", "slow module still yields the placeholder");
+        assert!(
+            FINISHED.load(Ordering::SeqCst),
+            "the scoped worker must have been joined (ran to completion) — no leak, no UAF"
+        );
+    }
+
+    #[test]
+    fn trace_module_multibyte_trace_id_does_not_panic() {
+        // trace_id = "中中中中" (4×3 bytes). A raw `&trace_id[..8]` splits the
+        // third codepoint (boundaries at 0,3,6,9,12) → panic. Fail-before.
+        let ctx = ModuleContext {
+            traceparent: Some("00-\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}-b7ad-01".to_owned()),
+            ..make_ctx()
+        };
+        let seg = TraceModule.evaluate(&ctx).expect("must return Some");
+        assert_eq!(seg.text, "trace:\u{4e2d}\u{4e2d}", "floors 8 bytes down to 6");
+    }
+
+    #[test]
+    fn session_id_module_multibyte_does_not_panic() {
+        // session_id starting with 3-byte codepoints; `&sid[..8]` would split
+        // the third one. Fail-before: panic.
+        let ctx = ModuleContext {
+            session_id: Some("\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}session".to_owned()),
+            ..make_ctx()
+        };
+        let seg = SessionIdModule.evaluate(&ctx).expect("must return Some");
+        assert_eq!(seg.text, "\u{4e2d}\u{4e2d}", "floors 8 bytes down to 6");
+    }
+
+    #[test]
+    fn cwd_module_multibyte_long_path_does_not_panic() {
+        // 41 three-byte codepoints = 123 bytes. The old `&cwd[cwd.len()-40..]`
+        // sliced at byte 83, which is mid-codepoint (not a multiple of 3) and
+        // panicked. Fail-before.
+        let cwd = "\u{20ac}".repeat(41);
+        let ctx = ModuleContext {
+            cwd: Some(cwd),
+            ..make_ctx()
+        };
+        let seg = CwdModule.evaluate(&ctx).expect("must return Some");
+        assert!(
+            seg.text.starts_with('\u{2026}'),
+            "an over-length path is prefixed with an ellipsis"
+        );
+        assert_eq!(
+            seg.text.chars().count(),
+            41,
+            "ellipsis + last 40 characters"
+        );
+        assert!(seg.text.chars().skip(1).all(|c| c == '\u{20ac}'));
     }
 }

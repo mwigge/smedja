@@ -3,6 +3,24 @@ use std::sync::Arc;
 use crate::cold::ColdStore;
 use crate::types::{Message, Stratum};
 
+/// Returns the largest byte index `<= max` that lies on a UTF-8 char boundary.
+///
+/// Slicing a `&str` at an arbitrary byte offset panics when the offset falls in
+/// the middle of a multi-byte codepoint (emoji, CJK, accented text). Flooring to
+/// the nearest boundary at or below `max` makes `&s[..floor_char_boundary(s, max)]`
+/// always safe while never exceeding the requested byte budget.
+#[must_use]
+pub(crate) fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut i = max;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Hot window size: the last `HOT_WINDOW` turns are always included verbatim.
 pub const HOT_WINDOW: usize = 5;
 
@@ -284,7 +302,11 @@ impl WorkingMemory {
                         budget = budget.saturating_sub(token_estimate);
                         result.push(msg.clone());
                     } else if budget > 0 {
-                        let char_limit = (budget * 4).min(msg.content.len());
+                        let byte_limit = (budget * 4).min(msg.content.len());
+                        // Floor to a UTF-8 char boundary: a raw byte slice at
+                        // `byte_limit` can land mid-codepoint (emoji/CJK/accented
+                        // text) and panic the whole turn-assembly.
+                        let char_limit = floor_char_boundary(&msg.content, byte_limit);
                         let mut truncated = msg.clone();
                         truncated.content =
                             format!("{}\n[... truncated]", &msg.content[..char_limit]);
@@ -1028,5 +1050,52 @@ mod tests {
         std::fs::write(ctx_dir.join("raw.txt"), "txt").unwrap();
         let result = super::load_context_files(tmp.path()).unwrap();
         assert_eq!(result, vec!["md"]);
+    }
+
+    #[test]
+    fn floor_char_boundary_never_splits_a_codepoint() {
+        let s = "a中🚀é"; // 1 + 3 + 4 + 2 bytes
+        for i in 0..=s.len() {
+            let f = floor_char_boundary(s, i);
+            assert!(s.is_char_boundary(f), "floor must land on a boundary");
+            assert!(f <= i, "floor must not exceed the requested max");
+            // Slicing at the floored index must never panic.
+            let _ = &s[..f];
+        }
+        assert_eq!(floor_char_boundary(s, 100), s.len());
+    }
+
+    #[test]
+    fn warm_truncation_floors_multibyte_content() {
+        // Six turns: under the default strata (hot=5) the oldest turn (index 0)
+        // is Warm and the rest are Hot. A tiny token budget forces that Warm
+        // turn down the truncation branch, where byte_limit = budget*4 = 8 lands
+        // in the middle of a 3-byte CJK codepoint. A raw `&content[..8]` panicked
+        // the whole turn-assembly before the floor-to-boundary fix.
+        let mut m = WorkingMemory::new(4096);
+        m.push(Message::user("中".repeat(10))); // 30 bytes, becomes Warm
+        for i in 0..5 {
+            m.push(Message::user(format!("hot {i}")));
+        }
+
+        // Fail-before: this call panicked at the mid-codepoint slice.
+        let (prompt, _omitted) = m.build_prompt_with_omitted(2);
+
+        let truncated = prompt
+            .iter()
+            .find(|msg| msg.content.contains("[... truncated]"))
+            .expect("the Warm turn must be present and truncated");
+        let kept = truncated
+            .content
+            .trim_end_matches("\n[... truncated]");
+        assert!(
+            kept.chars().all(|c| c == '中'),
+            "kept prefix must contain only whole codepoints"
+        );
+        assert!(
+            kept.len().is_multiple_of(3),
+            "kept prefix ends on a codepoint boundary"
+        );
+        assert!(kept.len() <= 8, "must not exceed the requested byte budget");
     }
 }

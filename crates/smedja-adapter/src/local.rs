@@ -253,10 +253,25 @@ async fn health_check(endpoint: &str) -> LocalCapability {
     );
     let _enter = span.enter();
 
-    let client = Client::builder()
-        .timeout(Duration::from_millis(500))
-        .build()
-        .expect("reqwest client build is infallible for plain HTTP");
+    let client = match Client::builder().timeout(Duration::from_millis(500)).build() {
+        Ok(client) => client,
+        Err(e) => {
+            // A failed client build must not crash the daemon: report the local
+            // tier as unhealthy so it is simply skipped, exactly as an
+            // unreachable endpoint would be.
+            tracing::warn!(
+                error = %e,
+                "smedja.local.error" = %e,
+                "otel.status_code" = "ERROR",
+                "local health check could not build HTTP client — tier will be skipped",
+            );
+            return LocalCapability {
+                inventory: Vec::new(),
+                active_model_id: None,
+                healthy: false,
+            };
+        }
+    };
 
     let url = format!("{endpoint}/v1/models");
     let counter = health_check_counter();

@@ -155,6 +155,26 @@ fn resolve_dim(stored: Option<i64>, embedding_bytes_len: usize) -> usize {
     }
 }
 
+/// Decodes a little-endian `f32` embedding BLOB.
+///
+/// Returns `None` when `bytes.len()` is not a multiple of four — the signature
+/// of a truncated, legacy, or externally-corrupted row. Callers skip such rows
+/// so a single malformed BLOB cannot turn a full-scan `query`/`search` into a
+/// store-wide panic. Decoding byte-by-byte (rather than `bytemuck::cast_slice`)
+/// also sidesteps the alignment requirement that `cast_slice` imposes on the
+/// borrowed `&[u8]`.
+fn decode_embedding(bytes: &[u8]) -> Option<Vec<f32>> {
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
 impl Vault {
     /// Opens or creates a vault database at `path`.
     ///
@@ -249,8 +269,14 @@ impl Vault {
         };
 
         for row in rows {
-            let stored: &[f32] = bytemuck::cast_slice::<u8, f32>(&row.embedding);
-            let sim = cosine_sim(&entry.embedding, stored);
+            let Some(stored) = decode_embedding(&row.embedding) else {
+                tracing::warn!(
+                    id = %row.id,
+                    "vault: skipping dedup candidate with malformed embedding blob"
+                );
+                continue;
+            };
+            let sim = cosine_sim(&entry.embedding, &stored);
             if sim > 0.85 {
                 if row.content_len >= entry.content.len() {
                     // Existing entry is at least as good — discard incoming.
@@ -413,7 +439,7 @@ impl Vault {
                 resolve_model_id(row.model_id.clone()) == query_model_id
                     && resolve_dim(row.dim, row.bytes.len()) == query_dim
             })
-            .map(|row| {
+            .filter_map(|row| {
                 let SearchRow {
                     id,
                     bytes,
@@ -431,8 +457,11 @@ impl Vault {
 
                 let embedder_model_id = resolve_model_id(model_id);
                 let resolved_dim = resolve_dim(dim, bytes.len());
-                let stored: &[f32] = bytemuck::cast_slice::<u8, f32>(&bytes);
-                let cosine_score = cosine_sim(query_vec, stored);
+                let Some(stored) = decode_embedding(&bytes) else {
+                    tracing::warn!(id = %id, "vault: skipping search row with malformed embedding blob");
+                    return None;
+                };
+                let cosine_score = cosine_sim(query_vec, &stored);
 
                 let content_lower = content.to_lowercase();
                 let keyword_boost: f32 = terms
@@ -460,11 +489,14 @@ impl Vault {
 
                 let total_score = cosine_score + keyword_boost + recency_boost;
 
-                let payload: serde_json::Value = serde_json::from_str(&payload_str)?;
+                let payload: serde_json::Value = match serde_json::from_str(&payload_str) {
+                    Ok(p) => p,
+                    Err(e) => return Some(Err(VaultError::from(e))),
+                };
 
                 let entry = VaultEntry {
                     id,
-                    embedding: stored.to_vec(),
+                    embedding: stored,
                     payload,
                     namespace: ns,
                     content,
@@ -477,7 +509,7 @@ impl Vault {
                     dim: resolved_dim,
                 };
 
-                Ok((total_score, entry))
+                Some(Ok((total_score, entry)))
             })
             .collect::<Result<_, VaultError>>()?;
 
@@ -620,19 +652,26 @@ impl Vault {
                 resolve_model_id(row.model_id.clone()) == query_model_id
                     && resolve_dim(row.dim, row.bytes.len()) == query_dim
             })
-            .map(
+            .filter_map(
                 |QueryRow {
                      id,
                      bytes,
                      payload_str,
                      ..
                  }| {
-                    // bytes were written by `bytemuck::cast_slice::<f32, u8>`,
-                    // so the length is always a multiple of 4.
-                    let stored: &[f32] = bytemuck::cast_slice::<u8, f32>(&bytes);
-                    let score = cosine_sim(query_embedding, stored);
-                    let payload: serde_json::Value = serde_json::from_str(&payload_str)?;
-                    Ok((score, id, payload))
+                    // Blobs are normally written by `bytemuck::cast_slice::<f32, u8>`
+                    // (length always a multiple of 4), but a legacy or corrupted row
+                    // may not be — skip it instead of panicking the full scan.
+                    let Some(stored) = decode_embedding(&bytes) else {
+                        tracing::warn!(id = %id, "vault: skipping query row with malformed embedding blob");
+                        return None;
+                    };
+                    let score = cosine_sim(query_embedding, &stored);
+                    let payload: serde_json::Value = match serde_json::from_str(&payload_str) {
+                        Ok(p) => p,
+                        Err(e) => return Some(Err(VaultError::from(e))),
+                    };
+                    Some(Ok((score, id, payload)))
                 },
             )
             .collect::<Result<_, VaultError>>()?;
@@ -693,12 +732,18 @@ impl Vault {
             .collect::<Result<_, rusqlite::Error>>()?;
 
         rows.into_iter()
-            .map(|row| {
+            .filter_map(|row| {
                 let embedder_model_id = resolve_model_id(row.model_id);
                 let dim = resolve_dim(row.dim, row.bytes.len());
-                let embedding = bytemuck::cast_slice::<u8, f32>(&row.bytes).to_vec();
-                let payload: serde_json::Value = serde_json::from_str(&row.payload_str)?;
-                Ok(VaultEntry {
+                let Some(embedding) = decode_embedding(&row.bytes) else {
+                    tracing::warn!(id = %row.id, "vault: skipping list row with malformed embedding blob");
+                    return None;
+                };
+                let payload: serde_json::Value = match serde_json::from_str(&row.payload_str) {
+                    Ok(p) => p,
+                    Err(e) => return Some(Err(VaultError::from(e))),
+                };
+                Some(Ok(VaultEntry {
                     id: row.id,
                     embedding,
                     payload,
@@ -711,7 +756,7 @@ impl Vault {
                     created_at: row.created_at,
                     embedder_model_id,
                     dim,
-                })
+                }))
             })
             .collect()
     }
@@ -1215,5 +1260,82 @@ mod tests {
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].id, "exact", "highest cosine must rank first");
         assert_eq!(results[2].id, "ortho", "orthogonal must rank last");
+    }
+
+    // ── malformed embedding blobs must not panic the retrieval path ───────────
+
+    /// Inserts a row whose embedding BLOB is 3 bytes — not a multiple of 4 — while
+    /// tagging it with a `dim`/`model_id` that passes the same-model filter, so
+    /// the row reaches the decode step. Before the fix, `bytemuck::cast_slice::<u8,
+    /// f32>` on a 3-byte slice panicked, turning any full-scan `query`/`search`
+    /// over the store into a store-wide DoS.
+    fn insert_corrupt_row(vault: &Vault, id: &str, namespace: &str, dim: i64) {
+        // 3 raw bytes: length is not a multiple of 4.
+        let corrupt: Vec<u8> = vec![1, 2, 3];
+        vault
+            .conn
+            .execute(
+                "INSERT INTO vault_entries \
+                 (id, embedding, payload, namespace, content, embedder_model_id, dim) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![id, corrupt, "{}", namespace, "corrupt", LEGACY_MODEL_ID, dim],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn query_skips_row_with_non_multiple_of_four_blob() {
+        let vault = Vault::open_in_memory().unwrap();
+        // dim = 1 matches the query dim below, so the row survives the same-model
+        // filter and is handed to the decode step (fail-before panicked here).
+        insert_corrupt_row(&vault, "corrupt", "default", 1);
+
+        let results = vault
+            .query(&[1.0_f32], 5, LEGACY_MODEL_ID, 1)
+            .expect("query must skip the malformed row, not panic");
+        assert!(
+            results.is_empty(),
+            "the corrupt row must be skipped, leaving no results"
+        );
+    }
+
+    #[test]
+    fn search_skips_row_with_non_multiple_of_four_blob() {
+        let mut vault = Vault::open_in_memory().unwrap();
+        insert_corrupt_row(&vault, "corrupt", "ns", 1);
+
+        // A well-formed same-model row so we can confirm the scan continues past
+        // the corrupt one rather than aborting the whole call.
+        let mut good = entry("good", vec![1.0_f32]);
+        good.namespace = "ns".to_string();
+        good.content = "good content".to_string();
+        good.dim = 1;
+        vault.insert(&good).unwrap();
+
+        let results = vault
+            .search(&[1.0_f32], "good", "ns", 5, LEGACY_MODEL_ID, 1)
+            .expect("search must skip the malformed row, not panic");
+        assert_eq!(results.len(), 1, "only the well-formed row is returned");
+        assert_eq!(results[0].id, "good");
+    }
+
+    #[test]
+    fn insert_dedup_scan_skips_corrupt_neighbour() {
+        let mut vault = Vault::open_in_memory().unwrap();
+        // A corrupt neighbour in the same namespace as the incoming insert. The
+        // dedup scan visits every same-namespace row and previously panicked on
+        // this blob before it could persist the new entry.
+        insert_corrupt_row(&vault, "corrupt", "default", 1);
+
+        let good = entry("good", vec![1.0_f32]);
+        vault
+            .insert(&good)
+            .expect("insert must skip the corrupt dedup neighbour, not panic");
+
+        let results = vault
+            .query(&[1.0_f32], 5, LEGACY_MODEL_ID, 1)
+            .expect("query after insert must not panic");
+        assert_eq!(results.len(), 1, "the freshly inserted row is present");
+        assert_eq!(results[0].id, "good");
     }
 }
