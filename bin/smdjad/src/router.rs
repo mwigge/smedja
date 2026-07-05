@@ -208,6 +208,14 @@ pub(crate) fn build_router(
     route!(router, "loop.run", state, handlers::loops::run);
     // Re-enters drive() from the last checkpointed slice index.
     route!(router, "loop.resume", state, handlers::loops::resume);
+    // Native OpenSpec engine: author/validate/inspect/archive changes over RPC.
+    route!(router, "spec.create", state, handlers::spec::create);
+    route!(router, "spec.validate", state, handlers::spec::validate);
+    route!(router, "spec.show", state, handlers::spec::show);
+    route!(router, "spec.diff", state, handlers::spec::diff);
+    route!(router, "spec.list", state, handlers::spec::list);
+    route!(router, "spec.status", state, handlers::spec::status);
+    route!(router, "spec.archive", state, handlers::spec::archive);
     route!(router, "audit.list", state, handlers::audit::list);
     // Bounded read-only repo/PR/branch audit; returns findings + report.
     route!(router, "audit.run", state, handlers::auditor::run);

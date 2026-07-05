@@ -39,6 +39,7 @@ pub(crate) mod quality;
 pub(crate) mod routing;
 pub(crate) mod savings;
 pub(crate) mod session;
+pub(crate) mod spec;
 pub(crate) mod task;
 pub(crate) mod turn;
 pub(crate) mod vault;

@@ -187,6 +187,22 @@ pub(crate) async fn run(state: HandlerState, params: Value) -> Result<Value, Rpc
 
     let workspace_root = crate::common::workspace_root();
     let change_name = rec.change_name.clone();
+
+    // Spec-validate gate: refuse to implement a change that fails strict
+    // validation (requirement without a scenario, a delta referencing a
+    // non-existent capability, non-normative requirement, or malformed tasks).
+    let report =
+        smedja_spec::SpecEngine::at_workspace(&workspace_root).validate(&change_name, true);
+    if !report.valid {
+        return Err(RpcError::new(
+            codes::INVALID_PARAMS,
+            format!(
+                "spec.validate --strict failed for '{change_name}'; refusing loop.run: {}",
+                report.errors.join("; ")
+            ),
+        ));
+    }
+
     let bg_loop_id = loop_id.clone();
 
     // Spawn the engine-backed runner into the shared task set so it is

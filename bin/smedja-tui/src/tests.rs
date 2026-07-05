@@ -1232,7 +1232,6 @@ fn make_state(session_id: &str) -> AppState {
         saved_input: String::new(),
         history_search_mode: false,
         history_search_query: String::new(),
-        openspec_bin: None,
         lsp_last_poll: None,
         lsp_snapshot: smedja_lsp::LspSnapshot::default(),
         obs_snapshot: obs_panel::ObsSnapshot::default(),
@@ -2445,106 +2444,70 @@ fn history_search_enter_accepts_match() {
     );
 }
 
-// --- tui-spec-command tests ---
+// --- tui native spec-command formatter tests ---
 
 #[test]
-fn format_openspec_list_empty_changes_returns_no_active() {
-    let json = r#"{"changes": []}"#;
-    assert_eq!(format_openspec_list(json), "no active changes");
+fn format_spec_list_renders_changes_archived_and_specs() {
+    let v = serde_json::json!({
+        "changes": ["add-auth", "add-widget"],
+        "archived": ["old-thing"],
+        "specs": ["auth", "widget"],
+    });
+    let result = crate::slash::format_spec_list(&v);
+    assert!(result.contains("add-auth"), "must list active changes");
+    assert!(result.contains("old-thing"), "must list archived");
+    assert!(result.contains("widget"), "must list specs");
 }
 
 #[test]
-fn format_openspec_list_missing_changes_key_returns_no_active() {
-    let json = r"{}";
-    assert_eq!(format_openspec_list(json), "no active changes");
+fn format_spec_list_empty_shows_none() {
+    let v = serde_json::json!({ "changes": [], "archived": [], "specs": [] });
+    let result = crate::slash::format_spec_list(&v);
+    assert!(result.contains("(none)"), "empty sections read (none)");
 }
 
 #[test]
-fn format_openspec_list_two_changes_shows_both_names() {
-    let json = r#"{"changes": [
-            {"name": "tui-input-modes", "status": "proposed"},
-            {"name": "smdjad-service",  "status": "implementing"}
-        ]}"#;
-    let result = format_openspec_list(json);
-    assert!(
-        result.contains("tui-input-modes"),
-        "must contain first change name"
-    );
-    assert!(
-        result.contains("smdjad-service"),
-        "must contain second change name"
-    );
-    assert!(result.contains("proposed"), "must contain status");
+fn format_spec_status_single_change_shows_tasks_and_validity() {
+    let v = serde_json::json!({
+        "name": "add-auth",
+        "tasks_done": 2,
+        "tasks_total": 5,
+        "valid": true,
+        "delta_capabilities": ["auth"],
+    });
+    let result = crate::slash::format_spec_status(&v);
+    assert!(result.contains("add-auth"), "must name the change");
+    assert!(result.contains("2/5"), "must show task progress");
+    assert!(result.contains("valid=true"), "must show validity");
 }
 
 #[test]
-fn format_openspec_list_invalid_json_returns_error() {
-    let result = format_openspec_list("not json");
-    assert!(
-        result.contains("parse error"),
-        "invalid JSON must produce a parse error message; got: {result}"
-    );
-}
-
-#[test]
-fn format_openspec_status_renders_key_value_lines() {
-    let json = r#"{"name": "my-change", "state": "implementing", "progress": "3/7"}"#;
-    let result = format_openspec_status(json);
-    assert!(
-        result.contains("name: my-change"),
-        "must contain name field"
-    );
-    assert!(
-        result.contains("state: implementing"),
-        "must contain state field"
-    );
-    assert!(
-        result.contains("progress: 3/7"),
-        "must contain progress field"
+fn format_spec_status_empty_list_reports_no_changes() {
+    let v = serde_json::json!({ "changes": [] });
+    assert_eq!(
+        crate::slash::format_spec_status(&v),
+        "spec: no active changes"
     );
 }
 
 #[test]
-fn format_openspec_status_invalid_json_returns_error() {
-    let result = format_openspec_status("{{bad}}");
-    assert!(result.contains("parse error"));
+fn format_spec_validation_fail_lists_errors() {
+    let v = serde_json::json!({
+        "change": "c",
+        "valid": false,
+        "errors": ["widget: requirement 'R' has no scenario"],
+        "warnings": ["proposal.md is missing"],
+    });
+    let result = crate::slash::format_spec_validation(&v);
+    assert!(result.contains("FAIL"), "invalid report must read FAIL");
+    assert!(result.contains("no scenario"), "must surface the error");
+    assert!(result.contains("warn:"), "must surface the warning");
 }
 
 #[test]
-fn spec_command_no_openspec_binary_shows_not_found() {
-    let mut state = make_state("sess-spec");
-    state.openspec_bin = None;
-
-    // Simulate the guard: no binary → push message
-    if state.openspec_bin.is_none() {
-        push_system_message(
-            &mut state,
-            "openspec not found — install it and restart smedja-tui",
-        );
-    }
-
-    let has_msg = state
-        .main_panel
-        .lines_text(0, 100)
-        .iter()
-        .any(|l| l.contains("openspec not found"));
-    assert!(
-        has_msg,
-        "missing binary must produce openspec-not-found message"
-    );
-}
-
-#[test]
-fn spec_unknown_subcommand_returns_usage() {
-    // Test the "_ =>" branch of the spec arm directly via format.
-    let text = "usage: /spec [list|status [name]|archive <name>]";
-    assert!(
-        text.contains("usage:"),
-        "unknown sub-command must show usage"
-    );
-    assert!(text.contains("list"), "usage must mention list");
-    assert!(text.contains("status"), "usage must mention status");
-    assert!(text.contains("archive"), "usage must mention archive");
+fn format_spec_validation_pass_reads_pass() {
+    let v = serde_json::json!({ "change": "c", "valid": true, "errors": [], "warnings": [] });
+    assert!(crate::slash::format_spec_validation(&v).contains("PASS"));
 }
 
 // --- cowork resolver helper ---

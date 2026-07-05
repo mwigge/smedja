@@ -15,11 +15,10 @@ use serde_json::{json, Value};
 use smedja_rpc::client::Client;
 
 use crate::{
-    fetch_latest_version, format_gov_list, format_openspec_list, format_openspec_status,
-    format_resume_rows, format_token_count, gov_create, gov_transition, is_newer,
-    parse_resume_args, parse_review_scope, push_system_message, render_findings_summary,
-    resume_blocked_by_pending_turn, resume_into_view, resume_plan, run_openspec, run_upgrade,
-    scan_gov_artifacts, slugify, submit, AppState, OutputType, HELP_TEXT, VERSION,
+    fetch_latest_version, format_gov_list, format_resume_rows, format_token_count, gov_create,
+    gov_transition, is_newer, parse_resume_args, parse_review_scope, push_system_message,
+    render_findings_summary, resume_blocked_by_pending_turn, resume_into_view, resume_plan,
+    run_upgrade, scan_gov_artifacts, slugify, submit, AppState, OutputType, HELP_TEXT, VERSION,
 };
 
 mod format;
@@ -508,39 +507,92 @@ pub(crate) async fn dispatch_slash(
             state.main_panel.clear_display();
             Ok(true)
         }
+        // Native OpenSpec engine over the `spec.*` daemon RPC — no external
+        // `openspec` binary. list/status/archive plus new/validate/show/diff.
         "spec" => {
-            let Some(ref bin) = state.openspec_bin else {
-                push_system_message(
-                    state,
-                    "openspec not found — install it and restart smedja-tui",
-                );
-                return Ok(true);
-            };
-            let bin = bin.clone();
             let (sub, rest) = args.split_once(' ').unwrap_or((args, ""));
+            let rest = rest.trim();
             let text = match sub {
-                "" | "list" => match run_openspec(&bin, &["list", "--json"]).await {
-                    Ok(json) => format_openspec_list(&json),
-                    Err(e) => e,
+                "" | "list" => match client.call("spec.list", json!({})).await {
+                    Ok(v) => format_spec_list(&v),
+                    Err(e) => format!("spec.list error: {e}"),
                 },
                 "status" => {
-                    let extra: Vec<&str> = if rest.is_empty() {
-                        vec!["status", "--json"]
+                    let params = if rest.is_empty() {
+                        json!({})
                     } else {
-                        vec!["status", "--change", rest, "--json"]
+                        json!({ "change": rest })
                     };
-                    match run_openspec(&bin, &extra).await {
-                        Ok(json) => format_openspec_status(&json),
-                        Err(e) => e,
+                    match client.call("spec.status", params).await {
+                        Ok(v) => format_spec_status(&v),
+                        Err(e) => format!("spec.status error: {e}"),
+                    }
+                }
+                "new" | "create" if !rest.is_empty() => {
+                    match client.call("spec.create", json!({ "change": rest })).await {
+                        Ok(v) => {
+                            let files = v
+                                .get("files")
+                                .and_then(Value::as_array)
+                                .map_or(0, Vec::len);
+                            format!("created change '{rest}' ({files} files scaffolded)")
+                        }
+                        Err(e) => format!("spec.create error: {e}"),
+                    }
+                }
+                "validate" if !rest.is_empty() => {
+                    match client
+                        .call("spec.validate", json!({ "change": rest, "strict": true }))
+                        .await
+                    {
+                        Ok(v) => format_spec_validation(&v),
+                        Err(e) => format!("spec.validate error: {e}"),
+                    }
+                }
+                "show" if !rest.is_empty() => {
+                    match client.call("spec.show", json!({ "change": rest })).await {
+                        Ok(v) => v
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("(no output)")
+                            .to_owned(),
+                        Err(e) => format!("spec.show error: {e}"),
+                    }
+                }
+                "diff" if !rest.is_empty() => {
+                    match client.call("spec.diff", json!({ "change": rest })).await {
+                        Ok(v) => v
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("(no output)")
+                            .to_owned(),
+                        Err(e) => format!("spec.diff error: {e}"),
                     }
                 }
                 "archive" if !rest.is_empty() => {
-                    match run_openspec(&bin, &["archive", rest, "--yes"]).await {
-                        Ok(_) => format!("archived: {rest}"),
-                        Err(e) => e,
+                    match client.call("spec.archive", json!({ "change": rest })).await {
+                        Ok(v) => {
+                            let caps = v
+                                .get("capabilities")
+                                .and_then(Value::as_array)
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(Value::as_str)
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_default();
+                            if caps.is_empty() {
+                                format!("archived: {rest}")
+                            } else {
+                                format!("archived: {rest} (merged specs: {caps})")
+                            }
+                        }
+                        Err(e) => format!("spec.archive error: {e}"),
                     }
                 }
-                _ => "usage: /spec [list|status [name]|archive <name>]".to_owned(),
+                _ => "usage: /spec [list | status [name] | new <name> | validate <name> | show <name> | diff <name> | archive <name>]"
+                    .to_owned(),
             };
             push_system_message(state, text);
             Ok(true)
@@ -1225,6 +1277,89 @@ pub(crate) async fn trigger_quality_review(state: &mut AppState, client: &mut Cl
             state.quality_review_in_progress = false;
         }
     }
+}
+
+/// Renders the `spec.list` response (active changes, archived, specs).
+#[must_use]
+pub(crate) fn format_spec_list(v: &Value) -> String {
+    let arr = |key: &str| {
+        v.get(key)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "(none)".to_owned())
+    };
+    [
+        format!("active changes: {}", arr("changes")),
+        format!("archived:       {}", arr("archived")),
+        format!("specs:          {}", arr("specs")),
+    ]
+    .join("\n")
+}
+
+/// Renders the `spec.status` response — a single change or the `changes` array.
+#[must_use]
+pub(crate) fn format_spec_status(v: &Value) -> String {
+    let one = |c: &Value| {
+        let name = c.get("name").and_then(Value::as_str).unwrap_or("?");
+        let done = c.get("tasks_done").and_then(Value::as_u64).unwrap_or(0);
+        let total = c.get("tasks_total").and_then(Value::as_u64).unwrap_or(0);
+        let valid = c.get("valid").and_then(Value::as_bool).unwrap_or(false);
+        let caps = c
+            .get("delta_capabilities")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        format!("  {name:<28} tasks {done}/{total}  valid={valid}  specs=[{caps}]")
+    };
+    if let Some(changes) = v.get("changes").and_then(Value::as_array) {
+        if changes.is_empty() {
+            return "spec: no active changes".to_owned();
+        }
+        let mut lines = vec!["change status:".to_owned()];
+        lines.extend(changes.iter().map(one));
+        return lines.join("\n");
+    }
+    format!("change status:\n{}", one(v))
+}
+
+/// Renders a `spec.validate` report (`{ valid, errors, warnings }`).
+#[must_use]
+pub(crate) fn format_spec_validation(v: &Value) -> String {
+    let change = v.get("change").and_then(Value::as_str).unwrap_or("?");
+    let valid = v.get("valid").and_then(Value::as_bool).unwrap_or(false);
+    let lines_of = |key: &str| -> Vec<String> {
+        v.get(key)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut out = vec![format!(
+        "spec validate {change}: {}",
+        if valid { "PASS" } else { "FAIL" }
+    )];
+    for e in lines_of("errors") {
+        out.push(format!("  error: {e}"));
+    }
+    for w in lines_of("warnings") {
+        out.push(format!("  warn:  {w}"));
+    }
+    out.join("\n")
 }
 
 /// Prints a Markdown ROI report for the active openspec change to the main panel.

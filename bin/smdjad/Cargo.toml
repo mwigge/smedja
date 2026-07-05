@@ -100,6 +100,7 @@ smedja-plugins     = { path = "../../crates/smedja-plugins" }
 smedja-review      = { path = "../../crates/smedja-review" }
 smedja-rpc         = { path = "../../crates/smedja-rpc" }
 smedja-security    = { path = "../../crates/smedja-security" }
+smedja-spec        = { path = "../../crates/smedja-spec" }
 smedja-testkit     = { path = "../../crates/smedja-testkit" }
 smedja-sre         = { path = "../../crates/smedja-sre" }
 smedja-telemetry   = { path = "../../crates/smedja-telemetry" }

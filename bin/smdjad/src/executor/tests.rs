@@ -381,6 +381,11 @@ fn mcp_server_tools_are_exactly_the_read_safe_subset() {
         "lsp_document_symbols",
         "lsp_workspace_symbols",
         "review_run",
+        "spec_validate",
+        "spec_show",
+        "spec_diff",
+        "spec_list",
+        "spec_status",
     ];
     // The exposed subset must match the read-safe list exactly.
     let mut got = super::MCP_SERVER_TOOLS.to_vec();
@@ -672,6 +677,96 @@ fn lsp_read_tools_are_registered_and_read_only() {
     assert!(super::LOCAL_TOOLS.contains(&"lsp_rename_symbol"));
     assert!(!super::READ_ONLY_TOOLS.contains(&"lsp_rename_symbol"));
     assert!(!super::MCP_SERVER_TOOLS.contains(&"lsp_rename_symbol"));
+}
+
+#[test]
+fn spec_tools_registered_with_correct_read_write_split() {
+    // Read-only spec tools: local, read-only-concurrent, and MCP-exposed.
+    for t in [
+        "spec_validate",
+        "spec_show",
+        "spec_diff",
+        "spec_list",
+        "spec_status",
+    ] {
+        assert!(super::LOCAL_TOOLS.contains(&t), "{t} must be a local tool");
+        assert!(
+            super::READ_ONLY_TOOLS.contains(&t),
+            "{t} must be read-only for concurrent dispatch"
+        );
+        assert!(
+            super::MCP_SERVER_TOOLS.contains(&t),
+            "{t} must be exposed in MCP server mode"
+        );
+    }
+    // Write spec tools: local only — gated, never in the read-only / MCP subsets.
+    for t in ["spec_create", "spec_archive"] {
+        assert!(super::LOCAL_TOOLS.contains(&t), "{t} must be a local tool");
+        assert!(
+            !super::READ_ONLY_TOOLS.contains(&t),
+            "{t} mutates and must not be read-only"
+        );
+        assert!(
+            !super::MCP_SERVER_TOOLS.contains(&t),
+            "{t} mutates and must not be MCP-exposed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn spec_tools_dispatch_end_to_end_through_execute_tool() {
+    use smedja_ingot::{Ingot, IngotHandle};
+    use smedja_vault::Vault;
+    use tokio::sync::Mutex;
+
+    let ingot = IngotHandle::new(Ingot::open_in_memory().unwrap());
+    let vault = Arc::new(Mutex::new(Vault::open_in_memory().unwrap()));
+    let ws = tempfile::tempdir().unwrap();
+
+    // spec_create through the real dispatcher.
+    let created = super::execute_tool(
+        "spec_create",
+        &serde_json::json!({ "change": "demo", "why": "prove the seam" }).to_string(),
+        ws.path(),
+        None,
+        &ingot,
+        &vault,
+        &test_embedder(),
+        None,
+    )
+    .await;
+    assert!(
+        created.contains("\"created\":true"),
+        "spec_create must scaffold; got {created}"
+    );
+    assert!(ws
+        .path()
+        .join("openspec/changes/demo/proposal.md")
+        .is_file());
+
+    // Author a delta, then spec_validate --strict through the dispatcher.
+    let delta = ws.path().join("openspec/changes/demo/specs/widget/spec.md");
+    std::fs::create_dir_all(delta.parent().unwrap()).unwrap();
+    std::fs::write(
+        &delta,
+        "## ADDED Requirements\n\n### Requirement: R\nThe system SHALL x.\n\n#### Scenario: S\n- THEN ok\n",
+    )
+    .unwrap();
+    let report = super::execute_tool(
+        "spec_validate",
+        &serde_json::json!({ "change": "demo", "strict": true }).to_string(),
+        ws.path(),
+        None,
+        &ingot,
+        &vault,
+        &test_embedder(),
+        None,
+    )
+    .await;
+    assert!(
+        report.contains("\"valid\":true"),
+        "spec_validate --strict must pass; got {report}"
+    );
 }
 
 #[tokio::test]

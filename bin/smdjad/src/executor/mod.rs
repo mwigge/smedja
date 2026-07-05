@@ -128,6 +128,13 @@ pub(crate) const LOCAL_TOOLS: &[&str] = &[
     "lsp_rename_symbol",
     "test_run",
     "review_run",
+    "spec_create",
+    "spec_validate",
+    "spec_show",
+    "spec_diff",
+    "spec_list",
+    "spec_status",
+    "spec_archive",
 ];
 
 /// Read-safe subset of [`LOCAL_TOOLS`] exposed by MCP server mode.
@@ -156,6 +163,11 @@ pub(crate) const MCP_SERVER_TOOLS: &[&str] = &[
     "lsp_document_symbols",
     "lsp_workspace_symbols",
     "review_run",
+    "spec_validate",
+    "spec_show",
+    "spec_diff",
+    "spec_list",
+    "spec_status",
 ];
 
 /// Read-only tools that can run concurrently without cowork gate approval.
@@ -180,6 +192,11 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "lsp_document_symbols",
     "lsp_workspace_symbols",
     "review_run",
+    "spec_validate",
+    "spec_show",
+    "spec_diff",
+    "spec_list",
+    "spec_status",
 ];
 
 /// Executes the named tool with the given JSON input string.
@@ -299,6 +316,13 @@ pub(crate) async fn execute_tool(
         },
         "test_run" => handlers::test::test_run(&input, workspace).await,
         "review_run" => handlers::review::review_run(&input, workspace).await,
+        "spec_create" => handlers::spec::spec_create(&input, workspace),
+        "spec_validate" => handlers::spec::spec_validate(&input, workspace),
+        "spec_show" => handlers::spec::spec_show(&input, workspace),
+        "spec_diff" => handlers::spec::spec_diff(&input, workspace),
+        "spec_list" => handlers::spec::spec_list(&input, workspace),
+        "spec_status" => handlers::spec::spec_status(&input, workspace),
+        "spec_archive" => handlers::spec::spec_archive(&input, workspace),
         other => dispatch_mcp_tool(other, &input, ingot).await,
     };
 
