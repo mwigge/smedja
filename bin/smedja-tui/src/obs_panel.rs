@@ -114,15 +114,11 @@ fn sparkline(samples: &VecDeque<u64>, width: usize) -> String {
 }
 
 /// Shared budget thresholds: green below 60%, amber 60–85%, red at/above 85%.
+/// Delegates to the single [`crate::viz::zone_color`] helper so every gauge in
+/// the TUI shares one green/amber/red rule.
 fn budget_color(pct: u64) -> ratatui::style::Color {
-    let p = palette();
-    if pct >= 85 {
-        p.error
-    } else if pct >= 60 {
-        p.warn
-    } else {
-        p.success
-    }
+    #[allow(clippy::cast_possible_truncation)]
+    crate::viz::zone_color(pct.min(100) as u8)
 }
 
 /// Builds a width-aware labeled gauge line: `prefix [████░░░] suffix`. The bar

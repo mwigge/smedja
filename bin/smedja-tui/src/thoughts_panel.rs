@@ -38,80 +38,6 @@ impl ThinkingStep {
     }
 }
 
-const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
-/// Renders a one-line spinner at the bottom of `area` while a turn is in
-/// flight.  Advances `spinner_tick` each call.  When `current_thinking` is
-/// non-empty it shows a trailing preview of the last ~50 chars.  When
-/// `pending_tool` is set it shows the tool name and truncated input instead.
-pub fn render_indicator(
-    area: Rect,
-    turn_in_flight: bool,
-    spinner_tick: &mut u8,
-    current_thinking: &str,
-    pending_tool: Option<&(usize, String, String)>,
-    no_color: bool,
-    frame: &mut Frame,
-) {
-    if !turn_in_flight || area.height < 1 {
-        return;
-    }
-    let frame_char = SPINNER[*spinner_tick as usize % SPINNER.len()];
-    *spinner_tick = spinner_tick.wrapping_add(1);
-
-    let indicator_area = Rect::new(
-        area.x,
-        area.y + area.height.saturating_sub(1),
-        area.width,
-        1,
-    );
-
-    let p = palette();
-    let spinner_style = if no_color {
-        Style::default()
-    } else {
-        // Signature molten lava-orange for the in-flight spinner (primary accent).
-        Style::default().fg(p.molten).add_modifier(Modifier::BOLD)
-    };
-    let dim_style = if no_color {
-        Style::default()
-    } else {
-        Style::default()
-            .fg(p.text_dim)
-            .add_modifier(Modifier::ITALIC)
-    };
-
-    let (label, show_preview) = if let Some((_, name, inp)) = pending_tool {
-        let inp_short: String = inp.chars().take(40).collect();
-        let ellipsis = if inp.chars().count() > 40 {
-            "\u{2026}"
-        } else {
-            ""
-        };
-        (format!("{frame_char} {name}: {inp_short}{ellipsis}"), false)
-    } else if !current_thinking.is_empty() {
-        (format!("{frame_char} thinking\u{2026}"), true)
-    } else {
-        (format!("{frame_char} working\u{2026}"), false)
-    };
-
-    let mut spans = vec![Span::styled(label, spinner_style)];
-    if show_preview {
-        let preview: String = current_thinking
-            .chars()
-            .rev()
-            .take(50)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        let preview = preview.replace('\n', " ");
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(preview, dim_style));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), indicator_area);
-}
-
 /// Renders a floating overlay showing the turn's thinking step timeline when
 /// `thinking_expanded` is true.  Each step is shown as a timestamped, color-
 /// coded line.  No-op when `steps` is empty or `area` is too small.
@@ -253,35 +179,4 @@ mod tests {
             .unwrap();
     }
 
-    fn make_frame_area(w: u16, h: u16) -> (Terminal<TestBackend>, Rect) {
-        let backend = TestBackend::new(w, h);
-        let terminal = Terminal::new(backend).unwrap();
-        let area = Rect::new(0, 0, w, h);
-        (terminal, area)
-    }
-
-    #[test]
-    fn render_indicator_no_panic_when_turn_in_flight() {
-        let (mut terminal, area) = make_frame_area(80, 10);
-        terminal
-            .draw(|f| {
-                let mut tick: u8 = 0;
-                render_indicator(area, true, &mut tick, "", None, true, f);
-                assert_eq!(tick, 1);
-            })
-            .unwrap();
-    }
-
-    #[test]
-    fn render_indicator_skips_when_not_in_flight() {
-        let (mut terminal, area) = make_frame_area(80, 10);
-        terminal
-            .draw(|f| {
-                let mut tick: u8 = 5;
-                render_indicator(area, false, &mut tick, "some thoughts", None, true, f);
-                // tick must not advance when not in flight
-                assert_eq!(tick, 5);
-            })
-            .unwrap();
-    }
 }
