@@ -253,7 +253,10 @@ async fn health_check(endpoint: &str) -> LocalCapability {
     );
     let _enter = span.enter();
 
-    let client = match Client::builder().timeout(Duration::from_millis(500)).build() {
+    let client = match Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+    {
         Ok(client) => client,
         Err(e) => {
             // A failed client build must not crash the daemon: report the local

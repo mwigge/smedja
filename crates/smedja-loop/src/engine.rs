@@ -804,7 +804,18 @@ mod tests {
         let (cfg, path) = config_with(&dir, "true", "[]");
         let rec = Recorder::default();
         let slices = vec!["s0".to_owned(), "s1".to_owned()];
-        let _ = drive(&cfg, dir.path(), &path, "mychange", &slices, &rec, &rec, 0, true).await;
+        let _ = drive(
+            &cfg,
+            dir.path(),
+            &path,
+            "mychange",
+            &slices,
+            &rec,
+            &rec,
+            0,
+            true,
+        )
+        .await;
 
         let ckpt_path = dir.path().join(".smedja").join("loop-state.json");
         assert!(ckpt_path.exists(), "checkpoint file must be written");
@@ -832,8 +843,18 @@ mod tests {
         // First pass: complete slice 0 only (drive a single-slice batch), which
         // advances the checkpoint to 1.
         let rec1 = Recorder::default();
-        let _ = drive(&cfg, dir.path(), &path, "mychange", &slices[..1], &rec1, &rec1, 0, true)
-            .await;
+        let _ = drive(
+            &cfg,
+            dir.path(),
+            &path,
+            "mychange",
+            &slices[..1],
+            &rec1,
+            &rec1,
+            0,
+            true,
+        )
+        .await;
         let ckpt_path = dir.path().join(".smedja").join("loop-state.json");
         let ckpt: LoopCheckpoint =
             serde_json::from_str(&std::fs::read_to_string(&ckpt_path).unwrap()).unwrap();
@@ -912,7 +933,18 @@ mod tests {
             current: AtomicUsize::new(0),
             max_seen: AtomicUsize::new(0),
         };
-        let out = drive(&cfg, dir.path(), &path, "demo", &slices, &probe, &probe, 0, true).await;
+        let out = drive(
+            &cfg,
+            dir.path(),
+            &path,
+            "demo",
+            &slices,
+            &probe,
+            &probe,
+            0,
+            true,
+        )
+        .await;
         assert_eq!(out.final_state, LoopState::Complete);
         assert_eq!(out.slices_completed, 3);
         assert_eq!(
@@ -927,7 +959,18 @@ mod tests {
             current: AtomicUsize::new(0),
             max_seen: AtomicUsize::new(0),
         };
-        let _ = drive(&cfg, dir.path(), &path, "demo", &slices, &probe2, &probe2, 0, false).await;
+        let _ = drive(
+            &cfg,
+            dir.path(),
+            &path,
+            "demo",
+            &slices,
+            &probe2,
+            &probe2,
+            0,
+            false,
+        )
+        .await;
         assert!(
             probe2.max_seen.load(Ordering::SeqCst) > 1,
             "an isolated workspace may run slices concurrently"
@@ -942,7 +985,18 @@ mod tests {
         let rec = Recorder::default();
         // Three slices, resume from index 1 (slice "s0" was already done).
         let slices = vec!["s0".to_owned(), "s1".to_owned(), "s2".to_owned()];
-        let out = drive(&cfg, dir.path(), &path, "mychange", &slices, &rec, &rec, 1, true).await;
+        let out = drive(
+            &cfg,
+            dir.path(),
+            &path,
+            "mychange",
+            &slices,
+            &rec,
+            &rec,
+            1,
+            true,
+        )
+        .await;
 
         assert_eq!(out.final_state, LoopState::Complete);
         // slices_completed = start_slice(1) + run_count(2) = 3
@@ -975,7 +1029,18 @@ mod tests {
         let rec = Recorder::default();
         let slices = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
 
-        let out = drive(&cfg, dir.path(), &path, "demo", &slices, &rec, &rec, 0, true).await;
+        let out = drive(
+            &cfg,
+            dir.path(),
+            &path,
+            "demo",
+            &slices,
+            &rec,
+            &rec,
+            0,
+            true,
+        )
+        .await;
 
         assert_eq!(out.final_state, LoopState::Complete);
         assert_eq!(out.slices_completed, 3);
@@ -1029,7 +1094,18 @@ mod tests {
             statuses: Mutex::new(Vec::new()),
         };
         let slices = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
-        let out = drive(&cfg, dir.path(), &path, "demo", &slices, &rec, &rec, 0, true).await;
+        let out = drive(
+            &cfg,
+            dir.path(),
+            &path,
+            "demo",
+            &slices,
+            &rec,
+            &rec,
+            0,
+            true,
+        )
+        .await;
         // All fail because verification command is "false".
         assert_eq!(out.final_state, LoopState::Failed);
         assert_eq!(
@@ -1055,7 +1131,18 @@ mod tests {
         let cfg = LoopConfig::from_file(&path).unwrap();
         let rec = Recorder::default();
         let slices = vec!["x".to_owned(), "y".to_owned(), "z".to_owned()];
-        let out = drive(&cfg, dir.path(), &path, "serial", &slices, &rec, &rec, 0, true).await;
+        let out = drive(
+            &cfg,
+            dir.path(),
+            &path,
+            "serial",
+            &slices,
+            &rec,
+            &rec,
+            0,
+            true,
+        )
+        .await;
         assert_eq!(out.final_state, LoopState::Complete);
         assert_eq!(out.slices_completed, 3);
         // All 3 implementer runs executed.

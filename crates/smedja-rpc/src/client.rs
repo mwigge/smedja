@@ -108,8 +108,10 @@ mod tests {
 
     #[tokio::test]
     async fn call_times_out_when_server_never_replies() {
-        let sock = std::env::temp_dir()
-            .join(format!("smedja-rpc-client-timeout-{}.sock", std::process::id()));
+        let sock = std::env::temp_dir().join(format!(
+            "smedja-rpc-client-timeout-{}.sock",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
         // Accept the connection but never send a response.
@@ -123,12 +125,9 @@ mod tests {
         client.set_timeout(Duration::from_millis(200));
 
         // Outer bound so the test cannot hang even if the timeout regressed.
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            client.call("ping", json!({})),
-        )
-        .await
-        .expect("call must return a Timeout error, not hang");
+        let result = tokio::time::timeout(Duration::from_secs(5), client.call("ping", json!({})))
+            .await
+            .expect("call must return a Timeout error, not hang");
 
         let err = result.expect_err("a call with no reply must be an Err");
         assert_eq!(err.code, codes::TIMEOUT);
