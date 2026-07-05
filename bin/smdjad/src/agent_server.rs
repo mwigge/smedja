@@ -59,6 +59,12 @@ pub async fn serve(listener: UnixListener, dispatcher: Arc<Dispatcher>, ingot: I
     let mut rx = dispatcher.subscribe();
     let subs_bg = Arc::clone(&subs);
     tokio::spawn(async move {
+        // Turn-start timestamps keyed by turn_id, so a TurnEnd can be stamped
+        // with the wall-clock latency the event itself does not carry. The map
+        // stays bounded: every TurnEnd removes its entry (a turn_id missing on
+        // TurnEnd simply yields no latency rather than leaking).
+        let mut turn_starts: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
         loop {
             let event = match rx.recv().await {
                 Ok(ev) => ev,
@@ -71,6 +77,27 @@ pub async fn serve(listener: UnixListener, dispatcher: Arc<Dispatcher>, ingot: I
             let Some(mut agent_event) = turn_event_to_agent_event(&event) else {
                 continue;
             };
+            match &mut agent_event {
+                AgentEvent::TurnStart { turn_id, .. } => {
+                    if let Some(id) = turn_id.clone() {
+                        turn_starts.insert(id, std::time::Instant::now());
+                    }
+                }
+                AgentEvent::TurnEnd {
+                    turn_id,
+                    latency_ms,
+                    ..
+                } => {
+                    if let Some(started) = turn_id
+                        .as_deref()
+                        .and_then(|id| turn_starts.remove(id))
+                    {
+                        *latency_ms =
+                            Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+                    }
+                }
+                _ => {}
+            }
             // Enrich TurnEnd with the cumulative token-economy figure so the
             // st-statusbar EfficiencyModule can render it. Sourced from the
             // savings ledger; advisory — a query error leaves the fields None
@@ -167,9 +194,24 @@ fn turn_event_to_agent_event(event: &TurnEvent) -> Option<AgentEvent> {
         TurnEvent::Completed {
             session_id,
             turn_id,
+            output_tokens,
+            input_tokens,
+            traceparent,
             ..
-        }
-        | TurnEvent::Failed {
+        } => Some(AgentEvent::TurnEnd {
+            turn_id: Some(turn_id.clone()),
+            session_id: Some(session_id.clone()),
+            // Filled in by enrich_turn_end_savings once the ledger is consulted.
+            tokens_saved: None,
+            efficiency_ratio: None,
+            input_tokens: input_tokens.map(u64::from),
+            output_tokens: Some(u64::from(*output_tokens)),
+            // Latency has no source field on the event; the fanout loop fills it
+            // statefully from the TurnStart→TurnEnd interval.
+            latency_ms: None,
+            traceparent: traceparent.clone(),
+        }),
+        TurnEvent::Failed {
             session_id,
             turn_id,
             ..
@@ -179,6 +221,11 @@ fn turn_event_to_agent_event(event: &TurnEvent) -> Option<AgentEvent> {
             // Filled in by enrich_turn_end_savings once the ledger is consulted.
             tokens_saved: None,
             efficiency_ratio: None,
+            // A failed turn reports no token or trace figures.
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: None,
+            traceparent: None,
         }),
         // Quality snapshots, cowork requests, streaming-only events, and compaction
         // notifications are not surfaced to agent consumers.
@@ -337,6 +384,12 @@ mod tests {
                 session_id: Some("s".into()),
                 tokens_saved: None,
                 efficiency_ratio: None,
+                // Completed carries the real token/trace figures; latency is
+                // filled by the fanout loop, not this pure mapper.
+                input_tokens: Some(412),
+                output_tokens: Some(88),
+                latency_ms: None,
+                traceparent: Some("00-abc123def456-0102030405060708-01".into()),
             }
         );
 
@@ -357,6 +410,11 @@ mod tests {
                 session_id: Some("s".into()),
                 tokens_saved: None,
                 efficiency_ratio: None,
+                // A failed turn reports no token/latency/trace figures.
+                input_tokens: None,
+                output_tokens: None,
+                latency_ms: None,
+                traceparent: None,
             }
         );
     }
@@ -385,6 +443,10 @@ mod tests {
             session_id: Some("sess-e".to_owned()),
             tokens_saved: None,
             efficiency_ratio: None,
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: None,
+            traceparent: None,
         };
         enrich_turn_end_savings(&mut event, &ingot).await;
         match event {
@@ -405,6 +467,10 @@ mod tests {
             session_id: Some("empty".to_owned()),
             tokens_saved: None,
             efficiency_ratio: None,
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: None,
+            traceparent: None,
         };
         enrich_turn_end_savings(&mut event, &ingot).await;
         match event {

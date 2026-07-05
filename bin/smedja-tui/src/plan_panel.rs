@@ -111,7 +111,8 @@ impl<'a> PlanPanel<'a> {
             let label = format!("{n}. ");
             let text_budget = inner_w.saturating_sub(label.len());
             let display = if step.len() > text_budget {
-                format!("{}…", &step[..text_budget.saturating_sub(1)])
+                let end = crate::floor_char_boundary(step, text_budget.saturating_sub(1));
+                format!("{}…", &step[..end])
             } else {
                 step.clone()
             };
@@ -201,5 +202,20 @@ mod tests {
     fn panel_height_caps_at_fourteen() {
         assert_eq!(panel_height(20), 14);
         assert_eq!(panel_height(3), 5); // 3 steps + 2 borders
+    }
+
+    // Regression: a long multibyte step once panicked in `&step[..budget]` when
+    // the truncation index fell mid-codepoint. It must now floor to a boundary.
+    #[test]
+    fn multibyte_step_truncation_renders_without_panic() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let steps = vec![
+            "café_αβγ_日本語_ελληνικά_привет_мир_こんにちは_世界".to_owned(),
+            "second_αβγ_日本語_step".to_owned(),
+        ];
+        let panel = PlanPanel::new(&steps);
+        let backend = TestBackend::new(20, 8);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| panel.render(f.area(), f)).unwrap();
     }
 }

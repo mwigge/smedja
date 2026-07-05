@@ -28,7 +28,10 @@ toml               = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 tree-sitter        = { workspace = true }
+tree-sitter-go         = { workspace = true }
+tree-sitter-python     = { workspace = true }
 tree-sitter-rust   = { workspace = true }
+tree-sitter-typescript = { workspace = true }
 unicode-width      = { workspace = true }
 which              = { workspace = true }
 

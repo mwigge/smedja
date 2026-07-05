@@ -449,17 +449,17 @@ fn forged_terminal_colors() -> ColorConfig {
             hex_to_rgba("#d65f2e").unwrap(), // 1  red
             hex_to_rgba("#5d946b").unwrap(), // 2  green
             hex_to_rgba("#d99b55").unwrap(), // 3  yellow
-            hex_to_rgba("#8f765b").unwrap(), // 4  blue
-            hex_to_rgba("#a9652f").unwrap(), // 5  magenta
-            hex_to_rgba("#f7c77e").unwrap(), // 6  cyan
+            hex_to_rgba("#6f86a8").unwrap(), // 4  blue (warm-tinted, still blue)
+            hex_to_rgba("#b57a9c").unwrap(), // 5  magenta (warm-tinted, still magenta)
+            hex_to_rgba("#58a89e").unwrap(), // 6  cyan (warm-tinted, still cyan)
             hex_to_rgba("#f4d7a1").unwrap(), // 7  white
             hex_to_rgba("#3b2a1f").unwrap(), // 8  bright black
             hex_to_rgba("#e8753e").unwrap(), // 9  bright red
             hex_to_rgba("#77aa7c").unwrap(), // 10 bright green
             hex_to_rgba("#ffd37a").unwrap(), // 11 bright yellow
-            hex_to_rgba("#b4845a").unwrap(), // 12 bright blue
-            hex_to_rgba("#c07a3a").unwrap(), // 13 bright magenta
-            hex_to_rgba("#ffb24a").unwrap(), // 14 bright cyan
+            hex_to_rgba("#90a8cc").unwrap(), // 12 bright blue (warm-tinted, still blue)
+            hex_to_rgba("#d494ba").unwrap(), // 13 bright magenta (warm-tinted, still magenta)
+            hex_to_rgba("#79c9be").unwrap(), // 14 bright cyan (warm-tinted, still cyan)
             hex_to_rgba("#fff1cf").unwrap(), // 15 bright white
         ],
     }

@@ -1,6 +1,6 @@
 //! Diff viewer — unified and side-by-side rendering for diff overlays.
 
-use crate::main_panel::apply_syntect;
+use crate::main_panel::highlight_code;
 use crate::theme::palette;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -160,8 +160,8 @@ pub fn highlighted_diff_line(
         return Line::from(vec![Span::styled(text, sigil_style)]);
     }
 
-    // Highlight via syntect — takes the first (and only) output line.
-    let highlighted = apply_syntect(lang, content);
+    // Highlight via the tree-sitter/syntect dispatch — first (and only) line.
+    let highlighted = highlight_code(lang, content);
     let mut spans: Vec<Span<'static>> = vec![Span::styled(sigil, sigil_style)];
     if let Some(styled_line) = highlighted.into_iter().next() {
         if let Some(line) = styled_line.spans {

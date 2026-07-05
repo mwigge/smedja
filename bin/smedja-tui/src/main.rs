@@ -1,7 +1,6 @@
 pub mod action_log;
 mod blocks;
 mod clipboard;
-pub mod code_widget;
 mod context_rail;
 mod cowork_widget;
 mod diff_viewer;
@@ -83,6 +82,21 @@ use ratatui::Terminal;
 use serde_json::{json, Value};
 use smedja_bellows::StreamEvent;
 use smedja_rpc::client::Client;
+
+/// Returns the largest byte index `<= max` that lies on a UTF-8 char boundary of
+/// `s`. Use this before `&s[..n]` byte slicing so multibyte names (e.g.
+/// `"café_αβγ_日本語"`) never panic mid-codepoint. Ported from the st-statusbar
+/// helper to avoid a dependency on the `term/` crates.
+pub(crate) fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut i = max;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -607,6 +621,11 @@ pub(crate) struct AppState {
     session_tokens_in: u64,
     /// Cumulative output tokens for this session.
     session_tokens_out: u64,
+    /// Running sum of every observed Tier-1 quality score (for the value panel's
+    /// real running average).
+    quality_score_sum: u64,
+    /// Count of observed quality scores contributing to `quality_score_sum`.
+    quality_score_count: u64,
     /// True while the session config peek overlay is visible (toggled by Ctrl+P in scroll mode).
     show_session_peek: bool,
 }
@@ -2120,6 +2139,13 @@ async fn handle_key(
                 }
                 return Ok(());
             }
+            // A (Shift-A): collapse / expand the action log. Uppercase so it does
+            // not collide with lowercase 'a' (exit scroll mode) or Ctrl-A (role
+            // cockpit).
+            KeyCode::Char('A') => {
+                state.action_log.visible = !state.action_log.visible;
+                return Ok(());
+            }
             // [ / ] : navigate session rail cursor (when rail is visible).
             KeyCode::Char('[') => {
                 if state.panels.session_rail {
@@ -2866,7 +2892,8 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
                 if i == cursor {
                     Line::from(Span::styled(
                         format!("▶ {label}"),
-                        Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+                        // Signature molten lava-orange for the active/selected row.
+                        Style::default().fg(p.molten).add_modifier(Modifier::BOLD),
                     ))
                 } else {
                     Line::from(Span::raw(format!("  {label}")))
@@ -2891,6 +2918,19 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     } else {
         Some(state.panel_search_query.as_str())
     };
+    // Animate the in-flight tool card's status glyph so a running tool shows
+    // liveness: cycle the braille spinner each render tick until its result
+    // settles the card to ✓/✗. Re-rendered every tick so the glyph visibly spins.
+    if state.turn_in_flight {
+        if let Some((idx, name, input)) = state.pending_tool.clone() {
+            const TOOL_SPINNER: [char; 10] =
+                ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let frame_char = TOOL_SPINNER[state.spinner_tick as usize % TOOL_SPINNER.len()];
+            let card = tool_call_card(&name, &input, state.no_color, frame_char);
+            state.main_panel.replace_styled_line(idx, card);
+        }
+    }
+
     state
         .main_panel
         .render(main_area, frame, selection, search_q, state.no_color);
@@ -2934,7 +2974,26 @@ fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     } else {
         Style::default().fg(p.text_dim).add_modifier(Modifier::DIM)
     };
-    let input_para = Paragraph::new(input_display)
+    // Colour the leading "> " prompt indicator with the signature molten
+    // lava-orange (primary accent); the typed text keeps the default fg.
+    let input_content: ratatui::text::Text<'static> =
+        if !state.no_color && state.secret_var.is_none() {
+            if let Some(rest) = input_display.strip_prefix("> ") {
+                Line::from(vec![
+                    Span::styled(
+                        "> ",
+                        Style::default().fg(p.molten).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(rest.to_owned()),
+                ])
+                .into()
+            } else {
+                input_display.clone().into()
+            }
+        } else {
+            input_display.clone().into()
+        };
+    let input_para = Paragraph::new(input_content)
         .wrap(ratatui::widgets::Wrap { trim: false })
         .scroll((input_scroll, 0));
     // Narrow the render rect to match input_w so the Paragraph wrap point
@@ -3789,6 +3848,8 @@ async fn main() -> Result<()> {
         latency_samples: VecDeque::new(),
         session_tokens_in: 0,
         session_tokens_out: 0,
+        quality_score_sum: 0,
+        quality_score_count: 0,
         show_session_peek: false,
     };
 
@@ -4269,6 +4330,11 @@ async fn main() -> Result<()> {
                             skill_advisories,
                             suggested_command,
                         };
+                        // Feed the real running average consumed by the value panel.
+                        state.quality_score_sum =
+                            state.quality_score_sum.saturating_add(u64::from(score));
+                        state.quality_score_count =
+                            state.quality_score_count.saturating_add(1);
                         if llm_reviewed {
                             state.quality_review_in_progress = false;
                         }
@@ -4674,7 +4740,28 @@ async fn main() -> Result<()> {
                 .await
             {
                 state.value_snapshot.change_name = vc["change_name"].as_str().map(str::to_owned);
-                state.value_snapshot.token_cost = vc["token_cost"].as_u64().unwrap_or(0);
+                let token_cost = vc["token_cost"].as_u64().unwrap_or(0);
+                state.value_snapshot.token_cost = token_cost;
+                // Session blended $/token rate applied to this change's tokens.
+                let total_tok = state
+                    .session_tokens_in
+                    .saturating_add(state.session_tokens_out);
+                state.value_snapshot.cost_usd_micros = value_panel::blended_cost_micros(
+                    state.obs_snapshot.session_cost_usd,
+                    total_tok,
+                    token_cost,
+                );
+                // Real running average of observed Tier-1 quality scores.
+                let quality_avg = state
+                    .quality_score_sum
+                    .checked_div(state.quality_score_count)
+                    .map_or(0u8, |avg| {
+                        #[allow(clippy::cast_possible_truncation)] // avg of 0–100 fits u8
+                        let a = avg as u8;
+                        a
+                    });
+                state.value_snapshot.quality_avg = quality_avg;
+                state.value_snapshot.estimated_value = value_panel::estimate_value(quality_avg);
             }
         }
 
@@ -6124,6 +6211,8 @@ mod tests {
             latency_samples: VecDeque::new(),
             session_tokens_in: 0,
             session_tokens_out: 0,
+            quality_score_sum: 0,
+            quality_score_count: 0,
             file_picker_open: false,
             file_picker_dir: std::path::PathBuf::new(),
             file_picker_entries: Vec::new(),

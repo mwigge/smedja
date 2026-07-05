@@ -105,7 +105,8 @@ impl Widget for ContextRail {
                 let pct = slot.pct();
                 let color = SlotStyle::from_pct(pct).color();
                 let bar = slot.fill_bar(bar_width);
-                let name_trunc = &slot.name[..slot.name.len().min(7)];
+                let name_trunc =
+                    &slot.name[..crate::floor_char_boundary(&slot.name, slot.name.len().min(7))];
                 let label = format!(" {name_trunc:<7}{pct:>3.0}%");
                 Line::from(vec![
                     Span::styled(bar, Style::default().fg(color)),
@@ -211,5 +212,20 @@ mod tests {
             SlotStyle::Low,
             "50% context usage must be Low (green)"
         );
+    }
+
+    // Regression: multibyte slot names once panicked in `&slot.name[..7]` when the
+    // 7th byte fell mid-codepoint. Rendering must now floor to a char boundary.
+    #[test]
+    fn multibyte_slot_name_renders_without_panic() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let rail = ContextRail::new(vec![ContextSlot {
+            name: "café_αβγ_日本語".into(),
+            used: 50,
+            total: 100,
+        }]);
+        let backend = TestBackend::new(30, 3);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| f.render_widget(rail, f.area())).unwrap();
     }
 }

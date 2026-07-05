@@ -40,6 +40,73 @@ pub struct Color {
     pub b: u8,
 }
 
+// ── Forge palette ───────────────────────────────────────────────────────────────
+//
+// Shared status-bar accent tones, matching the smedja-tui forge palette exactly
+// so the GPU terminal and the TUI read as one system.
+
+/// Forge green — success / healthy / low utilisation.
+pub const FORGE_SUCCESS: Color = Color {
+    r: 122,
+    g: 202,
+    b: 142,
+};
+/// Forge amber — warning / mid utilisation.
+pub const FORGE_WARN: Color = Color {
+    r: 243,
+    g: 197,
+    b: 92,
+};
+/// Forge ember — error / high utilisation.
+pub const FORGE_ERROR: Color = Color {
+    r: 240,
+    g: 120,
+    b: 72,
+};
+/// Forge teal — the `local` inference tier.
+pub const FORGE_LOCAL: Color = Color {
+    r: 78,
+    g: 185,
+    b: 178,
+};
+/// Forge gold — the `fast` inference tier.
+pub const FORGE_FAST: Color = Color {
+    r: 247,
+    g: 199,
+    b: 126,
+};
+/// Forge copper — the `deep` inference tier.
+pub const FORGE_DEEP: Color = Color {
+    r: 169,
+    g: 101,
+    b: 47,
+};
+
+/// Returns the published maximum context-window size (in tokens) for a model id.
+///
+/// The match is a case-insensitive substring test against well-known model
+/// families; the returned figures are each vendor's *published maximum* context
+/// window, not a per-request limit. Unknown models fall back to a conservative
+/// 128 K default.
+#[must_use]
+pub fn model_context_window(model: &str) -> usize {
+    let m = model.to_ascii_lowercase();
+    let has = |needle: &str| m.contains(needle);
+    if has("claude") || has("opus") || has("sonnet") || has("haiku") {
+        200_000
+    } else if has("gemini") {
+        1_000_000
+    } else if has("gemma") {
+        8_192
+    } else if has("qwen") {
+        32_768
+    } else {
+        // gpt-4o / gpt-4.1 / o1 / o3 / llama, and any unrecognised model, all
+        // land on the conservative 128 K default.
+        128_000
+    }
+}
+
 /// Visual style applied to a rendered [`Segment`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SegmentStyle {
@@ -161,7 +228,15 @@ impl StatusModule for TierModule {
 
     fn evaluate(&self, ctx: &ModuleContext) -> Option<Segment> {
         let tier = ctx.tier.as_deref()?;
-        Some(plain_segment("tier", format!("[{tier}]")))
+        let text = format!("[{tier}]");
+        // Colour the badge by tier so the terminal reads like the TUI; an
+        // unrecognised tier stays uncoloured rather than guessing a tone.
+        match tier {
+            "local" => Some(coloured_segment("tier", text, FORGE_LOCAL)),
+            "fast" => Some(coloured_segment("tier", text, FORGE_FAST)),
+            "deep" => Some(coloured_segment("tier", text, FORGE_DEEP)),
+            _ => Some(plain_segment("tier", text)),
+        }
     }
 }
 
@@ -181,9 +256,9 @@ impl StatusModule for ModelModule {
 
 /// Displays context-window utilisation with colour coding.
 ///
-/// - Green  (`0, 200, 0`)   — under 60 %
-/// - Yellow (`200, 200, 0`) — 60–80 %
-/// - Red    (`200, 0, 0`)   — over 80 %
+/// - [`FORGE_SUCCESS`] (forge green) — under 60 %
+/// - [`FORGE_WARN`]    (forge amber) — 60–80 %
+/// - [`FORGE_ERROR`]   (forge ember) — over 80 %
 pub struct ContextPctModule;
 
 impl StatusModule for ContextPctModule {
@@ -198,15 +273,11 @@ impl StatusModule for ContextPctModule {
         let pct = 100 * ctx.context_used / ctx.context_window;
         let text = format!("ctx: {pct}%");
         let fg = if pct < 60 {
-            Color { r: 0, g: 200, b: 0 }
+            FORGE_SUCCESS
         } else if pct <= 80 {
-            Color {
-                r: 200,
-                g: 200,
-                b: 0,
-            }
+            FORGE_WARN
         } else {
-            Color { r: 200, g: 0, b: 0 }
+            FORGE_ERROR
         };
         Some(coloured_segment("context_pct", text, fg))
     }
@@ -284,95 +355,6 @@ impl StatusModule for GitBranchModule {
     }
 }
 
-/// Displays a summary of uncommitted git changes: `+N ~M -K`.
-pub struct GitStatusModule;
-
-impl GitStatusModule {
-    /// Evaluate in an explicit working directory (useful for testing).
-    #[must_use]
-    pub fn evaluate_in(&self, _ctx: &ModuleContext, cwd: &Path) -> Option<Segment> {
-        let output = std::process::Command::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(cwd)
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let stdout = std::str::from_utf8(&output.stdout).ok()?;
-        let mut untracked = 0usize;
-        let mut modified = 0usize;
-        let mut deleted = 0usize;
-        for line in stdout.lines() {
-            if line.starts_with("?? ") {
-                untracked += 1;
-            } else if line.starts_with('M') || line.starts_with(" M") {
-                modified += 1;
-            } else if line.starts_with('D') || line.starts_with(" D") {
-                deleted += 1;
-            }
-        }
-        if untracked == 0 && modified == 0 && deleted == 0 {
-            return None;
-        }
-        Some(plain_segment(
-            "git_status",
-            format!("+{untracked} ~{modified} -{deleted}"),
-        ))
-    }
-}
-
-impl StatusModule for GitStatusModule {
-    fn name(&self) -> &'static str {
-        "git_status"
-    }
-
-    fn evaluate(&self, ctx: &ModuleContext) -> Option<Segment> {
-        let cwd = std::env::current_dir().ok()?;
-        self.evaluate_in(ctx, &cwd)
-    }
-
-    fn timeout_ms(&self) -> u64 {
-        500
-    }
-}
-
-/// Detects the primary language of the current working directory.
-///
-/// Priority: Rust > Node > Go > Python.
-pub struct LanguageModule;
-
-impl LanguageModule {
-    /// Evaluate against an explicit directory (useful for testing).
-    #[must_use]
-    pub fn evaluate_in(&self, _ctx: &ModuleContext, cwd: &Path) -> Option<Segment> {
-        let checks: &[(&str, &str)] = &[
-            ("Cargo.toml", "\u{1f980} Rust"),
-            ("package.json", "\u{2b21} Node"),
-            ("go.mod", "\u{1f439} Go"),
-            ("pyproject.toml", "\u{1f40d} Python"),
-            ("setup.py", "\u{1f40d} Python"),
-        ];
-        for (file, label) in checks {
-            if cwd.join(file).exists() {
-                return Some(plain_segment("language", *label));
-            }
-        }
-        None
-    }
-}
-
-impl StatusModule for LanguageModule {
-    fn name(&self) -> &'static str {
-        "language"
-    }
-
-    fn evaluate(&self, ctx: &ModuleContext) -> Option<Segment> {
-        let cwd = std::env::current_dir().ok()?;
-        self.evaluate_in(ctx, &cwd)
-    }
-}
-
 /// Displays the current local time in `HH:MM` format using raw UTC arithmetic.
 ///
 /// This module always returns `Some`.
@@ -386,38 +368,6 @@ impl StatusModule for TimeModule {
     fn evaluate(&self, _ctx: &ModuleContext) -> Option<Segment> {
         let now = Local::now();
         Some(plain_segment("time", now.format("%H:%M").to_string()))
-    }
-}
-
-/// Displays battery level from `/sys/class/power_supply/BAT0/`.
-///
-/// Returns `None` on systems without a battery (e.g. desktops, CI runners).
-pub struct BatteryModule;
-
-impl StatusModule for BatteryModule {
-    fn name(&self) -> &'static str {
-        "battery"
-    }
-
-    fn evaluate(&self, _ctx: &ModuleContext) -> Option<Segment> {
-        let capacity_path = Path::new("/sys/class/power_supply/BAT0/capacity");
-        let status_path = Path::new("/sys/class/power_supply/BAT0/status");
-        if !capacity_path.exists() {
-            return None;
-        }
-        let capacity = std::fs::read_to_string(capacity_path)
-            .ok()?
-            .trim()
-            .to_owned();
-        let status = std::fs::read_to_string(status_path)
-            .ok()
-            .unwrap_or_default();
-        let symbol = if status.trim() == "Charging" {
-            "\u{26a1}"
-        } else {
-            "\u{1f50b}"
-        };
-        Some(plain_segment("battery", format!("{symbol} {capacity}%")))
     }
 }
 
@@ -441,7 +391,7 @@ impl StatusModule for ExitCodeModule {
         Some(coloured_segment(
             "exit_code",
             format!("\u{2718} {code}"),
-            Color { r: 200, g: 0, b: 0 },
+            FORGE_ERROR,
         ))
     }
 }
@@ -583,19 +533,6 @@ impl StatusModule for CwdModule {
             format!("\u{2026}{tail}")
         };
         Some(plain_segment("cwd", short))
-    }
-}
-
-pub struct InterfaceModule;
-
-impl StatusModule for InterfaceModule {
-    fn name(&self) -> &'static str {
-        "interface"
-    }
-
-    fn evaluate(&self, ctx: &ModuleContext) -> Option<Segment> {
-        let iface = ctx.interface.as_deref()?;
-        Some(plain_segment("interface", iface.to_owned()))
     }
 }
 
@@ -770,6 +707,50 @@ mod tests {
         assert!(TierModule.evaluate(&ctx).is_none());
     }
 
+    #[test]
+    fn tier_module_colours_by_tier() {
+        for (tier, want) in [
+            ("local", &FORGE_LOCAL),
+            ("fast", &FORGE_FAST),
+            ("deep", &FORGE_DEEP),
+        ] {
+            let ctx = ModuleContext {
+                tier: Some(tier.to_owned()),
+                ..make_ctx()
+            };
+            let seg = TierModule.evaluate(&ctx).expect("should return Some");
+            assert_eq!(seg.text, format!("[{tier}]"));
+            assert_eq!(seg.style.fg.as_ref(), Some(want), "tier {tier} colour");
+        }
+    }
+
+    #[test]
+    fn tier_module_unknown_tier_stays_plain() {
+        let ctx = ModuleContext {
+            tier: Some("weird".to_owned()),
+            ..make_ctx()
+        };
+        let seg = TierModule.evaluate(&ctx).expect("should return Some");
+        assert_eq!(seg.text, "[weird]");
+        assert!(seg.style.fg.is_none(), "unknown tier must stay uncoloured");
+    }
+
+    #[test]
+    fn model_context_window_matches_published_maximums() {
+        assert_eq!(model_context_window("claude-opus-4-8"), 200_000);
+        assert_eq!(model_context_window("Claude-3.5-Sonnet"), 200_000);
+        assert_eq!(model_context_window("haiku"), 200_000);
+        assert_eq!(model_context_window("gpt-4o-mini"), 128_000);
+        assert_eq!(model_context_window("gpt-4.1"), 128_000);
+        assert_eq!(model_context_window("o3-mini"), 128_000);
+        assert_eq!(model_context_window("gemini-1.5-pro"), 1_000_000);
+        assert_eq!(model_context_window("gemma-4-27b-it"), 8_192);
+        assert_eq!(model_context_window("llama-3.1-70b"), 128_000);
+        assert_eq!(model_context_window("qwen2.5-coder"), 32_768);
+        // Unknown families fall back to the conservative 128 K default.
+        assert_eq!(model_context_window("some-unknown-model"), 128_000);
+    }
+
     // 3
     #[test]
     fn context_pct_module_colours_by_threshold() {
@@ -783,9 +764,9 @@ mod tests {
             .evaluate(&ctx_50)
             .expect("50% should return Some");
         let fg = seg.style.fg.as_ref().expect("should have fg colour");
-        assert_eq!((fg.r, fg.g, fg.b), (0, 200, 0), "50% should be green");
+        assert_eq!(*fg, FORGE_SUCCESS, "50% should be forge green");
 
-        // 70 % → yellow
+        // 70 % → forge amber
         let ctx_70 = ModuleContext {
             context_used: 70,
             context_window: 100,
@@ -795,9 +776,9 @@ mod tests {
             .evaluate(&ctx_70)
             .expect("70% should return Some");
         let fg = seg.style.fg.as_ref().expect("should have fg colour");
-        assert_eq!((fg.r, fg.g, fg.b), (200, 200, 0), "70% should be yellow");
+        assert_eq!(*fg, FORGE_WARN, "70% should be forge amber");
 
-        // 90 % → red
+        // 90 % → forge ember
         let ctx_90 = ModuleContext {
             context_used: 90,
             context_window: 100,
@@ -807,7 +788,7 @@ mod tests {
             .evaluate(&ctx_90)
             .expect("90% should return Some");
         let fg = seg.style.fg.as_ref().expect("should have fg colour");
-        assert_eq!((fg.r, fg.g, fg.b), (200, 0, 0), "90% should be red");
+        assert_eq!(*fg, FORGE_ERROR, "90% should be forge ember");
     }
 
     // 4
@@ -845,31 +826,6 @@ mod tests {
         );
     }
 
-    // 6
-    #[test]
-    fn language_module_detects_rust_from_cargo_toml() {
-        // Create a temp dir with a Cargo.toml file to trigger Rust detection.
-        let tmp = std::env::temp_dir().join(format!(
-            "smedja-test-lang-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&tmp).expect("create tmp dir");
-        std::fs::write(tmp.join("Cargo.toml"), "[package]").expect("write Cargo.toml");
-
-        let result = LanguageModule.evaluate_in(&make_ctx(), &tmp);
-        std::fs::remove_dir_all(&tmp).ok();
-
-        let seg = result.expect("should detect Rust");
-        assert!(
-            seg.text.contains("Rust"),
-            "expected text to contain 'Rust', got '{}'",
-            seg.text
-        );
-    }
-
     // 7
     #[test]
     fn format_bar_replaces_module_tokens() {
@@ -890,17 +846,6 @@ mod tests {
             result.contains('\u{2502}'),
             "expected box-drawing │, got '{result}'"
         );
-    }
-
-    // 9
-    #[test]
-    fn battery_module_no_battery_returns_none() {
-        // On CI / desktops without BAT0, the module must return None gracefully.
-        if Path::new("/sys/class/power_supply/BAT0/capacity").exists() {
-            // System has a battery — skip rather than assert (avoids false failures on laptops).
-            return;
-        }
-        assert!(BatteryModule.evaluate(&make_ctx()).is_none());
     }
 
     // 10
@@ -947,9 +892,7 @@ mod tests {
         assert!(seg.text.contains('1'), "text should include exit code");
         assert!(seg.text.contains('\u{2718}'), "text should contain ✘");
         let fg = seg.style.fg.as_ref().expect("should have fg colour");
-        assert_eq!(fg.r, 200, "should be red");
-        assert_eq!(fg.g, 0);
-        assert_eq!(fg.b, 0);
+        assert_eq!(*fg, FORGE_ERROR, "non-zero exit should use forge ember");
     }
 
     // 14

@@ -89,4 +89,17 @@ mod tests {
         assert!(text.contains("bash"));
         assert!(text.contains("find . -type f"));
     }
+
+    #[test]
+    fn tool_call_card_first_span_carries_spinner_frame() {
+        // A running card is built with a braille spinner frame as the status char;
+        // it must appear in the leading status span.
+        let line = tool_call_card("Read", "src/main.rs", true, '\u{2819}');
+        let first = line.spans.first().expect("status span present");
+        assert!(
+            first.content.contains('\u{2819}'),
+            "first span must carry the spinner frame; got: {:?}",
+            first.content
+        );
+    }
 }

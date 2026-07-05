@@ -72,26 +72,6 @@ fn segment_runner(ctx: &ModuleCtx<'_>) -> String {
 // Public render functions
 // ---------------------------------------------------------------------------
 
-/// Renders the status bar as a single string from ordered segments.
-///
-/// Delegates to [`render_status_bar_with_timeout`] with a default 30 ms timeout.
-/// Retained as the plain-text status API (config-driven format, tests); the live
-/// TUI now renders a styled segmented line via `status_bar_line`.
-#[allow(dead_code)]
-pub fn render_status_bar(ctx: &ModuleCtx<'_>) -> String {
-    render_status_bar_configured(ctx, None, 30)
-}
-
-#[allow(dead_code)] // public API — called by tests and future integration code
-/// Renders the status bar with a configurable per-segment timeout (milliseconds).
-///
-/// Each segment computation is dispatched to a thread; segments that do not
-/// return within `timeout_ms` are silently omitted.  When `timeout_ms` is 0
-/// every segment will be skipped (useful in tests).
-pub fn render_status_bar_with_timeout(ctx: &ModuleCtx<'_>, timeout_ms: u64) -> String {
-    render_status_bar_configured(ctx, None, timeout_ms)
-}
-
 /// Renders the status bar applying optional [`StatusBarConfig`] and timeout.
 ///
 /// - If `config.format` is `Some`, renders only the named segments in that
@@ -99,6 +79,10 @@ pub fn render_status_bar_with_timeout(ctx: &ModuleCtx<'_>, timeout_ms: u64) -> S
 /// - If a module key appears in `config` with `disabled: true`, it is skipped.
 /// - `timeout_ms` is accepted for API compatibility but ignored — all segments
 ///   are computed synchronously (they do no I/O) so no timeout is needed.
+///
+/// Retained as the plain-text status API (config-driven format, covered by
+/// tests); the live TUI renders a styled segmented line via `status_bar_line`.
+#[allow(dead_code)]
 pub fn render_status_bar_configured(
     ctx: &ModuleCtx<'_>,
     config: Option<&StatusBarConfig>,
@@ -159,7 +143,7 @@ mod tests {
             input_mode: false,
             ctx_pct: None,
         };
-        let bar = render_status_bar(&ctx);
+        let bar = render_status_bar_configured(&ctx, None, 30);
         assert!(bar.contains("[deep]"));
         assert!(bar.contains("[review]"));
     }
@@ -175,7 +159,7 @@ mod tests {
             input_mode: false,
             ctx_pct: None,
         };
-        assert!(render_status_bar(&ctx).contains('\u{27f3}'));
+        assert!(render_status_bar_configured(&ctx, None, 30).contains('\u{27f3}'));
     }
 
     #[test]
@@ -189,7 +173,7 @@ mod tests {
             input_mode: false,
             ctx_pct: None,
         };
-        assert!(!render_status_bar(&ctx).contains('\u{27f3}'));
+        assert!(!render_status_bar_configured(&ctx, None, 30).contains('\u{27f3}'));
     }
 
     #[test]
@@ -206,7 +190,7 @@ mod tests {
             input_mode: false,
             ctx_pct: None,
         };
-        let _ = render_status_bar_with_timeout(&ctx, 0);
+        let _ = render_status_bar_configured(&ctx, None, 0);
     }
 
     #[test]
@@ -244,7 +228,7 @@ mod tests {
             input_mode: false,
             ctx_pct: None,
         };
-        let bar = render_status_bar(&ctx);
+        let bar = render_status_bar_configured(&ctx, None, 30);
         assert!(
             bar.contains("[claude-sonnet]"),
             "runner expected, got: {bar}"
@@ -262,7 +246,7 @@ mod tests {
             input_mode: false,
             ctx_pct: None,
         };
-        let bar = render_status_bar(&ctx);
+        let bar = render_status_bar_configured(&ctx, None, 30);
         assert!(
             bar.contains("[unknown]"),
             "default runner expected, got: {bar}"
@@ -328,7 +312,7 @@ mod tests {
             input_mode: true,
             ctx_pct: None,
         };
-        let bar = render_status_bar(&ctx);
+        let bar = render_status_bar_configured(&ctx, None, 30);
         assert!(
             bar.contains("[I]"),
             "status bar must include [I] badge in input mode; got: {bar}"
