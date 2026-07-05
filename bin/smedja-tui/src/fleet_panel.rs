@@ -197,7 +197,9 @@ fn agent_row(a: &AgentState, width: usize, no_color: bool, mode: RenderMode) -> 
     let name_style = if no_color {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(p.text_bright).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(p.text_bright)
+            .add_modifier(Modifier::BOLD)
     };
     let dim = if no_color {
         Style::default()
@@ -212,7 +214,11 @@ fn agent_row(a: &AgentState, width: usize, no_color: bool, mode: RenderMode) -> 
     } else {
         format!(" {}/{}", a.step.0, a.step.1)
     };
-    let activity: String = a.activity.chars().take(width.saturating_sub(28).max(4)).collect();
+    let activity: String = a
+        .activity
+        .chars()
+        .take(width.saturating_sub(28).max(4))
+        .collect();
 
     Line::from(vec![
         Span::styled("◆ ", pip_style),

@@ -3,6 +3,7 @@ use smedja_types::Timestamp;
 use uuid::Uuid;
 
 use crate::error::IngotError;
+use crate::{Ingot, IngotHandle};
 
 /// A structured unit of work within a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +165,144 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         session_id: row.get(5)?,
         response: row.get(6)?,
     })
+}
+
+impl Ingot {
+    /// Inserts a new [`Task`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the INSERT fails.
+    #[must_use = "check the Result to confirm the task was created"]
+    pub fn create_task(&self, task: &Task) -> Result<(), IngotError> {
+        create(&self.conn, task)
+    }
+
+    /// Returns tasks, optionally filtered by `status`.
+    ///
+    /// Pass `None` to return all tasks. Pass `Some("planned")` (or any other valid
+    /// status string) to restrict the result set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned tasks"]
+    pub fn list_tasks(&self, status: Option<&str>) -> Result<Vec<Task>, IngotError> {
+        list(&self.conn, status)
+    }
+
+    /// Returns the completed conversation turns for `session_id`, oldest first
+    /// (each task's `title` is the user message, `response` the assistant reply).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    pub fn session_history(&self, session_id: &str) -> Result<Vec<Task>, IngotError> {
+        history_for_session(&self.conn, session_id)
+    }
+
+    /// Updates the `status` field for the task identified by `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the status was updated"]
+    pub fn update_task_status(&self, id: &str, status: &str) -> Result<(), IngotError> {
+        update_status(&self.conn, id, status)
+    }
+
+    /// Retrieves a [`Task`] by `id`, returning `None` when not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned task"]
+    pub fn get_task(&self, id: &str) -> Result<Option<Task>, IngotError> {
+        get(&self.conn, id)
+    }
+
+    /// Stores `response` text for the task identified by `id` and sets
+    /// `status = "complete"` in the same UPDATE.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the response was stored"]
+    pub fn set_task_response(&self, id: &str, response: &str) -> Result<(), IngotError> {
+        update_response(&self.conn, id, response)
+    }
+}
+
+impl IngotHandle {
+    /// Inserts a new [`Task`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying INSERT, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn create_task(&self, task: Task) -> Result<(), IngotError> {
+        self.run_blocking(move |ig| ig.create_task(&task)).await
+    }
+
+    /// Returns tasks, optionally filtered by `status`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn list_tasks(&self, status: Option<String>) -> Result<Vec<Task>, IngotError> {
+        self.run_blocking(move |ig| ig.list_tasks(status.as_deref()))
+            .await
+    }
+
+    /// Returns the completed conversation turns for `session_id`, oldest first
+    /// (`title` = user message, `response` = assistant reply).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`], or [`IngotError::TaskPanic`] on panic.
+    pub async fn session_history(&self, session_id: &str) -> Result<Vec<Task>, IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.session_history(&session_id))
+            .await
+    }
+
+    /// Updates the `status` field for a task.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPDATE, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn update_task_status(&self, id: &str, status: &str) -> Result<(), IngotError> {
+        let id = id.to_owned();
+        let status = status.to_owned();
+        self.run_blocking(move |ig| ig.update_task_status(&id, &status))
+            .await
+    }
+
+    /// Retrieves a [`Task`] by `id`, returning `None` when not found.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn get_task(&self, id: &str) -> Result<Option<Task>, IngotError> {
+        let id = id.to_owned();
+        self.run_blocking(move |ig| ig.get_task(&id)).await
+    }
+
+    /// Stores `response` text for a task and sets `status = "complete"`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPDATE, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn set_task_response(&self, id: &str, response: &str) -> Result<(), IngotError> {
+        let id = id.to_owned();
+        let response = response.to_owned();
+        self.run_blocking(move |ig| ig.set_task_response(&id, &response))
+            .await
+    }
 }
 
 #[cfg(test)]

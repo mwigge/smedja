@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use smedja_types::{Microdollars, Timestamp};
 
 use crate::error::IngotError;
+use crate::{Ingot, IngotHandle};
 
 /// Microseconds in one second.
 const MICROS_PER_SEC: i64 = 1_000_000;
@@ -284,6 +285,88 @@ pub(crate) fn materialise(
         )?;
     }
     Ok(buckets)
+}
+
+impl Ingot {
+    /// Computes time-tiered metrics buckets for `tier` over `[since, until)`.
+    ///
+    /// Aggregates tokens, cost, and turns from `cost_ledger` and error counts
+    /// from `audit_events` (`status = 'error'`) per `(bucket, runner)`, merging
+    /// the two on `(bucket_start, runner)`. Buckets are computed on read from the
+    /// source rows — there is no staleness and no background writer. Results are
+    /// ordered by `bucket_start` then `runner`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if either source query fails.
+    #[must_use = "check the Result and inspect the returned buckets"]
+    pub fn metrics_rollup(
+        &self,
+        tier: RollupTier,
+        since: Timestamp,
+        until: Timestamp,
+    ) -> Result<Vec<MetricsBucket>, IngotError> {
+        compute(&self.conn, tier, since, until)
+    }
+
+    /// Upserts the computed buckets for `tier` over `[epoch, until)` into the
+    /// `metrics_rollups` cache, keyed on `(tier, bucket_start, runner)`.
+    ///
+    /// Materialises every bucket up to (but not including) `until`. Idempotent:
+    /// re-running with the same `until` reproduces identical rows, and the stored
+    /// rows equal `metrics_rollup(tier, epoch, until)`. The returned buckets are
+    /// exactly what was stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the source queries or the upsert fail.
+    #[must_use = "check the Result to confirm the rollups were materialised"]
+    pub fn materialise_rollups(
+        &self,
+        tier: RollupTier,
+        until: Timestamp,
+    ) -> Result<Vec<MetricsBucket>, IngotError> {
+        materialise(
+            &self.conn,
+            tier,
+            smedja_types::Timestamp::from_micros(0),
+            until,
+        )
+    }
+}
+
+impl IngotHandle {
+    /// Computes time-tiered metrics buckets for `tier` over `[since, until)`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying queries, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn metrics_rollup(
+        &self,
+        tier: RollupTier,
+        since: Timestamp,
+        until: Timestamp,
+    ) -> Result<Vec<MetricsBucket>, IngotError> {
+        self.run_blocking(move |ig| ig.metrics_rollup(tier, since, until))
+            .await
+    }
+
+    /// Upserts the computed buckets for `tier` over `[epoch, until)` into the
+    /// `metrics_rollups` cache. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying queries or upsert, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn materialise_rollups(
+        &self,
+        tier: RollupTier,
+        until: Timestamp,
+    ) -> Result<Vec<MetricsBucket>, IngotError> {
+        self.run_blocking(move |ig| ig.materialise_rollups(tier, until))
+            .await
+    }
 }
 
 #[cfg(test)]

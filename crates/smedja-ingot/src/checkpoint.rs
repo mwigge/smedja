@@ -3,6 +3,7 @@ use smedja_types::Timestamp;
 use uuid::Uuid;
 
 use crate::error::IngotError;
+use crate::{Ingot, IngotHandle};
 
 /// A durable snapshot of a conversation turn, enabling rollback.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +222,177 @@ fn row_to_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<Checkpoint> {
         created_at: Timestamp::from_micros(crate::read_micros(row, 4)?),
         compaction_id: row.get(5)?,
     })
+}
+
+impl Ingot {
+    /// Saves a [`Checkpoint`], replacing any existing checkpoint for the same
+    /// `(session_id, turn_n)` pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the upsert fails.
+    #[must_use = "check the Result to confirm the checkpoint was saved"]
+    pub fn save_checkpoint(&self, cp: &Checkpoint) -> Result<(), IngotError> {
+        save(&self.conn, cp)
+    }
+
+    /// Loads the [`Checkpoint`] for `(session_id, turn_n)`, returning `None` if not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned checkpoint"]
+    pub fn load_checkpoint(
+        &self,
+        session_id: &str,
+        turn_n: u32,
+    ) -> Result<Option<Checkpoint>, IngotError> {
+        load(&self.conn, session_id, turn_n)
+    }
+
+    /// Returns the checkpoint with the highest `turn_n` for `session_id`, or `None`
+    /// if no checkpoints exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned checkpoint"]
+    pub fn latest_checkpoint(&self, session_id: &str) -> Result<Option<Checkpoint>, IngotError> {
+        latest(&self.conn, session_id)
+    }
+
+    /// Returns all ordinary (non-compaction) checkpoints for `session_id`,
+    /// ordered by turn number ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned checkpoints"]
+    pub fn list_checkpoints(&self, session_id: &str) -> Result<Vec<Checkpoint>, IngotError> {
+        list(&self.conn, session_id)
+    }
+
+    /// Returns all compaction checkpoints for `session_id`, ordered by
+    /// `created_at` ascending. Each carries a distinct `compaction_id`, so a
+    /// session retains every compaction rather than overwriting the previous one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned compaction checkpoints"]
+    pub fn list_compaction_checkpoints(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<Checkpoint>, IngotError> {
+        list_compactions(&self.conn, session_id)
+    }
+
+    /// Atomically rolls back a session to `turn_n`, pruning all later checkpoints.
+    ///
+    /// Loads the checkpoint at `turn_n` and, within the same `SQLite` transaction,
+    /// deletes every checkpoint for `session_id` with a turn number greater than
+    /// `turn_n`. Returns `Ok(Some(checkpoint))` on success, or `Ok(None)` when no
+    /// checkpoint exists at the requested turn (no rows are modified in that case).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if any SQL operation fails.
+    #[must_use = "check the Result to confirm the rollback succeeded"]
+    pub fn rollback_session(
+        &self,
+        session_id: &str,
+        turn_n: u32,
+    ) -> Result<Option<Checkpoint>, IngotError> {
+        rollback_session(&self.conn, session_id, turn_n)
+    }
+}
+
+impl IngotHandle {
+    /// Saves a [`Checkpoint`]. Ordinary per-turn checkpoints replace any existing
+    /// one for the same `(session_id, turn_n)`; compaction checkpoints are retained.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying upsert, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn save_checkpoint(&self, cp: Checkpoint) -> Result<(), IngotError> {
+        self.run_blocking(move |ig| ig.save_checkpoint(&cp)).await
+    }
+
+    /// Loads the ordinary [`Checkpoint`] for `(session_id, turn_n)`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn load_checkpoint(
+        &self,
+        session_id: &str,
+        turn_n: u32,
+    ) -> Result<Option<Checkpoint>, IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.load_checkpoint(&session_id, turn_n))
+            .await
+    }
+
+    /// Returns the ordinary checkpoint with the highest `turn_n` for `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn latest_checkpoint(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Checkpoint>, IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.latest_checkpoint(&session_id))
+            .await
+    }
+
+    /// Returns all ordinary checkpoints for `session_id`, ordered by turn number ascending.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn list_checkpoints(&self, session_id: &str) -> Result<Vec<Checkpoint>, IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.list_checkpoints(&session_id))
+            .await
+    }
+
+    /// Returns all compaction checkpoints for `session_id`, ordered by
+    /// `created_at` ascending. Every compaction is retained.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn list_compaction_checkpoints(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<Checkpoint>, IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.list_compaction_checkpoints(&session_id))
+            .await
+    }
+
+    /// Atomically rolls back a session to `turn_n`, pruning later checkpoints.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from any SQL operation, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn rollback_session(
+        &self,
+        session_id: &str,
+        turn_n: u32,
+    ) -> Result<Option<Checkpoint>, IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.rollback_session(&session_id, turn_n))
+            .await
+    }
 }
 
 #[cfg(test)]

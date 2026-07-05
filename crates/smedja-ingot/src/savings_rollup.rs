@@ -19,6 +19,7 @@ use smedja_types::Timestamp;
 
 use crate::error::IngotError;
 use crate::metrics_rollup::RollupTier;
+use crate::{Ingot, IngotHandle};
 
 /// The savings source recorded for provider prompt-cache reads.
 ///
@@ -197,6 +198,120 @@ pub(crate) fn summary(
         cache_saved,
         efficiency_ratio,
     })
+}
+
+impl Ingot {
+    /// Computes time-tiered savings buckets for `tier` over `[since, until)`.
+    ///
+    /// Aggregates `tokens_saved` from `tokens_saved_ledger` per
+    /// `(bucket, source)`, reusing [`RollupTier::bucket_start`] so savings
+    /// buckets align with the billed buckets in [`Self::metrics_rollup`].
+    /// Results are ordered by `bucket_start` then `source`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the source query fails.
+    #[must_use = "check the Result and inspect the returned buckets"]
+    pub fn savings_rollup(
+        &self,
+        tier: RollupTier,
+        since: Timestamp,
+        until: Timestamp,
+    ) -> Result<Vec<SavingsBucket>, IngotError> {
+        compute(&self.conn, tier, since, until)
+    }
+
+    /// Computes the efficiency ratio `saved / (saved + billed_input)` over
+    /// `[since, until)`.
+    ///
+    /// `saved` is the all-source `tokens_saved` sum; `billed_input` is the
+    /// `cost_ledger.input_tok` sum over the same range. Returns `0.0` for an
+    /// empty window. The `tier` argument is accepted for surface symmetry with
+    /// [`Self::savings_rollup`]; the ratio is computed over the whole window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if either source query fails.
+    #[must_use = "check the Result and inspect the returned ratio"]
+    pub fn efficiency_ratio(
+        &self,
+        tier: RollupTier,
+        since: Timestamp,
+        until: Timestamp,
+    ) -> Result<f64, IngotError> {
+        let _ = tier;
+        efficiency_ratio(&self.conn, since, until)
+    }
+
+    /// Computes the full [`SavingsSummary`] for `tier` over `[since, until)`.
+    ///
+    /// Carries the per-`(bucket, source)` rows plus the headline split:
+    /// compression total (`filter` + `crusher` + `cold-context`) and cache total
+    /// kept as separate figures, never summed, and the efficiency ratio.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if any source query fails.
+    #[must_use = "check the Result and inspect the returned summary"]
+    pub fn savings_summary(
+        &self,
+        tier: RollupTier,
+        since: Timestamp,
+        until: Timestamp,
+    ) -> Result<SavingsSummary, IngotError> {
+        summary(&self.conn, tier, since, until)
+    }
+}
+
+impl IngotHandle {
+    /// Computes time-tiered savings buckets for `tier` over `[since, until)`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn savings_rollup(
+        &self,
+        tier: RollupTier,
+        since: Timestamp,
+        until: Timestamp,
+    ) -> Result<Vec<SavingsBucket>, IngotError> {
+        self.run_blocking(move |ig| ig.savings_rollup(tier, since, until))
+            .await
+    }
+
+    /// Computes the efficiency ratio `saved / (saved + billed_input)` for `tier`
+    /// over `[since, until)`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying queries, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn efficiency_ratio(
+        &self,
+        tier: RollupTier,
+        since: Timestamp,
+        until: Timestamp,
+    ) -> Result<f64, IngotError> {
+        self.run_blocking(move |ig| ig.efficiency_ratio(tier, since, until))
+            .await
+    }
+
+    /// Computes the full [`SavingsSummary`] for `tier` over `[since, until)`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying queries, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn savings_summary(
+        &self,
+        tier: RollupTier,
+        since: Timestamp,
+        until: Timestamp,
+    ) -> Result<SavingsSummary, IngotError> {
+        self.run_blocking(move |ig| ig.savings_summary(tier, since, until))
+            .await
+    }
 }
 
 #[cfg(test)]

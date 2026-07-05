@@ -1,7 +1,6 @@
 //! [`Vault`] — vector KV cold store backed by `SQLite`.
 
 use crate::error::VaultError;
-use crate::similarity::cosine_sim;
 
 /// Default model identifier assumed for rows that predate per-row model tagging.
 ///
@@ -92,46 +91,30 @@ pub struct EmbedderIdentity {
 /// All operations are synchronous; callers inside an async runtime should use
 /// [`tokio::task::spawn_blocking`] to avoid blocking the executor thread.
 pub struct Vault {
-    conn: rusqlite::Connection,
-}
-
-/// A row read during the dedup scan in [`Vault::insert`].
-struct DedupeRow {
-    id: String,
-    embedding: Vec<u8>,
-    content_len: usize,
-}
-
-/// A row read during [`Vault::query`] before same-model filtering and scoring.
-struct QueryRow {
-    id: String,
-    bytes: Vec<u8>,
-    payload_str: String,
-    model_id: Option<String>,
-    dim: Option<i64>,
+    pub(crate) conn: rusqlite::Connection,
 }
 
 /// A fully-hydrated row read during [`Vault::search`].
 ///
 /// The whole row set is materialised before scoring so the prepared statement is
 /// dropped before the same-model filter and cosine math run.
-struct SearchRow {
-    id: String,
-    bytes: Vec<u8>,
-    payload_str: String,
-    ns: String,
-    content: String,
-    source_file: Option<String>,
-    added_by: Option<String>,
-    chunk_index: Option<i64>,
-    parent_id: Option<String>,
-    created_at: f64,
-    model_id: Option<String>,
-    dim: Option<i64>,
+pub(crate) struct SearchRow {
+    pub(crate) id: String,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) payload_str: String,
+    pub(crate) ns: String,
+    pub(crate) content: String,
+    pub(crate) source_file: Option<String>,
+    pub(crate) added_by: Option<String>,
+    pub(crate) chunk_index: Option<i64>,
+    pub(crate) parent_id: Option<String>,
+    pub(crate) created_at: f64,
+    pub(crate) model_id: Option<String>,
+    pub(crate) dim: Option<i64>,
 }
 
 /// Returns the current Unix time as a floating-point number of seconds.
-fn now_secs() -> f64 {
+pub(crate) fn now_secs() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -140,7 +123,7 @@ fn now_secs() -> f64 {
 
 /// Resolves the stored `embedder_model_id`, defaulting a legacy NULL to
 /// [`LEGACY_MODEL_ID`].
-fn resolve_model_id(stored: Option<String>) -> String {
+pub(crate) fn resolve_model_id(stored: Option<String>) -> String {
     stored.unwrap_or_else(|| LEGACY_MODEL_ID.to_owned())
 }
 
@@ -148,7 +131,7 @@ fn resolve_model_id(stored: Option<String>) -> String {
 ///
 /// Embeddings are written as little-endian `f32` BLOBs, so a legacy row's
 /// dimension is its byte length divided by four.
-fn resolve_dim(stored: Option<i64>, embedding_bytes_len: usize) -> usize {
+pub(crate) fn resolve_dim(stored: Option<i64>, embedding_bytes_len: usize) -> usize {
     match stored {
         Some(d) if d >= 0 => usize::try_from(d).unwrap_or(embedding_bytes_len / 4),
         _ => embedding_bytes_len / 4,
@@ -163,7 +146,7 @@ fn resolve_dim(stored: Option<i64>, embedding_bytes_len: usize) -> usize {
 /// store-wide panic. Decoding byte-by-byte (rather than `bytemuck::cast_slice`)
 /// also sidesteps the alignment requirement that `cast_slice` imposes on the
 /// borrowed `&[u8]`.
-fn decode_embedding(bytes: &[u8]) -> Option<Vec<f32>> {
+pub(crate) fn decode_embedding(bytes: &[u8]) -> Option<Vec<f32>> {
     if !bytes.len().is_multiple_of(4) {
         return None;
     }
@@ -206,640 +189,6 @@ impl Vault {
         let vault = Self { conn };
         vault.migrate()?;
         Ok(vault)
-    }
-
-    /// Inserts an entry with deduplication and embedder identity validation.
-    ///
-    /// The rules applied in order are:
-    ///
-    /// 1. Normalise an empty `namespace` to `"default"`.
-    /// 2. Check embedder identity: if a stored identity exists and `entry.embedding.len()`
-    ///    does not match `stored.dimensions`, return [`VaultError::EmbedderMismatch`].
-    /// 3. Scan same-namespace entries. When `cosine_sim > 0.85`:
-    ///    - If the existing entry's content is at least as long as the incoming → discard
-    ///      the incoming entry (return `Ok(())`).
-    ///    - Otherwise → remove the existing entry and continue insertion.
-    /// 4. Persist the incoming entry. If `entry.created_at == 0.0`, the current Unix
-    ///    timestamp is used.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VaultError::EmbedderMismatch`] on dimension mismatch with the stored
-    /// identity, [`VaultError::Db`] on a database failure, or [`VaultError::Json`] if
-    /// the payload cannot be serialised.
-    #[must_use = "check the Result to confirm the entry was persisted"]
-    pub fn insert(&mut self, entry: &VaultEntry) -> Result<(), VaultError> {
-        // 1. Normalise namespace.
-        let namespace = if entry.namespace.is_empty() {
-            "default"
-        } else {
-            &entry.namespace
-        };
-
-        // 2. Embedder identity check.
-        if let Some(identity) = self.get_embedder_identity()? {
-            if identity.dimensions != entry.embedding.len() {
-                return Err(VaultError::EmbedderMismatch {
-                    stored: format!("{}/{}", identity.model, identity.dimensions),
-                    incoming: format!("?/{}", entry.embedding.len()),
-                });
-            }
-        }
-
-        // 3. Dedup scan within the same namespace.
-        //    Load id, embedding bytes, and content length from the namespace.
-        let rows: Vec<DedupeRow> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id, embedding, content FROM vault_entries WHERE namespace = ?1")?;
-            let collected: Result<Vec<_>, rusqlite::Error> = stmt
-                .query_map(rusqlite::params![namespace], |row| {
-                    let id: String = row.get(0)?;
-                    let bytes: Vec<u8> = row.get(1)?;
-                    let content: String = row.get(2)?;
-                    Ok(DedupeRow {
-                        id,
-                        embedding: bytes,
-                        content_len: content.len(),
-                    })
-                })?
-                .collect();
-            // `stmt` is dropped here; `collected` owns all data.
-            collected?
-        };
-
-        // Collect the ids of near-duplicates the incoming entry supersedes. The
-        // actual deletes are deferred so they can be applied atomically with the
-        // insert below — see the transaction in step 4.
-        let mut ids_to_delete: Vec<String> = Vec::new();
-        for row in rows {
-            let Some(stored) = decode_embedding(&row.embedding) else {
-                tracing::warn!(
-                    id = %row.id,
-                    "vault: skipping dedup candidate with malformed embedding blob"
-                );
-                continue;
-            };
-            let sim = cosine_sim(&entry.embedding, &stored);
-            if sim > 0.85 {
-                if row.content_len >= entry.content.len() {
-                    // Existing entry is at least as good — discard incoming.
-                    return Ok(());
-                }
-                // Incoming is longer — mark the existing entry for removal.
-                ids_to_delete.push(row.id);
-            }
-        }
-
-        // 4. Persist.
-        let created_at = if entry.created_at == 0.0 {
-            now_secs()
-        } else {
-            entry.created_at
-        };
-
-        let embedding_bytes = bytemuck::cast_slice::<f32, u8>(&entry.embedding);
-        let payload_str = serde_json::to_string(&entry.payload)?;
-
-        // Apply the dedup delete(s) and the insert in a single transaction so a
-        // crash or error can never leave the vault in a state where the superseded
-        // entry has been deleted but its replacement is absent. rusqlite rolls the
-        // transaction back automatically if `tx` is dropped without `commit()`.
-        let tx = self.conn.transaction()?;
-        for id in &ids_to_delete {
-            tx.execute(
-                "DELETE FROM vault_entries WHERE id = ?1",
-                rusqlite::params![id],
-            )?;
-        }
-        tx.execute(
-            "INSERT OR REPLACE INTO vault_entries \
-             (id, embedding, payload, namespace, content, source_file, added_by, chunk_index, parent_id, created_at, embedder_model_id, dim) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            rusqlite::params![
-                entry.id,
-                embedding_bytes,
-                payload_str,
-                namespace,
-                entry.content,
-                entry.source_file,
-                entry.added_by,
-                entry.chunk_index,
-                entry.parent_id,
-                created_at,
-                entry.embedder_model_id,
-                i64::try_from(entry.dim).unwrap_or(i64::MAX),
-            ],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Inserts or replaces a [`VaultEntry`] (upsert by `id`).
-    ///
-    /// Legacy path — does not perform deduplication or embedder-identity checks.
-    /// Prefer [`Vault::insert`] for new call sites.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VaultError::Db`] if the database write fails, or
-    /// [`VaultError::Json`] if `entry.payload` cannot be serialised.
-    #[must_use = "check the Result to confirm the upsert succeeded"]
-    pub fn upsert(&mut self, entry: &VaultEntry) -> Result<(), VaultError> {
-        let embedding_bytes = bytemuck::cast_slice::<f32, u8>(&entry.embedding);
-        let payload_str = serde_json::to_string(&entry.payload)?;
-        let namespace = if entry.namespace.is_empty() {
-            "default"
-        } else {
-            &entry.namespace
-        };
-        self.conn.execute(
-            "INSERT OR REPLACE INTO vault_entries \
-             (id, embedding, payload, namespace, content, source_file, added_by, chunk_index, parent_id, created_at, embedder_model_id, dim) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            rusqlite::params![
-                entry.id,
-                embedding_bytes,
-                payload_str,
-                namespace,
-                entry.content,
-                entry.source_file,
-                entry.added_by,
-                entry.chunk_index,
-                entry.parent_id,
-                entry.created_at,
-                entry.embedder_model_id,
-                i64::try_from(entry.dim).unwrap_or(i64::MAX),
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Performs a hybrid search: cosine similarity + keyword boost + recency boost.
-    ///
-    /// Only rows produced by the same model as the query participate: a row whose
-    /// resolved `embedder_model_id` ≠ `query_model_id` or resolved `dim` ≠
-    /// `query_dim` is skipped before any cosine comparison — never an error.
-    /// Comparing vectors from different models is meaningless, so mismatched rows
-    /// are excluded from ranking rather than silently compared (or crashed).
-    ///
-    /// For each surviving entry in `namespace`:
-    /// - Compute cosine similarity with `query_vec`.
-    /// - Add a keyword boost: for each whitespace-split token in `query_text`,
-    ///   count case-insensitive occurrences in `entry.content` and add `0.01` per
-    ///   occurrence.
-    /// - Add a recency boost of `0.1` when `entry.created_at > (now − 86400.0)`.
-    ///
-    /// Results are sorted descending by total score. The top `k` are returned.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VaultError::Db`] on a database failure or [`VaultError::Json`] if
-    /// a stored payload cannot be deserialised.
-    #[must_use = "the search result is the entire purpose of calling this function"]
-    #[allow(clippy::too_many_lines)] // single hybrid-scoring scan; splitting it would obscure the flow
-    pub fn search(
-        &self,
-        query_vec: &[f32],
-        query_text: &str,
-        namespace: &str,
-        k: usize,
-        query_model_id: &str,
-        query_dim: usize,
-    ) -> Result<Vec<VaultEntry>, VaultError> {
-        let namespace = if namespace.is_empty() {
-            "default"
-        } else {
-            namespace
-        };
-
-        let mut stmt = self.conn.prepare(
-            "SELECT id, embedding, payload, namespace, content, source_file, added_by, \
-             chunk_index, parent_id, created_at, embedder_model_id, dim \
-             FROM vault_entries WHERE namespace = ?1",
-        )?;
-
-        let now = now_secs();
-        let terms: Vec<String> = query_text
-            .split_whitespace()
-            .map(str::to_lowercase)
-            .collect();
-
-        let rows: Vec<SearchRow> = stmt
-            .query_map(rusqlite::params![namespace], |row| {
-                Ok(SearchRow {
-                    id: row.get(0)?,
-                    bytes: row.get(1)?,
-                    payload_str: row.get(2)?,
-                    ns: row.get(3)?,
-                    content: row.get(4)?,
-                    source_file: row.get(5)?,
-                    added_by: row.get(6)?,
-                    chunk_index: row.get(7)?,
-                    parent_id: row.get(8)?,
-                    created_at: row.get(9)?,
-                    model_id: row.get(10)?,
-                    dim: row.get(11)?,
-                })
-            })?
-            .collect::<Result<_, rusqlite::Error>>()?;
-
-        let mut scored: Vec<(f32, VaultEntry)> = rows
-            .into_iter()
-            // Same-model-only: skip any row whose resolved model/dim differs from
-            // the query's before it ever reaches `cosine_sim`.
-            .filter(|row| {
-                resolve_model_id(row.model_id.clone()) == query_model_id
-                    && resolve_dim(row.dim, row.bytes.len()) == query_dim
-            })
-            .filter_map(|row| {
-                let SearchRow {
-                    id,
-                    bytes,
-                    payload_str,
-                    ns,
-                    content,
-                    source_file,
-                    added_by,
-                    chunk_index,
-                    parent_id,
-                    created_at,
-                    model_id,
-                    dim,
-                } = row;
-
-                let embedder_model_id = resolve_model_id(model_id);
-                let resolved_dim = resolve_dim(dim, bytes.len());
-                let Some(stored) = decode_embedding(&bytes) else {
-                    tracing::warn!(id = %id, "vault: skipping search row with malformed embedding blob");
-                    return None;
-                };
-                let cosine_score = cosine_sim(query_vec, &stored);
-
-                let content_lower = content.to_lowercase();
-                let keyword_boost: f32 = terms
-                    .iter()
-                    .map(|term| {
-                        let mut count = 0usize;
-                        let mut start = 0;
-                        while let Some(pos) = content_lower[start..].find(term.as_str()) {
-                            count += 1;
-                            start += pos + term.len();
-                        }
-                        #[allow(clippy::cast_precision_loss)]
-                        // keyword match counts fit comfortably in f32
-                        {
-                            count as f32 * 0.01
-                        }
-                    })
-                    .sum();
-
-                let recency_boost = if created_at > (now - 86_400.0) {
-                    0.1_f32
-                } else {
-                    0.0_f32
-                };
-
-                let total_score = cosine_score + keyword_boost + recency_boost;
-
-                let payload: serde_json::Value = match serde_json::from_str(&payload_str) {
-                    Ok(p) => p,
-                    Err(e) => return Some(Err(VaultError::from(e))),
-                };
-
-                let entry = VaultEntry {
-                    id,
-                    embedding: stored,
-                    payload,
-                    namespace: ns,
-                    content,
-                    source_file,
-                    added_by,
-                    chunk_index,
-                    parent_id,
-                    created_at,
-                    embedder_model_id,
-                    dim: resolved_dim,
-                };
-
-                Some(Ok((total_score, entry)))
-            })
-            .collect::<Result<_, VaultError>>()?;
-
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(k);
-
-        Ok(scored.into_iter().map(|(_, e)| e).collect())
-    }
-
-    /// Appends a diary entry for `role`.
-    ///
-    /// The entry is timestamped with the current Unix time.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VaultError::Db`] if the database write fails.
-    #[must_use = "check the Result to confirm the diary entry was written"]
-    pub fn diary_write(&mut self, role: &str, entry: &str) -> Result<(), VaultError> {
-        let created_at = now_secs();
-        self.conn.execute(
-            "INSERT INTO diary (role, entry, created_at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![role, entry, created_at],
-        )?;
-        Ok(())
-    }
-
-    /// Returns all diary entries for `role`, ordered by `created_at` ascending.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VaultError::Db`] if the query fails.
-    #[must_use = "check the Result and use the returned diary entries"]
-    pub fn diary_read(&self, role: &str) -> Result<Vec<DiaryEntry>, VaultError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, role, entry, created_at FROM diary WHERE role = ?1 ORDER BY created_at ASC",
-        )?;
-        let entries = stmt
-            .query_map(rusqlite::params![role], |row| {
-                Ok(DiaryEntry {
-                    id: row.get(0)?,
-                    role: row.get(1)?,
-                    entry: row.get(2)?,
-                    created_at: row.get(3)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(entries)
-    }
-
-    /// Stores the embedder identity, overwriting any previously stored value.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VaultError::Db`] if the database write fails.
-    #[must_use = "check the Result to confirm the embedder identity was stored"]
-    pub fn set_embedder_identity(&mut self, identity: &EmbedderIdentity) -> Result<(), VaultError> {
-        // Build the JSON with serde_json so a model name containing quotes,
-        // backslashes, or control characters is escaped correctly. Hand-rolled
-        // string interpolation would emit invalid JSON that get_embedder_identity
-        // could never parse back.
-        let json = serde_json::json!({
-            "model": identity.model,
-            "dimensions": identity.dimensions,
-        })
-        .to_string();
-        self.conn.execute(
-            "INSERT OR REPLACE INTO vault_meta (id, meta_key, meta_val) VALUES (1, 'embedder', ?1)",
-            rusqlite::params![json],
-        )?;
-        Ok(())
-    }
-
-    /// Returns the stored embedder identity, or `None` if none has been set.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VaultError::Db`] if the query fails, or [`VaultError::Json`] if
-    /// the stored JSON is malformed.
-    #[must_use = "check the Result and use the returned identity"]
-    pub fn get_embedder_identity(&self) -> Result<Option<EmbedderIdentity>, VaultError> {
-        let result: rusqlite::Result<String> = self.conn.query_row(
-            "SELECT meta_val FROM vault_meta WHERE id = 1 AND meta_key = 'embedder'",
-            [],
-            |row| row.get(0),
-        );
-        match result {
-            Ok(json_str) => {
-                let v: serde_json::Value = serde_json::from_str(&json_str)?;
-                let model = v["model"].as_str().unwrap_or_default().to_string();
-                let dimensions =
-                    usize::try_from(v["dimensions"].as_u64().unwrap_or(0)).unwrap_or(0);
-                Ok(Some(EmbedderIdentity { model, dimensions }))
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(VaultError::Db(e)),
-        }
-    }
-
-    /// Returns the top-K entries by cosine similarity to `query_embedding`.
-    ///
-    /// Performs a full table scan; suitable for cold stores with fewer than
-    /// ~10,000 entries. Returns fewer than `k` results when the vault contains
-    /// fewer entries. Returns an empty `Vec` when the vault is empty.
-    ///
-    /// Only rows produced by the same model as the query participate: a row whose
-    /// resolved `embedder_model_id` ≠ `query_model_id` or resolved `dim` ≠
-    /// `query_dim` is skipped before any cosine comparison. A mismatched-dimension
-    /// row is therefore excluded from ranking rather than raising an error — a
-    /// vault mid-migration keeps returning correct same-model results.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VaultError::Db`] if reading any row fails or [`VaultError::Json`]
-    /// if a stored payload cannot be deserialised.
-    #[must_use = "the query result is the entire purpose of calling this function"]
-    pub fn query(
-        &self,
-        query_embedding: &[f32],
-        k: usize,
-        query_model_id: &str,
-        query_dim: usize,
-    ) -> Result<Vec<QueryResult>, VaultError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, embedding, payload, embedder_model_id, dim FROM vault_entries")?;
-
-        let rows: Vec<QueryRow> = stmt
-            .query_map([], |row| {
-                Ok(QueryRow {
-                    id: row.get(0)?,
-                    bytes: row.get(1)?,
-                    payload_str: row.get(2)?,
-                    model_id: row.get(3)?,
-                    dim: row.get(4)?,
-                })
-            })?
-            .collect::<Result<_, rusqlite::Error>>()?;
-
-        let mut scored: Vec<(f32, String, serde_json::Value)> = rows
-            .into_iter()
-            // Same-model-only: a row from a different model or dimension is never
-            // fed to `cosine_sim` and never raises an error — it is simply not a
-            // candidate.
-            .filter(|row| {
-                resolve_model_id(row.model_id.clone()) == query_model_id
-                    && resolve_dim(row.dim, row.bytes.len()) == query_dim
-            })
-            .filter_map(
-                |QueryRow {
-                     id,
-                     bytes,
-                     payload_str,
-                     ..
-                 }| {
-                    // Blobs are normally written by `bytemuck::cast_slice::<f32, u8>`
-                    // (length always a multiple of 4), but a legacy or corrupted row
-                    // may not be — skip it instead of panicking the full scan.
-                    let Some(stored) = decode_embedding(&bytes) else {
-                        tracing::warn!(id = %id, "vault: skipping query row with malformed embedding blob");
-                        return None;
-                    };
-                    let score = cosine_sim(query_embedding, &stored);
-                    let payload: serde_json::Value = match serde_json::from_str(&payload_str) {
-                        Ok(p) => p,
-                        Err(e) => return Some(Err(VaultError::from(e))),
-                    };
-                    Some(Ok((score, id, payload)))
-                },
-            )
-            .collect::<Result<_, VaultError>>()?;
-
-        // Sort descending by score, then take the top K.
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(k);
-
-        let results = scored
-            .into_iter()
-            .map(|(score, id, payload)| QueryResult { id, score, payload })
-            .collect();
-        Ok(results)
-    }
-
-    /// Returns every entry in `namespace` as a [`VaultEntry`], unranked.
-    ///
-    /// Unlike [`Vault::search`] this applies no scoring, no `k` limit, and no
-    /// same-model filter — it is the read half of the re-embed/backfill path,
-    /// which must visit every row regardless of its current model. An empty
-    /// `namespace` is normalised to `"default"`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VaultError::Db`] on a database failure or [`VaultError::Json`]
-    /// if a stored payload cannot be deserialised.
-    #[must_use = "the listed entries are the input to a re-embed pass"]
-    pub fn list_namespace(&self, namespace: &str) -> Result<Vec<VaultEntry>, VaultError> {
-        let namespace = if namespace.is_empty() {
-            "default"
-        } else {
-            namespace
-        };
-
-        let mut stmt = self.conn.prepare(
-            "SELECT id, embedding, payload, namespace, content, source_file, added_by, \
-             chunk_index, parent_id, created_at, embedder_model_id, dim \
-             FROM vault_entries WHERE namespace = ?1",
-        )?;
-
-        let rows: Vec<SearchRow> = stmt
-            .query_map(rusqlite::params![namespace], |row| {
-                Ok(SearchRow {
-                    id: row.get(0)?,
-                    bytes: row.get(1)?,
-                    payload_str: row.get(2)?,
-                    ns: row.get(3)?,
-                    content: row.get(4)?,
-                    source_file: row.get(5)?,
-                    added_by: row.get(6)?,
-                    chunk_index: row.get(7)?,
-                    parent_id: row.get(8)?,
-                    created_at: row.get(9)?,
-                    model_id: row.get(10)?,
-                    dim: row.get(11)?,
-                })
-            })?
-            .collect::<Result<_, rusqlite::Error>>()?;
-
-        rows.into_iter()
-            .filter_map(|row| {
-                let embedder_model_id = resolve_model_id(row.model_id);
-                let dim = resolve_dim(row.dim, row.bytes.len());
-                let Some(embedding) = decode_embedding(&row.bytes) else {
-                    tracing::warn!(id = %row.id, "vault: skipping list row with malformed embedding blob");
-                    return None;
-                };
-                let payload: serde_json::Value = match serde_json::from_str(&row.payload_str) {
-                    Ok(p) => p,
-                    Err(e) => return Some(Err(VaultError::from(e))),
-                };
-                Some(Ok(VaultEntry {
-                    id: row.id,
-                    embedding,
-                    payload,
-                    namespace: row.ns,
-                    content: row.content,
-                    source_file: row.source_file,
-                    added_by: row.added_by,
-                    chunk_index: row.chunk_index,
-                    parent_id: row.parent_id,
-                    created_at: row.created_at,
-                    embedder_model_id,
-                    dim,
-                }))
-            })
-            .collect()
-    }
-
-    /// Returns every distinct namespace present in the vault.
-    ///
-    /// Used by the re-embed/backfill path to walk the whole vault when no single
-    /// namespace is specified.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VaultError::Db`] if the query fails.
-    #[must_use = "the namespace list is the input to a whole-vault re-embed"]
-    pub fn distinct_namespaces(&self) -> Result<Vec<String>, VaultError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT DISTINCT namespace FROM vault_entries")?;
-        let names = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(names)
-    }
-
-    /// Removes the entry identified by `id`.
-    ///
-    /// This is a no-op when no entry with that `id` exists.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VaultError::Db`] if the database write fails.
-    #[must_use = "check the Result to confirm the entry was removed"]
-    pub fn remove(&mut self, id: &str) -> Result<(), VaultError> {
-        self.conn.execute(
-            "DELETE FROM vault_entries WHERE id = ?1",
-            rusqlite::params![id],
-        )?;
-        Ok(())
-    }
-
-    /// Returns the total number of entries stored in the vault.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VaultError::Db`] if the count query fails.
-    #[must_use = "check the Result and use the returned count"]
-    pub fn count(&self) -> Result<usize, VaultError> {
-        let n: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM vault_entries", [], |row| row.get(0))?;
-        Ok(usize::try_from(n).unwrap_or(0))
-    }
-
-    /// Returns the number of entries in the given `namespace`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VaultError::Db`] if the count query fails.
-    #[must_use = "check the Result and use the returned count"]
-    pub fn count_by_namespace(&self, namespace: &str) -> Result<usize, VaultError> {
-        let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM vault_entries WHERE namespace = ?1",
-            rusqlite::params![namespace],
-            |row| row.get(0),
-        )?;
-        Ok(usize::try_from(n).unwrap_or(0))
     }
 
     /// Applies the database schema (idempotent).
@@ -1192,11 +541,21 @@ mod tests {
         // (the non-atomic failure mode), this vault would be empty and this search
         // would return nothing.
         let results = vault
-            .search(&[1.0_f32, 0.0], "replacement", "default", 5, LEGACY_MODEL_ID, 2)
+            .search(
+                &[1.0_f32, 0.0],
+                "replacement",
+                "default",
+                5,
+                LEGACY_MODEL_ID,
+                2,
+            )
             .unwrap();
         assert_eq!(results.len(), 1, "only B must remain");
         assert_eq!(results[0].id, "b", "A must be gone, B must be present");
-        assert_eq!(results[0].content, "short but a much longer replacement body");
+        assert_eq!(
+            results[0].content,
+            "short but a much longer replacement body"
+        );
     }
 
     #[test]
@@ -1359,7 +718,15 @@ mod tests {
                 "INSERT INTO vault_entries \
                  (id, embedding, payload, namespace, content, embedder_model_id, dim) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![id, corrupt, "{}", namespace, "corrupt", LEGACY_MODEL_ID, dim],
+                rusqlite::params![
+                    id,
+                    corrupt,
+                    "{}",
+                    namespace,
+                    "corrupt",
+                    LEGACY_MODEL_ID,
+                    dim
+                ],
             )
             .unwrap();
     }

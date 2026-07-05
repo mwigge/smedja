@@ -97,8 +97,7 @@ impl<'a> LspPanel<'a> {
             let loc = format!("{}:{}", file_name, diag.line);
             let loc_max = w.saturating_sub(2); // severity + space
             let loc_str = if loc.len() > loc_max {
-                let start =
-                    crate::floor_char_boundary(&loc, loc.len().saturating_sub(loc_max - 1));
+                let start = crate::floor_char_boundary(&loc, loc.len().saturating_sub(loc_max - 1));
                 format!("\u{2026}{}", &loc[start..])
             } else {
                 loc

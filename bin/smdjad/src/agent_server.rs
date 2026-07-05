@@ -88,9 +88,7 @@ pub async fn serve(listener: UnixListener, dispatcher: Arc<Dispatcher>, ingot: I
                     latency_ms,
                     ..
                 } => {
-                    if let Some(started) = turn_id
-                        .as_deref()
-                        .and_then(|id| turn_starts.remove(id))
+                    if let Some(started) = turn_id.as_deref().and_then(|id| turn_starts.remove(id))
                     {
                         *latency_ms =
                             Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));

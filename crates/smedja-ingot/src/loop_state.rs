@@ -3,6 +3,9 @@
 use serde::{Deserialize, Serialize};
 use smedja_types::Timestamp;
 
+use crate::error::IngotError;
+use crate::{Ingot, IngotHandle};
+
 /// Persisted state for a single loop run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopRecord {
@@ -149,6 +152,169 @@ pub(crate) fn list_by_status(
         )?;
         let rows: Result<Vec<_>, _> = stmt.query_map([], map_row)?.collect();
         Ok(rows?)
+    }
+}
+
+impl Ingot {
+    /// Inserts a new [`LoopRecord`] into the `loops` table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the INSERT fails (e.g. duplicate `id`).
+    #[must_use = "check the Result to confirm the loop record was created"]
+    pub fn create_loop(&self, rec: &LoopRecord) -> Result<(), IngotError> {
+        insert(&self.conn, rec)
+    }
+
+    /// Retrieves a [`LoopRecord`] by `id`, returning `None` when not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned loop record"]
+    pub fn get_loop(&self, id: &str) -> Result<Option<LoopRecord>, IngotError> {
+        get(&self.conn, id)
+    }
+
+    /// Updates the `status` and `updated_at` fields for the loop with `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the loop status was updated"]
+    pub fn update_loop_status(
+        &self,
+        id: &str,
+        status: &str,
+        updated_at: smedja_types::Timestamp,
+    ) -> Result<(), IngotError> {
+        update_status(&self.conn, id, status, updated_at)
+    }
+
+    /// Returns all [`LoopRecord`]s for `change_name`, ordered by `created_at` descending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned loop records"]
+    pub fn list_loops(&self, change_name: &str) -> Result<Vec<LoopRecord>, IngotError> {
+        list_by_change(&self.conn, change_name)
+    }
+
+    /// Updates `current_slice` and `updated_at` for the loop with `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the slice was updated"]
+    pub fn update_loop_slice(
+        &self,
+        id: &str,
+        current_slice: i64,
+        updated_at: smedja_types::Timestamp,
+    ) -> Result<(), IngotError> {
+        update_slice(&self.conn, id, current_slice, updated_at)
+    }
+
+    /// Returns all [`LoopRecord`]s, optionally filtered by `status`.
+    ///
+    /// Pass `None` to return all loops. Pass `Some("retired")` (or any other valid
+    /// status string) to restrict the result set. Results are ordered by
+    /// `created_at` descending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned loop records"]
+    pub fn list_loops_by_status(
+        &self,
+        status: Option<&str>,
+    ) -> Result<Vec<LoopRecord>, IngotError> {
+        list_by_status(&self.conn, status)
+    }
+}
+
+impl IngotHandle {
+    /// Inserts a new [`LoopRecord`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying INSERT, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn create_loop(&self, rec: LoopRecord) -> Result<(), IngotError> {
+        self.run_blocking(move |ig| ig.create_loop(&rec)).await
+    }
+
+    /// Retrieves a [`LoopRecord`] by `id`, returning `None` when not found.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn get_loop(&self, id: &str) -> Result<Option<LoopRecord>, IngotError> {
+        let id = id.to_owned();
+        self.run_blocking(move |ig| ig.get_loop(&id)).await
+    }
+
+    /// Updates `status` and `updated_at` for a loop.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPDATE, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn update_loop_status(
+        &self,
+        id: &str,
+        status: &str,
+        updated_at: Timestamp,
+    ) -> Result<(), IngotError> {
+        let id = id.to_owned();
+        let status = status.to_owned();
+        self.run_blocking(move |ig| ig.update_loop_status(&id, &status, updated_at))
+            .await
+    }
+
+    /// Returns all [`LoopRecord`]s for `change_name`, ordered by `created_at` descending.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn list_loops(&self, change_name: &str) -> Result<Vec<LoopRecord>, IngotError> {
+        let change_name = change_name.to_owned();
+        self.run_blocking(move |ig| ig.list_loops(&change_name))
+            .await
+    }
+
+    /// Updates `current_slice` and `updated_at` for a loop.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPDATE, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn update_loop_slice(
+        &self,
+        id: &str,
+        current_slice: i64,
+        updated_at: Timestamp,
+    ) -> Result<(), IngotError> {
+        let id = id.to_owned();
+        self.run_blocking(move |ig| ig.update_loop_slice(&id, current_slice, updated_at))
+            .await
+    }
+
+    /// Returns all [`LoopRecord`]s, optionally filtered by `status`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn list_loops_by_status(
+        &self,
+        status: Option<String>,
+    ) -> Result<Vec<LoopRecord>, IngotError> {
+        self.run_blocking(move |ig| ig.list_loops_by_status(status.as_deref()))
+            .await
     }
 }
 

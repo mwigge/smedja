@@ -2,6 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::IngotError;
+use crate::{Ingot, IngotHandle};
+
 /// A registered MCP server entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServer {
@@ -158,6 +161,210 @@ pub(crate) fn by_name(
         Ok(server) => Ok(Some(server)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(crate::error::IngotError::Db(e)),
+    }
+}
+
+impl Ingot {
+    /// Registers (or replaces) an [`McpServer`] in the registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the INSERT OR REPLACE fails.
+    #[must_use = "check the Result to confirm the MCP server was registered"]
+    pub fn register_mcp_server(&self, server: &McpServer) -> Result<(), IngotError> {
+        insert(&self.conn, server)
+    }
+
+    /// Returns all registered [`McpServer`]s ordered by `name` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned servers"]
+    pub fn list_mcp_servers(&self) -> Result<Vec<McpServer>, IngotError> {
+        list(&self.conn)
+    }
+
+    /// Removes the [`McpServer`] with the given `id` from the registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the DELETE fails.
+    #[must_use = "check the Result to confirm the MCP server was removed"]
+    pub fn remove_mcp_server(&self, id: &str) -> Result<(), IngotError> {
+        remove(&self.conn, id)
+    }
+
+    /// Updates the cached tool list and refresh timestamp for the server identified
+    /// by `name`. Sets `last_refresh` to the current Unix epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the tool list was updated"]
+    pub fn update_mcp_tools(&self, name: &str, tools_json: &str) -> Result<(), IngotError> {
+        update_tools(&self.conn, name, tools_json)
+    }
+
+    /// Returns all registered [`McpServer`]s whose `last_refresh` is older than
+    /// `older_than_secs` seconds ago, or that have never been refreshed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned servers"]
+    pub fn get_stale_servers(&self, older_than_secs: f64) -> Result<Vec<McpServer>, IngotError> {
+        stale(&self.conn, older_than_secs)
+    }
+
+    /// Returns all MCP servers that have a non-empty `tools_json`, as
+    /// `(server_name, tools_json)` pairs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned tool pairs"]
+    pub fn get_all_mcp_tools(&self) -> Result<Vec<(String, String)>, IngotError> {
+        all_tools(&self.conn)
+    }
+
+    /// Looks up a single [`McpServer`] by its registered name, returning `None`
+    /// when no server with that name exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned server"]
+    pub fn get_mcp_server_by_name(&self, name: &str) -> Result<Option<McpServer>, IngotError> {
+        by_name(&self.conn, name)
+    }
+
+    /// Finds the MCP server that exposes a tool with the given `tool_name`.
+    ///
+    /// Searches the `tools_json` of every server that has a non-empty tool
+    /// list.  Returns the first server whose list contains a tool entry with
+    /// `"name": tool_name`, or `None` when no match is found.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the tool-list query fails.
+    #[must_use = "check the Result; None means no registered MCP server owns this tool"]
+    pub fn find_mcp_server_for_tool(
+        &self,
+        tool_name: &str,
+    ) -> Result<Option<McpServer>, IngotError> {
+        for (server_name, tools_json) in all_tools(&self.conn)? {
+            let tools: Vec<serde_json::Value> =
+                serde_json::from_str(&tools_json).unwrap_or_default();
+            let owns_tool = tools
+                .iter()
+                .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(tool_name));
+            if owns_tool {
+                return by_name(&self.conn, &server_name);
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl IngotHandle {
+    /// Registers (or replaces) an [`McpServer`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying INSERT OR REPLACE, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn register_mcp_server(&self, server: McpServer) -> Result<(), IngotError> {
+        self.run_blocking(move |ig| ig.register_mcp_server(&server))
+            .await
+    }
+
+    /// Returns all registered [`McpServer`]s ordered by `name` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn list_mcp_servers(&self) -> Result<Vec<McpServer>, IngotError> {
+        self.run_blocking(Ingot::list_mcp_servers).await
+    }
+
+    /// Removes the [`McpServer`] with the given `id`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying DELETE, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn remove_mcp_server(&self, id: &str) -> Result<(), IngotError> {
+        let id = id.to_owned();
+        self.run_blocking(move |ig| ig.remove_mcp_server(&id)).await
+    }
+
+    /// Updates the cached tool list for a server.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPDATE, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn update_mcp_tools(&self, name: &str, tools_json: &str) -> Result<(), IngotError> {
+        let name = name.to_owned();
+        let tools_json = tools_json.to_owned();
+        self.run_blocking(move |ig| ig.update_mcp_tools(&name, &tools_json))
+            .await
+    }
+
+    /// Returns stale [`McpServer`]s whose `last_refresh` is older than `older_than_secs`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn get_stale_servers(
+        &self,
+        older_than_secs: f64,
+    ) -> Result<Vec<McpServer>, IngotError> {
+        self.run_blocking(move |ig| ig.get_stale_servers(older_than_secs))
+            .await
+    }
+
+    /// Returns all `(server_name, tools_json)` pairs for servers with non-empty tool lists.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn get_all_mcp_tools(&self) -> Result<Vec<(String, String)>, IngotError> {
+        self.run_blocking(Ingot::get_all_mcp_tools).await
+    }
+
+    /// Looks up a single [`McpServer`] by its registered name.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn get_mcp_server_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<McpServer>, IngotError> {
+        let name = name.to_owned();
+        self.run_blocking(move |ig| ig.get_mcp_server_by_name(&name))
+            .await
+    }
+
+    /// Finds the MCP server that exposes a tool with the given `tool_name`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] if the tool-list query fails, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn find_mcp_server_for_tool(
+        &self,
+        tool_name: &str,
+    ) -> Result<Option<McpServer>, IngotError> {
+        let tool_name = tool_name.to_owned();
+        self.run_blocking(move |ig| ig.find_mcp_server_for_tool(&tool_name))
+            .await
     }
 }
 

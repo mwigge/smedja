@@ -9,6 +9,7 @@ use smedja_types::Timestamp;
 use uuid::Uuid;
 
 use crate::error::IngotError;
+use crate::{Ingot, IngotHandle};
 
 /// Token usage snapshot for a single conversation turn.
 #[derive(Debug, Clone)]
@@ -96,6 +97,60 @@ fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenSnapshot> {
         cumulative_output: row.get(6)?,
         created_at: Timestamp::from_micros(crate::read_micros(row, 7)?),
     })
+}
+
+impl Ingot {
+    /// Saves a [`TokenSnapshot`], replacing any existing snapshot for the same
+    /// `(session_id, turn_n)` pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the upsert fails.
+    #[must_use = "check the Result to confirm the snapshot was saved"]
+    pub fn save_token_snapshot(&self, snap: &TokenSnapshot) -> Result<(), IngotError> {
+        save(&self.conn, snap)
+    }
+
+    /// Returns all [`TokenSnapshot`]s for `session_id`, ordered by `turn_n` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned snapshots"]
+    pub fn session_token_snapshots(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<TokenSnapshot>, IngotError> {
+        list_by_session(&self.conn, session_id)
+    }
+}
+
+impl IngotHandle {
+    /// Saves a [`TokenSnapshot`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying upsert, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn save_token_snapshot(&self, snap: TokenSnapshot) -> Result<(), IngotError> {
+        self.run_blocking(move |ig| ig.save_token_snapshot(&snap))
+            .await
+    }
+
+    /// Returns all [`TokenSnapshot`]s for `session_id`, ordered by `turn_n` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn session_token_snapshots(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<TokenSnapshot>, IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.session_token_snapshots(&session_id))
+            .await
+    }
 }
 
 #[cfg(test)]

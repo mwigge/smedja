@@ -22,7 +22,7 @@ use smedja_bellows::{Dispatcher, TurnEvent};
 use smedja_ingot::{Checkpoint, CostEntry, IngotHandle, TokenSnapshot, TokensSavedEntry};
 use smedja_memory::{estimate_messages_tokens, estimate_tokens, inject_conciseness, WorkingMemory};
 use smedja_types::{Microdollars, Timestamp};
-use smedja_vault::{Vault, VaultEntry};
+use smedja_vault::Vault;
 use tokio::sync::Mutex;
 use tracing::warn;
 use uuid::Uuid;
@@ -40,249 +40,21 @@ use cold::VaultColdStore;
 mod context;
 use context::{classify_tool_outcome, cold_k_for_tier, model_context_window, strata_for_tier};
 
-/// A provider-native resume identifier plus the last time it was read or written.
-///
-/// The `last_used` stamp lets the background GC evict only genuinely idle entries
-/// and never wipe a session whose turn is running right now.
-#[derive(Debug, Clone)]
-pub(crate) struct ProviderSessionEntry {
-    /// The provider-native resume id.
-    pub id: String,
-    /// When this entry was last read or inserted.
-    pub last_used: std::time::Instant,
-}
+mod routing;
+pub(crate) use routing::{
+    compact_threshold_from_env, context_pressure_exceeds_threshold, gc_provider_sessions,
+    AlignerKey, CacheAligners, ProviderSessionEntry, ProviderSessions,
+};
 
-impl ProviderSessionEntry {
-    /// Wraps a resume `id`, stamping it as used now.
-    pub fn new(id: String) -> Self {
-        Self {
-            id,
-            last_used: std::time::Instant::now(),
-        }
-    }
-}
+mod prompt;
+#[cfg(test)]
+use prompt::methodology_directive_for;
+use prompt::{
+    build_summariser_prompt, build_turn_context, derive_title, format_lsp_diagnostics,
+    format_vault_recalled, sanitize_unicode_tags,
+};
 
-/// Shared map from session-resume keys to provider-native resume identifiers.
-///
-/// Constructed once in `main()` and threaded explicitly to every orchestrator
-/// (replacing the former process-static `OnceLock` singleton) so tests can
-/// supply their own map.
-pub(crate) type ProviderSessions = Arc<Mutex<HashMap<String, ProviderSessionEntry>>>;
-
-/// Evicts idle entries from the provider-session `map` once it exceeds `cap`.
-///
-/// Only entries not read or written within `idle` are removed; a session whose
-/// turn touched its entry more recently than `idle` is retained even over `cap`,
-/// so in-flight turns never lose their provider-native resume id. Returns the
-/// number of entries evicted.
-pub(crate) fn gc_provider_sessions(
-    map: &mut HashMap<String, ProviderSessionEntry>,
-    cap: usize,
-    idle: std::time::Duration,
-) -> usize {
-    if map.len() <= cap {
-        return 0;
-    }
-    let now = std::time::Instant::now();
-    let before = map.len();
-    map.retain(|_, entry| now.duration_since(entry.last_used) < idle);
-    before - map.len()
-}
-
-/// Key identifying a persisted [`smedja_memory::CacheAligner`]: `(session_id, runner_name)`.
-///
-/// Keyed by runner as well as session because a [`smedja_memory::CacheHint`]
-/// targets one specific provider's warm cache; a `provider-failover` runner
-/// rotation must not smear one provider's prefix-digest history onto another.
-pub(crate) type AlignerKey = (String, String);
-
-/// Shared map from `(session_id, runner)` to its persisted cross-turn aligner.
-///
-/// Constructed once in `main()` and threaded to every orchestrator exactly like
-/// [`ProviderSessions`], so a single aligner instance outlives an individual turn
-/// and can observe the prior sealed prefix to report real `Grown`/`Mutated` drift.
-pub(crate) type CacheAligners = Arc<Mutex<HashMap<AlignerKey, smedja_memory::CacheAligner>>>;
-
-/// Builds the always-on foundational-discipline directive for the sealed system
-/// prefix, gated by `config`.
-///
-/// TDD and clean-code discipline are steer-first: the directive is injected into
-/// the cacheable system block on every code-writing turn so the agent is reminded
-/// of the discipline every turn (the primary enforcement), with the diff backstop
-/// secondary. Each discipline's clause is present only when its config flag is
-/// `true`; when both are disabled the directive is omitted entirely (`None`).
-#[must_use]
-/// Language-aware variant: when `is_rust` is false, Rust-specific idioms are
-/// replaced with generic equivalents so the directive is not actively misleading
-/// in Python, TypeScript, or other workspaces.
-pub(crate) fn methodology_directive_for(
-    config: smedja_methodology::MethodologyConfig,
-    is_rust: bool,
-) -> Option<String> {
-    if !config.tdd && !config.clean {
-        return None;
-    }
-    let mut clauses: Vec<&'static str> = Vec::new();
-    if config.tdd {
-        clauses.push(
-            "Write a failing test before the implementation it covers (Red, then Green, \
-             then Refactor); keep functions small and focused; prefer an early return over \
-             an `else` branch.",
-        );
-    }
-    if config.clean {
-        if is_rust {
-            clauses.push(
-                "Do not use `unwrap`, `expect`, or `println!` in library code — return errors \
-                 with `?` and log through the structured logger.",
-            );
-        } else {
-            clauses.push(
-                "Do not swallow errors silently — propagate or log them explicitly. \
-                 Avoid bare print statements in library code; use the structured logger.",
-            );
-        }
-    }
-    let body = clauses
-        .iter()
-        .map(|c| format!("- {c}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Some(format!(
-        "<methodology_discipline>\n{body}\n</methodology_discipline>"
-    ))
-}
-
-/// Derives a short title (≤10 words) from raw user turn content.
-///
-/// Strips any auto-injected context blocks (e.g. `<graph_symbols>`) that start
-/// after a blank line and takes the first ten whitespace-separated words of the
-/// remaining text.
-pub(crate) fn derive_title(content: &str) -> String {
-    let clean = content.split("\n\n<").next().unwrap_or(content).trim();
-    clean
-        .split_whitespace()
-        .take(10)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Formats the current LSP snapshot into a `<lsp_diagnostics>` context block.
-///
-/// Returns `None` when there are no errors or warnings (info / hints are skipped).
-/// At most 20 diagnostic lines are included; a trailing note is appended when
-/// the list is truncated.
-pub(crate) fn format_lsp_diagnostics(snapshot: &smedja_lsp::LspSnapshot) -> Option<String> {
-    use smedja_lsp::types::Severity;
-    const MAX: usize = 20;
-    let relevant: Vec<_> = snapshot
-        .diagnostics
-        .iter()
-        .filter(|d| matches!(d.severity, Severity::Error | Severity::Warning))
-        .collect();
-    if relevant.is_empty() {
-        return None;
-    }
-    let mut lines: Vec<String> = relevant
-        .iter()
-        .take(MAX)
-        .map(|d| {
-            let sev = match d.severity {
-                Severity::Error => "error",
-                Severity::Warning => "warning",
-                _ => "info",
-            };
-            let code = d
-                .code
-                .as_deref()
-                .map_or_else(String::new, |c| format!(" [{c}]"));
-            format!(
-                "{} {}:{}: {}{}",
-                sev,
-                d.file.display(),
-                d.line,
-                d.message,
-                code
-            )
-        })
-        .collect();
-    if relevant.len() > MAX {
-        lines.push(format!(
-            "... and {} more (only the first {MAX} shown)",
-            relevant.len() - MAX
-        ));
-    }
-    Some(format!(
-        "<lsp_diagnostics>\n{}\n</lsp_diagnostics>",
-        lines.join("\n")
-    ))
-}
-
-/// Returns the auto-compact threshold from `val` (an optional env value string), defaulting to
-/// 0.85. Values below 0.5 are clamped to 0.5 to prevent spurious compaction.
-pub(crate) fn compact_threshold_from_env(val: Option<&str>) -> f64 {
-    val.and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.85)
-        .max(0.5)
-}
-
-/// Returns `true` when context fill exceeds the auto-summarisation threshold.
-pub(crate) fn context_pressure_exceeds_threshold(
-    input_tokens: u32,
-    context_window: usize,
-    threshold: f64,
-) -> bool {
-    if context_window == 0 {
-        return false;
-    }
-    #[allow(clippy::cast_precision_loss)]
-    let ratio = f64::from(input_tokens) / context_window as f64;
-    ratio >= threshold
-}
-
-/// Builds the prompt sent to the LLM to produce a conversation summary.
-///
-/// At most 20 turns are included; older turns are dropped from the head.
-pub(crate) fn build_summariser_prompt(history: &[(String, String)]) -> String {
-    const MAX_TURNS: usize = 20;
-    let turns: Vec<_> = history.iter().rev().take(MAX_TURNS).collect();
-    let turns_text: String = turns
-        .into_iter()
-        .rev()
-        .map(|(role, content)| format!("{role}: {content}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "Produce a structured summary of the conversation so far. \
-Format it as three clearly labelled sections using bullet points:\n\
-- **Decisions**: key choices made and their rationale\n\
-- **Changed files**: files created, edited, or deleted (with brief reason)\n\
-- **Open questions**: unresolved issues or follow-up items\n\
-Omit sections that have no content. Keep total length under 400 words.\n\n\
-{turns_text}"
-    )
-}
-
-/// Strips Unicode Private Use Area characters in the tag block (U+E0000–U+E007F).
-///
-/// These code points can be used to inject hidden instructions via Unicode tag
-/// characters that are visually invisible but parsed by some LLM tokenizers.
-pub(crate) fn sanitize_unicode_tags(s: &str) -> String {
-    s.chars()
-        .filter(|&c| !('\u{E0000}'..='\u{E007F}').contains(&c))
-        .collect()
-}
-
-/// Builds a `<turn-context>` XML block injected at the start of each user turn.
-///
-/// The block carries per-turn metadata (current date, working directory) that
-/// helps the model orient itself without polluting the stable system-prompt
-/// prefix used for prompt cache hits.
-pub(crate) fn build_turn_context(date: &str, cwd: &str) -> String {
-    format!(
-        "<turn-context>\n<current-date>{date}</current-date>\n<working-directory>{cwd}</working-directory>\n</turn-context>"
-    )
-}
+mod tools_catalog;
 
 /// Owns all the shared resources needed to execute a single agent turn.
 pub(crate) struct TurnOrchestrator {
@@ -530,76 +302,10 @@ impl TurnOrchestrator {
         // Base system prompt, with workspace skills folded into the stable
         // (cacheable) system block. `base_system` is kept unsteered so verbosity
         // steering can be re-applied per tool-loop iteration without compounding.
-        let base_system = {
-            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-            let base = format!(
-                "You are smedja, an AI coding assistant.\
-                \nWorkspace: {workspace_root}\
-                \nDate: {today}{task_prefix}\
-                \n\nBe concise and direct. Apply the smallest diff that satisfies a \
-                request. Prefer reading graph/vault context before opening files, and \
-                reading files before writing them. When <recalled_context>, \
-                <cold_context>, or <graph_symbols> blocks are present, treat them as \
-                authoritative — reference specifics from them rather than asking the \
-                user to repeat information. Ask before acting only when the request is \
-                genuinely ambiguous or would be destructive.",
-                workspace_root = workspace_root.display(),
-            );
-            let with_skills = match smedja_memory::load_workspace_skills(&workspace_root) {
-                Ok(skills) if !skills.is_empty() => {
-                    let joined = skills.join("\n\n");
-                    format!("{base}\n\n<workspace_skills>\n{joined}\n</workspace_skills>")
-                }
-                Ok(_) => base,
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to load workspace skills; continuing without");
-                    base
-                }
-            };
-            // Role-bound rules/skills: inject the active role's pack
-            // (`.smedja/roles/<role>.md` / `roles/<role>/*.md`) so each role
-            // carries its own discipline (e.g. review checklist, research
-            // source-hygiene, planning rules).
-            let with_skills = match smedja_memory::load_role_skills(&workspace_root, role.label()) {
-                Ok(role_skills) if !role_skills.is_empty() => {
-                    let joined = role_skills.join("\n\n");
-                    format!(
-                        "{with_skills}\n\n<role_skills role=\"{}\">\n{joined}\n</role_skills>",
-                        role.label()
-                    )
-                }
-                Ok(_) => with_skills,
-                Err(e) => {
-                    tracing::warn!(error = %e, role = role.label(), "failed to load role skills; continuing without");
-                    with_skills
-                }
-            };
-            // Project-specific context files from `.smedja/context/*.md` are
-            // injected here so they ride the stable (cacheable) system block.
-            let with_skills = match smedja_memory::load_context_files(&workspace_root) {
-                Ok(files) if !files.is_empty() => {
-                    let joined = files.join("\n\n");
-                    format!("{with_skills}\n\n<project_context>\n{joined}\n</project_context>")
-                }
-                Ok(_) => with_skills,
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to load context files; continuing without");
-                    with_skills
-                }
-            };
-            // Always-on, steer-first foundational discipline: the directive is
-            // folded into the same cacheable system block as workspace skills so
-            // it is sealed into the stable prefix before `seal_prefix()` and the
-            // agent is reminded of the discipline on every code-writing turn.
-            // Config-gated per discipline; omitted entirely when both are off.
-            let methodology_config =
-                crate::methodology_config::load_methodology_config(&workspace_root);
-            let is_rust_workspace = workspace_root.join("Cargo.toml").exists();
-            match methodology_directive_for(methodology_config, is_rust_workspace) {
-                Some(directive) => format!("{with_skills}\n\n{directive}"),
-                None => with_skills,
-            }
-        };
+        // Base system prompt, with workspace skills folded into the stable
+        // (cacheable) system block. `base_system` is kept unsteered so verbosity
+        // steering can be re-applied per tool-loop iteration without compounding.
+        let base_system = prompt::build_base_system(&workspace_root, &task_prefix, role);
 
         let mcp_tools: Vec<serde_json::Value> = {
             ingot
@@ -647,101 +353,11 @@ impl TurnOrchestrator {
             tracing::debug!(tool_format = "xml", "local provider tool format: xml");
         }
 
-        let mut builtin_tools: Vec<serde_json::Value> = vec![
-            serde_json::json!({
-                "name": "smedja_vault_search",
-                "description": "Search the smedja vault for semantically similar entries. \
-                    namespace: optional — defaults to 'default'; use 'compact' for session \
-                    summaries, or the role label (e.g. 'review', 'sre') for role-scoped knowledge. \
-                    k: number of results to return, default 3.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "query": { "type": "string" },
-                        "namespace": { "type": "string", "description": "defaults to 'default'; known values: compact, default, review, sre, researcher" },
-                        "k": { "type": "integer", "description": "number of results, default 3" }
-                    },
-                    "required": ["query"]
-                }
-            }),
-            serde_json::json!({
-                "name": "smedja_vault_store",
-                "description": "Store an entry in the smedja vault for future retrieval. \
-                    namespace: optional — defaults to 'default'; use 'compact' for session \
-                    summaries, or the role label (e.g. 'review', 'sre') for role-scoped knowledge. \
-                    Omitting namespace stores in 'default', which is always included in proactive recall.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "content": { "type": "string" },
-                        "namespace": { "type": "string", "description": "defaults to 'default'; known values: compact, default, review, sre, researcher" },
-                        "id": { "type": "string" },
-                        "payload": { "type": "object" },
-                        "source_file": { "type": "string" },
-                        "added_by": { "type": "string" }
-                    },
-                    "required": ["content"]
-                }
-            }),
-            serde_json::json!({
-                "name": "smedja_retrieve",
-                "description": "Retrieve the original full content for a compressed block by its content hash.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": { "hash": { "type": "string" } },
-                    "required": ["hash"]
-                }
-            }),
-            serde_json::json!({
-                "name": "graph_query",
-                "description": "Query the workspace code graph for symbols related to a query.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "query": { "type": "string" },
-                        "depth": { "type": "integer" }
-                    },
-                    "required": ["query"]
-                }
-            }),
-            serde_json::json!({
-                "name": "load_skill",
-                "description": "Load a skill by name and return its body wrapped in XML. \
-                    Use this to load a skill at runtime when invoking it via a slash command \
-                    or when instructed to apply a specific skill.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": { "name": { "type": "string", "description": "Skill name (e.g. 'rust', 'tdd-workflow')" } },
-                    "required": ["name"]
-                }
-            }),
-        ];
         let is_sre_mode = session
             .as_ref()
             .and_then(|s| s.mode.as_deref())
             .is_some_and(|m| m == "sre");
-        if is_sre_mode {
-            builtin_tools.push(serde_json::json!({
-                "name": "alert_list",
-                "description": "Drain up to 50 pending alerts from the alert queue.",
-                "input_schema": { "type": "object", "properties": {} }
-            }));
-            builtin_tools.push(serde_json::json!({
-                "name": "otel_query",
-                "description": "Query SigNoz traces API.",
-                "input_schema": { "type": "object", "properties": { "service": { "type": "string" }, "filter": { "type": "string" }, "range_minutes": { "type": "integer" } }, "required": ["service"] }
-            }));
-            builtin_tools.push(serde_json::json!({
-                "name": "metric_query",
-                "description": "Query Prometheus with PromQL.",
-                "input_schema": { "type": "object", "properties": { "promql": { "type": "string" }, "range_minutes": { "type": "integer" } }, "required": ["promql"] }
-            }));
-            builtin_tools.push(serde_json::json!({
-                "name": "log_tail",
-                "description": "Tail logs from Loki.",
-                "input_schema": { "type": "object", "properties": { "service": { "type": "string" }, "filter": { "type": "string" }, "lines": { "type": "integer" } }, "required": ["service"] }
-            }));
-        }
+        let builtin_tools = tools_catalog::builtin_tools(is_sre_mode);
 
         let all_tools: Vec<serde_json::Value> =
             builtin_tools.into_iter().chain(mcp_tools).collect();
@@ -1038,10 +654,14 @@ impl TurnOrchestrator {
             let provider_session_id = if matches!(runner_enum, Runner::Claude | Runner::Codex) {
                 // Refresh `last_used` on read so an active turn's entry is never
                 // treated as idle by the background GC.
-                provider_sessions.lock().await.get_mut(&session_store_key).map(|e| {
-                    e.last_used = std::time::Instant::now();
-                    e.id.clone()
-                })
+                provider_sessions
+                    .lock()
+                    .await
+                    .get_mut(&session_store_key)
+                    .map(|e| {
+                        e.last_used = std::time::Instant::now();
+                        e.id.clone()
+                    })
             } else {
                 None
             };
@@ -1277,15 +897,14 @@ impl TurnOrchestrator {
                                             .or_insert_with(|| Arc::new(CoworkGate::default())),
                                     )
                                 };
-                                let args_val = serde_json::from_str(input)
-                                    .unwrap_or(serde_json::Value::Null);
+                                let args_val =
+                                    serde_json::from_str(input).unwrap_or(serde_json::Value::Null);
                                 // Thread `push` so a batch approval under Ask is
                                 // surfaced to the TUI (auto-approves in Auto mode);
                                 // passing `None` here left the approval invisible and
                                 // the turn hung on the gate.
                                 let push = Some((dispatcher.as_ref(), Some(turn_id.as_str())));
-                                let decision =
-                                    gate.gate_tool(0, name, args_val, "", push).await;
+                                let decision = gate.gate_tool(0, name, args_val, "", push).await;
                                 match decision {
                                     Decision::Approve => {
                                         execute_tool(
@@ -1319,26 +938,22 @@ impl TurnOrchestrator {
                         ordered_results
                     };
 
-                    let ordered_results =
-                        match tokio::time::timeout_at(turn_deadline, batch).await {
-                            Ok(r) => r,
-                            Err(_elapsed) => {
-                                let reason = format!(
-                                    "turn deadline exceeded after {}s",
-                                    crate::common::effective_agent_timeout_s()
-                                );
-                                warn!(turn_id = %turn_id, "turn wall-clock deadline exceeded during tool batch");
-                                let _ = ingot.update_task_status(&turn_id, "failed").await;
-                                dispatcher.publish(TurnEvent::fail(
-                                    &session_id,
-                                    &turn_id,
-                                    &reason,
-                                ));
-                                tel::set_span_error(&mut turn_span, "request", &reason, false);
-                                turn_span.end();
-                                return;
-                            }
-                        };
+                    let ordered_results = match tokio::time::timeout_at(turn_deadline, batch).await
+                    {
+                        Ok(r) => r,
+                        Err(_elapsed) => {
+                            let reason = format!(
+                                "turn deadline exceeded after {}s",
+                                crate::common::effective_agent_timeout_s()
+                            );
+                            warn!(turn_id = %turn_id, "turn wall-clock deadline exceeded during tool batch");
+                            let _ = ingot.update_task_status(&turn_id, "failed").await;
+                            dispatcher.publish(TurnEvent::fail(&session_id, &turn_id, &reason));
+                            tel::set_span_error(&mut turn_span, "request", &reason, false);
+                            turn_span.end();
+                            return;
+                        }
+                    };
 
                     // (c) Combine results in call order.
                     use std::fmt::Write as _;
@@ -2012,21 +1627,6 @@ impl TurnOrchestrator {
         });
     }
 }
-
-/// Formats vault recall results as a `<recalled_context>` XML block for injection
-/// into the user turn. Returns `None` when `entries` is empty.
-fn format_vault_recalled(entries: &[VaultEntry]) -> Option<String> {
-    if entries.is_empty() {
-        return None;
-    }
-    let body = entries
-        .iter()
-        .map(|e| e.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n---\n\n");
-    Some(format!("<recalled_context>\n{body}\n</recalled_context>"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

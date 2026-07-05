@@ -90,7 +90,11 @@ impl TurnTrace {
             .find(|s| s.depth == 1 && s.status == SpanStatus::Running)
         {
             span.dur_ms = end_ms.saturating_sub(span.start_ms);
-            span.status = if ok { SpanStatus::Ok } else { SpanStatus::Failed };
+            span.status = if ok {
+                SpanStatus::Ok
+            } else {
+                SpanStatus::Failed
+            };
         }
     }
 
@@ -103,7 +107,11 @@ impl TurnTrace {
                 } else {
                     span.dur_ms = total_ms.saturating_sub(span.start_ms);
                 }
-                span.status = if ok { SpanStatus::Ok } else { SpanStatus::Failed };
+                span.status = if ok {
+                    SpanStatus::Ok
+                } else {
+                    SpanStatus::Failed
+                };
             }
         }
     }
@@ -117,7 +125,12 @@ impl TurnTrace {
     /// Total wall-clock the axis spans (max span end, floored at 1ms).
     #[must_use]
     pub fn total_ms(&self) -> u64 {
-        self.spans.iter().map(TraceSpan::end_ms).max().unwrap_or(0).max(1)
+        self.spans
+            .iter()
+            .map(TraceSpan::end_ms)
+            .max()
+            .unwrap_or(0)
+            .max(1)
     }
 }
 
@@ -206,7 +219,9 @@ pub fn waterfall_lines(
                     Style::default()
                 }
             } else if is_sel {
-                Style::default().fg(p.text_bright).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(p.text_bright)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(p.text)
             };
@@ -236,7 +251,10 @@ pub fn waterfall_lines(
 // Recomputes bar length for trailing-pad calculation (kept in sync with
 // `bar_track`).
 fn bar_len(s: &TraceSpan, total: u64, axis_w: usize) -> usize {
-    bar_track(s.start_ms, s.dur_ms, total, axis_w).1.chars().count()
+    bar_track(s.start_ms, s.dur_ms, total, axis_w)
+        .1
+        .chars()
+        .count()
 }
 
 /// Detail lines for the selected span (shown when a span is expanded).
@@ -278,7 +296,13 @@ pub fn span_detail_lines(trace: &TurnTrace, selected: usize, no_color: bool) -> 
 }
 
 /// Renders the waterfall inside a bordered ` trace ` block.
-pub fn render(area: Rect, frame: &mut Frame, trace: &TurnTrace, selected: Option<usize>, no_color: bool) {
+pub fn render(
+    area: Rect,
+    frame: &mut Frame,
+    trace: &TurnTrace,
+    selected: Option<usize>,
+    no_color: bool,
+) {
     if area.height < 3 || trace.is_empty() {
         return;
     }
@@ -404,7 +428,8 @@ mod tests {
         let t = sample();
         let backend = TestBackend::new(50, 8);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| render(f.area(), f, &t, Some(0), false)).unwrap();
+        term.draw(|f| render(f.area(), f, &t, Some(0), false))
+            .unwrap();
         let rendered: String = term
             .backend()
             .buffer()

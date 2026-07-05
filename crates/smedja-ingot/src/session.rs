@@ -3,6 +3,7 @@ use smedja_types::Timestamp;
 use uuid::Uuid;
 
 use crate::error::IngotError;
+use crate::{Ingot, IngotHandle};
 
 /// A top-level orchestration session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,6 +325,359 @@ pub(crate) fn update_runner_override(
         rusqlite::params![runner, Timestamp::now().as_micros(), id],
     )?;
     Ok(())
+}
+
+impl Ingot {
+    /// Inserts a new [`Session`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the INSERT fails.
+    #[must_use = "check the Result to confirm the session was created"]
+    pub fn create_session(&self, session: &Session) -> Result<(), IngotError> {
+        create(&self.conn, session)
+    }
+
+    /// Retrieves a [`Session`] by `id`, returning `None` when not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned session"]
+    pub fn get_session(&self, id: &str) -> Result<Option<Session>, IngotError> {
+        get(&self.conn, id)
+    }
+
+    /// Returns all [`Session`]s ordered by `created_at` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the returned sessions"]
+    pub fn list_sessions(&self) -> Result<Vec<Session>, IngotError> {
+        list(&self.conn)
+    }
+
+    /// Searches sessions where `title` or `workspace_root` contains `query` (case-insensitive).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    #[must_use = "check the Result and inspect the matched sessions"]
+    pub fn search_sessions(&self, query: &str) -> Result<Vec<Session>, IngotError> {
+        search(&self.conn, query)
+    }
+
+    /// Deletes the session with the given `id`.
+    ///
+    /// Returns `true` if a row was deleted, `false` if no session with that `id`
+    /// existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the DELETE fails.
+    #[must_use = "check the Result to confirm the session was deleted"]
+    pub fn delete_session(&self, id: &str) -> Result<bool, IngotError> {
+        delete(&self.conn, id)
+    }
+
+    /// Updates the `status` of a session to `status` and records a new `updated_at`
+    /// timestamp using the current Unix epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the status was updated"]
+    pub fn update_session_status(&self, id: &str, status: &str) -> Result<(), IngotError> {
+        update_status(&self.conn, id, status, smedja_types::Timestamp::now())
+    }
+
+    /// Sets the `workspace_root` filesystem path for the session identified by `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the workspace root was updated"]
+    pub fn update_session_workspace_root(
+        &self,
+        session_id: &str,
+        workspace_root: &str,
+    ) -> Result<(), IngotError> {
+        update_workspace_root(&self.conn, session_id, workspace_root)
+    }
+
+    /// Sets the `mode` field for the session identified by `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the mode was updated"]
+    pub fn update_session_mode(&self, session_id: &str, mode: &str) -> Result<(), IngotError> {
+        update_mode(&self.conn, session_id, mode)
+    }
+
+    /// Sets the `model_override` field for the session identified by `session_id`.
+    ///
+    /// When set, `run_turn` uses this model name instead of the `SMEDJA_MODEL`
+    /// environment variable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the model override was updated"]
+    pub fn update_session_model_override(
+        &self,
+        session_id: &str,
+        model: &str,
+    ) -> Result<(), IngotError> {
+        update_model_override(&self.conn, session_id, model).map_err(IngotError::Db)
+    }
+
+    /// Sets the `runner_override` field for the session identified by `session_id`.
+    ///
+    /// When set, `run_turn` bypasses the assayer and routes directly to this runner
+    /// (e.g. `"claude-cli"`, `"codex-cli"`, `"local"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the runner override was updated"]
+    pub fn update_session_runner_override(
+        &self,
+        session_id: &str,
+        runner: &str,
+    ) -> Result<(), IngotError> {
+        update_runner_override(&self.conn, session_id, runner).map_err(IngotError::Db)
+    }
+
+    /// Links the session identified by `session_id` to a task by setting `task_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the task id was linked"]
+    pub fn update_session_task_id(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<(), IngotError> {
+        update_task_id(&self.conn, session_id, task_id)
+    }
+
+    /// Enables or disables the cowork gate for the session identified by `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the cowork mode was updated"]
+    pub fn update_session_cowork_mode(
+        &self,
+        session_id: &str,
+        enabled: bool,
+    ) -> Result<(), IngotError> {
+        update_cowork_mode(&self.conn, session_id, enabled)
+    }
+
+    /// Sets the human-readable `title` for the session identified by `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    pub fn update_session_title(&self, session_id: &str, title: &str) -> Result<(), IngotError> {
+        update_title(&self.conn, session_id, title)
+    }
+}
+
+impl IngotHandle {
+    /// Inserts a new [`Session`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying INSERT, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn create_session(&self, session: Session) -> Result<(), IngotError> {
+        self.run_blocking(move |ig| ig.create_session(&session))
+            .await
+    }
+
+    /// Retrieves a [`Session`] by `id`, returning `None` when not found.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn get_session(&self, id: &str) -> Result<Option<Session>, IngotError> {
+        let id = id.to_owned();
+        self.run_blocking(move |ig| ig.get_session(&id)).await
+    }
+
+    /// Returns all [`Session`]s ordered by `created_at` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying query, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn list_sessions(&self) -> Result<Vec<Session>, IngotError> {
+        self.run_blocking(Ingot::list_sessions).await
+    }
+
+    /// Searches sessions by title or workspace_root substring (case-insensitive).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the query fails.
+    pub async fn search_sessions(&self, query: &str) -> Result<Vec<Session>, IngotError> {
+        let q = query.to_owned();
+        self.run_blocking(move |ingot| ingot.search_sessions(&q))
+            .await
+    }
+
+    /// Deletes the session with the given `id`.
+    ///
+    /// Returns `true` if a row was deleted, `false` if none existed.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying DELETE, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn delete_session(&self, id: &str) -> Result<bool, IngotError> {
+        let id = id.to_owned();
+        self.run_blocking(move |ig| ig.delete_session(&id)).await
+    }
+
+    /// Updates the `status` of a session.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPDATE, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn update_session_status(&self, id: &str, status: &str) -> Result<(), IngotError> {
+        let id = id.to_owned();
+        let status = status.to_owned();
+        self.run_blocking(move |ig| ig.update_session_status(&id, &status))
+            .await
+    }
+
+    /// Sets the `workspace_root` path for a session.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPDATE, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn update_session_workspace_root(
+        &self,
+        session_id: &str,
+        workspace_root: &str,
+    ) -> Result<(), IngotError> {
+        let session_id = session_id.to_owned();
+        let workspace_root = workspace_root.to_owned();
+        self.run_blocking(move |ig| ig.update_session_workspace_root(&session_id, &workspace_root))
+            .await
+    }
+
+    /// Sets the `mode` field for a session.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPDATE, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn update_session_mode(
+        &self,
+        session_id: &str,
+        mode: &str,
+    ) -> Result<(), IngotError> {
+        let session_id = session_id.to_owned();
+        let mode = mode.to_owned();
+        self.run_blocking(move |ig| ig.update_session_mode(&session_id, &mode))
+            .await
+    }
+
+    /// Sets the `model_override` for a session.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPDATE, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn update_session_model_override(
+        &self,
+        session_id: &str,
+        model: &str,
+    ) -> Result<(), IngotError> {
+        let session_id = session_id.to_owned();
+        let model = model.to_owned();
+        self.run_blocking(move |ig| ig.update_session_model_override(&session_id, &model))
+            .await
+    }
+
+    /// Sets the `runner_override` for a session.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPDATE, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn update_session_runner_override(
+        &self,
+        session_id: &str,
+        runner: &str,
+    ) -> Result<(), IngotError> {
+        let session_id = session_id.to_owned();
+        let runner = runner.to_owned();
+        self.run_blocking(move |ig| ig.update_session_runner_override(&session_id, &runner))
+            .await
+    }
+
+    /// Links a session to a task.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPDATE, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn update_session_task_id(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<(), IngotError> {
+        let session_id = session_id.to_owned();
+        let task_id = task_id.to_owned();
+        self.run_blocking(move |ig| ig.update_session_task_id(&session_id, &task_id))
+            .await
+    }
+
+    /// Enables or disables the cowork gate for a session.
+    ///
+    /// This is the single canonical cowork-mode setter; it also refreshes the
+    /// session's `updated_at` timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPDATE, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn update_session_cowork_mode(
+        &self,
+        session_id: &str,
+        enabled: bool,
+    ) -> Result<(), IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.update_session_cowork_mode(&session_id, enabled))
+            .await
+    }
+
+    /// Sets the human-readable `title` for a session.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPDATE, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn update_session_title(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> Result<(), IngotError> {
+        let session_id = session_id.to_owned();
+        let title = title.to_owned();
+        self.run_blocking(move |ig| ig.update_session_title(&session_id, &title))
+            .await
+    }
 }
 
 #[cfg(test)]

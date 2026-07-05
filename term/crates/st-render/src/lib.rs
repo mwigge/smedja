@@ -21,11 +21,9 @@
     clippy::implicit_clone
 )]
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use cosmic_text::{fontdb, FontSystem, SwashCache};
 use parking_lot::Mutex;
 use st_statusbar::Segment;
 use thiserror::Error;
@@ -33,6 +31,17 @@ use thiserror::Error;
 // Re-export so callers don't have to depend on winit/wgpu directly.
 pub use wgpu;
 pub use winit;
+
+mod atlas;
+mod packer;
+mod shaders;
+mod vertices;
+
+pub use atlas::{is_pua_codepoint, select_atlas, AtlasKind, GlyphAtlas, GlyphEntry};
+pub use packer::ShelfPacker;
+
+use atlas::ATLAS_SIZE;
+use shaders::{BG_IMAGE_SHADER_SRC, BG_SHADER_SRC, COLOUR_SHADER_SRC, SHADER_SRC};
 
 /// Errors produced by the renderer.
 #[derive(Debug, Error)]
@@ -200,609 +209,6 @@ impl GlyphVertex {
     }
 }
 
-// ── Shelf packer ─────────────────────────────────────────────────────────────
-
-/// A simple shelf bin-packer for the glyph atlas.
-///
-/// Glyphs are packed left-to-right in horizontal shelves.  A new shelf starts
-/// whenever the current one is full.
-#[derive(Debug)]
-pub struct ShelfPacker {
-    current_x: u32,
-    current_y: u32,
-    shelf_height: u32,
-    atlas_size: u32,
-}
-
-impl ShelfPacker {
-    /// Creates a new [`ShelfPacker`] for an atlas of `atlas_size × atlas_size`.
-    #[must_use]
-    pub fn new(atlas_size: u32) -> Self {
-        Self {
-            current_x: 0,
-            current_y: 0,
-            shelf_height: 0,
-            atlas_size,
-        }
-    }
-
-    /// Allocates a `w × h` region in the atlas, returning the top-left `[x, y]`.
-    ///
-    /// Returns `None` when the atlas is full.
-    pub fn alloc(&mut self, w: u32, h: u32) -> Option<[u32; 2]> {
-        if w > self.atlas_size || h > self.atlas_size {
-            return None;
-        }
-        // Need a new shelf?
-        if self.current_x + w > self.atlas_size {
-            self.current_y += self.shelf_height;
-            self.current_x = 0;
-            self.shelf_height = 0;
-        }
-        if self.current_y + h > self.atlas_size {
-            return None; // Atlas full.
-        }
-        let pos = [self.current_x, self.current_y];
-        self.current_x += w;
-        self.shelf_height = self.shelf_height.max(h);
-        Some(pos)
-    }
-}
-
-// ── Glyph atlas ───────────────────────────────────────────────────────────────
-
-const ATLAS_SIZE: u32 = 1024;
-
-/// First codepoint of the Unicode Private Use Area block (inclusive).
-const PUA_START: u32 = 0xE000;
-/// Last codepoint of the Unicode Private Use Area block (inclusive).
-const PUA_END: u32 = 0xF8FF;
-
-/// Returns `true` when `ch` falls inside the Unicode Private Use Area block
-/// (`U+E000 ..= U+F8FF`) used for registered glyphs.
-#[must_use]
-pub fn is_pua_codepoint(ch: char) -> bool {
-    let cp = ch as u32;
-    (PUA_START..=PUA_END).contains(&cp)
-}
-
-/// Identifies which texture atlas a glyph is sampled from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AtlasKind {
-    /// The `R8Unorm` alpha-only atlas for font glyphs (tinted by cell foreground).
-    Alpha,
-    /// The `Rgba8UnormSrgb` colour atlas for registered PUA-codepoint glyphs.
-    Colour,
-}
-
-/// Selects the atlas a cell glyph is drawn from.
-///
-/// A codepoint in the PUA range that has a registered bitmap
-/// (`has_registered_bitmap`) is sampled from the [`AtlasKind::Colour`] atlas;
-/// every other glyph (ordinary text, or a PUA codepoint with no registered
-/// bitmap) falls through to the [`AtlasKind::Alpha`] font atlas.
-#[must_use]
-pub fn select_atlas(ch: char, has_registered_bitmap: bool) -> AtlasKind {
-    if has_registered_bitmap && is_pua_codepoint(ch) {
-        AtlasKind::Colour
-    } else {
-        AtlasKind::Alpha
-    }
-}
-
-/// Per-glyph entry stored in the atlas after rasterisation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GlyphEntry {
-    /// X origin of the glyph bitmap in atlas pixels.
-    pub x: u32,
-    /// Y origin of the glyph bitmap in atlas pixels.
-    pub y: u32,
-    /// Width of the glyph bitmap in atlas pixels.
-    pub w: u32,
-    /// Height of the glyph bitmap in atlas pixels.
-    pub h: u32,
-    /// Horizontal offset from the cell's cursor position to the left edge of
-    /// the bitmap (positive = right of cursor). From `swash::Placement::left`.
-    pub bearing_x: i32,
-    /// Vertical offset from the baseline to the top edge of the bitmap
-    /// (positive = above baseline). From `swash::Placement::top`.
-    pub bearing_y: i32,
-    /// Atlas allocation handle (for deallocation on LRU eviction). Used by both
-    /// the alpha and colour atlases; `None` only for entries built without a
-    /// backing allocator (e.g. in unit tests).
-    pub id: Option<etagere::AllocId>,
-    /// Frame index when this glyph was last used — the LRU key.
-    pub last_used: u64,
-}
-
-/// GPU texture atlas for rasterised glyphs.
-///
-/// Glyphs are keyed by `(char, is_bold, is_italic)` and cached after first
-/// rasterisation via [`cosmic_text`].
-pub struct GlyphAtlas {
-    /// The GPU texture.
-    pub texture: wgpu::Texture,
-    /// View into [`Self::texture`].
-    pub view: wgpu::TextureView,
-    /// Dynamic shelf allocator for the alpha atlas — supports per-glyph
-    /// deallocation, so a full atlas evicts only the least-recently-used glyphs
-    /// (not a full clear).
-    pub alpha_alloc: etagere::AtlasAllocator,
-    /// Monotonic frame counter; each glyph's `last_used` is stamped with it so
-    /// eviction never drops a glyph still on screen this frame.
-    pub frame: u64,
-    /// Maps `(char, bold, italic, font_size_bits)` → per-glyph atlas entry.
-    ///
-    /// `font_size_bits` is `font_size.to_bits()` so that glyphs rasterised at
-    /// different sizes (e.g. terminal grid vs status-bar) never share a slot.
-    pub glyphs: HashMap<(char, bool, bool, u32), GlyphEntry>,
-    /// `Rgba8UnormSrgb` colour texture holding registered PUA-glyph bitmaps.
-    pub colour_texture: wgpu::Texture,
-    /// View into [`Self::colour_texture`].
-    pub colour_view: wgpu::TextureView,
-    /// Dynamic allocator for the colour atlas — mirrors [`Self::alpha_alloc`] so
-    /// a full colour atlas evicts the least-recently-used registered glyph rather
-    /// than growing RAM without bound when untrusted child output registers many
-    /// PUA/colour glyphs.
-    pub colour_alloc: etagere::AtlasAllocator,
-    /// Maps a registered PUA codepoint → its entry in the colour atlas.
-    pub colour_glyphs: HashMap<char, GlyphEntry>,
-    /// Shared glyph registry used to resolve PUA codepoints to bitmaps.
-    glyph_registry: Option<Arc<Mutex<st_glyph::GlyphRegistry>>>,
-    font_system: FontSystem,
-    swash_cache: SwashCache,
-}
-
-impl GlyphAtlas {
-    /// Creates a new [`GlyphAtlas`] backed by `device`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `ATLAS_SIZE` does not fit in `i32` (compile-time invariant).
-    #[must_use]
-    pub fn new(device: &wgpu::Device) -> Self {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("glyph_atlas"),
-            size: wgpu::Extent3d {
-                width: ATLAS_SIZE,
-                height: ATLAS_SIZE,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let colour_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("glyph_atlas_colour"),
-            size: wgpu::Extent3d {
-                width: ATLAS_SIZE,
-                height: ATLAS_SIZE,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let colour_view = colour_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        Self {
-            texture,
-            view,
-            alpha_alloc: etagere::AtlasAllocator::new(etagere::size2(
-                i32::try_from(ATLAS_SIZE).expect("ATLAS_SIZE fits i32"),
-                i32::try_from(ATLAS_SIZE).expect("ATLAS_SIZE fits i32"),
-            )),
-            frame: 0,
-            glyphs: HashMap::new(),
-            colour_texture,
-            colour_view,
-            colour_alloc: etagere::AtlasAllocator::new(etagere::size2(
-                i32::try_from(ATLAS_SIZE).expect("ATLAS_SIZE fits i32"),
-                i32::try_from(ATLAS_SIZE).expect("ATLAS_SIZE fits i32"),
-            )),
-            colour_glyphs: HashMap::new(),
-            glyph_registry: None,
-            // Use an empty fontdb so init is non-blocking (< 5 ms).
-            // Glyphs are rasterised lazily via ensure_cell_glyphs(); the OS
-            // font scanner is skipped here and only called via
-            // new_with_system_fonts() when full font coverage is needed.
-            font_system: FontSystem::new_with_locale_and_db(
-                "en-US".to_owned(),
-                fontdb::Database::new(),
-            ),
-            swash_cache: SwashCache::new(),
-        }
-    }
-
-    /// Creates a [`GlyphAtlas`] that loads all system fonts (slow — use on a
-    /// background thread or when full font coverage is needed).
-    #[must_use]
-    pub fn new_with_system_fonts(device: &wgpu::Device) -> Self {
-        let mut s = Self::new(device);
-        s.font_system.db_mut().load_system_fonts();
-        s
-    }
-
-    /// Returns the cached [`GlyphEntry`] for `ch`, or rasterises and uploads it
-    /// if not yet cached.
-    ///
-    /// Returns `None` if the atlas is full or rasterisation fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a rasterised glyph dimension does not fit in `i32`.
-    pub fn get_or_insert(
-        &mut self,
-        _device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        ch: char,
-        font_size: f32,
-        bold: bool,
-        italic: bool,
-    ) -> Option<GlyphEntry> {
-        // Registered PUA glyphs are uploaded to the colour atlas from their
-        // cached RGBA bitmap rather than shaped through cosmic-text.
-        if is_pua_codepoint(ch) {
-            if let Some(entry) = self.get_or_insert_colour(queue, ch) {
-                return Some(entry);
-            }
-            // No registered bitmap — fall through to the font path (tofu).
-        }
-
-        let key = (ch, bold, italic, font_size.to_bits());
-        if let Some(entry) = self.glyphs.get_mut(&key) {
-            entry.last_used = self.frame;
-            return Some(*entry);
-        }
-
-        // Rasterise the glyph using cosmic-text + swash.
-        let metrics = cosmic_text::Metrics::new(font_size, font_size * 1.2);
-        let mut buffer = cosmic_text::Buffer::new(&mut self.font_system, metrics);
-        buffer.set_size(
-            &mut self.font_system,
-            Some(font_size * 2.0),
-            Some(font_size * 2.0),
-        );
-
-        let attrs = cosmic_text::Attrs::new();
-        let attrs = if bold {
-            attrs.weight(cosmic_text::Weight::BOLD)
-        } else {
-            attrs
-        };
-        let attrs = if italic {
-            attrs.style(cosmic_text::Style::Italic)
-        } else {
-            attrs
-        };
-
-        buffer.set_text(
-            &mut self.font_system,
-            &ch.to_string(),
-            attrs,
-            cosmic_text::Shaping::Advanced,
-        );
-        buffer.shape_until_scroll(&mut self.font_system, false);
-
-        // Collect pixel data and placement offsets from swash.
-        let mut pixel_data: Option<(Vec<u8>, u32, u32, i32, i32)> = None;
-
-        for run in buffer.layout_runs() {
-            for glyph in run.glyphs {
-                let physical = glyph.physical((0.0, 0.0), 1.0);
-                if let Some(image) = self
-                    .swash_cache
-                    .get_image(&mut self.font_system, physical.cache_key)
-                {
-                    let w = image.placement.width;
-                    let h = image.placement.height;
-                    if w > 0 && h > 0 {
-                        let data = match image.content {
-                            cosmic_text::SwashContent::Mask => image.data.to_vec(),
-                            cosmic_text::SwashContent::Color => {
-                                // Convert RGBA → alpha-only for the atlas.
-                                image.data.chunks(4).map(|c| c[3]).collect()
-                            }
-                            cosmic_text::SwashContent::SubpixelMask => {
-                                vec![0u8; (w * h) as usize]
-                            }
-                        };
-                        pixel_data = Some((data, w, h, image.placement.left, image.placement.top));
-                        break;
-                    }
-                }
-            }
-            if pixel_data.is_some() {
-                break;
-            }
-        }
-
-        let (data, w, h, bearing_x, bearing_y) = pixel_data.unwrap_or_else(|| {
-            // Fallback: blank 1×1 glyph so the atlas entry is valid.
-            (vec![0u8], 1, 1, 0, 0)
-        });
-
-        // Allocate a slot. When the atlas is full, evict the least-recently-used
-        // glyph that is NOT in use this frame and retry — incremental LRU rather
-        // than a full clear. ensure_cell_glyphs stamps every on-screen glyph's
-        // `last_used` to the current frame, so an in-use glyph is never dropped.
-        // If nothing is evictable the glyph is skipped (returns None) for this
-        // frame; it is re-warmed next frame once room frees up.
-        let alloc = loop {
-            if let Some(a) = self.alpha_alloc.allocate(etagere::size2(
-                i32::try_from(w).expect("glyph width fits i32"),
-                i32::try_from(h).expect("glyph height fits i32"),
-            )) {
-                break a;
-            }
-            let victim = self
-                .glyphs
-                .iter()
-                .filter(|(_, e)| e.id.is_some() && e.last_used < self.frame)
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(k, e)| (*k, e.id));
-            if let Some((vkey, Some(vid))) = victim {
-                self.alpha_alloc.deallocate(vid);
-                self.glyphs.remove(&vkey);
-            } else {
-                tracing::debug!("glyph atlas full and nothing evictable — skipping glyph");
-                return None;
-            }
-        };
-        #[allow(clippy::cast_sign_loss)]
-        let x = alloc.rectangle.min.x as u32;
-        #[allow(clippy::cast_sign_loss)]
-        let y = alloc.rectangle.min.y as u32;
-
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &self.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x, y, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            &data,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(w),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-
-        let entry = GlyphEntry {
-            x,
-            y,
-            w,
-            h,
-            bearing_x,
-            bearing_y,
-            id: Some(alloc.id),
-            last_used: self.frame,
-        };
-        self.glyphs.insert(key, entry);
-        Some(entry)
-    }
-
-    /// Attaches the shared glyph registry used to resolve PUA codepoints.
-    pub fn set_glyph_registry(&mut self, registry: Arc<Mutex<st_glyph::GlyphRegistry>>) {
-        self.glyph_registry = Some(registry);
-    }
-
-    /// Returns `true` when `ch` is a PUA codepoint with a registered bitmap in
-    /// the attached registry.
-    #[must_use]
-    pub fn has_registered_bitmap(&self, ch: char) -> bool {
-        if !is_pua_codepoint(ch) {
-            return false;
-        }
-        self.glyph_registry
-            .as_ref()
-            .is_some_and(|reg| reg.lock().bitmap(ch).is_some())
-    }
-
-    /// Returns the cached colour-atlas entry for a registered PUA codepoint,
-    /// uploading its RGBA bitmap on first use.
-    ///
-    /// Returns `None` when no registry is attached, `ch` has no registered
-    /// bitmap, or the colour atlas is full.
-    fn get_or_insert_colour(&mut self, queue: &wgpu::Queue, ch: char) -> Option<GlyphEntry> {
-        if let Some(entry) = self.colour_glyphs.get_mut(&ch) {
-            entry.last_used = self.frame;
-            return Some(*entry);
-        }
-
-        // Copy the bitmap out of the registry under a short-lived lock so the
-        // mutex is released before the GPU upload.
-        let (pixels, width, height) = {
-            let registry = self.glyph_registry.as_ref()?;
-            let guard = registry.lock();
-            let bitmap = guard.bitmap(ch)?;
-            (bitmap.pixels.clone(), bitmap.width, bitmap.height)
-        };
-
-        if width == 0 || height == 0 {
-            return None;
-        }
-
-        // Allocate a slot. When the colour atlas is full, evict the
-        // least-recently-used colour glyph that is NOT in use this frame and
-        // retry — the same incremental LRU the alpha atlas uses. touch_or_warm
-        // stamps every on-screen colour glyph's `last_used` to the current frame,
-        // so a visible glyph is never dropped. If nothing is evictable the glyph
-        // is skipped for this frame and re-warmed later once room frees up. This
-        // bounds RAM: untrusted child output can no longer fill the atlas without
-        // bound and leak.
-        let alloc = loop {
-            if let Some(a) = self.colour_alloc.allocate(etagere::size2(
-                i32::try_from(width).ok()?,
-                i32::try_from(height).ok()?,
-            )) {
-                break a;
-            }
-            let victim = self
-                .colour_glyphs
-                .iter()
-                .filter(|(_, e)| e.id.is_some() && e.last_used < self.frame)
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(k, e)| (*k, e.id));
-            if let Some((vkey, Some(vid))) = victim {
-                self.colour_alloc.deallocate(vid);
-                self.colour_glyphs.remove(&vkey);
-            } else {
-                tracing::debug!("colour atlas full and nothing evictable — skipping glyph");
-                return None;
-            }
-        };
-        #[allow(clippy::cast_sign_loss)]
-        let x = alloc.rectangle.min.x as u32;
-        #[allow(clippy::cast_sign_loss)]
-        let y = alloc.rectangle.min.y as u32;
-
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &self.colour_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x, y, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            &pixels,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(width * 4),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-
-        let entry = GlyphEntry {
-            x,
-            y,
-            w: width,
-            h: height,
-            bearing_x: 0,
-            bearing_y: i32::try_from(height).unwrap_or(0),
-            id: Some(alloc.id),
-            last_used: self.frame,
-        };
-        self.colour_glyphs.insert(ch, entry);
-        Some(entry)
-    }
-}
-
-// ── WGSL shader ───────────────────────────────────────────────────────────────
-
-const SHADER_SRC: &str = r"
-struct VertexInput {
-    @location(0) position:   vec2<f32>,
-    @location(1) tex_coords: vec2<f32>,
-    @location(2) color:      vec4<f32>,
-}
-
-struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) tex_coords: vec2<f32>,
-    @location(1) color:      vec4<f32>,
-}
-
-@vertex
-fn vs_main(in: VertexInput) -> VertexOutput {
-    var out: VertexOutput;
-    out.clip_position = vec4<f32>(in.position, 0.0, 1.0);
-    out.tex_coords    = in.tex_coords;
-    out.color         = in.color;
-    return out;
-}
-
-@group(0) @binding(0) var t_atlas:  texture_2d<f32>;
-@group(0) @binding(1) var s_atlas:  sampler;
-
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let alpha = textureSample(t_atlas, s_atlas, in.tex_coords).r;
-    return vec4<f32>(in.color.rgb, in.color.a * alpha);
-}
-";
-
-// ── Colour glyph shader (registered RGBA glyphs) ──────────────────────────────
-
-/// Shader for registered glyphs: samples the RGBA colour atlas directly so the
-/// glyph keeps its own colours (only the cell foreground alpha modulates it).
-const COLOUR_SHADER_SRC: &str = r"
-struct VertexInput {
-    @location(0) position:   vec2<f32>,
-    @location(1) tex_coords: vec2<f32>,
-    @location(2) color:      vec4<f32>,
-}
-
-struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) tex_coords: vec2<f32>,
-    @location(1) color:      vec4<f32>,
-}
-
-@vertex
-fn vs_colour(in: VertexInput) -> VertexOutput {
-    var out: VertexOutput;
-    out.clip_position = vec4<f32>(in.position, 0.0, 1.0);
-    out.tex_coords    = in.tex_coords;
-    out.color         = in.color;
-    return out;
-}
-
-@group(0) @binding(0) var t_colour: texture_2d<f32>;
-@group(0) @binding(1) var s_colour: sampler;
-
-@fragment
-fn fs_colour(in: VertexOutput) -> @location(0) vec4<f32> {
-    let texel = textureSample(t_colour, s_colour, in.tex_coords);
-    return vec4<f32>(texel.rgb, texel.a * in.color.a);
-}
-";
-
-// ── Background shader ─────────────────────────────────────────────────────────
-
-const BG_SHADER_SRC: &str = r"
-struct VertexInput {
-    @location(0) position: vec2<f32>,
-    @location(1) color:    vec4<f32>,
-}
-
-struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) color: vec4<f32>,
-}
-
-@vertex
-fn vs_bg(in: VertexInput) -> VertexOutput {
-    var out: VertexOutput;
-    out.clip_position = vec4<f32>(in.position, 0.0, 1.0);
-    out.color = in.color;
-    return out;
-}
-
-@fragment
-fn fs_bg(in: VertexOutput) -> @location(0) vec4<f32> {
-    return in.color;
-}
-";
-
 /// Background vertex: position + colour only.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -862,36 +268,6 @@ struct BgImageParams {
     opacity: f32,
     _pad: [f32; 3],
 }
-
-// ── Background image shader ───────────────────────────────────────────────────
-
-const BG_IMAGE_SHADER_SRC: &str = r"
-struct VIn {
-    @location(0) position:   vec2<f32>,
-    @location(1) tex_coords: vec2<f32>,
-}
-struct VOut {
-    @builtin(position) clip_pos: vec4<f32>,
-    @location(0) tex_coords: vec2<f32>,
-}
-@vertex fn vs_bg_img(in: VIn) -> VOut {
-    var out: VOut;
-    out.clip_pos  = vec4<f32>(in.position, 0.0, 1.0);
-    out.tex_coords = in.tex_coords;
-    return out;
-}
-
-@group(0) @binding(0) var t_bg: texture_2d<f32>;
-@group(0) @binding(1) var s_bg: sampler;
-
-struct Params { opacity: f32, _p1: f32, _p2: f32, _p3: f32 }
-@group(1) @binding(0) var<uniform> params: Params;
-
-@fragment fn fs_bg_img(in: VOut) -> @location(0) vec4<f32> {
-    let c = textureSample(t_bg, s_bg, in.tex_coords);
-    return vec4<f32>(c.rgb, c.a * params.opacity);
-}
-";
 
 // ── Dynamic vertex buffer ─────────────────────────────────────────────────────
 
@@ -962,13 +338,13 @@ pub struct Renderer {
     /// Uploaded background image texture (None if no image is configured).
     bg_image_texture: Option<wgpu::Texture>,
     /// Bind group containing the background image texture and sampler.
-    bg_image_bind_group: Option<wgpu::BindGroup>,
+    pub(crate) bg_image_bind_group: Option<wgpu::BindGroup>,
     /// 16-byte uniform buffer carrying the opacity value for the image pass.
     #[allow(dead_code)] // held for RAII lifetime; Drop releases the GPU allocation
     bg_image_params_buf: wgpu::Buffer,
     /// Bind group for [`Self::bg_image_params_buf`].
     bg_image_params_bind_group: wgpu::BindGroup,
-    atlas: GlyphAtlas,
+    pub(crate) atlas: GlyphAtlas,
     bind_group: wgpu::BindGroup,
     /// Pipeline for registered RGBA colour glyphs.
     colour_pipeline: wgpu::RenderPipeline,
@@ -981,20 +357,20 @@ pub struct Renderer {
     glyph_vbuf: DynamicVertexBuffer,
     colour_vbuf: DynamicVertexBuffer,
     /// Current cell grid snapshot.
-    cells: Vec<Cell>,
+    pub(crate) cells: Vec<Cell>,
     /// Block decorations to draw.
-    block_decorations: Vec<BlockDecoration>,
+    pub(crate) block_decorations: Vec<BlockDecoration>,
     /// Agent blocks to draw.
-    agent_blocks: Vec<AgentBlockView>,
-    config: st_config::Config,
+    pub(crate) agent_blocks: Vec<AgentBlockView>,
+    pub(crate) config: st_config::Config,
     /// Background image and transparency configuration.
     pub background: BackgroundConfig,
     /// Physical size of the window in pixels.
     pub size: winit::dpi::PhysicalSize<u32>,
     /// Status bar segments to overlay at the bottom of the window.
-    status_bar_segments: Vec<Segment>,
+    pub(crate) status_bar_segments: Vec<Segment>,
     /// Top bar segments to overlay at the top of the window.
-    top_bar_segments: Vec<Segment>,
+    pub(crate) top_bar_segments: Vec<Segment>,
     /// Device pixel ratio for this window (1.0 on non-HiDPI, 2.0 on 2× displays).
     pub scale_factor: f64,
 }
@@ -1698,10 +1074,16 @@ impl Renderer {
         }
         self.bg_vbuf
             .upload(&self.device, &self.queue, bytemuck::cast_slice(&bg_verts));
-        self.glyph_vbuf
-            .upload(&self.device, &self.queue, bytemuck::cast_slice(&glyph_verts));
-        self.colour_vbuf
-            .upload(&self.device, &self.queue, bytemuck::cast_slice(&colour_verts));
+        self.glyph_vbuf.upload(
+            &self.device,
+            &self.queue,
+            bytemuck::cast_slice(&glyph_verts),
+        );
+        self.colour_vbuf.upload(
+            &self.device,
+            &self.queue,
+            bytemuck::cast_slice(&colour_verts),
+        );
 
         // The persistent buffers may be larger than this frame's data (they only
         // grow); slice each to exactly this frame's byte length so the vertex
@@ -1762,11 +1144,7 @@ impl Renderer {
             }
 
             // Glyph quads.
-            if let Some(buf) = self
-                .glyph_vbuf
-                .buffer()
-                .filter(|_| !glyph_verts.is_empty())
-            {
+            if let Some(buf) = self.glyph_vbuf.buffer().filter(|_| !glyph_verts.is_empty()) {
                 render_pass.set_pipeline(&self.glyph_pipeline);
                 render_pass.set_bind_group(0, &self.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, buf.slice(..glyph_slice_len));
@@ -1792,737 +1170,6 @@ impl Renderer {
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
         Ok(())
-    }
-
-    // ── Private helpers ───────────────────────────────────────────────────────
-
-    /// Estimates cell size in physical pixels.
-    ///
-    /// Font size is multiplied by `scale_factor` so each cell occupies the
-    /// correct number of physical pixels on `HiDPI` displays.
-    fn cell_size(&self) -> (f32, f32) {
-        let eff = self.config.font.size * self.scale_factor as f32;
-        (eff * 0.6, eff * 1.2)
-    }
-
-    fn cell_to_ndc(&self, col: u16, row: u16, cell_w: f32, cell_h: f32) -> (f32, f32, f32, f32) {
-        let pw = self.size.width as f32;
-        let ph = self.size.height as f32;
-        let top_off = self.top_bar_height_px() as f32;
-        let x0 = (f32::from(col) * cell_w) / pw * 2.0 - 1.0;
-        let y0 = 1.0 - (f32::from(row) * cell_h + top_off) / ph * 2.0;
-        let x1 = x0 + cell_w / pw * 2.0;
-        let y1 = y0 - cell_h / ph * 2.0;
-        (x0, y0, x1, y1)
-    }
-
-    /// Converts a pixel-space rectangle `(px0, py0, px1, py1)` to NDC.
-    ///
-    /// `py0` is the top edge (smaller y in pixel space, larger y in NDC).
-    fn px_to_ndc(&self, px0: f32, py0: f32, px1: f32, py1: f32) -> (f32, f32, f32, f32) {
-        let pw = self.size.width as f32;
-        let ph = self.size.height as f32;
-        let x0 = px0 / pw * 2.0 - 1.0;
-        let y0 = 1.0 - py0 / ph * 2.0;
-        let x1 = px1 / pw * 2.0 - 1.0;
-        let y1 = 1.0 - py1 / ph * 2.0;
-        (x0, y0, x1, y1)
-    }
-
-    fn build_bg_vertices(&self) -> Vec<BgVertex> {
-        let (cw, ch) = self.cell_size();
-        let mut verts = Vec::with_capacity(self.cells.len() * 6);
-        // When a background image is active, multiply cell-background alpha by
-        // opacity so the image shows through.  Without an image the existing
-        // solid-color behaviour is preserved (alpha unchanged).
-        let cell_alpha_mult = if self.bg_image_bind_group.is_some() {
-            self.background.opacity
-        } else {
-            1.0
-        };
-
-        for cell in &self.cells {
-            let (x0, y0, x1, y1) = self.cell_to_ndc(cell.col, cell.row, cw, ch);
-            let c = [
-                cell.bg[0],
-                cell.bg[1],
-                cell.bg[2],
-                cell.bg[3] * cell_alpha_mult,
-            ];
-            // Two triangles forming a quad.
-            verts.extend_from_slice(&[
-                BgVertex {
-                    position: [x0, y0],
-                    color: c,
-                },
-                BgVertex {
-                    position: [x1, y0],
-                    color: c,
-                },
-                BgVertex {
-                    position: [x0, y1],
-                    color: c,
-                },
-                BgVertex {
-                    position: [x1, y0],
-                    color: c,
-                },
-                BgVertex {
-                    position: [x1, y1],
-                    color: c,
-                },
-                BgVertex {
-                    position: [x0, y1],
-                    color: c,
-                },
-            ]);
-
-            // Underline / strikethrough rules drawn in the cell's foreground
-            // colour. NDC y0 is the top edge, y1 the bottom edge.
-            if cell.underline || cell.strikethrough {
-                let fg = cell.fg;
-                let t = 2.0 / self.size.height as f32; // ~1px thick in NDC
-                let mut rule = |ytop: f32, ybot: f32| {
-                    verts.extend_from_slice(&[
-                        BgVertex {
-                            position: [x0, ytop],
-                            color: fg,
-                        },
-                        BgVertex {
-                            position: [x1, ytop],
-                            color: fg,
-                        },
-                        BgVertex {
-                            position: [x0, ybot],
-                            color: fg,
-                        },
-                        BgVertex {
-                            position: [x1, ytop],
-                            color: fg,
-                        },
-                        BgVertex {
-                            position: [x1, ybot],
-                            color: fg,
-                        },
-                        BgVertex {
-                            position: [x0, ybot],
-                            color: fg,
-                        },
-                    ]);
-                };
-                if cell.underline {
-                    rule(y1 + t * 2.0, y1);
-                }
-                if cell.strikethrough {
-                    let ymid = f32::midpoint(y0, y1);
-                    rule(ymid + t, ymid - t);
-                }
-            }
-        }
-
-        // Block decoration borders (left 1px bar in #a9652f).
-        let border_color: [f32; 4] = [0.663, 0.396, 0.184, 1.0];
-        let bar_w = 2.0 / self.size.width as f32; // 1 pixel in NDC
-        for dec in &self.block_decorations {
-            let (x0, y0, _, _) = self.cell_to_ndc(0, dec.start_row, cw, ch);
-            let (_, _, _, y1) = self.cell_to_ndc(0, dec.end_row, cw, ch);
-            let x1 = x0 + bar_w;
-            let c = border_color;
-            verts.extend_from_slice(&[
-                BgVertex {
-                    position: [x0, y0],
-                    color: c,
-                },
-                BgVertex {
-                    position: [x1, y0],
-                    color: c,
-                },
-                BgVertex {
-                    position: [x0, y1],
-                    color: c,
-                },
-                BgVertex {
-                    position: [x1, y0],
-                    color: c,
-                },
-                BgVertex {
-                    position: [x1, y1],
-                    color: c,
-                },
-                BgVertex {
-                    position: [x0, y1],
-                    color: c,
-                },
-            ]);
-        }
-
-        // ── Agent block backgrounds ───────────────────────────────────────────
-        // Each block gets a semi-transparent dark background panel.
-        {
-            let agent_bg: [f32; 4] = [0.05, 0.05, 0.08, 0.85];
-            let pw = self.size.width as f32;
-            for block in &self.agent_blocks {
-                let row_offset = f32::from(block.start_row);
-                let row_count = (block.content_lines.len() + 1) as f32; // +1 for header
-                let py0 = row_offset * ch;
-                let py1 = py0 + row_count * ch;
-                let (x0, y0, x1, y1) = self.px_to_ndc(0.0, py0, pw, py1);
-                verts.extend_from_slice(&[
-                    BgVertex {
-                        position: [x0, y0],
-                        color: agent_bg,
-                    },
-                    BgVertex {
-                        position: [x1, y0],
-                        color: agent_bg,
-                    },
-                    BgVertex {
-                        position: [x0, y1],
-                        color: agent_bg,
-                    },
-                    BgVertex {
-                        position: [x1, y0],
-                        color: agent_bg,
-                    },
-                    BgVertex {
-                        position: [x1, y1],
-                        color: agent_bg,
-                    },
-                    BgVertex {
-                        position: [x0, y1],
-                        color: agent_bg,
-                    },
-                ]);
-            }
-        }
-
-        // ── Status bar background strip ───────────────────────────────────────
-        {
-            // Always draw the status bar background so the strip is visible
-            // even when no modules produce output.
-            let sb_h = self.status_bar_height_px() as f32;
-            let ph = self.size.height as f32;
-            let pw = self.size.width as f32;
-            let py0 = ph - sb_h;
-            let py1 = ph;
-            // Dark background slightly different from terminal bg.
-            let sb_bg: [f32; 4] = [0.07, 0.07, 0.09, 1.0];
-            let (x0, y0, x1, y1) = self.px_to_ndc(0.0, py0, pw, py1);
-            verts.extend_from_slice(&[
-                BgVertex {
-                    position: [x0, y0],
-                    color: sb_bg,
-                },
-                BgVertex {
-                    position: [x1, y0],
-                    color: sb_bg,
-                },
-                BgVertex {
-                    position: [x0, y1],
-                    color: sb_bg,
-                },
-                BgVertex {
-                    position: [x1, y0],
-                    color: sb_bg,
-                },
-                BgVertex {
-                    position: [x1, y1],
-                    color: sb_bg,
-                },
-                BgVertex {
-                    position: [x0, y1],
-                    color: sb_bg,
-                },
-            ]);
-        }
-
-        // ── Top bar background strip ──────────────────────────────────────────
-        {
-            let tb_h = self.top_bar_height_px() as f32;
-            if tb_h > 0.0 {
-                let pw = self.size.width as f32;
-                let tb_bg: [f32; 4] = [0.05, 0.05, 0.08, 1.0];
-                let (x0, y0, x1, y1) = self.px_to_ndc(0.0, 0.0, pw, tb_h);
-                verts.extend_from_slice(&[
-                    BgVertex {
-                        position: [x0, y0],
-                        color: tb_bg,
-                    },
-                    BgVertex {
-                        position: [x1, y0],
-                        color: tb_bg,
-                    },
-                    BgVertex {
-                        position: [x0, y1],
-                        color: tb_bg,
-                    },
-                    BgVertex {
-                        position: [x1, y0],
-                        color: tb_bg,
-                    },
-                    BgVertex {
-                        position: [x1, y1],
-                        color: tb_bg,
-                    },
-                    BgVertex {
-                        position: [x0, y1],
-                        color: tb_bg,
-                    },
-                ]);
-            }
-        }
-
-        verts
-    }
-
-    fn build_glyph_vertices(&self) -> Vec<GlyphVertex> {
-        let (cw, ch) = self.cell_size();
-        let eff_font = self.config.font.size * self.scale_factor as f32;
-        let eff_font_key = eff_font.to_bits();
-        let sb_font_size = self.status_bar_height_px() as f32 * 0.65;
-        let sb_font_key = sb_font_size.to_bits();
-        let atlas_size_f = ATLAS_SIZE as f32;
-        // Reserve extra capacity for status bar glyphs.
-        let extra: usize = self
-            .status_bar_segments
-            .iter()
-            .map(|s| s.text.len())
-            .sum::<usize>()
-            + self.status_bar_segments.len().saturating_sub(1); // separators
-        let mut verts = Vec::with_capacity(self.cells.len() * 6 + extra * 6);
-
-        for cell in &self.cells {
-            if cell.ch == ' ' {
-                continue;
-            }
-            // Registered PUA glyphs are drawn by the colour pass — skip them
-            // here so they are not also (incorrectly) sampled from the alpha
-            // atlas.
-            if self.atlas.colour_glyphs.contains_key(&cell.ch) {
-                continue;
-            }
-            // Look up glyph entry from atlas (read-only view — we cannot call
-            // get_or_insert here because we'd need &mut self; use cached value).
-            let Some(&entry) =
-                self.atlas
-                    .glyphs
-                    .get(&(cell.ch, cell.bold, cell.italic, eff_font_key))
-            else {
-                tracing::warn!(ch = %cell.ch, "glyph atlas miss — cell skipped");
-                continue;
-            };
-            let u0 = entry.x as f32 / atlas_size_f;
-            let v0 = entry.y as f32 / atlas_size_f;
-            let u1 = (entry.x + entry.w) as f32 / atlas_size_f;
-            let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
-
-            // A double-width glyph is centred over two columns, not one.
-            let advance = if cell.wide { cw * 2.0 } else { cw };
-            let top_off = self.top_bar_height_px() as f32;
-            let baseline_y = f32::from(cell.row) * ch + ch * (2.0 / 3.0) + top_off;
-            let glyph_top = baseline_y - entry.bearing_y as f32;
-            let glyph_left = f32::from(cell.col) * cw + (advance - entry.w as f32) / 2.0;
-            let (x0, y0, x1, y1) = self.px_to_ndc(
-                glyph_left,
-                glyph_top,
-                glyph_left + entry.w as f32,
-                glyph_top + entry.h as f32,
-            );
-            let c = cell.fg;
-            verts.extend_from_slice(&[
-                GlyphVertex {
-                    position: [x0, y0],
-                    tex_coords: [u0, v0],
-                    color: c,
-                },
-                GlyphVertex {
-                    position: [x1, y0],
-                    tex_coords: [u1, v0],
-                    color: c,
-                },
-                GlyphVertex {
-                    position: [x0, y1],
-                    tex_coords: [u0, v1],
-                    color: c,
-                },
-                GlyphVertex {
-                    position: [x1, y0],
-                    tex_coords: [u1, v0],
-                    color: c,
-                },
-                GlyphVertex {
-                    position: [x1, y1],
-                    tex_coords: [u1, v1],
-                    color: c,
-                },
-                GlyphVertex {
-                    position: [x0, y1],
-                    tex_coords: [u0, v1],
-                    color: c,
-                },
-            ]);
-        }
-
-        // ── Status bar glyphs ─────────────────────────────────────────────────
-        //
-        // Text is rendered at a fixed 12×18 cell size (independent of the
-        // terminal grid font) so it fits within the status_bar_height_px() strip.
-        let sb_h = self.status_bar_height_px() as f32;
-        let ph = self.size.height as f32;
-        let pw = self.size.width as f32;
-        // Status bar font metrics: fixed 12 px wide, sb_h tall.
-        let sb_cw = 7.2_f32; // ~60 % of 12 px
-        let mut col_px = 4.0_f32; // 4 px left padding
-
-        for (seg_idx, seg) in self.status_bar_segments.iter().enumerate() {
-            // Separator between segments.
-            if seg_idx > 0 {
-                col_px += sb_cw; // one character-width gap
-            }
-            let fg_color: [f32; 4] =
-                seg.style
-                    .fg
-                    .as_ref()
-                    .map_or([0.957, 0.843, 0.631, 1.0], |c| {
-                        [
-                            f32::from(c.r) / 255.0,
-                            f32::from(c.g) / 255.0,
-                            f32::from(c.b) / 255.0,
-                            1.0,
-                        ]
-                    }); // forged_terminal fg
-
-            for ch in seg.text.chars() {
-                if ch == ' ' {
-                    col_px += sb_cw;
-                    continue;
-                }
-                let Some(&entry) = self.atlas.glyphs.get(&(ch, false, false, sb_font_key)) else {
-                    tracing::warn!(ch = %ch, "glyph atlas miss — status-bar cell skipped");
-                    col_px += sb_cw;
-                    continue;
-                };
-                let u0 = entry.x as f32 / atlas_size_f;
-                let v0 = entry.y as f32 / atlas_size_f;
-                let u1 = (entry.x + entry.w) as f32 / atlas_size_f;
-                let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
-
-                // Place glyph at natural size — center horizontally in the
-                // allocated cell, use bearing_y for vertical baseline placement.
-                let strip_top = ph - sb_h;
-                let glyph_w = entry.w as f32;
-                let glyph_h = entry.h as f32;
-                let glyph_left = col_px + (sb_cw - glyph_w) / 2.0;
-                let baseline = strip_top + sb_h * (2.0 / 3.0);
-                let glyph_top = baseline - entry.bearing_y as f32;
-                let (x0, y0, x1, y1) = self.px_to_ndc(
-                    glyph_left,
-                    glyph_top,
-                    glyph_left + glyph_w,
-                    glyph_top + glyph_h,
-                );
-                let c = fg_color;
-                verts.extend_from_slice(&[
-                    GlyphVertex {
-                        position: [x0, y0],
-                        tex_coords: [u0, v0],
-                        color: c,
-                    },
-                    GlyphVertex {
-                        position: [x1, y0],
-                        tex_coords: [u1, v0],
-                        color: c,
-                    },
-                    GlyphVertex {
-                        position: [x0, y1],
-                        tex_coords: [u0, v1],
-                        color: c,
-                    },
-                    GlyphVertex {
-                        position: [x1, y0],
-                        tex_coords: [u1, v0],
-                        color: c,
-                    },
-                    GlyphVertex {
-                        position: [x1, y1],
-                        tex_coords: [u1, v1],
-                        color: c,
-                    },
-                    GlyphVertex {
-                        position: [x0, y1],
-                        tex_coords: [u0, v1],
-                        color: c,
-                    },
-                ]);
-                col_px += sb_cw;
-                // Stop if we run off the right edge.
-                if col_px >= pw {
-                    break;
-                }
-            }
-            if col_px >= pw {
-                break;
-            }
-        }
-
-        // ── Top bar glyphs ────────────────────────────────────────────────────
-        {
-            let tb_h = self.top_bar_height_px() as f32;
-            if tb_h > 0.0 {
-                let pw = self.size.width as f32;
-                let tb_cw = 7.2_f32;
-                let mut tb_col_px = 4.0_f32;
-
-                for (seg_idx, seg) in self.top_bar_segments.iter().enumerate() {
-                    if seg_idx > 0 {
-                        tb_col_px += tb_cw;
-                    }
-                    let fg_color: [f32; 4] =
-                        seg.style
-                            .fg
-                            .as_ref()
-                            .map_or([0.957, 0.843, 0.631, 1.0], |c| {
-                                [
-                                    f32::from(c.r) / 255.0,
-                                    f32::from(c.g) / 255.0,
-                                    f32::from(c.b) / 255.0,
-                                    1.0,
-                                ]
-                            });
-
-                    for ch in seg.text.chars() {
-                        if ch == ' ' {
-                            tb_col_px += tb_cw;
-                            continue;
-                        }
-                        let Some(&entry) = self.atlas.glyphs.get(&(ch, false, false, sb_font_key))
-                        else {
-                            tracing::warn!(ch = %ch, "glyph atlas miss — top-bar cell skipped");
-                            tb_col_px += tb_cw;
-                            continue;
-                        };
-                        let u0 = entry.x as f32 / atlas_size_f;
-                        let v0 = entry.y as f32 / atlas_size_f;
-                        let u1 = (entry.x + entry.w) as f32 / atlas_size_f;
-                        let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
-
-                        let glyph_w = entry.w as f32;
-                        let glyph_h = entry.h as f32;
-                        let glyph_left = tb_col_px + (tb_cw - glyph_w) / 2.0;
-                        let baseline = tb_h * (2.0 / 3.0);
-                        let glyph_top = baseline - entry.bearing_y as f32;
-                        let (x0, y0, x1, y1) = self.px_to_ndc(
-                            glyph_left,
-                            glyph_top,
-                            glyph_left + glyph_w,
-                            glyph_top + glyph_h,
-                        );
-                        let c = fg_color;
-                        verts.extend_from_slice(&[
-                            GlyphVertex {
-                                position: [x0, y0],
-                                tex_coords: [u0, v0],
-                                color: c,
-                            },
-                            GlyphVertex {
-                                position: [x1, y0],
-                                tex_coords: [u1, v0],
-                                color: c,
-                            },
-                            GlyphVertex {
-                                position: [x0, y1],
-                                tex_coords: [u0, v1],
-                                color: c,
-                            },
-                            GlyphVertex {
-                                position: [x1, y0],
-                                tex_coords: [u1, v0],
-                                color: c,
-                            },
-                            GlyphVertex {
-                                position: [x1, y1],
-                                tex_coords: [u1, v1],
-                                color: c,
-                            },
-                            GlyphVertex {
-                                position: [x0, y1],
-                                tex_coords: [u0, v1],
-                                color: c,
-                            },
-                        ]);
-                        tb_col_px += tb_cw;
-                        if tb_col_px >= pw {
-                            break;
-                        }
-                    }
-                    if tb_col_px >= pw {
-                        break;
-                    }
-                }
-            }
-        }
-
-        // ── Agent block glyphs ────────────────────────────────────────────────
-        //
-        // Render each agent block's header (model name) and content lines at
-        // the block's start_row, using the terminal cell metrics.
-        if !self.agent_blocks.is_empty() {
-            let agent_header_color: [f32; 4] = [0.4, 0.8, 1.0, 1.0]; // light-blue header
-            let agent_text_color: [f32; 4] = [0.9, 0.9, 0.9, 1.0]; // near-white body
-
-            // Helper closure: emit glyph quads for one line of text.
-            let emit_line =
-                |verts: &mut Vec<GlyphVertex>, text: &str, line_row: u16, color: [f32; 4]| {
-                    let mut col = 0u16;
-                    for glyph_ch in text.chars() {
-                        if glyph_ch == ' ' {
-                            col += 1;
-                            continue;
-                        }
-                        let Some(&entry) =
-                            self.atlas
-                                .glyphs
-                                .get(&(glyph_ch, false, false, eff_font_key))
-                        else {
-                            col += 1;
-                            continue;
-                        };
-                        let u0 = entry.x as f32 / atlas_size_f;
-                        let v0 = entry.y as f32 / atlas_size_f;
-                        let u1 = (entry.x + entry.w) as f32 / atlas_size_f;
-                        let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
-                        let baseline_y = f32::from(line_row) * ch + ch * (2.0 / 3.0);
-                        let glyph_top = baseline_y - entry.bearing_y as f32;
-                        let glyph_left = f32::from(col) * cw + (cw - entry.w as f32) / 2.0;
-                        let (x0, y0, x1, y1) = self.px_to_ndc(
-                            glyph_left,
-                            glyph_top,
-                            glyph_left + entry.w as f32,
-                            glyph_top + entry.h as f32,
-                        );
-                        verts.extend_from_slice(&[
-                            GlyphVertex {
-                                position: [x0, y0],
-                                tex_coords: [u0, v0],
-                                color,
-                            },
-                            GlyphVertex {
-                                position: [x1, y0],
-                                tex_coords: [u1, v0],
-                                color,
-                            },
-                            GlyphVertex {
-                                position: [x0, y1],
-                                tex_coords: [u0, v1],
-                                color,
-                            },
-                            GlyphVertex {
-                                position: [x1, y0],
-                                tex_coords: [u1, v0],
-                                color,
-                            },
-                            GlyphVertex {
-                                position: [x1, y1],
-                                tex_coords: [u1, v1],
-                                color,
-                            },
-                            GlyphVertex {
-                                position: [x0, y1],
-                                tex_coords: [u0, v1],
-                                color,
-                            },
-                        ]);
-                        col += 1;
-                    }
-                };
-
-            for block in self.agent_blocks.clone() {
-                let mut line_row = block.start_row;
-                // Header line: model name.
-                let header = format!("[ {} ]", block.model);
-                emit_line(&mut verts, &header, line_row, agent_header_color);
-                line_row += 1;
-                // Content lines.
-                for line_text in &block.content_lines {
-                    emit_line(&mut verts, line_text, line_row, agent_text_color);
-                    line_row += 1;
-                }
-            }
-        }
-
-        verts
-    }
-
-    /// Builds the vertex quads for registered PUA-codepoint cells, sampling the
-    /// colour atlas.
-    ///
-    /// Returns an empty vector when no visible cell resolves to a registered
-    /// colour glyph (the common case), so the colour draw is skipped entirely.
-    fn build_colour_glyph_vertices(&self) -> Vec<GlyphVertex> {
-        let (cw, ch) = self.cell_size();
-        let atlas_size_f = ATLAS_SIZE as f32;
-        let top_off = self.top_bar_height_px() as f32;
-        let mut verts: Vec<GlyphVertex> = Vec::new();
-
-        for cell in &self.cells {
-            if cell.ch == ' ' {
-                continue;
-            }
-            let Some(&entry) = self.atlas.colour_glyphs.get(&cell.ch) else {
-                continue;
-            };
-            let u0 = entry.x as f32 / atlas_size_f;
-            let v0 = entry.y as f32 / atlas_size_f;
-            let u1 = (entry.x + entry.w) as f32 / atlas_size_f;
-            let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
-
-            let baseline_y = f32::from(cell.row) * ch + ch * (2.0 / 3.0) + top_off;
-            let glyph_top = baseline_y - entry.bearing_y as f32;
-            let glyph_left = f32::from(cell.col) * cw + (cw - entry.w as f32) / 2.0;
-            let (x0, y0, x1, y1) = self.px_to_ndc(
-                glyph_left,
-                glyph_top,
-                glyph_left + entry.w as f32,
-                glyph_top + entry.h as f32,
-            );
-            // Carry the cell foreground alpha so transparency still applies; the
-            // colour shader keeps the glyph's own RGB.
-            let c = cell.fg;
-            verts.extend_from_slice(&[
-                GlyphVertex {
-                    position: [x0, y0],
-                    tex_coords: [u0, v0],
-                    color: c,
-                },
-                GlyphVertex {
-                    position: [x1, y0],
-                    tex_coords: [u1, v0],
-                    color: c,
-                },
-                GlyphVertex {
-                    position: [x0, y1],
-                    tex_coords: [u0, v1],
-                    color: c,
-                },
-                GlyphVertex {
-                    position: [x1, y0],
-                    tex_coords: [u1, v0],
-                    color: c,
-                },
-                GlyphVertex {
-                    position: [x1, y1],
-                    tex_coords: [u1, v1],
-                    color: c,
-                },
-                GlyphVertex {
-                    position: [x0, y1],
-                    tex_coords: [u0, v1],
-                    color: c,
-                },
-            ]);
-        }
-
-        verts
     }
 }
 
@@ -2607,6 +1254,10 @@ use wgpu::util::DeviceExt;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use cosmic_text::{fontdb, FontSystem};
+
     use super::*;
 
     #[test]
@@ -2672,7 +1323,6 @@ mod tests {
 
     #[test]
     fn glyph_atlas_key_distinguishes_bold_and_italic() {
-        use std::collections::HashMap;
         let sz = 28.0_f32.to_bits();
         let entry = |x: u32| GlyphEntry {
             x,
@@ -2720,7 +1370,6 @@ mod tests {
     )]
     #[test]
     fn renderer_glyph_atlas_key_stores_bold_and_regular_separately() {
-        use std::collections::HashMap;
         let sz = 28.0_f32.to_bits();
         let entry = |x: u32| GlyphEntry {
             x,
@@ -3091,7 +1740,10 @@ mod tests {
             frame += 1;
             ch = char::from_u32(ch as u32 + 1).expect("valid PUA codepoint");
         }
-        assert!(glyphs.len() >= 2, "atlas should hold at least two 16×16 slots");
+        assert!(
+            glyphs.len() >= 2,
+            "atlas should hold at least two 16×16 slots"
+        );
 
         // Current frame stamps the newest glyph as visible now → protected.
         let current_frame = frame;
@@ -3107,7 +1759,10 @@ mod tests {
             .map(|(k, e)| (*k, e.id));
         let (vkey, vid) = victim.expect("an evictable glyph must exist");
         assert_eq!(vkey, '\u{E000}', "the oldest glyph must be chosen");
-        assert_ne!(vkey, newest, "the current-frame glyph must never be evicted");
+        assert_ne!(
+            vkey, newest,
+            "the current-frame glyph must never be evicted"
+        );
 
         // Deallocating the victim must free room for a new glyph.
         alloc.deallocate(vid.expect("victim carries an alloc id"));

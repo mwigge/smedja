@@ -28,87 +28,37 @@ pub mod sandbox;
 pub mod security;
 pub mod stream_server;
 
+mod exec;
+pub(crate) use exec::{exec_bash, exec_bash_ext};
+
+mod socket;
+
+mod bootstrap;
+use bootstrap::{
+    init_tracing, sd_notify_ready, spawn_blocking_bounded, spawn_supervised, spawn_worker,
+};
+
+mod router;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use smedja_adapter::types::Message as AdapterMessage;
-use smedja_assayer::{Assayer, WorktreePool};
+use smedja_assayer::Assayer;
 
 use crate::price_table::PriceTable;
 use crate::provider_pool::{build_provider_pool, ProviderPool};
 use smedja_bellows::{Dispatcher, TurnEvent};
 use smedja_ingot::{Ingot, IngotHandle, McpServer};
-use smedja_rpc::{codes, router::Router, server::Server, RpcError};
+use smedja_rpc::{codes, server::Server, RpcError};
 use smedja_vault::Vault;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::cowork::CoworkGate;
-
-/// Spawns a long-lived background subsystem, logging if it ever panics or exits.
-///
-/// The subsystem futures wrapped here (`serve` loops, GC loops, subscriber
-/// loops) are meant to run for the daemon's whole lifetime, so *either* a panic
-/// *or* a normal return means that subsystem silently died. A bare
-/// `tokio::spawn` swallows both; this wrapper makes the death visible in the
-/// logs. Behaviour is otherwise identical to `tokio::spawn`.
-fn spawn_supervised<F>(name: &'static str, fut: F) -> tokio::task::JoinHandle<()>
-where
-    F: std::future::Future<Output = ()> + Send + 'static,
-{
-    use futures_util::future::FutureExt as _;
-    tokio::spawn(async move {
-        match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
-            Ok(()) => tracing::error!(task = name, "supervised subsystem exited unexpectedly"),
-            Err(_) => tracing::error!(task = name, "supervised subsystem panicked"),
-        }
-    })
-}
-
-/// Runs `job` on the blocking pool, but only after acquiring a permit from
-/// `sem`, so at most `sem`'s permit-count jobs run concurrently. Awaiting the
-/// permit provides backpressure: an unbounded fan-out of `spawn_blocking` can
-/// otherwise saturate the blocking pool and starve DB writes.
-async fn spawn_blocking_bounded<F>(sem: &Arc<tokio::sync::Semaphore>, job: F)
-where
-    F: FnOnce() + Send + 'static,
-{
-    // The semaphore is never closed, so acquire only fails if it is — treat that
-    // defensively as "skip" rather than unwrapping.
-    let Ok(permit) = Arc::clone(sem).acquire_owned().await else {
-        return;
-    };
-    tokio::task::spawn_blocking(move || {
-        // Held for the job's duration; dropped (releasing the permit) on return.
-        let _permit = permit;
-        job();
-    });
-}
-
-fn socket_path() -> PathBuf {
-    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
-        tracing::warn!("XDG_RUNTIME_DIR not set; using /tmp for socket — set XDG_RUNTIME_DIR for a secure socket location");
-        "/tmp".into()
-    });
-    PathBuf::from(base).join("smdjad.sock")
-}
-
-/// RAII guard that removes the Unix socket file when dropped.
-///
-/// This ensures the socket is cleaned up on both clean shutdown and error
-/// propagation (e.g. when `server.serve()` returns `Err` and `?` exits early).
-struct SocketGuard {
-    path: PathBuf,
-}
-
-impl Drop for SocketGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
 
 /// Assembles a conversation transcript for compaction from a checkpoint's
 /// `messages_json` blob, routing it through working-memory strata (deep tier) so
@@ -192,169 +142,6 @@ pub(crate) fn missing_param(name: &str) -> RpcError {
         codes::INVALID_PARAMS,
         format!("missing required param: {name}"),
     )
-}
-
-/// Timeout for `exec_bash` commands (git diff on large repos, cargo clippy, etc.).
-const EXEC_BASH_TIMEOUT_SECS: u64 = 30;
-
-/// Maximum per-call timeout accepted via the `timeout_secs` input field.
-pub(crate) const SMEDJA_BASH_MAX_TIMEOUT_SECS: u64 = 600;
-
-/// Executes a bash command in `workspace` using `sh -c`, returning stdout or a
-/// formatted error string. Bounded by [`EXEC_BASH_TIMEOUT_SECS`]; a hung command
-/// (e.g. git diff on a large repo) returns a timeout error rather than blocking.
-pub(crate) async fn exec_bash(cmd: &str, workspace: &std::path::Path) -> String {
-    exec_bash_ext(cmd, workspace, None, None, None).await
-}
-
-/// Extended `exec_bash` supporting per-call timeout, extra env vars, and stdin.
-///
-/// Uses spawn-based execution so stdout/stderr are captured concurrently.
-/// On timeout the child is killed and any partial stdout already read is
-/// returned with a timeout suffix. Stderr is appended as a `[stderr]` block
-/// when the exit status is non-zero.
-#[allow(clippy::items_after_statements)]
-pub(crate) async fn exec_bash_ext(
-    cmd: &str,
-    workspace: &std::path::Path,
-    timeout_secs: Option<u64>,
-    env_extra: Option<std::collections::HashMap<String, String>>,
-    stdin_bytes: Option<Vec<u8>>,
-) -> String {
-    use std::process::Stdio;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-    let timeout = timeout_secs.map_or(EXEC_BASH_TIMEOUT_SECS, |t| {
-        t.min(SMEDJA_BASH_MAX_TIMEOUT_SECS)
-    });
-
-    let mut builder = tokio::process::Command::new("sh");
-    builder
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(workspace)
-        .stdin(if stdin_bytes.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    if let Some(ref env_map) = env_extra {
-        for (k, v) in env_map {
-            builder.env(k, v);
-        }
-    }
-
-    let mut child = match builder.spawn() {
-        Ok(c) => c,
-        Err(e) => return format!("error: {e}"),
-    };
-
-    async fn read_into(
-        mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
-        target: Arc<std::sync::Mutex<String>>,
-    ) {
-        let mut chunk = [0u8; 8192];
-        loop {
-            let n = match reader.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            let text = String::from_utf8_lossy(&chunk[..n]);
-            if let Ok(mut buf) = target.lock() {
-                buf.push_str(&text);
-            }
-        }
-    }
-
-    fn snapshot(target: &Arc<std::sync::Mutex<String>>) -> String {
-        target
-            .lock()
-            .map_or_else(|_| String::new(), |buf| buf.clone())
-    }
-
-    async fn finish_reader(
-        task: tokio::task::JoinHandle<()>,
-        target: &Arc<std::sync::Mutex<String>>,
-    ) -> String {
-        let abort = task.abort_handle();
-        if tokio::time::timeout(std::time::Duration::from_millis(250), task)
-            .await
-            .is_err()
-        {
-            abort.abort();
-        }
-        snapshot(target)
-    }
-
-    let stdout_reader = child.stdout.take().expect("stdout piped");
-    let stderr_reader = child.stderr.take().expect("stderr piped");
-    let stdout_buf = Arc::new(std::sync::Mutex::new(String::new()));
-    let stderr_buf = Arc::new(std::sync::Mutex::new(String::new()));
-    let stdout_task = tokio::spawn(read_into(stdout_reader, Arc::clone(&stdout_buf)));
-    let stderr_task = tokio::spawn(read_into(stderr_reader, Arc::clone(&stderr_buf)));
-
-    // Feed stdin only AFTER the stdout/stderr readers are draining. Writing all
-    // of stdin first (as before) deadlocks whenever the child emits more than one
-    // pipe buffer (~64 KB) of output: the child blocks on a full stdout pipe that
-    // nothing is reading yet, while we block writing stdin. Running the writer on
-    // its own task lets both directions make progress; dropping the handle on
-    // completion signals EOF to the child.
-    if let Some(bytes) = stdin_bytes {
-        if let Some(mut h) = child.stdin.take() {
-            tokio::spawn(async move {
-                let _ = h.write_all(&bytes).await;
-                // `h` drops here, closing the child's stdin (EOF).
-            });
-        }
-    }
-
-    match tokio::time::timeout(std::time::Duration::from_secs(timeout), child.wait()).await {
-        Ok(Ok(status)) => {
-            let out = finish_reader(stdout_task, &stdout_buf).await;
-            let err = finish_reader(stderr_task, &stderr_buf).await;
-            if status.success() {
-                out
-            } else {
-                let mut result = format!("error: exit status {status}\n");
-                result.push_str(&out);
-                if !err.is_empty() {
-                    if !result.ends_with('\n') {
-                        result.push('\n');
-                    }
-                    result.push_str("[stderr]\n");
-                    result.push_str(&err);
-                }
-                result
-            }
-        }
-        Ok(Err(e)) => format!("error: {e}"),
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(100), child.wait()).await;
-            let out = snapshot(&stdout_buf);
-            let err = snapshot(&stderr_buf);
-            stdout_task.abort();
-            stderr_task.abort();
-            let mut result = out;
-            if !err.is_empty() {
-                if !result.ends_with('\n') {
-                    result.push('\n');
-                }
-                result.push_str("[stderr]\n");
-                result.push_str(&err);
-            }
-            if !result.ends_with('\n') && !result.is_empty() {
-                result.push('\n');
-            }
-            result.push_str("error: command timed out after ");
-            result.push_str(&timeout.to_string());
-            result.push('s');
-            result
-        }
-    }
 }
 
 /// Builds the `turn.subscribe` response envelope from a task's current state.
@@ -463,7 +250,7 @@ pub(crate) async fn await_turn_terminal(
 /// Executes a single turn: loads the task, calls the LLM, handles tool calls,
 /// stores the final response.
 #[allow(clippy::too_many_arguments)] // forwarded directly to TurnOrchestrator
-async fn run_turn(
+pub(crate) async fn run_turn(
     ingot: IngotHandle,
     dispatcher: Arc<Dispatcher>,
     session_id: String,
@@ -517,81 +304,6 @@ async fn run_turn(
     )
     .run(session_id, turn_id)
     .await;
-}
-
-/// Subscribes to [`TurnEvent::Started`] and spawns a [`run_turn`] task for each.
-///
-/// Owns its `JoinSet` exclusively — no shared mutex. Finished tasks are reaped
-/// via `try_join_next` so the set size tracks only *in-flight* work. When
-/// `work_rx` closes (all senders dropped), the worker exits its loop and
-/// returns the set so the caller can drain any remaining tasks at shutdown.
-///
-/// Started events arrive via a dedicated `work_rx` mpsc channel (sent by the
-/// `turn.submit` handler) rather than the broadcast, so they cannot be dropped
-/// even when the broadcast is temporarily full from delta events.
-#[allow(clippy::too_many_arguments)] // forwarded directly to TurnOrchestrator
-fn spawn_worker(
-    ingot: IngotHandle,
-    dispatcher: Arc<Dispatcher>,
-    gates: Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
-    pool: Arc<ProviderPool>,
-    assayer: Arc<Assayer>,
-    price_table: Arc<PriceTable>,
-    vault: Arc<Mutex<Vault>>,
-    embedder: Arc<dyn embedder_port::Embedder>,
-    provider_sessions: orchestrator::ProviderSessions,
-    cache_aligners: orchestrator::CacheAligners,
-    mut work_rx: tokio::sync::mpsc::Receiver<(String, String)>,
-    turn_registry: handlers::TurnRegistry,
-    active_change: Option<Arc<str>>,
-    lsp_manager: Arc<smedja_lsp::LspManager>,
-) -> tokio::task::JoinHandle<tokio::task::JoinSet<()>> {
-    tokio::spawn(async move {
-        let mut set = tokio::task::JoinSet::new();
-        loop {
-            let Some((session_id, turn_id)) = work_rx.recv().await else {
-                break; // all senders dropped — daemon shutting down
-            };
-            let ig = ingot.clone();
-            let dp = Arc::clone(&dispatcher);
-            let g = Arc::clone(&gates);
-            let pl = Arc::clone(&pool);
-            let as_ = Arc::clone(&assayer);
-            let pt = Arc::clone(&price_table);
-            let vt = Arc::clone(&vault);
-            let em = Arc::clone(&embedder);
-            let ps = Arc::clone(&provider_sessions);
-            let ca = Arc::clone(&cache_aligners);
-            let reg = Arc::clone(&turn_registry);
-            let ac = active_change.clone();
-            let lsp = Arc::clone(&lsp_manager);
-            let handle = set.spawn(run_turn(
-                ig,
-                dp,
-                session_id,
-                turn_id.clone(),
-                g,
-                pl,
-                as_,
-                pt,
-                vt,
-                em,
-                ps,
-                ca,
-                Arc::clone(&turn_registry),
-                ac,
-                lsp,
-            ));
-            // Register the abort handle so `turn.cancel` can interrupt this turn.
-            if let Ok(mut map) = reg.lock() {
-                map.insert(turn_id, handle);
-            }
-            // Reap finished tasks so the set tracks only in-flight work.
-            while set.try_join_next().is_some() {}
-            tracing::debug!(in_flight = set.len(), "turn spawned");
-        }
-        set
-    })
 }
 
 /// Returns `true` when `addr` falls in a range the daemon must never reach
@@ -660,218 +372,6 @@ pub(crate) fn is_safe_mcp_url(url: &str) -> bool {
     true
 }
 
-/// Registers an RPC handler with boilerplate-free cloning.
-///
-/// Expands to: clone `$state`, register a closure that re-clones state per
-/// call, and delegates to `$handler(state, params)`. This eliminates the
-/// 4-line let+register+move+async pattern that would otherwise repeat for
-/// every method.
-macro_rules! route {
-    ($router:expr, $method:literal, $state:expr, $handler:path) => {{
-        let s = $state.clone();
-        $router.register($method, move |params: Value| {
-            let state = s.clone();
-            async move { $handler(state, params).await }
-        });
-    }};
-}
-
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn build_router(
-    ingot: &IngotHandle,
-    dispatcher: &Arc<Dispatcher>,
-    gates: &Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
-    pool: &Arc<ProviderPool>,
-    assayer: &Arc<Assayer>,
-    startup_runner: &Arc<str>,
-    startup_model: &Arc<str>,
-    price_table: &Arc<PriceTable>,
-    vault: &Arc<Mutex<Vault>>,
-    embedder: &Arc<dyn embedder_port::Embedder>,
-    provider_sessions: &orchestrator::ProviderSessions,
-    cache_aligners: &orchestrator::CacheAligners,
-    task_set: &Arc<Mutex<tokio::task::JoinSet<()>>>,
-    lsp_manager: &Arc<smedja_lsp::LspManager>,
-    work_tx: tokio::sync::mpsc::Sender<(String, String)>,
-    turn_registry: handlers::TurnRegistry,
-    active_change: Option<Arc<str>>,
-) -> Router {
-    let mut router = Router::new();
-
-    // The shared handler state bundle: every handler closure clones this and
-    // calls the corresponding module function. This is the only construction
-    // point; the registrations below are thin wiring over `handlers::*`.
-    let state = handlers::HandlerState {
-        ingot: ingot.clone(),
-        dispatcher: Arc::clone(dispatcher),
-        gates: Arc::clone(gates),
-        provider_pool: Arc::clone(pool),
-        // Worktree pool shared by task.parallel and task.cancel.
-        worktree_pool: Arc::new(Mutex::new(WorktreePool::default())),
-        assayer: Arc::clone(assayer),
-        price_table: Arc::clone(price_table),
-        vault: Arc::clone(vault),
-        embedder: Arc::clone(embedder),
-        provider_sessions: Arc::clone(provider_sessions),
-        cache_aligners: Arc::clone(cache_aligners),
-        task_set: Arc::clone(task_set),
-        startup_runner: Arc::clone(startup_runner),
-        startup_model: Arc::clone(startup_model),
-        lsp_manager: Arc::clone(lsp_manager),
-        active_change,
-        work_tx,
-        turn_registry,
-    };
-
-    router.register("ping", |_| async { Ok(json!("pong")) });
-
-    route!(router, "session.create", state, handlers::session::create);
-    route!(router, "session.list", state, handlers::session::list);
-    route!(router, "session.search", state, handlers::session::search);
-    route!(router, "session.get", state, handlers::session::get);
-    route!(router, "session.delete", state, handlers::session::delete);
-    route!(router, "session.fork", state, handlers::session::fork);
-    route!(
-        router,
-        "session.takeover",
-        state,
-        handlers::session::takeover
-    );
-    route!(
-        router,
-        "session.set_model",
-        state,
-        handlers::session::set_model
-    );
-    route!(
-        router,
-        "session.set_runner",
-        state,
-        handlers::session::set_runner
-    );
-    route!(
-        router,
-        "session.set_tier",
-        state,
-        handlers::session::set_tier
-    );
-    route!(
-        router,
-        "session.set_mode",
-        state,
-        handlers::session::set_mode
-    );
-    route!(
-        router,
-        "session.set_title",
-        state,
-        handlers::session::set_title
-    );
-    route!(router, "session.context", state, handlers::session::context);
-    route!(
-        router,
-        "session.token_usage",
-        state,
-        handlers::session::token_usage
-    );
-    route!(router, "session.history", state, handlers::session::history);
-    route!(
-        router,
-        "session.checkpoint.list",
-        state,
-        handlers::checkpoint::list
-    );
-    route!(
-        router,
-        "session.rollback",
-        state,
-        handlers::checkpoint::rollback
-    );
-    route!(
-        router,
-        "session.compact",
-        state,
-        handlers::checkpoint::compact
-    );
-    route!(router, "session.cost", state, handlers::cost::cost);
-    route!(
-        router,
-        "cost.active_change",
-        state,
-        handlers::cost::active_change
-    );
-    route!(router, "runner.list", state, handlers::session::runner_list);
-    route!(router, "turn.submit", state, handlers::turn::submit);
-    route!(router, "turn.cancel", state, handlers::turn::cancel);
-    // Blocks until terminal status or 60 s deadline; event-driven, no poll.
-    route!(router, "turn.subscribe", state, handlers::turn::subscribe);
-    route!(router, "task.get", state, handlers::task::get);
-    route!(router, "task.list", state, handlers::task::list);
-    route!(router, "task.create", state, handlers::task::create);
-    route!(router, "task.close", state, handlers::task::close);
-    route!(router, "task.parallel", state, handlers::task::parallel);
-    route!(router, "task.cancel", state, handlers::task::cancel);
-    route!(router, "metrics.summary", state, handlers::metrics::summary);
-    route!(router, "savings.summary", state, handlers::savings::summary);
-    route!(router, "cowork.set", state, handlers::audit::set);
-    route!(router, "cowork.set_mode", state, handlers::audit::set_mode);
-    route!(
-        router,
-        "cowork.gate_tool",
-        state,
-        handlers::audit::gate_tool
-    );
-    route!(router, "cowork.approve", state, handlers::audit::approve);
-    route!(router, "cowork.deny", state, handlers::audit::deny);
-    route!(router, "cowork.modify", state, handlers::audit::modify);
-    route!(router, "cowork.pending", state, handlers::audit::pending);
-    route!(router, "mcp.register", state, handlers::mcp::register);
-    route!(router, "mcp.list", state, handlers::mcp::list);
-    route!(router, "mcp.remove", state, handlers::mcp::remove);
-    route!(router, "mcp.refresh", state, handlers::mcp::refresh);
-    route!(router, "local.models", state, handlers::local::models);
-    route!(router, "local.gpu", state, handlers::local::gpu);
-    route!(router, "local.swap", state, handlers::local::swap);
-    route!(router, "local.install", state, handlers::local::install);
-    route!(router, "loop.create", state, handlers::loops::create);
-    route!(router, "loop.status", state, handlers::loops::status);
-    route!(router, "loop.cancel", state, handlers::loops::cancel);
-    route!(router, "loop.list", state, handlers::loops::list);
-    route!(router, "loop.retire", state, handlers::loops::retire);
-    route!(
-        router,
-        "loop.list_by_status",
-        state,
-        handlers::loops::list_by_status
-    );
-    // Drives the smedja-loop engine: policy hash, evaluator separation, slice pipeline.
-    route!(router, "loop.run", state, handlers::loops::run);
-    // Re-enters drive() from the last checkpointed slice index.
-    route!(router, "loop.resume", state, handlers::loops::resume);
-    route!(router, "audit.list", state, handlers::audit::list);
-    // Bounded read-only repo/PR/branch audit; returns findings + report.
-    route!(router, "audit.run", state, handlers::auditor::run);
-    // Resolves (role, complexity?) through the assayer.
-    route!(router, "agent.routing", state, handlers::routing::routing);
-    route!(router, "lsp.status", state, handlers::lsp::status);
-    route!(router, "lsp.diagnostics", state, handlers::lsp::diagnostics);
-    route!(router, "graph.index", state, handlers::graph::index);
-    route!(router, "graph.query", state, handlers::graph::query);
-    route!(router, "graph.status", state, handlers::graph::status);
-    route!(router, "vault.reembed", state, handlers::vault::reembed);
-    route!(router, "quality.review", state, handlers::quality::review);
-
-    // quota.limit — reads SMEDJA_DAILY_TOKEN_LIMIT env var; no handler state needed.
-    router.register("quota.limit", |_| async {
-        let limit = std::env::var("SMEDJA_DAILY_TOKEN_LIMIT")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok());
-        Ok(serde_json::json!({ "daily_tokens": limit }))
-    });
-
-    router
-}
-
 /// Writes the ACP auth token to the runtime secret file with 0o600 permissions.
 ///
 /// Path preference: `$XDG_RUNTIME_DIR/smdjad.secret` → `$HOME/.cache/smdjad.secret`
@@ -937,51 +437,6 @@ fn resolve_workspace_root() -> std::path::PathBuf {
     let env = std::env::var("SMEDJA_WORKSPACE").ok();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     resolve_workspace_root_from(env, cwd)
-}
-
-/// Signals `READY=1` to systemd via `$NOTIFY_SOCKET` (for `Type=notify` units),
-/// after the socket is bound and the database is open. A no-op when not run
-/// under systemd (the variable is absent) or off Linux.
-#[cfg(target_os = "linux")]
-fn sd_notify_ready() {
-    let Ok(path) = std::env::var("NOTIFY_SOCKET") else {
-        return;
-    };
-    let Ok(sock) = std::os::unix::net::UnixDatagram::unbound() else {
-        return;
-    };
-    let sent = if let Some(name) = path.strip_prefix('@') {
-        // Abstract namespace socket (common for user services).
-        use std::os::linux::net::SocketAddrExt as _;
-        std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
-            .and_then(|addr| sock.send_to_addr(b"READY=1", &addr))
-            .is_ok()
-    } else {
-        sock.send_to(b"READY=1", &path).is_ok()
-    };
-    if sent {
-        tracing::debug!("notified systemd: READY=1");
-    }
-}
-
-/// No-op readiness notification off Linux (systemd is Linux-only).
-#[cfg(not(target_os = "linux"))]
-fn sd_notify_ready() {}
-
-/// Initialises the tracing subscriber, honouring `SMEDJA_LOG_FORMAT`.
-///
-/// `text` (default) uses the human-readable formatter; `json` emits structured
-/// JSON for log-ingestion pipelines (Loki, `OpenSearch`); an unrecognised value
-/// falls back to text with a warning.
-fn init_tracing() {
-    match std::env::var("SMEDJA_LOG_FORMAT").as_deref() {
-        Ok("json") => tracing_subscriber::fmt().json().init(),
-        Ok("text" | "") | Err(_) => tracing_subscriber::fmt().init(),
-        Ok(other) => {
-            tracing_subscriber::fmt().init();
-            tracing::warn!(format = other, "unrecognised SMEDJA_LOG_FORMAT; using text");
-        }
-    }
 }
 
 #[allow(clippy::too_many_lines)] // startup sequence: bind, migrate, orphan sweep, spawn workers
@@ -1052,7 +507,7 @@ async fn main() -> anyhow::Result<()> {
         info!("SMEDJA_OTLP_ENDPOINT not set; trace destination: structured logs only (set the endpoint to export OTLP spans)");
     }
 
-    let path = socket_path();
+    let path = socket::socket_path();
 
     // Single-instance guard: refuse to hijack a socket a live daemon is already
     // serving. A blind `remove_file` + rebind let a second daemon steal the
@@ -1085,7 +540,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let listener = bind_result?;
     // Guard removes the socket on any exit path (clean shutdown or error propagation).
-    let _socket_guard = SocketGuard { path: path.clone() };
+    let _socket_guard = socket::SocketGuard { path: path.clone() };
 
     // Re-assert 0o600 as defence in depth (the umask above already created it so).
     #[cfg(unix)]
@@ -1287,8 +742,7 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tokio::time::sleep(std::time::Duration::from_mins(5)).await;
                 let mut map = ps.lock().await;
-                let evicted =
-                    orchestrator::gc_provider_sessions(&mut map, SESSION_CAP, idle);
+                let evicted = orchestrator::gc_provider_sessions(&mut map, SESSION_CAP, idle);
                 if evicted > 0 {
                     tracing::info!(
                         "provider_sessions: evicted {evicted} idle entries (cap exceeded, {} retained)",
@@ -1333,7 +787,7 @@ async fn main() -> anyhow::Result<()> {
     let turn_registry: handlers::TurnRegistry =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
-    let router = build_router(
+    let router = router::build_router(
         &ingot,
         &dispatcher,
         &gates,
@@ -1460,7 +914,7 @@ async fn main() -> anyhow::Result<()> {
     let delta_store = stream_server::spawn_delta_buffer(&dispatcher);
     let stream_sock_path = stream_server::stream_socket_path(&path);
     let _ = std::fs::remove_file(&stream_sock_path);
-    let _stream_sock_guard = SocketGuard {
+    let _stream_sock_guard = socket::SocketGuard {
         path: stream_sock_path.clone(),
     };
     // Bind under a 0077 umask so the sibling socket is never world-accessible.
@@ -1478,11 +932,8 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(
-                    &stream_sock_path,
-                    std::fs::Permissions::from_mode(0o600),
-                )
-                .map_err(|e| anyhow::anyhow!("failed to set stream socket permissions: {e}"))?;
+                std::fs::set_permissions(&stream_sock_path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| anyhow::anyhow!("failed to set stream socket permissions: {e}"))?;
             }
             info!(path = %stream_sock_path.display(), "turn stream server listening");
             let ds = Arc::clone(&delta_store);
@@ -1499,7 +950,7 @@ async fn main() -> anyhow::Result<()> {
     // Agent-event push server — sibling socket for live pane telemetry.
     let agent_sock_path = agent_server::agent_socket_path(&path);
     let _ = std::fs::remove_file(&agent_sock_path);
-    let _agent_sock_guard = SocketGuard {
+    let _agent_sock_guard = socket::SocketGuard {
         path: agent_sock_path.clone(),
     };
     // Bind under a 0077 umask so the sibling socket is never world-accessible.
@@ -1517,11 +968,8 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(
-                    &agent_sock_path,
-                    std::fs::Permissions::from_mode(0o600),
-                )
-                .map_err(|e| anyhow::anyhow!("failed to set agent socket permissions: {e}"))?;
+                std::fs::set_permissions(&agent_sock_path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| anyhow::anyhow!("failed to set agent socket permissions: {e}"))?;
             }
             info!(path = %agent_sock_path.display(), "agent event server listening");
             let dp = Arc::clone(&dispatcher);

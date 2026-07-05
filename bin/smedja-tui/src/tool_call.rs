@@ -238,7 +238,11 @@ pub fn tool_card_line(
 
     if !input.is_empty() {
         let title: String = input.chars().take(72).collect();
-        let ellipsis = if input.chars().count() > 72 { "…" } else { "" };
+        let ellipsis = if input.chars().count() > 72 {
+            "…"
+        } else {
+            ""
+        };
         spans.push(Span::styled(format!("  {title}{ellipsis}"), arg_style));
     }
 
@@ -274,7 +278,13 @@ pub(crate) fn tool_call_card(
 /// status pill. Used where a full card (known width) is drawn rather than the
 /// collapsed transcript line.
 #[must_use]
-pub fn card_header(name: &str, title: &str, width: usize, no_color: bool, status: CardStatus) -> Line<'static> {
+pub fn card_header(
+    name: &str,
+    title: &str,
+    width: usize,
+    no_color: bool,
+    status: CardStatus,
+) -> Line<'static> {
     let kind = tool_kind_of(name);
     let p = palette();
     let pk = match status {
@@ -322,7 +332,10 @@ mod tests {
     #[test]
     fn tool_kind_maps_mcp_namespaced() {
         assert_eq!(tool_kind_of("mcp__github__search_issues"), ToolKind::Search);
-        assert_eq!(tool_kind_of("mcp__drive__read_file_content"), ToolKind::Read);
+        assert_eq!(
+            tool_kind_of("mcp__drive__read_file_content"),
+            ToolKind::Read
+        );
         assert_eq!(tool_kind_of("mcp__gmail__create_draft"), ToolKind::Edit);
     }
 
@@ -398,7 +411,13 @@ mod tests {
 
     #[test]
     fn mcp_line_carries_tag() {
-        let line = tool_card_line("mcp__github__list_issues", "repo:x", true, CardStatus::Ok, None);
+        let line = tool_card_line(
+            "mcp__github__list_issues",
+            "repo:x",
+            true,
+            CardStatus::Ok,
+            None,
+        );
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("mcp:"), "mcp tag present: {text}");
     }

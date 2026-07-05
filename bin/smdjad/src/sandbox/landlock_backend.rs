@@ -36,8 +36,8 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use landlock::{
-    Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
-    RulesetStatus, ABI,
+    Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreated,
+    RulesetCreatedAttr, RulesetStatus, ABI,
 };
 
 use super::{
