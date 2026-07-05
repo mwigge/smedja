@@ -513,15 +513,19 @@ pub async fn build_provider_pool() -> ProviderPool {
         info!(runner = "pool", "provider ready");
     }
 
-    // 6. Minimax
+    // 6. Minimax — keyed under its own runner so it is routable by name and does
+    //    not shadow a local endpoint sharing the (Local, _) key space.
     if let Some(p) = MinimaxProvider::detect() {
-        add!(Runner::Local, Tier::Fast, p, "minimax", "MiniMax-M2");
+        add!(Runner::Minimax, Tier::Fast, p, "minimax", "MiniMax-M2");
         info!(runner = "minimax", "provider ready");
     }
 
-    // 6. Berget
+    // 7. Berget — keyed under Runner::Berget. Registering it under Runner::Local
+    //    collided with the local rs-llmctl endpoint at (Local, Local): whichever
+    //    probed second overwrote the other, so a healthy local endpoint made
+    //    Berget dead config. Its own runner key lets both coexist.
     if let Some(p) = BergetProvider::detect() {
-        add!(Runner::Local, Tier::Local, p, "berget", "gpt-4o-mini");
+        add!(Runner::Berget, Tier::Local, p, "berget", "gpt-4o-mini");
         info!(runner = "berget", "provider ready");
     }
 
@@ -681,6 +685,37 @@ mod tests {
         let previous = local.set_active_model_id("llama3-8b");
         assert_eq!(previous.as_deref(), Some("qwen3-14b"));
         assert_eq!(local.active_model_id().as_deref(), Some("llama3-8b"));
+    }
+
+    #[test]
+    fn berget_and_local_coexist_under_distinct_keys() {
+        // With Berget keyed under its own runner, a healthy local endpoint and
+        // Berget both live in the pool and each resolves to its own provider.
+        let pool = pool_with(vec![
+            ((Runner::Local, Tier::Local), "local", "local"),
+            ((Runner::Berget, Tier::Local), "berget", "gpt-4o-mini"),
+        ]);
+        assert_eq!(
+            pool.get(Runner::Local, Tier::Local).map(|e| e.runner_name),
+            Some("local"),
+        );
+        assert_eq!(
+            pool.get(Runner::Berget, Tier::Local).map(|e| e.runner_name),
+            Some("berget"),
+            "Berget stays routable alongside a healthy local endpoint",
+        );
+
+        // Contrast — the pre-fix keying put both under (Local, Local), which
+        // collapses to a single entry so whichever probed second silently wins.
+        let collided = pool_with(vec![
+            ((Runner::Local, Tier::Local), "local", "local"),
+            ((Runner::Local, Tier::Local), "berget", "gpt-4o-mini"),
+        ]);
+        assert_eq!(
+            collided.list_all_entries().len(),
+            1,
+            "a shared key drops one provider",
+        );
     }
 
     #[test]

@@ -268,6 +268,10 @@ impl Vault {
             collected?
         };
 
+        // Collect the ids of near-duplicates the incoming entry supersedes. The
+        // actual deletes are deferred so they can be applied atomically with the
+        // insert below — see the transaction in step 4.
+        let mut ids_to_delete: Vec<String> = Vec::new();
         for row in rows {
             let Some(stored) = decode_embedding(&row.embedding) else {
                 tracing::warn!(
@@ -282,11 +286,8 @@ impl Vault {
                     // Existing entry is at least as good — discard incoming.
                     return Ok(());
                 }
-                // Incoming is longer — remove the existing entry.
-                self.conn.execute(
-                    "DELETE FROM vault_entries WHERE id = ?1",
-                    rusqlite::params![row.id],
-                )?;
+                // Incoming is longer — mark the existing entry for removal.
+                ids_to_delete.push(row.id);
             }
         }
 
@@ -300,7 +301,18 @@ impl Vault {
         let embedding_bytes = bytemuck::cast_slice::<f32, u8>(&entry.embedding);
         let payload_str = serde_json::to_string(&entry.payload)?;
 
-        self.conn.execute(
+        // Apply the dedup delete(s) and the insert in a single transaction so a
+        // crash or error can never leave the vault in a state where the superseded
+        // entry has been deleted but its replacement is absent. rusqlite rolls the
+        // transaction back automatically if `tx` is dropped without `commit()`.
+        let tx = self.conn.transaction()?;
+        for id in &ids_to_delete {
+            tx.execute(
+                "DELETE FROM vault_entries WHERE id = ?1",
+                rusqlite::params![id],
+            )?;
+        }
+        tx.execute(
             "INSERT OR REPLACE INTO vault_entries \
              (id, embedding, payload, namespace, content, source_file, added_by, chunk_index, parent_id, created_at, embedder_model_id, dim) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -319,6 +331,7 @@ impl Vault {
                 i64::try_from(entry.dim).unwrap_or(i64::MAX),
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -566,10 +579,15 @@ impl Vault {
     /// Returns [`VaultError::Db`] if the database write fails.
     #[must_use = "check the Result to confirm the embedder identity was stored"]
     pub fn set_embedder_identity(&mut self, identity: &EmbedderIdentity) -> Result<(), VaultError> {
-        let json = format!(
-            r#"{{"model":"{}","dimensions":{}}}"#,
-            identity.model, identity.dimensions
-        );
+        // Build the JSON with serde_json so a model name containing quotes,
+        // backslashes, or control characters is escaped correctly. Hand-rolled
+        // string interpolation would emit invalid JSON that get_embedder_identity
+        // could never parse back.
+        let json = serde_json::json!({
+            "model": identity.model,
+            "dimensions": identity.dimensions,
+        })
+        .to_string();
         self.conn.execute(
             "INSERT OR REPLACE INTO vault_meta (id, meta_key, meta_val) VALUES (1, 'embedder', ?1)",
             rusqlite::params![json],
@@ -1116,6 +1134,69 @@ mod tests {
         let stored = vault.get_embedder_identity().unwrap().unwrap();
         assert_eq!(stored.model, "text-embedding-3-small");
         assert_eq!(stored.dimensions, 1536);
+    }
+
+    #[test]
+    fn embedder_identity_round_trips_with_special_chars_in_model_name() {
+        // A model name containing a quote and a backslash must survive
+        // set -> get byte-identically. Before the serde_json fix, the value was
+        // interpolated raw into a JSON string literal, producing invalid JSON
+        // that get_embedder_identity could never parse (parse error forever).
+        let mut vault = Vault::open_in_memory().unwrap();
+        let tricky = r#"my"model\with/control"#;
+        vault
+            .set_embedder_identity(&EmbedderIdentity {
+                model: tricky.to_string(),
+                dimensions: 384,
+            })
+            .unwrap();
+
+        let stored = vault
+            .get_embedder_identity()
+            .expect("stored identity must be valid JSON and parse back")
+            .expect("an identity was set, so it must be present");
+        assert_eq!(
+            stored.model, tricky,
+            "model name must round-trip byte-identically"
+        );
+        assert_eq!(stored.dimensions, 384);
+    }
+
+    #[test]
+    fn insert_dedup_delete_and_replace_are_atomic() {
+        // Insert A, then insert a near-duplicate B (cosine 1.0 here) with LONGER
+        // content. That path deletes A and inserts B. Both statements now run in a
+        // single transaction, so the vault can never be observed in a state where A
+        // has been deleted but B is absent. We assert the committed end state: the
+        // vault holds exactly one entry, and it is B (A gone, B present).
+        let mut vault = Vault::open_in_memory().unwrap();
+
+        let mut a = entry("a", vec![1.0_f32, 0.0]);
+        a.namespace = "default".to_string();
+        a.content = "short".to_string();
+        vault.insert(&a).unwrap();
+
+        let mut b = entry("b", vec![1.0_f32, 0.0]);
+        b.namespace = "default".to_string();
+        b.content = "short but a much longer replacement body".to_string();
+        vault.insert(&b).unwrap();
+
+        // Exactly one entry survived the delete-then-insert.
+        assert_eq!(
+            vault.count().unwrap(),
+            1,
+            "dedup must leave exactly one entry after replacing A with B"
+        );
+
+        // The survivor is B, not A. If the delete had committed without the insert
+        // (the non-atomic failure mode), this vault would be empty and this search
+        // would return nothing.
+        let results = vault
+            .search(&[1.0_f32, 0.0], "replacement", "default", 5, LEGACY_MODEL_ID, 2)
+            .unwrap();
+        assert_eq!(results.len(), 1, "only B must remain");
+        assert_eq!(results[0].id, "b", "A must be gone, B must be present");
+        assert_eq!(results[0].content, "short but a much longer replacement body");
     }
 
     #[test]

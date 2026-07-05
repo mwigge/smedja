@@ -226,7 +226,9 @@ impl Provider for GeminiProvider {
             }
 
             let mut bytes_stream = resp.bytes_stream();
-            let mut buf = String::new();
+            // Raw byte buffer: multibyte UTF-8 chars split across chunk
+            // boundaries are only decoded once a complete line has arrived.
+            let mut buf: Vec<u8> = Vec::new();
 
             while let Some(chunk) = bytes_stream.next().await {
                 let chunk = match chunk {
@@ -237,13 +239,8 @@ impl Provider for GeminiProvider {
                     }
                 };
 
-                buf.push_str(&String::from_utf8_lossy(&chunk));
-
-                while let Some(nl) = buf.find('\n') {
-                    let line = buf[..nl].trim_end_matches('\r').to_owned();
-                    buf.drain(..=nl);
-
-                    if let Some(data) = line.strip_prefix("data: ") {
+                for line in crate::sse::drain_complete_lines(&mut buf, &chunk) {
+                    if let Some(data) = crate::sse::strip_sse_data(&line) {
                         match parse_gemini_line(data) {
                             Ok(Some(delta)) => {
                                 if tx.send(Ok(delta)).await.is_err() {
@@ -261,8 +258,9 @@ impl Provider for GeminiProvider {
             }
 
             // Flush any remaining partial line.
-            let leftover = buf.trim_end_matches('\r').trim_end_matches('\n');
-            if let Some(data) = leftover.strip_prefix("data: ") {
+            let leftover = String::from_utf8_lossy(&buf);
+            let leftover = leftover.trim_end_matches('\r').trim_end_matches('\n');
+            if let Some(data) = crate::sse::strip_sse_data(leftover) {
                 match parse_gemini_line(data) {
                     Ok(Some(delta)) => {
                         let _ = tx.send(Ok(delta)).await;
@@ -288,6 +286,31 @@ mod tests {
         let data = r#"{"candidates":[{"content":{"parts":[{"text":"Hello, world!"}],"role":"model"},"finishReason":"STOP"}]}"#;
         let result = parse_gemini_line(data).expect("parse must not error");
         assert_eq!(result, Some(Delta::Text("Hello, world!".to_owned())));
+    }
+
+    #[test]
+    fn split_multibyte_text_decoded_intact() {
+        // The 4 bytes of 😀 are split across two byte chunks; byte-level buffering
+        // must reassemble the character with no U+FFFD replacement char.
+        let payload = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"😀\"}]}}]}\n";
+        let bytes = payload.as_bytes();
+        let split = payload.find('😀').unwrap() + 2; // mid 4-byte sequence
+        let mut buf: Vec<u8> = Vec::new();
+        let mut lines = crate::sse::drain_complete_lines(&mut buf, &bytes[..split]);
+        lines.extend(crate::sse::drain_complete_lines(&mut buf, &bytes[split..]));
+
+        assert!(
+            lines.iter().all(|l| !l.contains('\u{FFFD}')),
+            "no replacement char in any decoded line"
+        );
+        let data = lines
+            .iter()
+            .find_map(|l| crate::sse::strip_sse_data(l))
+            .expect("a data: frame must be present");
+        assert_eq!(
+            parse_gemini_line(data).expect("parse must not error"),
+            Some(Delta::Text("😀".to_owned()))
+        );
     }
 
     #[test]

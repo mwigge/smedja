@@ -5,6 +5,38 @@
 
 use crate::{AdapterError, Delta};
 
+/// Appends `chunk` to `buf` and returns every complete, newline-terminated line
+/// as a decoded `String`, draining those lines from `buf`.
+///
+/// Bytes are accumulated at the byte level so that a multibyte UTF-8 character
+/// split across a chunk boundary is not decoded until every one of its bytes has
+/// arrived: only bytes up to and including a `\n` are decoded, and `\n` (`0x0A`)
+/// can never fall inside a multibyte sequence. Any bytes after the final `\n` —
+/// possibly a partial trailing character — stay in `buf` for the next chunk. A
+/// single trailing `\r` is trimmed from each returned line.
+pub(crate) fn drain_complete_lines(buf: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
+    buf.extend_from_slice(chunk);
+    let mut lines = Vec::new();
+    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+        let mut line: Vec<u8> = buf.drain(..=pos).collect();
+        line.pop(); // drop the trailing '\n'
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        lines.push(String::from_utf8_lossy(&line).into_owned());
+    }
+    lines
+}
+
+/// Strips an SSE `data:` field prefix, tolerating the single optional space that
+/// the SSE specification permits after the colon (`data: x` and `data:x` are
+/// equivalent). Returns the field value, or `None` when the line is not a
+/// `data:` field.
+pub(crate) fn strip_sse_data(line: &str) -> Option<&str> {
+    line.strip_prefix("data:")
+        .map(|rest| rest.strip_prefix(' ').unwrap_or(rest))
+}
+
 /// Parses a single `OpenAI` SSE data payload (the text after the `data: ` prefix)
 /// into a [`Delta`].
 ///
@@ -183,6 +215,44 @@ pub(crate) fn parse_anthropic_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── byte-buffer line splitting ────────────────────────────────────────────
+
+    #[test]
+    fn drain_complete_lines_keeps_split_multibyte_char_intact() {
+        // The two bytes of 'é' (0xC3 0xA9) are split across two chunks. A
+        // per-chunk lossy decode would emit U+FFFD; byte-level buffering must
+        // reassemble the character intact.
+        let full = "data: café\n".as_bytes();
+        let boundary = full.len() - 2; // between 0xC3 and 0xA9
+        let mut buf: Vec<u8> = Vec::new();
+        let mut out = drain_complete_lines(&mut buf, &full[..boundary]);
+        assert!(out.is_empty(), "no complete line before the newline arrives");
+        out.extend(drain_complete_lines(&mut buf, &full[boundary..]));
+        assert_eq!(out, vec!["data: café".to_owned()]);
+        assert!(!out[0].contains('\u{FFFD}'), "no replacement char");
+    }
+
+    #[test]
+    fn drain_complete_lines_retains_partial_tail() {
+        let mut buf: Vec<u8> = Vec::new();
+        let out = drain_complete_lines(&mut buf, b"line one\npartial");
+        assert_eq!(out, vec!["line one".to_owned()]);
+        // "partial" (no newline yet) is retained for the next chunk.
+        let out2 = drain_complete_lines(&mut buf, b" rest\n");
+        assert_eq!(out2, vec!["partial rest".to_owned()]);
+    }
+
+    // ── SSE data: prefix ──────────────────────────────────────────────────────
+
+    #[test]
+    fn strip_sse_data_accepts_optional_space() {
+        assert_eq!(strip_sse_data("data: {\"a\":1}"), Some("{\"a\":1}"));
+        assert_eq!(strip_sse_data("data:{\"a\":1}"), Some("{\"a\":1}"));
+        // Only a single leading space is consumed.
+        assert_eq!(strip_sse_data("data:  x"), Some(" x"));
+        assert_eq!(strip_sse_data("event: foo"), None);
+    }
 
     // ── OpenAI ───────────────────────────────────────────────────────────────
 

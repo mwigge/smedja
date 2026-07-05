@@ -181,7 +181,9 @@ impl Provider for OpenAiProvider {
             }
 
             let mut bytes_stream = resp.bytes_stream();
-            let mut buf = String::new();
+            // Raw byte buffer: multibyte UTF-8 chars split across chunk
+            // boundaries are only decoded once a complete line has arrived.
+            let mut buf: Vec<u8> = Vec::new();
             let mut input_tok: Option<u32> = None;
             let mut output_tok: Option<u32> = None;
             let mut ttft_ms: Option<i64> = None;
@@ -195,14 +197,9 @@ impl Provider for OpenAiProvider {
                     }
                 };
 
-                buf.push_str(&String::from_utf8_lossy(&chunk));
-
                 // Process all complete newline-terminated lines.
-                while let Some(nl) = buf.find('\n') {
-                    let line = buf[..nl].trim_end_matches('\r').to_owned();
-                    buf.drain(..=nl);
-
-                    if let Some(data) = line.strip_prefix("data: ") {
+                for line in crate::sse::drain_complete_lines(&mut buf, &chunk) {
+                    if let Some(data) = crate::sse::strip_sse_data(&line) {
                         // Emit partial tool-call argument chunks before the generic parse.
                         if let Some((name, partial_input)) = parse_openai_tool_call_chunk(data) {
                             if tx
@@ -261,8 +258,9 @@ impl Provider for OpenAiProvider {
             }
 
             // Flush any remaining partial line (no trailing newline).
-            let leftover = buf.trim_end_matches('\r').trim_end_matches('\n');
-            if let Some(data) = leftover.strip_prefix("data: ") {
+            let leftover = String::from_utf8_lossy(&buf);
+            let leftover = leftover.trim_end_matches('\r').trim_end_matches('\n');
+            if let Some(data) = crate::sse::strip_sse_data(leftover) {
                 match parse_openai_line(data) {
                     Ok(Some(delta)) => {
                         if matches!(delta, Delta::Text(_)) && ttft_ms.is_none() {
@@ -403,5 +401,43 @@ mod tests {
         opts.cache_strategy = CacheStrategy::OpenAiAutomatic { cache_key: None };
         let body = build_body(&[], &opts);
         assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn split_multibyte_content_decoded_intact() {
+        // The 4 bytes of 😀 are split across two byte chunks; byte-level buffering
+        // must reassemble the character with no U+FFFD replacement char.
+        let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"😀\"}}]}\n";
+        let bytes = payload.as_bytes();
+        let split = payload.find('😀').unwrap() + 2; // mid 4-byte sequence
+        let mut buf: Vec<u8> = Vec::new();
+        let mut lines = crate::sse::drain_complete_lines(&mut buf, &bytes[..split]);
+        lines.extend(crate::sse::drain_complete_lines(&mut buf, &bytes[split..]));
+
+        assert!(
+            lines.iter().all(|l| !l.contains('\u{FFFD}')),
+            "no replacement char in any decoded line"
+        );
+        let data = lines
+            .iter()
+            .find_map(|l| crate::sse::strip_sse_data(l))
+            .expect("a data: frame must be present");
+        assert_eq!(
+            crate::sse::parse_openai_line(data).expect("parse must not error"),
+            Some(crate::Delta::Text("😀".to_owned()))
+        );
+    }
+
+    #[test]
+    fn data_frame_without_space_is_parsed() {
+        // Per the SSE spec the space after `data:` is optional; a frame with no
+        // space must still be parsed rather than silently dropped.
+        let line = "data:{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}";
+        let data = crate::sse::strip_sse_data(line)
+            .expect("a data: frame must be recognised without a trailing space");
+        assert_eq!(
+            crate::sse::parse_openai_line(data).expect("parse must not error"),
+            Some(crate::Delta::Text("hi".to_owned()))
+        );
     }
 }

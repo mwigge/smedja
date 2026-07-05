@@ -4,8 +4,10 @@ use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 
+use serde_json::Value;
+
 use crate::codec::{read_frame, write_frame};
-use crate::{router::Router, Request, Response};
+use crate::{codes, router::Router, Request, Response, RpcError};
 
 /// Maximum number of concurrently-handled connections.
 ///
@@ -84,9 +86,25 @@ async fn handle_connection(stream: UnixStream, router: Arc<Router>) {
         let Ok(Some(frame)) = read_frame(&mut reader).await else {
             break;
         };
-        let Ok(req) = serde_json::from_str::<Request>(frame.trim_end()) else {
-            // Malformed frame — no reliable id to correlate an error to; skip it.
-            continue;
+        let req = match serde_json::from_str::<Request>(frame.trim_end()) {
+            Ok(req) => req,
+            Err(_) => {
+                // Not a valid `Request`. If the payload is JSON carrying a
+                // non-null `id`, the sender is awaiting a reply, so answer with
+                // an Invalid Request error rather than dropping it silently and
+                // leaving the caller blocked forever. A payload with no id (or a
+                // null id) is treated as a notification and skipped.
+                if let Ok(value) = serde_json::from_str::<Value>(frame.trim_end()) {
+                    if let Some(id) = value.get("id").filter(|v| !v.is_null()) {
+                        let resp = Response::err(
+                            Some(id.clone()),
+                            RpcError::new(codes::INVALID_REQUEST, "invalid request"),
+                        );
+                        let _ = tx.send(resp).await;
+                    }
+                }
+                continue;
+            }
         };
         let is_notification = req.is_notification();
         let id = req.id.clone();
@@ -157,5 +175,82 @@ mod tests {
 
         let second = codec.recv_response().await.unwrap().unwrap();
         assert_eq!(second.id, Some(json!(1)));
+    }
+
+    #[tokio::test]
+    async fn malformed_request_with_id_gets_invalid_request_error() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        // A router with no handlers is enough; the payload never reaches dispatch.
+        let router = Router::new();
+        let sock =
+            std::env::temp_dir().join(format!("smedja-rpc-malformed-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        tokio::spawn(Server::new(router).serve(listener));
+
+        let mut client = UnixStream::connect(&sock).await.unwrap();
+        // Valid JSON, but not a valid `Request` (no `method`), carrying an id.
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":99,\"params\":{}}\n")
+            .await
+            .unwrap();
+
+        // Bound the read so a regression (silent drop) fails fast instead of hanging.
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("server must reply to an id-bearing malformed request, not hang")
+        .unwrap();
+        assert!(n > 0, "expected an error reply, got EOF/silence");
+
+        let resp: Response = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(resp.id, Some(json!(99)));
+        assert_eq!(
+            resp.error.expect("must carry an error").code,
+            codes::INVALID_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_notification_without_id_is_dropped() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let mut router = Router::new();
+        router.register("ping", |_| async { Ok(json!("pong")) });
+        let sock = std::env::temp_dir()
+            .join(format!("smedja-rpc-malformed-notif-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        tokio::spawn(Server::new(router).serve(listener));
+
+        let mut client = UnixStream::connect(&sock).await.unwrap();
+        // Not a valid Request and no id: nothing to correlate a reply to.
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        // A well-formed request follows; only its reply should come back.
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\",\"params\":{}}\n")
+            .await
+            .unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("must not hang")
+        .unwrap();
+        let resp: Response = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(resp.id, Some(json!(7)), "first reply must be for the ping, not the dropped notification");
+        assert_eq!(resp.result, Some(json!("pong")));
     }
 }

@@ -1234,19 +1234,26 @@ async fn main() -> anyhow::Result<()> {
     // handler and the orchestrator (replaces the former OnceLock singleton).
     let provider_sessions: orchestrator::ProviderSessions = Arc::new(Mutex::new(HashMap::new()));
 
-    // Background GC: cap the provider_sessions map at 10 000 entries.  Each
-    // entry is soft state (cleared sessions reconnect cleanly on the next turn),
-    // so a full clear is safe. The GC task wakes every 5 minutes.
+    // Background GC: cap the provider_sessions map at 10 000 entries. When the
+    // cap is exceeded, evict only entries idle for over 30 minutes — a session
+    // whose turn is running right now touched its entry more recently and is
+    // retained even over cap, so an in-flight turn never loses its provider-native
+    // resume id. The GC task wakes every 5 minutes.
     {
+        const SESSION_CAP: usize = 10_000;
+        let idle = std::time::Duration::from_secs(30 * 60);
         let ps = Arc::clone(&provider_sessions);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_mins(5)).await;
                 let mut map = ps.lock().await;
-                let n = map.len();
-                if n > 10_000 {
-                    map.clear();
-                    tracing::info!("provider_sessions: cleared {n} entries (cap exceeded)");
+                let evicted =
+                    orchestrator::gc_provider_sessions(&mut map, SESSION_CAP, idle);
+                if evicted > 0 {
+                    tracing::info!(
+                        "provider_sessions: evicted {evicted} idle entries (cap exceeded, {} retained)",
+                        map.len()
+                    );
                 }
             }
         });

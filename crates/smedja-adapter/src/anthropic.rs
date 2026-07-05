@@ -131,7 +131,9 @@ async fn run_sse_loop(
     request_start: std::time::Instant,
 ) -> (Option<u32>, Option<u32>, Option<i64>) {
     let mut bytes_stream = resp.bytes_stream();
-    let mut buf = String::new();
+    // Raw byte buffer: multibyte UTF-8 chars split across chunk boundaries are
+    // only decoded once a complete line has arrived (see `drain_complete_lines`).
+    let mut buf: Vec<u8> = Vec::new();
     // Track the current SSE `event:` type across lines.
     let mut current_event: Option<String> = None;
     // Track the active tool_use block (name) for input_json_delta chunks.
@@ -149,12 +151,7 @@ async fn run_sse_loop(
             }
         };
 
-        buf.push_str(&String::from_utf8_lossy(&chunk));
-
-        while let Some(nl) = buf.find('\n') {
-            let line = buf[..nl].trim_end_matches('\r').to_owned();
-            buf.drain(..=nl);
-
+        for line in crate::sse::drain_complete_lines(&mut buf, &chunk) {
             if line.is_empty() {
                 // Blank line separates SSE events; reset pending event type.
                 current_event = None;
@@ -166,7 +163,7 @@ async fn run_sse_loop(
                 continue;
             }
 
-            if let Some(data) = line.strip_prefix("data: ") {
+            if let Some(data) = crate::sse::strip_sse_data(&line) {
                 let Some(ev) = &current_event else {
                     continue;
                 };
@@ -444,6 +441,31 @@ mod tests {
         inject_traceparent(&mut headers);
         // No assertion on header presence — background context produces no traceparent.
         // The test passes as long as no panic occurs.
+    }
+
+    #[test]
+    fn split_multibyte_delta_decoded_intact() {
+        // The 4 bytes of 😀 are split across two byte chunks; byte-level buffering
+        // must reassemble the character with no U+FFFD replacement char.
+        let payload = "event: content_block_delta\n\
+             data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"😀\"}}\n";
+        let bytes = payload.as_bytes();
+        let split = payload.find('😀').unwrap() + 2; // mid 4-byte sequence
+        let mut buf: Vec<u8> = Vec::new();
+        let mut lines = crate::sse::drain_complete_lines(&mut buf, &bytes[..split]);
+        lines.extend(crate::sse::drain_complete_lines(&mut buf, &bytes[split..]));
+
+        assert!(
+            lines.iter().all(|l| !l.contains('\u{FFFD}')),
+            "no replacement char in any decoded line"
+        );
+        let data = lines
+            .iter()
+            .find_map(|l| crate::sse::strip_sse_data(l))
+            .expect("a data: frame must be present");
+        let delta =
+            parse_anthropic_event("content_block_delta", data).expect("parse must not error");
+        assert_eq!(delta, Some(Delta::Text("😀".to_owned())));
     }
 
     fn base_opts() -> CallOptions {
