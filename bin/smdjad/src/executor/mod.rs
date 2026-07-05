@@ -126,6 +126,8 @@ pub(crate) const LOCAL_TOOLS: &[&str] = &[
     "lsp_document_symbols",
     "lsp_workspace_symbols",
     "lsp_rename_symbol",
+    "test_run",
+    "review_run",
 ];
 
 /// Read-safe subset of [`LOCAL_TOOLS`] exposed by MCP server mode.
@@ -153,6 +155,7 @@ pub(crate) const MCP_SERVER_TOOLS: &[&str] = &[
     "lsp_hover",
     "lsp_document_symbols",
     "lsp_workspace_symbols",
+    "review_run",
 ];
 
 /// Read-only tools that can run concurrently without cowork gate approval.
@@ -176,6 +179,7 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "lsp_hover",
     "lsp_document_symbols",
     "lsp_workspace_symbols",
+    "review_run",
 ];
 
 /// Executes the named tool with the given JSON input string.
@@ -293,6 +297,8 @@ pub(crate) async fn execute_tool(
             None => "error: LSP tools are unavailable in this context (no language-server manager)"
                 .to_owned(),
         },
+        "test_run" => handlers::test::test_run(&input, workspace).await,
+        "review_run" => handlers::review::review_run(&input, workspace).await,
         other => dispatch_mcp_tool(other, &input, ingot).await,
     };
 

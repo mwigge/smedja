@@ -380,6 +380,7 @@ fn mcp_server_tools_are_exactly_the_read_safe_subset() {
         "lsp_hover",
         "lsp_document_symbols",
         "lsp_workspace_symbols",
+        "review_run",
     ];
     // The exposed subset must match the read-safe list exactly.
     let mut got = super::MCP_SERVER_TOOLS.to_vec();

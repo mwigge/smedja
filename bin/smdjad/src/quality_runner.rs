@@ -133,10 +133,13 @@ pub fn parse_review_response(
 /// On any adapter or parse error this returns
 /// [`QualityLlmReview::unavailable`] with `tier1_score`.
 pub async fn review_turn(diff: &str, tier1_score: u8, reviewer_model: &str) -> QualityLlmReview {
-    // Truncate diff at 2 000 chars per security review requirement.
-    let diff_truncated: String = diff.chars().take(2_000).collect();
+    // Feed the full diff to the adversary reviewer rather than the former
+    // 2 000-char cut, which hid most changes from review. A generous ceiling
+    // still bounds token cost on pathologically large diffs.
+    const MAX_DIFF_CHARS: usize = 100_000;
+    let diff_bounded: String = diff.chars().take(MAX_DIFF_CHARS).collect();
     let prompt = RUBRIC
-        .replace("{diff}", &diff_truncated)
+        .replace("{diff}", &diff_bounded)
         .replace("{tier1_score}", &tier1_score.to_string());
 
     let messages = vec![Message::user(prompt)];

@@ -22,6 +22,7 @@ serde_json         = { workspace = true }
 smedja-bellows      = { path = "../../crates/smedja-bellows" }
 smedja-lsp         = { path = "../../crates/smedja-lsp" }
 smedja-rpc         = { path = "../../crates/smedja-rpc" }
+smedja-testkit     = { path = "../../crates/smedja-testkit" }
 syntect            = "5"
 tokio              = { workspace = true }
 toml               = { workspace = true }

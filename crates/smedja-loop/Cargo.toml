@@ -14,6 +14,7 @@ serde              = { workspace = true }
 serde_json         = { workspace = true }
 sha2               = { workspace = true }
 smedja-assayer     = { path = "../smedja-assayer" }
+smedja-testkit     = { path = "../smedja-testkit" }
 smedja-types       = { path = "../smedja-types" }
 thiserror          = { workspace = true }
 tokio              = { workspace = true }
