@@ -325,7 +325,10 @@ mod tests {
             SavingsSnapshot::default(),
         );
         let joined = view.lines().join("\n");
-        assert!(joined.contains("none yet"), "explicit empty state: {joined}");
+        assert!(
+            joined.contains("none yet"),
+            "explicit empty state: {joined}"
+        );
     }
 
     #[test]

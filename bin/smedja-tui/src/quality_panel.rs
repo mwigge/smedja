@@ -156,14 +156,7 @@ impl<'a> QualityPanel<'a> {
         let mut row: Vec<Span<'_>> = vec![pill(snap.verdict_pill(), false), Span::raw(" ")];
         if snap.trend.len() >= 2 {
             let keep = inner_w.saturating_sub(8).max(1);
-            let recent: Vec<u8> = snap
-                .trend
-                .iter()
-                .rev()
-                .take(keep)
-                .rev()
-                .copied()
-                .collect();
+            let recent: Vec<u8> = snap.trend.iter().rev().take(keep).rev().copied().collect();
             row.push(Span::styled(
                 crate::viz::sparkline(&recent, 100),
                 Style::default().fg(p.accent),

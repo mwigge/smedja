@@ -478,7 +478,8 @@ async fn handle_stream_connection(
     // long ago and no snapshot ever landed) closes at once instead of idling for
     // the whole grace window.
     let grace = std::time::Duration::from_secs(QUALITY_GRACE_SECS);
-    let mut grace_until = (saw_done && buf_age < grace).then(|| tokio::time::Instant::now() + grace);
+    let mut grace_until =
+        (saw_done && buf_age < grace).then(|| tokio::time::Instant::now() + grace);
 
     // Forward live events filtered to this turn's task_id.
     //
