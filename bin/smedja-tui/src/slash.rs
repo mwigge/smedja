@@ -167,7 +167,19 @@ pub(crate) async fn dispatch_slash(
                 );
                 return Ok(true);
             }
-            let workspace = args.to_owned();
+            // Absolutise against the CLIENT's cwd before sending. The daemon is
+            // a systemd user service with no WorkingDirectory, so a relative
+            // path (e.g. `dev/src/smedja`) would resolve against the daemon's
+            // cwd — the wrong tree — and index 0 symbols. Resolving here means
+            // the daemon receives the path the user actually meant.
+            let typed = Path::new(args.trim());
+            let workspace = if typed.is_absolute() {
+                typed.to_path_buf()
+            } else {
+                std::env::current_dir().map_or_else(|_| typed.to_path_buf(), |cwd| cwd.join(typed))
+            }
+            .to_string_lossy()
+            .into_owned();
             push_system_message(state, format!("indexing code graph: {workspace}\u{2026}"));
             let text = match client
                 .call("graph.index", json!({ "workspace": workspace }))

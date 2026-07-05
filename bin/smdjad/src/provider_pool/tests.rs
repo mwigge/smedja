@@ -286,19 +286,25 @@ fn eligible_ring_orders_routed_first_then_compatible_dedup() {
     ]);
 
     // Route to fast: ring starts with the routed fast entry, then the more
-    // capable local and deep entries in priority order, ending with the
-    // default (already yielded → not duplicated).
+    // capable deep entry in priority order. The local entry is *less* capable
+    // than fast (Local < Fast < Deep), so rotating to it would degrade the
+    // turn — it is excluded. The default (claude-fast) is already yielded → not
+    // duplicated.
     let ring = pool.eligible_ring(Runner::Claude, Tier::Fast);
     let names: Vec<&str> = ring.iter().map(|e| e.runner_name).collect();
     assert_eq!(
         names,
-        vec!["claude-cli", "claude-cli", "local"],
-        "ring must be routed-first then compatible entries in priority order"
+        vec!["claude-cli", "claude-cli"],
+        "ring must be routed-first then compatible (>= routed) entries in priority order"
     );
 
-    // Every (Runner, Tier) appears at most once: ring length never exceeds
-    // the number of distinct entries.
-    assert_eq!(ring.len(), 3, "ring must de-duplicate by (Runner, Tier)");
+    // Every (Runner, Tier) appears at most once, and the below-tier local
+    // entry never enters the ring.
+    assert_eq!(
+        ring.len(),
+        2,
+        "ring must de-duplicate and exclude below-tier entries"
+    );
 }
 
 #[test]
@@ -316,8 +322,8 @@ fn deep_route_does_not_rotate_down_to_fast() {
         "fast may rotate up to deep"
     );
     assert!(
-        tier_compatible(Tier::Fast, Tier::Local, "rate_limited"),
-        "fast may rotate up to local"
+        !tier_compatible(Tier::Fast, Tier::Local, "rate_limited"),
+        "fast must not rotate down to the less-capable local tier"
     );
 }
 
@@ -332,8 +338,8 @@ fn context_length_kind_requires_more_capable_tier() {
         "context-length may rotate to a strictly-more-capable tier"
     );
     assert!(
-        !tier_compatible(Tier::Local, Tier::Fast, "context_length_exceeded"),
-        "context-length must not rotate down"
+        tier_compatible(Tier::Local, Tier::Fast, "context_length_exceeded"),
+        "local may rotate up to the more-capable fast tier on context-length"
     );
     assert!(
         tier_compatible(Tier::Local, Tier::Deep, "context_length_exceeded"),

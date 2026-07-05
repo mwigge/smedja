@@ -96,15 +96,19 @@ pub(crate) async fn set_mode(state: HandlerState, params: Value) -> Result<Value
 }
 
 /// Handles `cowork.gate_tool`: the `PreToolUse` hook entry point for external CLIs
-/// (claude via `smj tool-gate`). Evaluates the session's permission policy and
-/// returns `{decision, reason}` where `decision` is `"allow"` or `"deny"`. An
-/// unresolved "ask" is denied by default (fail-closed) because the hook has no
-/// interactive path to request approval from the user.
+/// (claude via `smj tool-gate`). Routes the tool call through the SAME interactive
+/// gate the native tool loop uses ([`CoworkGate::gate_tool`]): `Allow`/`Deny`
+/// resolve outright per policy, while `Ask` publishes a [`TurnEvent::CoworkRequest`]
+/// to the TUI and suspends on the gate until the user answers y/n/m — instead of
+/// the old synchronous path that hard-denied every `Ask`.
+///
+/// Returns `{decision, reason}` (`decision` is `"allow"` or `"deny"`), plus an
+/// `updated_input` object when the user chose *modify* with replacement args.
 ///
 /// # Errors
 ///
 /// Never returns an RPC error — a missing tool/session resolves to a decision so
-/// the hook always gets an answer (fail-safe is handled by the policy/gate).
+/// the hook always gets an answer (gate timeout/close fails closed to deny).
 pub(crate) async fn gate_tool(state: HandlerState, params: Value) -> Result<Value, RpcError> {
     let session_id = params
         .get("session_id")
@@ -116,6 +120,7 @@ pub(crate) async fn gate_tool(state: HandlerState, params: Value) -> Result<Valu
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    let tool_input = params.get("tool_input").cloned().unwrap_or(Value::Null);
 
     let gate = {
         let mut g = state.gates.lock().await;
@@ -124,37 +129,47 @@ pub(crate) async fn gate_tool(state: HandlerState, params: Value) -> Result<Valu
                 .or_insert_with(|| Arc::new(CoworkGate::default())),
         )
     };
-    // Evaluate the policy synchronously — the hook cannot block waiting for a
-    // TUI approval dialog (no push path). `Allow` (read-only tools, auto-mode
-    // allowlists, accept-edits edits) resolves to allow; `Plan` is a hard deny.
-    // `Ask` MUST fail CLOSED: with no interactive approval path from an external
-    // CLI, auto-allowing it defeats the approval gate entirely, so an unresolved
-    // "ask" is denied by default rather than silently permitted.
-    let mode = gate.mode().await;
-    let (decision, reason) = gate_tool_decision(mode, &tool_name);
-    Ok(json!({ "decision": decision, "reason": reason }))
+    // Route through the real interactive gate: read-only/auto/accept-edits allow
+    // immediately, plan denies, and `Ask` suspends (publishing a CoworkRequest to
+    // the TUI) until the user resolves it — up to the gate's 30-min wait, which
+    // the hook's 1800s timeout mirrors. A timeout or channel close fails closed.
+    let decision = gate
+        .gate_tool(
+            0,
+            &tool_name,
+            tool_input,
+            "",
+            Some((state.dispatcher.as_ref(), None)),
+        )
+        .await;
+    Ok(gate_response(&decision))
 }
 
-/// Resolves the external-CLI `PreToolUse` decision for a `(mode, tool)` pair.
+/// Maps a resolved cowork [`Decision`] to the `{decision, reason, updated_input}`
+/// payload the `smj tool-gate` hook translates into Claude's `PreToolUse` output.
 ///
-/// `Allow` (read-only tools, auto-mode allowlists, accept-edits edits) permits;
-/// `Plan` is a hard deny. Crucially, `Ask` is DENIED by default (fail-closed):
-/// the hook has no interactive path to request approval from the user, so
-/// resolving `Ask` to allow — as the old code did — silently defeated the
-/// approval gate. Kept pure so the fail-closed contract is unit-testable.
-fn gate_tool_decision(mode: crate::cowork::PermissionMode, tool: &str) -> (&'static str, String) {
-    match crate::cowork::evaluate(mode, tool) {
-        crate::cowork::PermissionDecision::Deny => {
-            ("deny", format!("blocked by {} mode", mode.as_str()))
-        }
-        crate::cowork::PermissionDecision::Allow => ("allow", String::new()),
-        crate::cowork::PermissionDecision::Ask => (
-            "deny",
-            format!(
-                "{} mode requires approval and no interactive approval path is available from an external CLI; denied by default",
-                mode.as_str()
-            ),
-        ),
+/// `Approve` → allow; `Deny` → deny-with-reason. `Modify` carries a free-form
+/// instruction; Claude's hook can only rewrite a call via `updatedInput` (a JSON
+/// object of replacement args), so a modify instruction is applied as
+/// `updated_input` when — and only when — it parses to a JSON object. Otherwise
+/// there is no valid rewrite to hand back, so it falls back to deny-with-reason.
+/// Kept pure so the mapping is unit-testable.
+fn gate_response(decision: &crate::cowork::Decision) -> Value {
+    use crate::cowork::Decision;
+    match decision {
+        Decision::Approve => json!({ "decision": "allow", "reason": "" }),
+        Decision::Deny(reason) => json!({ "decision": "deny", "reason": reason }),
+        Decision::Modify(instruction) => match serde_json::from_str::<Value>(instruction) {
+            Ok(v) if v.is_object() => {
+                json!({ "decision": "allow", "reason": "", "updated_input": v })
+            }
+            _ => json!({
+                "decision": "deny",
+                "reason": format!(
+                    "modify requires replacement arguments as a JSON object; got: {instruction}"
+                ),
+            }),
+        },
     }
 }
 
@@ -262,50 +277,152 @@ pub(crate) async fn pending(state: HandlerState, params: Value) -> Result<Value,
 
 #[cfg(test)]
 mod tests {
-    use super::gate_tool_decision;
-    use crate::cowork::PermissionMode;
+    use super::gate_response;
+    use crate::cowork::{CoworkGate, Decision, PermissionMode};
+    use serde_json::json;
+    use smedja_bellows::Dispatcher;
+    use std::sync::Arc;
+
+    // ── gate_response mapping (pure) ─────────────────────────────────────────
 
     #[test]
-    fn ask_mode_denies_by_default_not_allows() {
-        // Regression for the fail-open gate: an unresolved "ask" must deny.
-        for tool in ["bash", "write_file", "edit_file"] {
-            let (decision, _) = gate_tool_decision(PermissionMode::Ask, tool);
+    fn approve_maps_to_allow() {
+        let out = gate_response(&Decision::Approve);
+        assert_eq!(out["decision"], "allow");
+    }
+
+    #[test]
+    fn deny_maps_to_deny_with_reason() {
+        let out = gate_response(&Decision::Deny("blocked by plan mode".into()));
+        assert_eq!(out["decision"], "deny");
+        assert_eq!(out["reason"], "blocked by plan mode");
+    }
+
+    #[test]
+    fn modify_with_json_object_produces_updated_input() {
+        // A modify instruction that parses to a JSON object is handed back as
+        // `updated_input` so the claude hook can rewrite the call (allow).
+        let out = gate_response(&Decision::Modify(r#"{"command":"ls -a"}"#.into()));
+        assert_eq!(out["decision"], "allow");
+        assert_eq!(out["updated_input"]["command"], "ls -a");
+    }
+
+    #[test]
+    fn modify_with_non_object_falls_back_to_deny() {
+        // Free-form / non-object modify text can't become valid `updatedInput`,
+        // so it must deny rather than silently letting the original call through.
+        for instruction in ["use a safer path", "\"just a string\"", "42", "[1,2]"] {
+            let out = gate_response(&Decision::Modify(instruction.into()));
             assert_eq!(
-                decision, "deny",
-                "ask mode must fail closed for {tool}, not auto-allow"
+                out["decision"], "deny",
+                "non-object modify {instruction:?} must deny"
             );
+            assert!(out.get("updated_input").is_none());
         }
     }
 
-    #[test]
-    fn accept_edits_denies_exec_but_allows_edits() {
-        // accept_edits -> Exec resolves to Ask -> must now deny (was fail-open).
-        let (exec_decision, _) = gate_tool_decision(PermissionMode::AcceptEdits, "bash");
-        assert_eq!(exec_decision, "deny", "accept_edits must deny exec tools");
-        // Edits are explicitly allowed under accept_edits.
-        let (edit_decision, _) = gate_tool_decision(PermissionMode::AcceptEdits, "write_file");
-        assert_eq!(edit_decision, "allow", "accept_edits must allow edits");
-    }
+    // ── interactive gate routing (Ask suspends, not an immediate deny) ────────
 
-    #[test]
-    fn auto_mode_allowlist_still_allows() {
-        // auto-mode explicit allowlists are preserved (not broken by the fix).
-        let (decision, _) = gate_tool_decision(PermissionMode::Auto, "bash");
-        assert_eq!(decision, "allow", "auto mode must still allow");
-    }
+    #[tokio::test]
+    async fn ask_mode_suspends_then_returns_interactive_decision() {
+        // Regression for the fail-closed synchronous gate: under Ask, a mutation
+        // must SUSPEND (create a pending approval) and then return the user's
+        // interactive decision — not an immediate deny.
+        let gate = Arc::new(CoworkGate::default()); // Ask by default.
+        let dispatcher = Arc::new(Dispatcher::new(16));
+        let g2 = Arc::clone(&gate);
+        let d2 = Arc::clone(&dispatcher);
+        let handle = tokio::spawn(async move {
+            let decision = g2
+                .gate_tool(
+                    0,
+                    "write_file",
+                    json!({ "path": "x" }),
+                    "",
+                    Some((d2.as_ref(), None)),
+                )
+                .await;
+            gate_response(&decision)
+        });
 
-    #[test]
-    fn read_only_tools_always_allowed() {
-        let (decision, _) = gate_tool_decision(PermissionMode::Ask, "read_file");
+        // The call must be pending (suspended), proving it did not deny immediately.
+        let id = {
+            let mut found = None;
+            for _ in 0..10_000 {
+                if let Some((id, _)) = gate.list_pending().await.first() {
+                    found = Some(id.clone());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            found.expect("Ask mode must suspend on a pending approval, not deny immediately")
+        };
+        assert!(gate.approve(&id).await);
+        let out = handle.await.unwrap();
         assert_eq!(
-            decision, "allow",
-            "read-only tools stay allowed even under ask"
+            out["decision"], "allow",
+            "approving the suspended call must resolve to allow"
         );
     }
 
-    #[test]
-    fn plan_mode_hard_denies() {
-        let (decision, _) = gate_tool_decision(PermissionMode::Plan, "write_file");
-        assert_eq!(decision, "deny", "plan mode is a hard deny");
+    #[tokio::test]
+    async fn ask_mode_deny_resolves_to_deny() {
+        let gate = Arc::new(CoworkGate::default());
+        let dispatcher = Arc::new(Dispatcher::new(16));
+        let g2 = Arc::clone(&gate);
+        let d2 = Arc::clone(&dispatcher);
+        let handle = tokio::spawn(async move {
+            let decision = g2
+                .gate_tool(
+                    0,
+                    "bash",
+                    json!({ "command": "rm -rf /" }),
+                    "",
+                    Some((d2.as_ref(), None)),
+                )
+                .await;
+            gate_response(&decision)
+        });
+        let id = {
+            let mut found = None;
+            for _ in 0..10_000 {
+                if let Some((id, _)) = gate.list_pending().await.first() {
+                    found = Some(id.clone());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            found.expect("Ask mode must suspend")
+        };
+        assert!(gate.deny(&id, "too dangerous".into()).await);
+        let out = handle.await.unwrap();
+        assert_eq!(out["decision"], "deny");
+        assert_eq!(out["reason"], "too dangerous");
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_allows_without_suspending() {
+        let gate = CoworkGate::default();
+        let dispatcher = Dispatcher::new(16);
+        let out = gate_response(
+            &gate
+                .gate_tool(0, "read_file", json!({}), "", Some((&dispatcher, None)))
+                .await,
+        );
+        assert_eq!(out["decision"], "allow");
+        assert!(gate.list_pending().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_mode_denies_mutation() {
+        let gate = CoworkGate::default();
+        gate.set_mode(PermissionMode::Plan).await;
+        let dispatcher = Dispatcher::new(16);
+        let out = gate_response(
+            &gate
+                .gate_tool(0, "write_file", json!({}), "", Some((&dispatcher, None)))
+                .await,
+        );
+        assert_eq!(out["decision"], "deny");
     }
 }

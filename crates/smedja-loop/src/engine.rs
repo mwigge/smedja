@@ -22,7 +22,7 @@ use opentelemetry::trace::{Span as _, Tracer as _};
 use crate::config::LoopConfig;
 use crate::role::LoopRole;
 use crate::state::LoopState;
-use crate::verify::{run_verification, verification_timeout};
+use crate::verify::{run_verification, verification_timeout, VerifyResult};
 
 use checkpoint::{resolve_role, runner_label, tier_label, write_checkpoint};
 
@@ -108,6 +108,7 @@ pub async fn drive<R: RoleRunner, S: StatusSink>(
         let _ = crate::mining::write_failure_guide(
             "reviewer",
             &["reviewer and implementer must use different runners".to_owned()],
+            None,
             workspace,
         );
         sink.set_status(&LoopState::Failed).await;
@@ -303,6 +304,10 @@ async fn run_slice_parallel<'a, R: RoleRunner, S: StatusSink>(
     sink.set_slice((idx + 1) as i64).await;
 
     let mut passed = false;
+    // The most recent failing verification result, threaded into the failure
+    // guide so the fix role sees the real test output rather than only a generic
+    // "slice failed" line.
+    let mut last_verify: Option<VerifyResult> = None;
     for attempt in 0..max_attempts {
         let role = if attempt == 0 { implementer } else { fix };
         if run_role_traced(runner, role, idx, slice, attempt)
@@ -316,9 +321,16 @@ async fn run_slice_parallel<'a, R: RoleRunner, S: StatusSink>(
         let verified = if config.verification.command.trim().is_empty() {
             true
         } else {
-            run_verification(&config.verification.command, timeout)
-                .await
-                .is_ok_and(|r| r.passed())
+            match run_verification(&config.verification.command, timeout).await {
+                Ok(result) => {
+                    let ok = result.passed();
+                    last_verify = Some(result);
+                    ok
+                }
+                // A spawn failure leaves the prior captured output (if any) in
+                // place; treat this attempt as unverified.
+                Err(_) => false,
+            }
         };
 
         if verified {
@@ -334,6 +346,7 @@ async fn run_slice_parallel<'a, R: RoleRunner, S: StatusSink>(
                             "slice {} (idx {idx}) rejected by reviewer",
                             idx + 1
                         )],
+                        None,
                         workspace,
                     );
                     break;
@@ -352,6 +365,7 @@ async fn run_slice_parallel<'a, R: RoleRunner, S: StatusSink>(
                 "slice {} (idx {idx}) failed verification after {max_attempts} attempt(s)",
                 idx + 1
             )],
+            last_verify.as_ref(),
             workspace,
         );
     }

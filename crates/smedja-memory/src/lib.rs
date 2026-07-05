@@ -21,7 +21,8 @@ pub use error::MemoryError;
 pub use guides::write_failure_guide;
 pub use memory::{
     detect_agents_md, inject_workspace_skills, load_context_files, load_role_skills,
-    load_workspace_skills, ColdQuery, StrataConfig, WorkingMemory, HOT_WINDOW, WARM_WINDOW,
+    load_workspace_skills, strip_managed_agents_section, ColdQuery, StrataConfig, WorkingMemory,
+    AGENTS_MANAGED_BEGIN, AGENTS_MANAGED_END, HOT_WINDOW, WARM_WINDOW,
 };
 pub use types::{Message, Role, Stratum};
 pub use working::inject_conciseness;

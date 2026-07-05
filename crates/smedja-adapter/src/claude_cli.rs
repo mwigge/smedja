@@ -44,34 +44,96 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Installs smedja's `PreToolUse` approval hook on a `claude` command so each of
-/// claude's own tool calls is gated through the daemon's permission policy
-/// (`smj tool-gate` → `cowork.gate_tool`, which blocks on the user when the
-/// policy says "ask"). The smedja session id is passed via `SMEDJA_SESSION_ID`
-/// so the hook knows which session's gate to consult.
-///
-/// No-op when `SMEDJA_TOOL_GATE=off`, `smj` is not on `$PATH`, or there is no
-/// session to attribute approvals to — the hook then "fails open" (claude runs
-/// unimpeded) rather than bricking the agent.
-fn install_tool_gate(command: &mut tokio::process::Command, session_id: Option<&str>) {
-    let disabled = std::env::var("SMEDJA_TOOL_GATE").is_ok_and(|v| {
+/// Removes a temp file on drop so per-invocation settings / system-prompt files
+/// don't accumulate. Held by the spawned task until the child exits, so claude
+/// has finished reading the file before it's unlinked.
+struct TempFileGuard(std::path::PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A unique temp path so concurrent claude invocations never share a file.
+fn unique_temp_path(stem: &str, ext: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    std::env::temp_dir().join(format!("{stem}-{}-{nanos}.{ext}", std::process::id()))
+}
+
+/// True when `SMEDJA_TOOL_GATE` is set to an off-like value (the intentional
+/// escape hatch that runs claude with no approval gate).
+fn tool_gate_disabled() -> bool {
+    std::env::var("SMEDJA_TOOL_GATE").is_ok_and(|v| {
         matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "off" | "0" | "false" | "none" | "disable" | "disabled"
         )
-    });
+    })
+}
+
+/// True when `SMEDJA_TOOL_GATE_FALLBACK=open` — reverts the *expected-but-
+/// unavailable* gate case to the old fail-OPEN behaviour (claude runs unguarded).
+/// Default is fail-CLOSED.
+fn tool_gate_fallback_open() -> bool {
+    std::env::var("SMEDJA_TOOL_GATE_FALLBACK").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "open" | "1" | "true" | "allow"
+        )
+    })
+}
+
+/// What the `PreToolUse` gate hook should do for a claude invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatePlan {
+    /// Install the real interactive `smj tool-gate` hook.
+    Interactive,
+    /// A gate was expected but `smj`/session is missing: install a deny-all hook
+    /// (fail closed) so claude cannot run tools unguarded.
+    DenyAll,
+    /// No hook — the intentional escape hatch, an unattributable/Auto run, or an
+    /// explicit fail-open override.
+    Open,
+}
+
+/// Decides the gate plan from the resolved inputs. Pure so the fail-closed
+/// contract is unit-testable.
+///
+/// A gate is *expected* whenever the permission mode is not `auto` (in `auto`
+/// every tool is allowed anyway, so a missing gate is not a hole). When a gate
+/// is expected but cannot be installed (`smj` not on `$PATH` or no session id to
+/// attribute approvals to), the plan is `DenyAll` — unless the caller opted back
+/// into fail-open via `SMEDJA_TOOL_GATE_FALLBACK=open`.
+fn plan_tool_gate(
+    disabled: bool,
+    fallback_open: bool,
+    has_session: bool,
+    mode: Option<&str>,
+    smj_available: bool,
+) -> GatePlan {
     if disabled {
-        return;
+        return GatePlan::Open;
     }
-    let Some(session_id) = session_id.filter(|s| !s.is_empty()) else {
-        return;
-    };
-    // Bake the absolute smj path into the hook so it resolves regardless of
-    // claude's own PATH. If smj can't be found, skip the hook (fail open).
-    let Ok(smj) = which::which("smj") else {
-        return;
-    };
-    let hook_command = format!("{} tool-gate", shell_quote(&smj.to_string_lossy()));
+    if has_session && smj_available {
+        return GatePlan::Interactive;
+    }
+    let is_auto = mode.is_some_and(|m| m.eq_ignore_ascii_case("auto"));
+    if is_auto || fallback_open {
+        GatePlan::Open
+    } else {
+        GatePlan::DenyAll
+    }
+}
+
+/// Writes a claude `--settings` file carrying a single `PreToolUse` hook and
+/// attaches it to `command`. Returns a guard that unlinks the file on drop.
+fn attach_settings(
+    command: &mut tokio::process::Command,
+    hook_command: &str,
+) -> Option<TempFileGuard> {
     let settings = serde_json::json!({
         "hooks": {
             "PreToolUse": [{
@@ -84,12 +146,101 @@ fn install_tool_gate(command: &mut tokio::process::Command, session_id: Option<&
             }],
         }
     });
-    let path = std::env::temp_dir().join("smedja-claude-settings.json");
+    let path = unique_temp_path("smedja-claude-settings", "json");
     if std::fs::write(&path, settings.to_string()).is_err() {
-        return;
+        tracing::warn!("failed to write claude --settings file; tool gate not installed");
+        return None;
     }
     command.arg("--settings").arg(&path);
-    command.env("SMEDJA_SESSION_ID", session_id);
+    Some(TempFileGuard(path))
+}
+
+/// Installs smedja's `PreToolUse` approval hook on a `claude` command so each of
+/// claude's own tool calls is gated through the daemon's permission policy
+/// (`smj tool-gate` → `cowork.gate_tool`, which blocks on the user when the
+/// policy says "ask"). The smedja session id is passed via `SMEDJA_SESSION_ID`
+/// so the hook knows which session's gate to consult.
+///
+/// `SMEDJA_TOOL_GATE=off` disables the gate entirely (logged escape hatch). When
+/// a gate is *expected* (mode is not `auto`) but `smj`/session is missing, a
+/// deny-all hook is installed instead of silently running unguarded — override
+/// with `SMEDJA_TOOL_GATE_FALLBACK=open`. Returns a guard for the settings file.
+fn install_tool_gate(
+    command: &mut tokio::process::Command,
+    session_id: Option<&str>,
+    permission_mode: Option<&str>,
+) -> Option<TempFileGuard> {
+    let disabled = tool_gate_disabled();
+    let has_session = session_id.is_some_and(|s| !s.is_empty());
+    let smj = which::which("smj").ok();
+    match plan_tool_gate(
+        disabled,
+        tool_gate_fallback_open(),
+        has_session,
+        permission_mode,
+        smj.is_some(),
+    ) {
+        GatePlan::Open => {
+            if disabled {
+                tracing::warn!(
+                    "SMEDJA_TOOL_GATE disabled: claude tool calls run WITHOUT the smedja approval gate"
+                );
+            }
+            None
+        }
+        GatePlan::DenyAll => {
+            tracing::error!(
+                has_session,
+                smj_on_path = smj.is_some(),
+                mode = permission_mode.unwrap_or("ask"),
+                "smedja approval gate expected but unavailable (smj or session missing); \
+                 installing a fail-CLOSED deny-all PreToolUse hook. Set \
+                 SMEDJA_TOOL_GATE_FALLBACK=open to run claude unguarded instead."
+            );
+            // A self-contained hook that emits a PreToolUse deny for every tool.
+            const DENY_JSON: &str = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"smedja approval gate unavailable (smj/session missing); denied fail-closed. Set SMEDJA_TOOL_GATE_FALLBACK=open to override."}}"#;
+            let hook_command = format!("printf '%s' {}", shell_quote(DENY_JSON));
+            attach_settings(command, &hook_command)
+        }
+        GatePlan::Interactive => {
+            // Bake the absolute smj path into the hook so it resolves regardless
+            // of claude's own PATH.
+            let smj = smj?;
+            let hook_command = format!("{} tool-gate", shell_quote(&smj.to_string_lossy()));
+            let guard = attach_settings(command, &hook_command);
+            if guard.is_some() {
+                if let Some(sid) = session_id {
+                    command.env("SMEDJA_SESSION_ID", sid);
+                }
+            }
+            guard
+        }
+    }
+}
+
+/// Writes the assembled system block to a temp file and appends it to claude's
+/// default system prompt via `--append-system-prompt-file`. Delivered as a file
+/// (not `--append-system-prompt <arg>`) because the block — role packs,
+/// workspace/role skills, methodology, project context — can exceed
+/// `MAX_ARG_STRLEN` (128 KiB) and overflow `execve` with `E2BIG`.
+///
+/// Returns a guard that unlinks the file on drop, or `None` when there is no
+/// system block to deliver.
+fn install_system_prompt(
+    command: &mut tokio::process::Command,
+    system: Option<&str>,
+) -> Option<TempFileGuard> {
+    let system = system?;
+    if system.trim().is_empty() {
+        return None;
+    }
+    let path = unique_temp_path("smedja-claude-system", "txt");
+    if std::fs::write(&path, system).is_err() {
+        tracing::warn!("failed to write claude system-prompt file; system block not delivered");
+        return None;
+    }
+    command.arg("--append-system-prompt-file").arg(&path);
+    Some(TempFileGuard(path))
 }
 
 fn stream_claude_cli(messages: &[Message], opts: &CallOptions) -> DeltaStream {
@@ -101,6 +252,8 @@ fn stream_claude_cli(messages: &[Message], opts: &CallOptions) -> DeltaStream {
     let prompt = render_conversation(messages);
     let model = opts.model.clone();
     let session_id = opts.smedja_session_id.clone();
+    let permission_mode = opts.permission_mode.clone();
+    let system = opts.system.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::spawn(async move {
@@ -135,8 +288,16 @@ fn stream_claude_cli(messages: &[Message], opts: &CallOptions) -> DeltaStream {
         }
 
         // Install the PreToolUse approval hook so claude's own tool calls are
-        // gated through smedja's permission policy (ask → approve/deny).
-        install_tool_gate(&mut command, session_id.as_deref());
+        // gated through smedja's permission policy (ask → approve/deny). Deliver
+        // the assembled system block via --append-system-prompt-file. Both guards
+        // are held until the child exits so the temp files outlive claude reading
+        // them, then are unlinked on drop.
+        let _gate_guard = install_tool_gate(
+            &mut command,
+            session_id.as_deref(),
+            permission_mode.as_deref(),
+        );
+        let _system_guard = install_system_prompt(&mut command, system.as_deref());
 
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -580,6 +741,150 @@ mod tests {
         assert!(
             !args.contains("hi"),
             "prompt must not be passed as an argv element; args were:\n{args}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // ── gate plan (fail-closed contract) ─────────────────────────────────────
+
+    #[test]
+    fn plan_open_when_disabled() {
+        // The escape hatch always fails open, regardless of session/smj/mode.
+        assert_eq!(
+            plan_tool_gate(true, false, true, Some("ask"), true),
+            GatePlan::Open
+        );
+        assert_eq!(
+            plan_tool_gate(true, false, false, Some("ask"), false),
+            GatePlan::Open
+        );
+    }
+
+    #[test]
+    fn plan_interactive_when_session_and_smj_present() {
+        for mode in [Some("ask"), Some("accept_edits"), Some("plan"), None] {
+            assert_eq!(
+                plan_tool_gate(false, false, true, mode, true),
+                GatePlan::Interactive,
+                "mode {mode:?} with session+smj must install the real gate"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_deny_all_when_gate_expected_but_smj_missing() {
+        // Expected-but-missing (mode != auto, smj absent) must fail CLOSED.
+        assert_eq!(
+            plan_tool_gate(false, false, true, Some("ask"), false),
+            GatePlan::DenyAll
+        );
+    }
+
+    #[test]
+    fn plan_deny_all_when_gate_expected_but_session_missing() {
+        assert_eq!(
+            plan_tool_gate(false, false, false, Some("ask"), true),
+            GatePlan::DenyAll
+        );
+    }
+
+    #[test]
+    fn plan_open_when_auto_mode_even_if_gate_missing() {
+        // Auto allows everything anyway, so a missing gate is not a hole.
+        assert_eq!(
+            plan_tool_gate(false, false, false, Some("auto"), false),
+            GatePlan::Open
+        );
+        assert_eq!(
+            plan_tool_gate(false, false, true, Some("Auto"), false),
+            GatePlan::Open
+        );
+    }
+
+    #[test]
+    fn plan_open_when_fallback_override_set() {
+        // Explicit opt-back-in to the old fail-open behaviour.
+        assert_eq!(
+            plan_tool_gate(false, true, true, Some("ask"), false),
+            GatePlan::Open
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the stream to serialize $PATH mutation across concurrent tests
+    async fn system_block_reaches_claude_via_append_system_prompt_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "smedja-claude-sys-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let args_file = temp_dir.join("args.txt");
+        let captured_system = temp_dir.join("captured-system.txt");
+        let script_path = temp_dir.join("claude");
+        // Record argv and, while the run is live, copy the appended system-prompt
+        // file to a known path so the test can read it after the guard unlinks it.
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"--append-system-prompt-file\" ]; then cp \"$a\" '{}'; fi\n  prev=\"$a\"\ndone\ncat > /dev/null\nprintf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok\"}}]}}}}'\n",
+                args_file.display(),
+                captured_system.display()
+            ),
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = std::fs::metadata(&script_path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script_path, permissions).unwrap();
+        }
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old_path}", temp_dir.display()));
+
+        let provider = ClaudeCliProvider::detect(None).expect("mock claude should be detected");
+        let system_block = "SMEDJA-SYSTEM-BLOCK: role packs, skills, methodology, project context";
+        let opts = CallOptions {
+            model: String::new(),
+            max_tokens: None,
+            temperature: None,
+            system: Some(system_block.to_owned()),
+            tools: None,
+            provider_session_id: None,
+            smedja_session_id: None,
+            permission_mode: None,
+            stable_prefix_len: None,
+            cache_strategy: crate::types::CacheStrategy::None,
+            workspace: None,
+        };
+        let messages = vec![Message {
+            role: crate::Role::User,
+            content: "hi".into(),
+        }];
+
+        let mut stream = provider.stream_chat(&messages, &opts);
+        while stream.next().await.is_some() {}
+
+        std::env::set_var("PATH", old_path);
+
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        assert!(
+            args.contains("--append-system-prompt-file"),
+            "system block must be delivered via --append-system-prompt-file; args were:\n{args}"
+        );
+        let delivered = std::fs::read_to_string(&captured_system)
+            .expect("the appended system-prompt file must exist during the run");
+        assert_eq!(
+            delivered, system_block,
+            "the exact assembled system block must reach claude"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);

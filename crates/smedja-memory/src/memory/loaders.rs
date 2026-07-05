@@ -163,3 +163,76 @@ pub fn detect_agents_md(
     let content = std::fs::read_to_string(&path)?;
     Ok(Some(content))
 }
+
+/// Markers delimiting the smedja-managed section inside a workspace `AGENTS.md`.
+///
+/// The codex adapter (`smedja-adapter`'s `codex_cli.rs`) writes this section so
+/// codex sees smedja's system block; [`strip_managed_agents_section`] removes it
+/// when that same `AGENTS.md` is fed back into the system prompt, so smedja's own
+/// injected block is never double-counted.
+///
+/// NOTE: these literals are duplicated in `smedja-adapter` (which this crate
+/// depends on, so the dependency cannot be reversed to share them). Keep them in
+/// sync with `AGENTS_MANAGED_BEGIN`/`AGENTS_MANAGED_END` there.
+pub const AGENTS_MANAGED_BEGIN: &str =
+    "<!-- BEGIN SMEDJA-MANAGED: auto-generated, do not edit below -->";
+/// End marker for the smedja-managed `AGENTS.md` section. See
+/// [`AGENTS_MANAGED_BEGIN`].
+pub const AGENTS_MANAGED_END: &str = "<!-- END SMEDJA-MANAGED -->";
+
+/// Removes the smedja-managed section (and its markers) from an `AGENTS.md`
+/// body, returning only the user-authored content.
+///
+/// Returns the input unchanged when no managed section is present. Used before
+/// injecting a repo's own `AGENTS.md` into the system prompt so smedja's own
+/// block (which the codex adapter may have written into that file) is not fed
+/// back to itself.
+#[must_use]
+pub fn strip_managed_agents_section(body: &str) -> String {
+    match (
+        body.find(AGENTS_MANAGED_BEGIN),
+        body.find(AGENTS_MANAGED_END),
+    ) {
+        (Some(start), Some(end)) if end > start => {
+            let end_full = end + AGENTS_MANAGED_END.len();
+            let head = body[..start].trim_end();
+            let tail = body[end_full..].trim_start();
+            match (head.is_empty(), tail.is_empty()) {
+                (true, true) => String::new(),
+                (false, true) => head.to_owned(),
+                (true, false) => tail.to_owned(),
+                (false, false) => format!("{head}\n\n{tail}"),
+            }
+        }
+        _ => body.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod agents_md_tests {
+    use super::{strip_managed_agents_section, AGENTS_MANAGED_BEGIN, AGENTS_MANAGED_END};
+
+    #[test]
+    fn strip_returns_input_when_no_managed_section() {
+        let body = "# My rules\n\nDo the thing.\n";
+        assert_eq!(strip_managed_agents_section(body), body);
+    }
+
+    #[test]
+    fn strip_removes_managed_section_keeps_user_content() {
+        let body = format!(
+            "# User rules\n\nBe careful.\n\n{AGENTS_MANAGED_BEGIN}\nSMEDJA BLOCK\n{AGENTS_MANAGED_END}\n"
+        );
+        let out = strip_managed_agents_section(&body);
+        assert!(out.contains("# User rules"));
+        assert!(out.contains("Be careful."));
+        assert!(!out.contains("SMEDJA BLOCK"));
+        assert!(!out.contains(AGENTS_MANAGED_BEGIN));
+    }
+
+    #[test]
+    fn strip_of_managed_only_file_is_empty() {
+        let body = format!("{AGENTS_MANAGED_BEGIN}\nSMEDJA BLOCK\n{AGENTS_MANAGED_END}\n");
+        assert!(strip_managed_agents_section(&body).is_empty());
+    }
+}

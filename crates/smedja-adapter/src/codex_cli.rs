@@ -42,9 +42,18 @@ impl Provider for CodexCliProvider {
 
 #[allow(clippy::too_many_lines)]
 fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
-    let prompt = messages
+    let raw_prompt = messages
         .last()
         .map_or_else(String::new, |m| m.content.clone());
+    let system = opts.system.clone();
+    // codex has no `system` field, so the assembled system block (rules +
+    // methodology + skills index) is delivered two ways: prepended to the prompt
+    // string, and materialised into the workspace `AGENTS.md` (which codex reads)
+    // below. Both together make sure the block reaches the model.
+    let prompt = match system.as_deref() {
+        Some(s) if !s.trim().is_empty() => format!("{s}\n\n{raw_prompt}"),
+        _ => raw_prompt,
+    };
     let resume_id = opts.provider_session_id.clone();
     let model = opts.model.clone();
     let workspace = opts.workspace.clone();
@@ -55,6 +64,15 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
         // Emit a synthetic session marker immediately so the daemon uses --last on the
         // next turn, even if the stream is interrupted before stdout closes.
         let _ = tx.send(Ok(Delta::SessionId("last".to_owned()))).await;
+
+        // Materialise the system block into the workspace `AGENTS.md` so codex
+        // picks it up. A user's existing AGENTS.md is preserved — only the
+        // smedja-managed section is written/updated.
+        if let (Some(dir), Some(sys)) = (workspace.as_ref(), system.as_deref()) {
+            if !sys.trim().is_empty() {
+                write_agents_md(dir, sys);
+            }
+        }
 
         let mut command = tokio::process::Command::new("codex");
 
@@ -196,6 +214,63 @@ async fn read_stderr(stderr: Option<tokio::process::ChildStderr>) -> String {
     let mut buf = String::new();
     let _ = stderr.read_to_string(&mut buf).await;
     buf
+}
+
+/// Markers delimiting the smedja-managed section of a workspace `AGENTS.md`.
+///
+/// NOTE: these literals must stay in sync with `smedja_memory`'s
+/// `AGENTS_MANAGED_BEGIN`/`AGENTS_MANAGED_END` (that crate strips this section
+/// when the same `AGENTS.md` is fed back into the system prompt, so smedja's own
+/// block is never double-counted). `smedja-memory` depends on this crate, so the
+/// dependency cannot be reversed to share the constants directly.
+const AGENTS_MANAGED_BEGIN: &str =
+    "<!-- BEGIN SMEDJA-MANAGED: auto-generated, do not edit below -->";
+const AGENTS_MANAGED_END: &str = "<!-- END SMEDJA-MANAGED -->";
+
+/// Merges `block` into an existing `AGENTS.md` body as a smedja-managed section,
+/// preserving any user-authored content outside the markers. Idempotent: an
+/// existing managed section is replaced in place, never stacked.
+fn merge_agents_md(existing: Option<&str>, block: &str) -> String {
+    let managed = format!("{AGENTS_MANAGED_BEGIN}\n{block}\n{AGENTS_MANAGED_END}\n");
+    let Some(body) = existing else {
+        return managed;
+    };
+    if let (Some(start), Some(end)) = (
+        body.find(AGENTS_MANAGED_BEGIN),
+        body.find(AGENTS_MANAGED_END),
+    ) {
+        if end > start {
+            let end_full = end + AGENTS_MANAGED_END.len();
+            let mut out = String::with_capacity(body.len() + managed.len());
+            out.push_str(&body[..start]);
+            out.push_str(&managed);
+            // Drop one newline immediately after the old end marker so the region
+            // swap doesn't grow the file with each turn.
+            let tail = body[end_full..]
+                .strip_prefix('\n')
+                .unwrap_or(&body[end_full..]);
+            out.push_str(tail);
+            return out;
+        }
+    }
+    // No managed section yet: append after the user's content.
+    let sep = if body.is_empty() || body.ends_with('\n') {
+        ""
+    } else {
+        "\n\n"
+    };
+    format!("{body}{sep}{managed}")
+}
+
+/// Writes the assembled system `block` into `workspace/AGENTS.md`, preserving a
+/// user's existing file by updating only the smedja-managed section.
+fn write_agents_md(workspace: &std::path::Path, block: &str) {
+    let path = workspace.join("AGENTS.md");
+    let existing = std::fs::read_to_string(&path).ok();
+    let merged = merge_agents_md(existing.as_deref(), block);
+    if let Err(e) = std::fs::write(&path, merged) {
+        tracing::warn!(error = %e, "failed to write codex AGENTS.md; system block delivered via prompt only");
+    }
 }
 
 /// Parses a single JSONL line from `codex exec --json`.
@@ -783,5 +858,108 @@ mod tests {
             got_error,
             "expected an error delta when codex exits 0 with no output"
         );
+    }
+
+    // ── AGENTS.md merge (system-block delivery) ──────────────────────────────
+
+    #[test]
+    fn merge_agents_md_creates_managed_section_when_absent() {
+        let out = merge_agents_md(None, "SYSTEM BLOCK");
+        assert!(out.contains(AGENTS_MANAGED_BEGIN));
+        assert!(out.contains("SYSTEM BLOCK"));
+        assert!(out.contains(AGENTS_MANAGED_END));
+    }
+
+    #[test]
+    fn merge_agents_md_preserves_user_content() {
+        let user = "# My project rules\n\nAlways run the linter.\n";
+        let out = merge_agents_md(Some(user), "SMEDJA BLOCK");
+        assert!(out.contains("# My project rules"));
+        assert!(out.contains("Always run the linter."));
+        assert!(out.contains("SMEDJA BLOCK"));
+        // User content must come before the managed section.
+        assert!(out.find("My project rules").unwrap() < out.find(AGENTS_MANAGED_BEGIN).unwrap());
+    }
+
+    #[test]
+    fn merge_agents_md_is_idempotent_replaces_in_place() {
+        let user = "# Rules\n";
+        let first = merge_agents_md(Some(user), "BLOCK V1");
+        let second = merge_agents_md(Some(&first), "BLOCK V2");
+        // Old managed content is replaced, not stacked.
+        assert!(!second.contains("BLOCK V1"));
+        assert!(second.contains("BLOCK V2"));
+        assert_eq!(
+            second.matches(AGENTS_MANAGED_BEGIN).count(),
+            1,
+            "managed section must not stack across turns"
+        );
+        // User content is still intact.
+        assert!(second.contains("# Rules"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn codex_run_writes_agents_md_and_prepends_system_without_clobbering() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "smedja-codex-agents-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Pre-existing user AGENTS.md must survive.
+        let ws = tmp.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("AGENTS.md"), "# User rules\n\nBe careful.\n").unwrap();
+
+        let bindir = tmp.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let args_file = tmp.join("args.txt");
+        // Echo argv to a file so we can assert the system block was prepended.
+        make_mock_codex(
+            &bindir,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'done\\n'\n",
+                args_file.display()
+            ),
+        );
+
+        let old = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old}", bindir.display()));
+
+        let system_block = "SMEDJA-SYSTEM: rules + methodology + skills index";
+        let mut opts = base_opts(None);
+        opts.system = Some(system_block.to_owned());
+        opts.workspace = Some(ws.clone());
+        let provider = CodexCliProvider::Cli;
+        let mut stream = provider.stream_chat(&[user_msg("do the thing")], &opts);
+        while stream.next().await.is_some() {}
+
+        std::env::set_var("PATH", old);
+
+        // AGENTS.md now carries the managed block AND the user's original content.
+        let agents = std::fs::read_to_string(ws.join("AGENTS.md")).unwrap();
+        assert!(
+            agents.contains("# User rules") && agents.contains("Be careful."),
+            "user AGENTS.md must not be clobbered; got:\n{agents}"
+        );
+        assert!(
+            agents.contains(system_block),
+            "AGENTS.md must carry the smedja system block; got:\n{agents}"
+        );
+        assert!(agents.contains(AGENTS_MANAGED_BEGIN));
+
+        // The system block is also prepended to the prompt argv.
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        assert!(
+            args.contains(system_block),
+            "system block must be prepended to the codex prompt; args were:\n{args}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
