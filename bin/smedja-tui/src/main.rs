@@ -542,6 +542,9 @@ pub(crate) async fn submit(input: &str, state: &mut AppState, client: &mut Clien
             state.trace_selected = 0;
             state.trace_expanded = false;
             state.live_tokens = 0;
+            // Fresh per-turn token high-water marks for the obs throughput bar.
+            state.turn_tokens_in = 0;
+            state.turn_tokens_out = 0;
             state.last_stream_activity = Some(std::time::Instant::now());
             state.tool_started_at = None;
             state.plan_current = 0;

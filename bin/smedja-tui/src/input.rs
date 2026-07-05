@@ -575,6 +575,36 @@ pub(crate) async fn handle_key(
     }
 
     // ------------------------------------------------------------------
+    // Trace-waterfall span inspector: `x` steps through the current turn's
+    // spans and expands the selected span's detail. The trace panel is drawn
+    // whenever obs is on and the turn recorded spans — including in input mode
+    // — so this is handled here rather than only inside the scroll block. To
+    // avoid stealing a typed 'x', it only fires when the trace panel is visible
+    // and the user is not composing (scroll mode, or an empty input line).
+    // ------------------------------------------------------------------
+    if key.code == KeyCode::Char('x')
+        && key.modifiers.is_empty()
+        && state.panels.obs
+        && !state.current_trace.is_empty()
+        && (state.scroll_focus || state.input.is_empty())
+    {
+        let n = state.current_trace.spans.len();
+        if n > 0 {
+            if state.trace_expanded {
+                // Step to the next span; wrapping past the last collapses.
+                state.trace_selected = (state.trace_selected + 1) % n;
+                if state.trace_selected == 0 {
+                    state.trace_expanded = false;
+                }
+            } else {
+                state.trace_expanded = true;
+                state.trace_selected = 0;
+            }
+        }
+        return Ok(());
+    }
+
+    // ------------------------------------------------------------------
     // Scroll / visual-selection mode intercept.
     // ------------------------------------------------------------------
     if state.scroll_focus {
@@ -678,24 +708,8 @@ pub(crate) async fn handle_key(
                 }
                 return Ok(());
             }
-            // x: step through the trace waterfall's spans, expanding the selected
-            // span's detail (the in-terminal OTel span inspector).
-            KeyCode::Char('x') => {
-                let n = state.current_trace.spans.len();
-                if n > 0 {
-                    if state.trace_expanded {
-                        state.trace_selected = (state.trace_selected + 1) % n;
-                        if state.trace_selected == 0 {
-                            // Wrapped past the last span → collapse.
-                            state.trace_expanded = false;
-                        }
-                    } else {
-                        state.trace_expanded = true;
-                        state.trace_selected = 0;
-                    }
-                }
-                return Ok(());
-            }
+            // (`x` — the trace-waterfall span inspector — is handled by a
+            // mode-independent intercept above so it also works in input mode.)
             // A (Shift-A): collapse / expand the action log. Uppercase so it does
             // not collide with lowercase 'a' (exit scroll mode) or Ctrl-A (role
             // cockpit).

@@ -293,6 +293,15 @@ pub(crate) struct AppState {
     pub(crate) session_tokens_in: u64,
     /// Cumulative output tokens for this session.
     pub(crate) session_tokens_out: u64,
+    /// Running input-token high-water mark for the in-flight turn, fed by
+    /// mid-stream `Usage` events so the obs throughput bar shows live values
+    /// before the turn's `Done` commits them into the session totals. Reset at
+    /// each turn submit; tracked as a max because providers split usage across
+    /// several events (a zero from one must not clobber a non-zero from another).
+    pub(crate) turn_tokens_in: u64,
+    /// Running output-token high-water mark for the in-flight turn (see
+    /// [`Self::turn_tokens_in`]).
+    pub(crate) turn_tokens_out: u64,
     /// Running sum of every observed Tier-1 quality score (for the value panel's
     /// real running average).
     pub(crate) quality_score_sum: u64,

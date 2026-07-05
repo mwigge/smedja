@@ -188,6 +188,8 @@ pub(crate) async fn bootstrap() -> Result<Session> {
         latency_samples: VecDeque::new(),
         session_tokens_in: 0,
         session_tokens_out: 0,
+        turn_tokens_in: 0,
+        turn_tokens_out: 0,
         quality_score_sum: 0,
         quality_score_count: 0,
         show_session_peek: false,
