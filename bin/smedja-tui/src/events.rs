@@ -491,8 +491,9 @@ pub(crate) fn apply_stream_event(
             state.turn_tokens_out = state.turn_tokens_out.max(u64::from(output_tok));
             state.obs_snapshot.tokens_input =
                 state.session_tokens_in.saturating_add(state.turn_tokens_in);
-            state.obs_snapshot.tokens_output =
-                state.session_tokens_out.saturating_add(state.turn_tokens_out);
+            state.obs_snapshot.tokens_output = state
+                .session_tokens_out
+                .saturating_add(state.turn_tokens_out);
         }
         StreamEvent::Unknown | StreamEvent::ToolCallChunk { .. } => {}
     }

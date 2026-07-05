@@ -1637,7 +1637,10 @@ async fn x_inspects_trace_in_input_mode_when_panel_visible() {
     handle_key(x, &mut state, &mut client, &mut editor)
         .await
         .unwrap();
-    assert!(state.trace_expanded, "x must expand the trace in input mode");
+    assert!(
+        state.trace_expanded,
+        "x must expand the trace in input mode"
+    );
     assert_eq!(state.trace_selected, 0);
     assert!(
         state.input.is_empty(),
