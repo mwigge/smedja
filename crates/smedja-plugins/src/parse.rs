@@ -33,6 +33,8 @@ struct RawMetadata {
     tags: Vec<String>,
     #[serde(default)]
     supporting_files: Vec<String>,
+    #[serde(default)]
+    paths: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +90,7 @@ pub fn parse_skill(content: &str, path: &Path) -> Result<Skill, PluginsError> {
             arguments,
             tags: raw.metadata.tags,
             supporting_files: raw.metadata.supporting_files,
+            paths: raw.metadata.paths,
         },
         path: path.to_owned(),
         body: body.to_owned(),
@@ -164,7 +167,7 @@ pub fn apply_skill_arguments(body: &str, args: &[&str], manifest: &SkillManifest
 /// Expects the content to start with a line that is exactly `---`, followed
 /// by YAML, followed by another line that is exactly `---`. Returns `None`
 /// when the structure cannot be found.
-fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     let content = content.trim_start_matches('\u{feff}'); // strip UTF-8 BOM if present
 
     // The file must begin with the opening delimiter.
@@ -324,6 +327,7 @@ All args: $ARGUMENTS
             ],
             tags: vec![],
             supporting_files: vec![],
+            paths: vec![],
         };
         let result = apply_skill_arguments(body, &["api", "prod"], &manifest);
         assert_eq!(
@@ -356,6 +360,7 @@ All args: $ARGUMENTS
             ],
             tags: vec![],
             supporting_files: vec![],
+            paths: vec![],
         };
         let result = apply_skill_arguments(body, &["api"], &manifest);
         assert_eq!(result, "env=staging");

@@ -174,69 +174,102 @@ mod tests {
         );
     }
 
-    // ── 10. incremental re-index — same sha skips unchanged files ─────────────
+    // ── 10. incremental re-index — unchanged files are skipped, total stable ──
 
     #[test]
-    fn incremental_reindex_same_sha_returns_zero() {
+    fn incremental_reindex_unchanged_returns_stable_total() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("a.rs"), "fn hello() {}\n").expect("write");
 
         let mut store = GraphStore::open_in_memory().unwrap();
 
-        // First index run with a sha — should insert symbols.
+        // First index run — should insert symbols and report the repo total.
         let first = store
-            .index_workspace_incremental(dir.path(), "ws-incr", Some("abc123"))
+            .index_workspace_incremental(dir.path(), "ws-incr")
             .unwrap();
         assert!(
             first >= 1,
             "expected at least 1 symbol on first index, got {first}"
         );
 
-        // Second run with the same sha — file is unchanged, should return 0.
+        // Second run — file is unchanged, so nothing is re-parsed, but the
+        // reported total (whole-repo symbol count) stays the same.
         let second = store
-            .index_workspace_incremental(dir.path(), "ws-incr", Some("abc123"))
+            .index_workspace_incremental(dir.path(), "ws-incr")
             .unwrap();
         assert_eq!(
-            second, 0,
-            "same sha + unchanged file must return 0 new symbols"
+            second, first,
+            "unchanged file must keep the same total symbol count"
         );
     }
 
-    // ── 11. incremental re-index — new sha re-indexes all files ──────────────
+    // ── 11. incremental re-index — a modified file is re-indexed ──────────────
 
     #[test]
-    fn incremental_reindex_new_sha_returns_symbols() {
+    fn incremental_reindex_picks_up_modifications() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("b.rs"), "fn world() {}\n").expect("write");
+        let file = dir.path().join("b.rs");
+        std::fs::write(&file, "fn world() {}\n").expect("write");
 
         let mut store = GraphStore::open_in_memory().unwrap();
-
-        store
-            .index_workspace_incremental(dir.path(), "ws-newsha", Some("sha-v1"))
+        let first = store
+            .index_workspace_incremental(dir.path(), "ws-mod")
             .unwrap();
+        assert_eq!(first, 1, "one function on first pass, got {first}");
 
-        // New sha — all files are treated as changed.
+        // Rewrite the file with an extra symbol and force a newer mtime so the
+        // mtime-skip does not fire.
+        std::fs::write(&file, "fn world() {}\nfn again() {}\n").expect("rewrite");
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        filetime_set(&file, future);
+
         let second = store
-            .index_workspace_incremental(dir.path(), "ws-newsha", Some("sha-v2"))
+            .index_workspace_incremental(dir.path(), "ws-mod")
             .unwrap();
+        assert_eq!(second, 2, "modified file must be re-indexed, got {second}");
+    }
+
+    // ── 12. incremental re-index — a deleted file is pruned ───────────────────
+
+    #[test]
+    fn incremental_reindex_prunes_deleted_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let keep = dir.path().join("keep.rs");
+        let gone = dir.path().join("gone.rs");
+        std::fs::write(&keep, "fn keep() {}\n").expect("write");
+        std::fs::write(&gone, "fn gone() {}\n").expect("write");
+
+        let mut store = GraphStore::open_in_memory().unwrap();
+        let first = store
+            .index_workspace_incremental(dir.path(), "ws-del")
+            .unwrap();
+        assert_eq!(first, 2, "two functions on first pass, got {first}");
+
+        std::fs::remove_file(&gone).expect("remove");
+        let second = store
+            .index_workspace_incremental(dir.path(), "ws-del")
+            .unwrap();
+        assert_eq!(
+            second, 1,
+            "deleted file's symbol must be pruned, got {second}"
+        );
         assert!(
-            second >= 1,
-            "new sha must re-index all files; expected ≥ 1 symbol, got {second}"
+            store.graph_query("gone", 5, 0).unwrap().is_empty(),
+            "pruned symbol must not be queryable"
         );
     }
 
-    // ── 12. incremental re-index — None sha performs full re-index ────────────
-
-    #[test]
-    fn incremental_reindex_none_sha_is_full_reindex() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("c.rs"), "fn full() {}\n").expect("write");
-
-        let mut store = GraphStore::open_in_memory().unwrap();
-        let n = store
-            .index_workspace_incremental(dir.path(), "ws-full", None)
-            .unwrap();
-        assert!(n >= 1, "full re-index should return symbols; got {n}");
+    /// Sets a file's mtime to `t` for deterministic incremental-index tests,
+    /// without pulling in an extra crate: shells out to `touch -d`.
+    fn filetime_set(path: &std::path::Path, t: std::time::SystemTime) {
+        let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let status = std::process::Command::new("touch")
+            .arg("-d")
+            .arg(format!("@{secs}"))
+            .arg(path)
+            .status()
+            .expect("touch");
+        assert!(status.success(), "touch failed");
     }
 
     // ── 13. integration: index smedja repo; query WorkingMemory ─────────────

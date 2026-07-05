@@ -41,10 +41,10 @@ pub(crate) async fn dispatch_workspace(action: WorkspaceCmd, sock: &std::path::P
             println!("Indexed {count} symbols in {}", target.display());
             cmd_workspace_init(&target)?;
         }
-        WorkspaceCmd::Index { commit_sha } => {
-            // `commit_sha` is accepted for CLI compatibility; the server-side
-            // index performs a full re-index.
-            let _ = commit_sha;
+        WorkspaceCmd::Index => {
+            // The server resolves the enclosing git root from this path and runs
+            // an incremental (mtime-based) index, so launching from a subdir
+            // still indexes the whole repository.
             let workspace =
                 std::env::current_dir().context("cannot determine current directory")?;
             let mut client = Client::connect(sock)

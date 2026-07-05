@@ -5,6 +5,42 @@
 //! unparseable file resolves to the FNV default and never blocks startup. The
 //! resolved config then drives [`resolve_embedder`], which probes a configured
 //! learned endpoint and degrades to the FNV backend when it is unreachable.
+//!
+//! # Recall quality: prefer a local semantic endpoint
+//!
+//! The FNV bag-of-words backend is the *offline safety net*, not a good default
+//! for recall — it is lexical (keyword overlap), so "semantic" recall over it is
+//! keyword search. The **recommended** production configuration points at a
+//! local, OpenAI-compatible embeddings server (e.g. a bge-small / MiniLM served
+//! by llama.cpp, Ollama, or text-embeddings-inference on localhost):
+//!
+//! ```toml
+//! # <workspace>/.smedja/config.toml
+//! [embedder]
+//! backend  = "learned"
+//! endpoint = "http://127.0.0.1:9090"   # local /v1/embeddings server
+//! model    = "bge-small-en-v1.5"
+//! dim      = 384
+//! ```
+//!
+//! With this set, recall is genuinely semantic; FNV only takes over if the
+//! endpoint is unreachable, and that degradation is now *surfaced* (a WARN plus
+//! [`Embedder::status`](crate::embedder_port::Embedder::status)) rather than
+//! silent.
+//!
+//! # Seam: bundling a local model next
+//!
+//! The clean next step is an in-process semantic embedder (a bge-small / MiniLM
+//! via `candle` or an ONNX runtime) so semantic recall needs no sidecar server.
+//! It was deliberately *not* bundled here: the model weights (~90 MB) plus a
+//! candle/ONNX + tokenizer dependency stack are too heavy and supply-chain-risky
+//! to add well in a single pass. The seam is already in place — implement
+//! [`Embedder`](crate::embedder_port::Embedder) for the bundled model (its
+//! `status().semantic` returns `true`), then add a `EmbedderBackend::Local` arm
+//! to [`resolve_embedder`] that constructs it and falls back to
+//! [`FnvEmbedder`] on load failure, exactly as the learned arm falls back today.
+//! No call site changes: every embedding flows through the resolved
+//! `Arc<dyn Embedder>`.
 
 use std::path::Path;
 use std::sync::Arc;

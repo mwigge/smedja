@@ -33,16 +33,55 @@ pub(crate) fn now_epoch() -> f64 {
         .as_secs_f64()
 }
 
-/// Resolves the daemon workspace root from the `SMEDJA_WORKSPACE` env var,
-/// defaulting to the relative `"."` when unset.
+/// Resolves the single active repository for `start`: the nearest ancestor that
+/// contains a `.git` entry (the git top-level, à la `git rev-parse
+/// --show-toplevel` / Aider's `search_parent_directories`), as an **absolute,
+/// canonical** path.
 ///
-/// This consolidates the inline `"."`-defaulting lookups; the startup default
-/// (an absolute cwd) is resolved separately by `resolve_workspace_root` in
-/// `main.rs` and is intentionally not changed here.
+/// `start` is canonicalised first; only a real, resolvable path is walked. When
+/// `start` cannot be canonicalised (nonexistent / relative-bad) it is returned
+/// verbatim so the caller keeps a deterministic key and no accidental match on a
+/// parent `.git` via relative components. When `start` is canonical but sits
+/// outside any git repository, the canonicalised `start` itself is returned.
+///
+/// This is the one place a root is turned into an active repo, so
+/// `session.create`, the per-turn orchestrator root, and `graph.index` /
+/// `graph.query` all agree on the exact path that keys the graph DB.
+#[must_use]
+pub(crate) fn resolve_active_repo(start: &std::path::Path) -> std::path::PathBuf {
+    let Ok(canonical) = start.canonicalize() else {
+        return start.to_path_buf();
+    };
+    let mut dir: &std::path::Path = &canonical;
+    loop {
+        // `.git` is a directory for a normal checkout and a file for worktrees /
+        // submodules; `exists()` accepts both.
+        if dir.join(".git").exists() {
+            return dir.to_path_buf();
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => return canonical,
+        }
+    }
+}
+
+/// Resolves the daemon's default active repository.
+///
+/// Starts from `SMEDJA_WORKSPACE` when set, else the daemon's current directory,
+/// then walks up to the enclosing git root via [`resolve_active_repo`]. The
+/// result is the absolute canonical repo root, so a daemon (or CLI) launched
+/// from a subdirectory still keys the graph off the repository, not the subdir.
 #[must_use]
 pub(crate) fn workspace_root() -> std::path::PathBuf {
-    std::env::var("SMEDJA_WORKSPACE")
-        .map_or_else(|_| std::path::PathBuf::from("."), std::path::PathBuf::from)
+    let start = std::env::var("SMEDJA_WORKSPACE")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map_or_else(
+            || std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            std::path::PathBuf::from,
+        );
+    resolve_active_repo(&start)
 }
 
 /// Extracts `(trace_id, span_id)` strings from the currently active `OTel` span.
@@ -402,6 +441,48 @@ mod tests {
 
     fn error_stream(err: AdapterError) -> smedja_adapter::DeltaStream {
         Box::pin(futures_util::stream::iter(vec![Err(err)]))
+    }
+
+    #[test]
+    fn resolve_active_repo_walks_up_to_git_root_from_subdir() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        let sub = repo.path().join("crates").join("deep").join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let root = resolve_active_repo(&sub);
+        // The repo root is the nearest ancestor containing `.git`, canonicalised.
+        assert_eq!(root, repo.path().canonicalize().unwrap());
+        assert!(root.is_absolute());
+    }
+
+    #[test]
+    fn resolve_active_repo_falls_back_to_canonical_start_outside_repo() {
+        // A directory with no `.git` ancestor resolves to itself (canonical), not
+        // to some unrelated parent repo.
+        let plain = tempfile::tempdir().unwrap();
+        let root = resolve_active_repo(plain.path());
+        assert_eq!(root, plain.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_active_repo_preserves_unresolvable_path_verbatim() {
+        // A nonexistent relative path must not walk up into the test's cwd `.git`.
+        let raw = std::path::Path::new("definitely/not/a/real/path/xyzzy");
+        assert_eq!(resolve_active_repo(raw), raw.to_path_buf());
+    }
+
+    #[test]
+    fn resolve_active_repo_accepts_git_file_worktree_marker() {
+        // Worktrees / submodules use a `.git` *file*, not a directory.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        let sub = repo.path().join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(
+            resolve_active_repo(&sub),
+            repo.path().canonicalize().unwrap()
+        );
     }
 
     #[test]

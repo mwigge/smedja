@@ -130,12 +130,8 @@ pub(crate) enum WorkspaceCmd {
         /// Directory to initialise (defaults to current directory)
         path: Option<std::path::PathBuf>,
     },
-    /// Index the current workspace into the code graph
-    Index {
-        /// Optional git commit SHA for incremental re-indexing
-        #[arg(long)]
-        commit_sha: Option<String>,
-    },
+    /// Index the current workspace into the code graph (incremental, mtime-based)
+    Index,
     /// Register a directory path with the workspace
     Add {
         /// Directory path to add to the workspace

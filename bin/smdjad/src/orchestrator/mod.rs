@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use opentelemetry::{
@@ -260,23 +259,23 @@ impl TurnOrchestrator {
         ));
 
         let workspace_root = {
-            let p = session
+            // The session stores the resolved absolute canonical git root (see
+            // session.create). Re-resolving is idempotent for that stored value
+            // and repairs the fallback case (no stored root) by walking to the
+            // enclosing repo, so index / query / injection all key one DB path.
+            let start = session
                 .as_ref()
                 .and_then(|s| s.workspace_root.as_deref())
-                .map_or_else(
-                    || {
-                        std::env::var("SMEDJA_WORKSPACE")
-                            .map_or_else(|_| PathBuf::from("."), PathBuf::from)
-                    },
-                    PathBuf::from,
-                );
-            if !p.join(".git").exists() {
+                .map_or_else(crate::common::workspace_root, |s| {
+                    crate::common::resolve_active_repo(std::path::Path::new(s))
+                });
+            if !start.join(".git").exists() {
                 tracing::warn!(
-                    path = %p.display(),
+                    path = %start.display(),
                     "workspace does not contain .git; tool execution may be in wrong directory",
                 );
             }
-            p
+            start
         };
 
         let task_prefix = {
@@ -459,6 +458,27 @@ impl TurnOrchestrator {
                     let _ = write!(content, "\n\n{diag_block}");
                 }
             }
+            // Auto-activate relevant bundle skills: match the turn text and the
+            // turn's touched files against skill triggers/paths, inlining the
+            // full body of each selected skill for this turn only (the L1 index
+            // already rode the stable prefix). Warn-free when nothing matches.
+            {
+                let touched: Vec<String> =
+                    crate::quality_hook::changed_file_sizes_for_review(&workspace_root)
+                        .into_iter()
+                        .map(|(abs, _)| {
+                            abs.strip_prefix(&workspace_root)
+                                .unwrap_or(&abs)
+                                .to_string_lossy()
+                                .into_owned()
+                        })
+                        .collect();
+                if let Some(block) =
+                    prompt::build_selected_skills_block(&workspace_root, &task.title, &touched)
+                {
+                    let _ = write!(content, "\n\n{block}");
+                }
+            }
             // Sanitize Unicode tag block (U+E0000–U+E007F) to block prompt injection.
             let content = sanitize_unicode_tags(&content);
             // Prepend per-turn context block (date + cwd) for model orientation.
@@ -619,6 +639,42 @@ impl TurnOrchestrator {
         'ring: for entry in &ring {
             let entry_runner_name = entry.runner_name.to_owned();
             let runner_enum = entry.runner;
+            // Runner-agnostic subagents: claude-cli reads native subagent
+            // definitions from `<workspace>/.claude/agents/`. Project the one
+            // bundle's agent defs into that directory so the same folder that
+            // feeds smedja's internal routing also reaches the native runner.
+            // Additive and idempotent — a no-op when the bundle has no agents.
+            if runner_enum == Runner::Claude {
+                let bundle = crate::bundle_config::load_bundle(&workspace_root);
+                // Log how each agent def binds to smedja's internal routing:
+                // a name matching a built-in role refines that role's tool
+                // policy; an unmatched name is materialised only for the native
+                // runner. This is the AgentRole mapping surface for subagents.
+                for agent in bundle.agents() {
+                    match crate::subagents::role_for_agent(&agent.name) {
+                        Some(role) => tracing::debug!(
+                            agent = %agent.name,
+                            role = role.label(),
+                            tools = crate::subagents::agent_tools(agent).len(),
+                            "bundle agent bound to role"
+                        ),
+                        None => tracing::debug!(
+                            agent = %agent.name,
+                            "bundle agent is native-only (no matching role)"
+                        ),
+                    }
+                }
+                let dest = workspace_root.join(".claude").join("agents");
+                match crate::subagents::materialize_agents(&bundle, &dest) {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::debug!(count = n, "materialized bundle agents for claude-cli")
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to materialize bundle agents; continuing")
+                    }
+                }
+            }
             // Key the provider-native resume id by (session, runner), NOT by
             // runner alone. A bare runner key ("claude-cli") is global: the
             // first turn's native conversation id leaks into every other

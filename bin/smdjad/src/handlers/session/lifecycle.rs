@@ -54,6 +54,19 @@ pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, 
         .and_then(|mut sessions| sessions.pop())
         .map_or((None, None), |s| (s.runner_override, s.model_override));
 
+    // Resolve the ONE canonical active repository for this session up front: the
+    // git root enclosing the client's workspace (or the daemon's default when no
+    // workspace was supplied). Storing this absolute canonical path on the
+    // session — and reusing it verbatim below for the LSP root and auto-index —
+    // makes `/index`, `graph.query`, and per-turn injection all hash the same
+    // `graph_db_path`, and makes a subdir launch index the repo root, not the
+    // subdir.
+    let active_repo = match workspace.as_deref() {
+        Some(w) => crate::common::resolve_active_repo(std::path::Path::new(w)),
+        None => crate::common::workspace_root(),
+    };
+    let active_repo_str = active_repo.to_string_lossy().into_owned();
+
     let now = Timestamp::now();
     let session_id = Uuid::new_v4();
 
@@ -86,7 +99,7 @@ pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, 
         mode,
         title: title.clone().unwrap_or_default(),
         cowork_mode,
-        workspace_root: workspace.clone(),
+        workspace_root: Some(active_repo_str),
         model_override: inherited_model.clone(),
         runner_override: inherited_runner.clone(),
     };
@@ -99,9 +112,8 @@ pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, 
     // falling back to the daemon cwd when none was supplied. This is what makes
     // rust-analyzer start for the project and the graph reflect the right repo,
     // instead of the daemon's $HOME.
-    let ws_path = workspace.map_or_else(crate::common::workspace_root, std::path::PathBuf::from);
-    lsp_manager.ensure_workspace(ws_path.clone());
-    maybe_reindex_workspace(ws_path);
+    lsp_manager.ensure_workspace(active_repo.clone());
+    maybe_reindex_workspace(active_repo);
 
     // When cowork_mode is requested, register the per-session gate.
     // The gate map is owned by build_router; session.create handles the DB flag
@@ -140,76 +152,107 @@ pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, 
     }))
 }
 
-/// Triggers a background workspace graph re-index when the workspace has been
-/// initialised (`.smedja/workspace.toml` exists) and the graph is stale (older
-/// than 24 h, or never indexed).
+/// Path of the auto-index staleness marker for a repo's graph DB.
 ///
-/// Errors are logged and swallowed — re-indexing is advisory and must not fail
-/// the `session.create` RPC call that triggers it.
-#[allow(clippy::needless_pass_by_value)]
-fn maybe_reindex_workspace(cwd: PathBuf) {
-    let toml_path = cwd.join(".smedja").join("workspace.toml");
-    let needs_index = if toml_path.exists() {
-        let content = std::fs::read_to_string(&toml_path).unwrap_or_default();
-        if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
-            parsed
-                .get("graph")
-                .and_then(|g| g.get("last_indexed_at"))
-                .and_then(|v| v.as_str())
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .is_none_or(|ts| {
-                    let age =
-                        chrono::Utc::now().signed_duration_since(ts.with_timezone(&chrono::Utc));
-                    age.num_hours() >= 24
-                })
-        } else {
-            true
-        }
-    } else {
-        // Only auto-index if workspace.toml already exists (workspace was initialised).
-        false
-    };
+/// It lives *next to* the graph DB under the daemon's writable state dir
+/// (`~/.local/share/smedja/graphs/<hash>/last_indexed_at`), keyed by the git
+/// root through the same hash `graph_db_path` uses. Keeping it there — rather
+/// than in `<repo>/.smedja/workspace.toml` — is what lets the sandboxed daemon
+/// (`ProtectHome=read-only`) record indexing progress at all, and ties the
+/// staleness check to the exact DB the index/query/injection paths read.
+fn index_marker_path(repo_root: &std::path::Path) -> Option<PathBuf> {
+    crate::handlers::graph::graph_db_path(repo_root)
+        .parent()
+        .map(|p| p.join("last_indexed_at"))
+}
 
-    if needs_index {
-        let bg_cwd = cwd.clone();
-        let bg_toml = toml_path.clone();
-        tokio::task::spawn(async move {
-            use opentelemetry::trace::Span as _;
-            let tracer = opentelemetry::global::tracer("smedja");
-            let mut span = opentelemetry::trace::Tracer::start(&tracer, "smedja.workspace.index");
-            let start = std::time::Instant::now();
-            let db_path = crate::handlers::graph::graph_db_path(&bg_cwd);
-            let bg_cwd_clone = bg_cwd.clone();
-            let symbol_count = tokio::task::spawn_blocking(move || {
-                smedja_graph::GraphStore::open(&db_path)
-                    .and_then(|mut s| {
-                        s.index_workspace_incremental(&bg_cwd_clone, "workspace", None)
-                    })
-                    .unwrap_or(0)
-            })
-            .await
-            .unwrap_or(0);
-            let duration_ms = start.elapsed().as_millis();
-            span.set_attribute(opentelemetry::KeyValue::new(
-                "workspace_path",
-                bg_cwd.to_string_lossy().into_owned(),
-            ));
-            span.set_attribute(opentelemetry::KeyValue::new(
-                "symbol_count",
-                i64::try_from(symbol_count).unwrap_or(i64::MAX),
-            ));
-            span.set_attribute(opentelemetry::KeyValue::new(
-                "duration_ms",
-                i64::try_from(duration_ms).unwrap_or(i64::MAX),
-            ));
-            span.end();
-            let ts = chrono::Utc::now().to_rfc3339();
-            let new_content = format!("[graph]\nauto_index = true\nlast_indexed_at = \"{ts}\"\n");
-            if let Err(e) = std::fs::write(&bg_toml, new_content) {
-                tracing::warn!(error = %e, "failed to update workspace.toml after auto-index");
-            }
-        });
+/// Returns whether the repo's graph should be (re-)indexed: `true` when it has
+/// never been indexed (no marker) or the last index is at least 24 h old.
+///
+/// Crucially there is **no** `.smedja/workspace.toml` precondition: a repo with
+/// no marker yet is treated as stale, so the first `session.create` for it
+/// triggers an auto-index.
+fn graph_is_stale(repo_root: &std::path::Path) -> bool {
+    let content = index_marker_path(repo_root).and_then(|m| std::fs::read_to_string(m).ok());
+    marker_is_stale(content.as_deref())
+}
+
+/// Pure staleness decision over a marker's contents: `None` (never indexed) or an
+/// unparseable / ≥24 h-old RFC 3339 timestamp is stale.
+fn marker_is_stale(content: Option<&str>) -> bool {
+    let Some(content) = content else {
+        return true; // never indexed → index now
+    };
+    chrono::DateTime::parse_from_rfc3339(content.trim())
+        .ok()
+        .is_none_or(|ts| {
+            let age = chrono::Utc::now().signed_duration_since(ts.with_timezone(&chrono::Utc));
+            age.num_hours() >= 24
+        })
+}
+
+/// Triggers a background graph index for the active repo on `session.create`.
+///
+/// Unlike the previous behaviour, this no longer requires a pre-existing
+/// `.smedja/workspace.toml`: the first session opened for a repository indexes
+/// it (bounded, in the background). A 24 h staleness marker next to the graph DB
+/// avoids re-indexing on every session. The index itself is incremental
+/// (mtime-based), so a re-index only re-parses changed files.
+///
+/// Errors are logged and swallowed — indexing is advisory and must not fail the
+/// `session.create` RPC that triggers it.
+#[allow(clippy::needless_pass_by_value)]
+fn maybe_reindex_workspace(repo_root: PathBuf) {
+    if !graph_is_stale(&repo_root) {
+        return;
     }
+
+    tokio::task::spawn(async move {
+        use opentelemetry::trace::Span as _;
+        let tracer = opentelemetry::global::tracer("smedja");
+        let mut span = opentelemetry::trace::Tracer::start(&tracer, "smedja.workspace.index");
+        let start = std::time::Instant::now();
+        let db_path = crate::handlers::graph::graph_db_path(&repo_root);
+        let marker = index_marker_path(&repo_root);
+        let index_root = repo_root.clone();
+        let symbol_count = tokio::task::spawn_blocking(move || {
+            if let Some(parent) = db_path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::warn!(error = %e, "auto-index: cannot create graph dir");
+                    return 0;
+                }
+            }
+            smedja_graph::GraphStore::open(&db_path)
+                .and_then(|mut s| s.index_workspace_incremental(&index_root, "workspace"))
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "auto-index failed");
+                    0
+                })
+        })
+        .await
+        .unwrap_or(0);
+        let duration_ms = start.elapsed().as_millis();
+        span.set_attribute(opentelemetry::KeyValue::new(
+            "workspace_path",
+            repo_root.to_string_lossy().into_owned(),
+        ));
+        span.set_attribute(opentelemetry::KeyValue::new(
+            "symbol_count",
+            i64::try_from(symbol_count).unwrap_or(i64::MAX),
+        ));
+        span.set_attribute(opentelemetry::KeyValue::new(
+            "duration_ms",
+            i64::try_from(duration_ms).unwrap_or(i64::MAX),
+        ));
+        span.end();
+        // Record completion so the 24 h staleness check can skip the next call.
+        if let Some(marker) = marker {
+            let ts = chrono::Utc::now().to_rfc3339();
+            if let Err(e) = std::fs::write(&marker, ts) {
+                tracing::warn!(error = %e, "failed to write auto-index marker");
+            }
+        }
+    });
 }
 
 /// Handles `session.delete`.
@@ -475,4 +518,53 @@ pub(crate) async fn takeover(state: HandlerState, params: Value) -> Result<Value
         "context_namespace": "handoff",
         "context_id": handoff_context_id,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{graph_is_stale, index_marker_path, marker_is_stale};
+
+    #[test]
+    fn marker_absent_is_stale_no_workspace_toml_required() {
+        // The whole point of the new behaviour: with no marker (and no
+        // workspace.toml anywhere), the repo is stale so auto-index fires on the
+        // first session.create.
+        assert!(marker_is_stale(None), "never-indexed repo must be stale");
+    }
+
+    #[test]
+    fn marker_fresh_is_not_stale_but_old_is() {
+        let fresh = chrono::Utc::now().to_rfc3339();
+        assert!(
+            !marker_is_stale(Some(&fresh)),
+            "just-indexed repo must not be re-indexed"
+        );
+
+        let old = (chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+        assert!(marker_is_stale(Some(&old)), "≥24h-old index must be stale");
+
+        // Whitespace tolerance + garbage → treated as stale (re-index).
+        assert!(!marker_is_stale(Some(&format!("  {fresh}\n"))));
+        assert!(marker_is_stale(Some("not-a-timestamp")));
+    }
+
+    // `graph_is_stale` reads the marker via `index_marker_path`. When the marker
+    // (and thus its graphs/<hash> dir) does not exist, the repo is stale — no
+    // `.smedja/workspace.toml` is consulted. Uses a $HOME-independent path check:
+    // `index_marker_path` returns a path only when a home dir is resolvable, so
+    // we assert the marker basename and the never-indexed staleness together.
+    #[test]
+    fn graph_is_stale_true_for_never_indexed_repo() {
+        let repo = tempfile::tempdir().unwrap();
+        // No marker has ever been written for this fresh temp repo → stale.
+        assert!(graph_is_stale(repo.path()));
+        if let Some(marker) = index_marker_path(repo.path()) {
+            assert_eq!(
+                marker.file_name().and_then(|n| n.to_str()),
+                Some("last_indexed_at")
+            );
+            // The marker never lives inside the workspace (sandbox-writable dir).
+            assert!(!marker.starts_with(repo.path()), "{marker:?}");
+        }
+    }
 }

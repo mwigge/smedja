@@ -4,14 +4,18 @@
 //! either as directory-based entries (`<name>/SKILL.md`) or as flat files
 //! (`<name>.md`) directly inside the skills directory.
 
+mod bundle;
 mod error;
 mod parse;
 mod registry;
+mod selector;
 mod types;
 
+pub use bundle::{parse_agent_item, parse_skill_item, AgentDef, Bundle, BundleItem, BundleKind};
 pub use error::PluginsError;
 pub use parse::{apply_skill_arguments, parse_skill};
 pub use registry::{SkillRegistry, SyncResult};
+pub use selector::{glob_match, select};
 pub use types::{Skill, SkillArgument, SkillManifest};
 
 /// Wraps a skill body in an XML envelope, escaping `<`, `>`, and `&` in the

@@ -67,7 +67,6 @@ impl GraphStore {
                  workspace_id TEXT    NOT NULL,
                  file_path    TEXT    NOT NULL,
                  indexed_at   REAL    NOT NULL,
-                 commit_sha   TEXT,
                  PRIMARY KEY (workspace_id, file_path)
              );",
         )?;
@@ -92,49 +91,47 @@ impl GraphStore {
         index_directory(&self.conn, root, workspace_id)
     }
 
-    /// Incrementally indexes `.rs` files under `root` for `workspace_id`.
+    /// Incrementally re-indexes source files under `root` for `workspace_id`,
+    /// mtime-based (Aider-style) — no commit hash required.
     ///
-    /// When `commit_sha` is `Some(sha)`:
-    /// - Files that were previously indexed under the **same** `sha` and whose
-    ///   filesystem modification time has not advanced beyond the stored
-    ///   `indexed_at` timestamp are **skipped** (assumed unchanged).
-    /// - Files that are new, or whose mtime is newer than the last `indexed_at`
-    ///   record, are re-indexed: their old symbols are deleted and fresh ones
-    ///   are inserted.
+    /// For every recognised source file:
+    /// - A file whose filesystem modification time has **not** advanced beyond
+    ///   the stored `indexed_at` timestamp is **skipped** (assumed unchanged).
+    /// - A file that is new, or whose mtime is newer than the recorded
+    ///   `indexed_at`, is re-indexed: its old symbols are deleted and fresh ones
+    ///   inserted, and its `indexed_at` is bumped.
     ///
-    /// When `commit_sha` is `None` the method falls back to a full re-index
-    /// (equivalent to calling [`Self::clear_workspace`] then [`Self::index_workspace`]).
+    /// After the walk, files that were previously indexed but no longer exist on
+    /// disk are pruned (their symbols and `indexed_files` rows are removed) so a
+    /// deleted file's symbols do not linger.
     ///
-    /// Returns the number of **new** symbols inserted.
+    /// Returns the **total** number of symbols stored for `workspace_id` after
+    /// the run (so `/index` reports the repo's whole symbol count, not just the
+    /// delta from an incremental pass).
     ///
     /// # Errors
     ///
-    /// Returns [`GraphError::Io`] on filesystem errors or [`GraphError::Db`] on
-    /// database errors.
+    /// Returns [`GraphError::InvalidRoot`] when `root` is not a directory,
+    /// [`GraphError::Io`] on filesystem errors, or [`GraphError::Db`] on database
+    /// errors.
     pub fn index_workspace_incremental(
         &mut self,
         root: &Path,
         workspace_id: &str,
-        commit_sha: Option<&str>,
     ) -> Result<usize, GraphError> {
-        // Fail loudly on a bad root before clearing existing symbols — a
-        // nonexistent/relative-bad path must not wipe the graph and report
-        // Ok(0). (index_directory validates too; this guards the sha branch
-        // and the pre-clear step below.)
+        // Fail loudly on a bad root before touching the graph — a
+        // nonexistent/relative-bad path must not report Ok and silently prune
+        // every previously-indexed file below.
         crate::indexer::validate_root(root)?;
-
-        let Some(sha) = commit_sha else {
-            // Full re-index path.
-            self.clear_workspace(workspace_id)?;
-            return index_directory(&self.conn, root, workspace_id);
-        };
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
 
-        let mut total_new = 0usize;
+        // Files seen on this pass; anything previously indexed but absent here
+        // is a deletion and is pruned afterwards.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for entry in crate::indexer::workspace_files(root) {
             let abs_path = entry.path();
@@ -148,6 +145,7 @@ impl GraphStore {
                 |_| abs_path.to_string_lossy().into_owned(),
                 |p| p.to_string_lossy().into_owned(),
             );
+            seen.insert(rel_path.clone());
 
             // Filesystem modification time as epoch f64.
             let mtime: f64 = abs_path
@@ -157,13 +155,13 @@ impl GraphStore {
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map_or(0.0, |d| d.as_secs_f64());
 
-            // Query whether this file was previously indexed under the same sha.
+            // When was this file last indexed (regardless of commit)?
             let existing: Option<f64> = self
                 .conn
                 .query_row(
                     "SELECT indexed_at FROM indexed_files \
-                     WHERE workspace_id = ?1 AND file_path = ?2 AND commit_sha = ?3",
-                    rusqlite::params![workspace_id, rel_path, sha],
+                     WHERE workspace_id = ?1 AND file_path = ?2",
+                    rusqlite::params![workspace_id, rel_path],
                     |row| row.get(0),
                 )
                 .ok();
@@ -179,7 +177,7 @@ impl GraphStore {
                 }
             }
 
-            // Remove stale symbols for this file.
+            // Remove stale symbols for this file before re-inserting.
             self.conn.execute(
                 "DELETE FROM symbols WHERE workspace_id = ?1 AND file_path = ?2",
                 rusqlite::params![workspace_id, rel_path],
@@ -196,7 +194,6 @@ impl GraphStore {
                 query_str,
             ) {
                 Ok(n) => {
-                    total_new += n;
                     tracing::debug!(file = %rel_path, symbols = n, "incremental: indexed");
                 }
                 Err(GraphError::ParseFailed { ref path }) => {
@@ -205,16 +202,50 @@ impl GraphStore {
                 Err(e) => return Err(e),
             }
 
-            // Record the file as indexed at `now` under this sha.
+            // Record the file as indexed at `now`.
             self.conn.execute(
                 "INSERT OR REPLACE INTO indexed_files \
-                 (workspace_id, file_path, indexed_at, commit_sha) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![workspace_id, rel_path, now, sha],
+                 (workspace_id, file_path, indexed_at) \
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![workspace_id, rel_path, now],
             )?;
         }
 
-        Ok(total_new)
+        self.prune_deleted_files(workspace_id, &seen)?;
+
+        self.symbol_count(workspace_id)
+    }
+
+    /// Removes symbols and `indexed_files` rows for files that were previously
+    /// indexed under `workspace_id` but are absent from `seen` (deleted on disk).
+    fn prune_deleted_files(
+        &self,
+        workspace_id: &str,
+        seen: &std::collections::HashSet<String>,
+    ) -> Result<(), GraphError> {
+        let previously: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT file_path FROM indexed_files WHERE workspace_id = ?1")?;
+            let rows = stmt.query_map(rusqlite::params![workspace_id], |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for file_path in previously {
+            if seen.contains(&file_path) {
+                continue;
+            }
+            self.conn.execute(
+                "DELETE FROM symbols WHERE workspace_id = ?1 AND file_path = ?2",
+                rusqlite::params![workspace_id, file_path],
+            )?;
+            self.conn.execute(
+                "DELETE FROM indexed_files WHERE workspace_id = ?1 AND file_path = ?2",
+                rusqlite::params![workspace_id, file_path],
+            )?;
+        }
+        Ok(())
     }
 
     /// Returns the top-`k` symbols whose name contains `query` (case-insensitive).

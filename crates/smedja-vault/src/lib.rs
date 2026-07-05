@@ -6,6 +6,7 @@
 //! This is the "cold" stratum: turns older than the working window are stored
 //! here and retrieved on demand by semantic similarity search.
 
+mod ann;
 mod diary;
 mod embedder;
 mod entries;
