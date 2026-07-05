@@ -114,6 +114,11 @@ uuid               = { workspace = true }
 walkdir            = { workspace = true }
 which              = { workspace = true }
 
+# Unix-only libc bindings: used to set a restrictive `umask` around the socket
+# bind so the Unix socket is created 0600 with no world-accessible window.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Linux-only Landlock LSM bindings for the native sandbox backend. Target-gated
 # so the macOS build never pulls it in.
 [target.'cfg(target_os = "linux")'.dependencies]

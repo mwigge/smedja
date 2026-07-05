@@ -742,41 +742,45 @@ impl TurnOrchestrator {
             if !nouns.is_empty() {
                 let graph_db_path = crate::handlers::graph::graph_db_path(&workspace_root);
                 if graph_db_path.exists() {
-                    match smedja_graph::GraphStore::open(&graph_db_path) {
-                        Ok(store) => {
-                            let query = nouns.join(" ");
-                            match store.graph_query(&query, 3, 2) {
-                                Ok(symbols) => {
-                                    if !symbols.is_empty() {
-                                        let snippets: Vec<String> = symbols
-                                            .iter()
-                                            .map(|s| {
-                                                format!(
-                                                    "// {} {} ({}:{})\n{}",
-                                                    s.kind.as_str(),
-                                                    s.name,
-                                                    s.file_path,
-                                                    s.start_line,
-                                                    s.snippet
-                                                )
-                                            })
-                                            .collect();
-                                        let _ = write!(
-                                            content,
-                                            "\n\n<graph_symbols>\n{}\n</graph_symbols>",
-                                            snippets.join("\n\n")
-                                        );
-                                        injected_count = symbols.len();
-                                    }
-                                }
+                    let query = nouns.join(" ");
+                    // GraphStore open + query are blocking (SQLite) calls; run
+                    // them on the blocking pool so a tokio worker is never stalled.
+                    let snippets: Vec<String> = tokio::task::spawn_blocking(move || {
+                        match smedja_graph::GraphStore::open(&graph_db_path) {
+                            Ok(store) => match store.graph_query(&query, 3, 2) {
+                                Ok(symbols) => symbols
+                                    .iter()
+                                    .map(|s| {
+                                        format!(
+                                            "// {} {} ({}:{})\n{}",
+                                            s.kind.as_str(),
+                                            s.name,
+                                            s.file_path,
+                                            s.start_line,
+                                            s.snippet
+                                        )
+                                    })
+                                    .collect(),
                                 Err(e) => {
                                     tracing::debug!(error = %e, "graph_query failed; skipping injection");
+                                    Vec::new()
                                 }
+                            },
+                            Err(e) => {
+                                tracing::debug!(error = %e, "could not open graph.db; skipping injection");
+                                Vec::new()
                             }
                         }
-                        Err(e) => {
-                            tracing::debug!(error = %e, "could not open graph.db; skipping injection");
-                        }
+                    })
+                    .await
+                    .unwrap_or_default();
+                    if !snippets.is_empty() {
+                        let _ = write!(
+                            content,
+                            "\n\n<graph_symbols>\n{}\n</graph_symbols>",
+                            snippets.join("\n\n")
+                        );
+                        injected_count = snippets.len();
                     }
                 } else {
                     tracing::debug!("graph.db not found; skipping auto-injection");

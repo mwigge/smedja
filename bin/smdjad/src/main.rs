@@ -212,12 +212,6 @@ pub(crate) async fn exec_bash_ext(
         Err(e) => return format!("error: {e}"),
     };
 
-    if let Some(bytes) = stdin_bytes {
-        if let Some(mut h) = child.stdin.take() {
-            let _ = h.write_all(&bytes).await;
-        }
-    }
-
     async fn read_into(
         mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
         target: Arc<std::sync::Mutex<String>>,
@@ -261,6 +255,21 @@ pub(crate) async fn exec_bash_ext(
     let stderr_buf = Arc::new(std::sync::Mutex::new(String::new()));
     let stdout_task = tokio::spawn(read_into(stdout_reader, Arc::clone(&stdout_buf)));
     let stderr_task = tokio::spawn(read_into(stderr_reader, Arc::clone(&stderr_buf)));
+
+    // Feed stdin only AFTER the stdout/stderr readers are draining. Writing all
+    // of stdin first (as before) deadlocks whenever the child emits more than one
+    // pipe buffer (~64 KB) of output: the child blocks on a full stdout pipe that
+    // nothing is reading yet, while we block writing stdin. Running the writer on
+    // its own task lets both directions make progress; dropping the handle on
+    // completion signals EOF to the child.
+    if let Some(bytes) = stdin_bytes {
+        if let Some(mut h) = child.stdin.take() {
+            tokio::spawn(async move {
+                let _ = h.write_all(&bytes).await;
+                // `h` drops here, closing the child's stdin (EOF).
+            });
+        }
+    }
 
     match tokio::time::timeout(std::time::Duration::from_secs(timeout), child.wait()).await {
         Ok(Ok(status)) => {
@@ -1005,15 +1014,40 @@ async fn main() -> anyhow::Result<()> {
 
     let path = socket_path();
 
-    // Remove stale socket if it exists.
+    // Single-instance guard: refuse to hijack a socket a live daemon is already
+    // serving. A blind `remove_file` + rebind let a second daemon steal the
+    // socket while both processes held the same databases. Probe by connecting;
+    // a successful connect means a peer is alive, so abort. Only a stale socket
+    // (connect refused / absent) is reclaimed.
+    #[cfg(unix)]
+    if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+        anyhow::bail!(
+            "another smdjad is already listening on {}; refusing to start a second instance",
+            path.display()
+        );
+    }
+
+    // Remove the stale socket if it exists.
     let _ = std::fs::remove_file(&path);
 
-    // Bind BEFORE spawning so a port-conflict error exits cleanly.
-    let listener = UnixListener::bind(&path)?;
+    // Bind under a restrictive umask so the socket node is created 0600 from the
+    // start. Otherwise it is briefly world-accessible between `bind` and the
+    // `set_permissions` below — and with XDG_RUNTIME_DIR unset the socket lives
+    // in world-traversable /tmp, where another local user could connect in that
+    // window and issue `exec_bash`. The umask is restored immediately after.
+    // Bind BEFORE spawning so a bind error exits cleanly.
+    #[cfg(unix)]
+    let prev_umask = unsafe { libc::umask(0o077) };
+    let bind_result = UnixListener::bind(&path);
+    #[cfg(unix)]
+    unsafe {
+        libc::umask(prev_umask);
+    }
+    let listener = bind_result?;
     // Guard removes the socket on any exit path (clean shutdown or error propagation).
     let _socket_guard = SocketGuard { path: path.clone() };
 
-    // Set Unix socket permissions to 0o600 immediately after binding.
+    // Re-assert 0o600 as defence in depth (the umask above already created it so).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1378,15 +1412,26 @@ async fn main() -> anyhow::Result<()> {
     let _stream_sock_guard = SocketGuard {
         path: stream_sock_path.clone(),
     };
-    match UnixListener::bind(&stream_sock_path) {
+    // Bind under a 0077 umask so the sibling socket is never world-accessible.
+    #[cfg(unix)]
+    let prev_umask = unsafe { libc::umask(0o077) };
+    let stream_bind = UnixListener::bind(&stream_sock_path);
+    #[cfg(unix)]
+    unsafe {
+        libc::umask(prev_umask);
+    }
+    match stream_bind {
         Ok(stream_listener) => {
+            // A failure to restrict the socket is fatal: an exposed streaming
+            // socket lets another local user read live turn events.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
-                let _ = std::fs::set_permissions(
+                std::fs::set_permissions(
                     &stream_sock_path,
                     std::fs::Permissions::from_mode(0o600),
-                );
+                )
+                .map_err(|e| anyhow::anyhow!("failed to set stream socket permissions: {e}"))?;
             }
             info!(path = %stream_sock_path.display(), "turn stream server listening");
             let ds = Arc::clone(&delta_store);
@@ -1406,15 +1451,26 @@ async fn main() -> anyhow::Result<()> {
     let _agent_sock_guard = SocketGuard {
         path: agent_sock_path.clone(),
     };
-    match UnixListener::bind(&agent_sock_path) {
+    // Bind under a 0077 umask so the sibling socket is never world-accessible.
+    #[cfg(unix)]
+    let prev_umask = unsafe { libc::umask(0o077) };
+    let agent_bind = UnixListener::bind(&agent_sock_path);
+    #[cfg(unix)]
+    unsafe {
+        libc::umask(prev_umask);
+    }
+    match agent_bind {
         Ok(agent_listener) => {
+            // A failure to restrict the socket is fatal: an exposed agent socket
+            // lets another local user read live pane telemetry.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
-                let _ = std::fs::set_permissions(
+                std::fs::set_permissions(
                     &agent_sock_path,
                     std::fs::Permissions::from_mode(0o600),
-                );
+                )
+                .map_err(|e| anyhow::anyhow!("failed to set agent socket permissions: {e}"))?;
             }
             info!(path = %agent_sock_path.display(), "agent event server listening");
             let dp = Arc::clone(&dispatcher);
@@ -1521,6 +1577,33 @@ mod tests {
             session_id: None,
             response: response.map(str::to_owned),
         }
+    }
+
+    // ── 7. exec_bash_ext must not deadlock on large stdin + stdout ────────────
+
+    #[tokio::test]
+    async fn exec_bash_ext_no_deadlock_on_large_io() {
+        // The child writes >64 KB to stdout BEFORE it reads its stdin, and we
+        // feed it >64 KB of stdin. The previous code wrote ALL of stdin before
+        // spawning the stdout reader, so the child blocked on a full stdout pipe
+        // while the parent blocked on a full stdin pipe — a deadlock. With the
+        // readers draining first (and stdin written on its own task), it
+        // completes. Fails (times out) before the fix; passes after.
+        let workspace = std::env::temp_dir();
+        let stdin = vec![b'x'; 200_000];
+        let cmd = "yes aaaaaaaa | head -c 200000; cat";
+        let fut = super::exec_bash_ext(cmd, &workspace, Some(30), None, Some(stdin));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(20), fut)
+            .await
+            .expect("exec_bash_ext must not deadlock on large stdin+stdout");
+        assert!(
+            out.contains("aaaaaaaa"),
+            "the pre-stdin stdout burst must be captured"
+        );
+        assert!(
+            out.contains("xxxxxxxx"),
+            "the echoed stdin must be captured after draining stdout"
+        );
     }
 
     #[tokio::test]

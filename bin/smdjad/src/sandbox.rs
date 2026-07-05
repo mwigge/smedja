@@ -499,11 +499,24 @@ pub(crate) fn resolve_confined_root(
         }
     }
 
+    // Read-confinement guard: `.git` is bind-mounted (Docker) / read-allowed
+    // (Seatbelt) into the sandbox, so a symlinked `.git` would let it resolve to
+    // an arbitrary host path (e.g. `ln -s ~/.ssh .git`) and expose host secrets
+    // at `/workspace/.git`. Use `symlink_metadata` (which does NOT follow the
+    // final component) and refuse to treat a symlinked `.git` as the git dir;
+    // additionally require that the resolved path stays under the confined root.
     let git_dir = root.join(".git");
-    let git = if git_dir.exists() {
-        Some(git_dir)
-    } else {
-        None
+    let git = match std::fs::symlink_metadata(&git_dir) {
+        // A symlinked `.git` is never mounted — it is the escape vector.
+        Ok(meta) if meta.file_type().is_symlink() => None,
+        // A real `.git` (directory or worktree pointer file) is mounted only
+        // when it canonicalises to a path still inside the confined root.
+        Ok(_) => match git_dir.canonicalize() {
+            Ok(canon) if canon.starts_with(&root) => Some(canon),
+            _ => None,
+        },
+        // Absent `.git` (or unreadable): nothing to mount.
+        Err(_) => None,
     };
     Ok((root, git))
 }
@@ -894,6 +907,45 @@ mod tests {
         assert!(
             NetworkPolicy::Open.permits_dest(public),
             "public must stay reachable under open"
+        );
+    }
+
+    // ── 1. read-confinement escape via a symlinked .git ───────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_confined_root_rejects_symlinked_git() {
+        // Attack: `ln -s <secret> .git` inside the confined root. The old
+        // `.exists()` check followed the symlink and mounted the secret at
+        // `/workspace/.git`. The guard must refuse a symlinked `.git`.
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        let secret_dir = tempfile::tempdir().unwrap();
+        let secret = secret_dir.path().canonicalize().unwrap();
+        std::fs::write(secret.join("id_rsa"), "HOSTKEY").unwrap();
+
+        std::os::unix::fs::symlink(&secret, root.join(".git")).unwrap();
+
+        let (_r, git) = resolve_confined_root(&root).unwrap();
+        assert!(
+            git.is_none(),
+            "a symlinked .git must never be mounted; got: {git:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_confined_root_mounts_real_git_dir() {
+        // A genuine `.git` directory inside the root is still mounted (canonical
+        // path under the root), preserving the read-only .git shadow behaviour.
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+
+        let (_r, git) = resolve_confined_root(&root).unwrap();
+        assert_eq!(
+            git,
+            Some(root.join(".git")),
+            "a real .git directory must still be mounted"
         );
     }
 }

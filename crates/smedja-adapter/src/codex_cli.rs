@@ -48,6 +48,7 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
     let resume_id = opts.provider_session_id.clone();
     let model = opts.model.clone();
     let workspace = opts.workspace.clone();
+    let permission_mode = opts.permission_mode.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::spawn(async move {
@@ -71,21 +72,38 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
         }
 
         // `codex exec` runs autonomously — it has no per-tool approval hook like
-        // claude, so smedja's permission mode maps to codex's sandbox level
-        // instead. Auto keeps the full bypass; Plan makes codex read-only; every
-        // other mode contains it to the workspace.
-        //
-        // `codex exec resume` does not accept `--sandbox`; only the bypass flag
-        // is shared between the two sub-commands.
+        // claude, so smedja's permission mode maps to codex's sandbox LEVEL
+        // instead of a blanket bypass:
+        //   auto            → full bypass (matches auto-mode's explicit allowlists)
+        //   plan            → read-only
+        //   ask/accept/none → workspace-write (confined to the workspace)
+        // Only `auto` is unconfined; every other mode (including an unset mode)
+        // now defaults to a real sandbox rather than the previous hardcoded
+        // `--dangerously-bypass-approvals-and-sandbox`.
         command.arg("--json").arg("--skip-git-repo-check");
-        // Bypass codex's own bwrap sandbox entirely. The smedja cowork gate
-        // (smj tool-gate / PreToolUse hook on the claude side) and landlock
-        // filesystem confinement are the actual approval boundary. Codex's
-        // `--sandbox workspace-write` invokes bwrap which fails with EAFNOSUPPORT
-        // when AF_NETLINK is blocked by an outer seccomp filter — the same
-        // condition that prevents `unshare --net`. Bypass is safe here because
-        // smdjad itself provides the workspace boundary.
-        command.arg("--dangerously-bypass-approvals-and-sandbox");
+
+        let sandbox_mode = match permission_mode.as_deref() {
+            Some("auto") => None, // full bypass, preserving auto-mode allowlists
+            Some("plan") => Some("read-only"),
+            _ => Some("workspace-write"),
+        };
+        match sandbox_mode {
+            // Auto: bypass codex's own bwrap sandbox; the smedja cowork gate and
+            // landlock confinement are the boundary for auto-mode runs.
+            None => {
+                command.arg("--dangerously-bypass-approvals-and-sandbox");
+            }
+            Some(mode) => {
+                if is_resume {
+                    // `codex exec resume` does not accept `--sandbox`; apply the
+                    // sandbox level via the global `-c sandbox_mode=…` config
+                    // override, which both sub-commands honour.
+                    command.arg("-c").arg(format!("sandbox_mode={mode}"));
+                } else {
+                    command.arg("--sandbox").arg(mode);
+                }
+            }
+        }
 
         if !model.is_empty() {
             command.arg("-m").arg(&model);
@@ -661,6 +679,82 @@ mod tests {
         assert!(
             output.contains("-m") && output.contains("o3-mini"),
             "expected '-m o3-mini' in args; got: {output:?}"
+        );
+    }
+
+    /// Runs the mock codex (which echoes its argv) for a given permission mode
+    /// and returns the joined stdout so tests can assert on the sandbox flags.
+    async fn run_mock_and_capture_args(tag: &str, permission_mode: Option<&str>) -> String {
+        let tmp = std::env::temp_dir().join(format!(
+            "smedja-codex-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        make_mock_codex(&tmp, "#!/bin/sh\nprintf \"args: $*\\n\"\n");
+
+        let old = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old}", tmp.display()));
+
+        let mut opts = base_opts(None);
+        opts.permission_mode = permission_mode.map(str::to_owned);
+        let provider = CodexCliProvider::Cli;
+        let mut stream = provider.stream_chat(&[user_msg("hi")], &opts);
+        let mut output = String::new();
+        while let Some(item) = stream.next().await {
+            if let Ok(Delta::Text(t)) = item {
+                output.push_str(&t);
+            }
+        }
+
+        std::env::set_var("PATH", old);
+        let _ = std::fs::remove_dir_all(&tmp);
+        output
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn plan_mode_maps_to_read_only_sandbox() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let out = run_mock_and_capture_args("plan", Some("plan")).await;
+        assert!(
+            out.contains("--sandbox") && out.contains("read-only"),
+            "plan mode must confine codex to --sandbox read-only; got: {out:?}"
+        );
+        assert!(
+            !out.contains("--dangerously-bypass-approvals-and-sandbox"),
+            "plan mode must NOT bypass the sandbox; got: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn default_and_ask_modes_confine_to_workspace_write() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for mode in [None, Some("ask"), Some("accept_edits")] {
+            let out = run_mock_and_capture_args("ws", mode).await;
+            assert!(
+                out.contains("--sandbox") && out.contains("workspace-write"),
+                "mode {mode:?} must confine codex to --sandbox workspace-write; got: {out:?}"
+            );
+            assert!(
+                !out.contains("--dangerously-bypass-approvals-and-sandbox"),
+                "mode {mode:?} must NOT bypass the sandbox; got: {out:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn auto_mode_keeps_full_bypass() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let out = run_mock_and_capture_args("auto", Some("auto")).await;
+        assert!(
+            out.contains("--dangerously-bypass-approvals-and-sandbox"),
+            "auto mode preserves the full-access bypass (auto-mode allowlists); got: {out:?}"
+        );
+        assert!(
+            !out.contains("--sandbox"),
+            "auto mode must not also pass --sandbox; got: {out:?}"
         );
     }
 

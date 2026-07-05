@@ -909,7 +909,7 @@ pub(crate) async fn execute_tool(
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            match std::fs::rename(&src, &dst) {
+            match tokio::fs::rename(&src, &dst).await {
                 Ok(()) => serde_json::json!({"moved": true}).to_string(),
                 Err(e) => format!("error: move_file failed: {e}"),
             }
@@ -930,9 +930,9 @@ pub(crate) async fn execute_tool(
                 Err(e) => return e,
             };
             if let Some(parent) = dst.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                let _ = tokio::fs::create_dir_all(parent).await;
             }
-            match std::fs::copy(&src, &dst) {
+            match tokio::fs::copy(&src, &dst).await {
                 Ok(_) => serde_json::json!({"copied": true}).to_string(),
                 Err(e) => format!("error: copy_file failed: {e}"),
             }
@@ -950,15 +950,15 @@ pub(crate) async fn execute_tool(
                 path = path_str,
                 "delete_file: cowork gate (full approval gate is in roadmap)"
             );
-            match std::fs::metadata(&full) {
+            match tokio::fs::metadata(&full).await {
                 Err(e) => format!("error: delete_file failed: {e}"),
-                Ok(meta) if meta.is_dir() => match std::fs::remove_dir(&full) {
+                Ok(meta) if meta.is_dir() => match tokio::fs::remove_dir(&full).await {
                     Ok(()) => serde_json::json!({"deleted": true}).to_string(),
                     Err(e) => format!(
                         "error: delete_file failed (use bash for non-empty directories): {e}"
                     ),
                 },
-                Ok(_) => match std::fs::remove_file(&full) {
+                Ok(_) => match tokio::fs::remove_file(&full).await {
                     Ok(()) => serde_json::json!({"deleted": true}).to_string(),
                     Err(e) => format!("error: delete_file failed: {e}"),
                 },
@@ -1084,33 +1084,45 @@ pub(crate) async fn execute_tool(
                 tracing::debug!("graph.db not found; returning empty symbols");
                 return serde_json::json!({ "symbols": [] }).to_string();
             }
-            match smedja_graph::GraphStore::open(&graph_db_path) {
-                Ok(store) => match store.graph_query(query, 10, depth) {
-                    Ok(symbols) => {
-                        let sym_json: Vec<serde_json::Value> = symbols
-                            .iter()
-                            .map(|s| {
-                                serde_json::json!({
-                                    "name": s.name,
-                                    "kind": s.kind.as_str(),
-                                    "file": s.file_path,
-                                    "line": s.start_line,
-                                    "snippet": s.snippet,
+            // Opening the graph store and running the query are blocking
+            // (SQLite) calls; run them on the blocking pool so they never stall
+            // a tokio worker thread.
+            let query = query.to_owned();
+            let joined = tokio::task::spawn_blocking(move || {
+                match smedja_graph::GraphStore::open(&graph_db_path) {
+                    Ok(store) => match store.graph_query(&query, 10, depth) {
+                        Ok(symbols) => {
+                            let sym_json: Vec<serde_json::Value> = symbols
+                                .iter()
+                                .map(|s| {
+                                    serde_json::json!({
+                                        "name": s.name,
+                                        "kind": s.kind.as_str(),
+                                        "file": s.file_path,
+                                        "line": s.start_line,
+                                        "snippet": s.snippet,
+                                    })
                                 })
-                            })
-                            .collect();
-                        serde_json::json!({ "symbols": sym_json }).to_string()
-                    }
+                                .collect();
+                            serde_json::json!({ "symbols": sym_json }).to_string()
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "graph_query error");
+                            serde_json::json!({ "symbols": [], "error": e.to_string() })
+                                .to_string()
+                        }
+                    },
                     Err(e) => {
-                        tracing::warn!(error = %e, "graph_query error");
-                        serde_json::json!({ "symbols": [], "error": e.to_string() }).to_string()
+                        tracing::warn!(error = %e, "failed to open graph store");
+                        serde_json::json!({ "symbols": [] }).to_string()
                     }
-                },
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to open graph store");
-                    serde_json::json!({ "symbols": [] }).to_string()
                 }
-            }
+            })
+            .await;
+            joined.unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "graph_query task join failed");
+                serde_json::json!({ "symbols": [] }).to_string()
+            })
         }
         "alert_list" => {
             let alerts = crate::alert::drain_alerts(50).await;
@@ -1128,11 +1140,14 @@ pub(crate) async fn execute_tool(
                 .and_then(|n| u32::try_from(n).ok())
                 .unwrap_or(60);
             if let Ok(cfg) = smedja_sre::SreConfig::from_env() {
-                let client = reqwest::Client::builder()
+                let client = match reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(15))
                     .connect_timeout(std::time::Duration::from_secs(5))
                     .build()
-                    .unwrap_or_default();
+                {
+                    Ok(c) => c,
+                    Err(e) => return format!("error: failed to build HTTP client: {e}"),
+                };
                 match smedja_sre::otel_query(&client, &cfg, service, filter, range).await {
                     Ok(v) => serde_json::to_string(&v).unwrap_or_default(),
                     Err(e) => format!("error: {e}"),
@@ -1149,11 +1164,14 @@ pub(crate) async fn execute_tool(
                 .and_then(|n| u32::try_from(n).ok())
                 .unwrap_or(60);
             if let Ok(cfg) = smedja_sre::SreConfig::from_env() {
-                let client = reqwest::Client::builder()
+                let client = match reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(15))
                     .connect_timeout(std::time::Duration::from_secs(5))
                     .build()
-                    .unwrap_or_default();
+                {
+                    Ok(c) => c,
+                    Err(e) => return format!("error: failed to build HTTP client: {e}"),
+                };
                 match smedja_sre::metric_query(&client, &cfg, promql, range).await {
                     Ok(v) => serde_json::to_string(&v).unwrap_or_default(),
                     Err(e) => format!("error: {e}"),
@@ -1174,11 +1192,14 @@ pub(crate) async fn execute_tool(
                 .and_then(|n| u32::try_from(n).ok())
                 .unwrap_or(100);
             if let Ok(cfg) = smedja_sre::SreConfig::from_env() {
-                let client = reqwest::Client::builder()
+                let client = match reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(15))
                     .connect_timeout(std::time::Duration::from_secs(5))
                     .build()
-                    .unwrap_or_default();
+                {
+                    Ok(c) => c,
+                    Err(e) => return format!("error: failed to build HTTP client: {e}"),
+                };
                 match smedja_sre::log_tail(&client, &cfg, service, filter, lines).await {
                     Ok(v) => serde_json::to_string(&v).unwrap_or_default(),
                     Err(e) => format!("error: {e}"),
@@ -1208,12 +1229,16 @@ pub(crate) async fn execute_tool(
                 return "error: URL blocked by SSRF policy".into();
             }
 
-            // DNS-level SSRF: resolve and check every returned address.
+            // DNS-level SSRF: resolve once, vet every returned address, and PIN
+            // the vetted set so the HTTP client cannot re-resolve the hostname to
+            // a different (private/IMDS) address between this check and the
+            // connect (DNS-rebind TOCTOU).
             let Ok(parsed) = url_str.parse::<url::Url>() else {
                 return "error: invalid URL".into();
             };
             let host = parsed.host_str().unwrap_or("").to_owned();
             let port = parsed.port_or_known_default().unwrap_or(443);
+            let mut vetted: Vec<std::net::SocketAddr> = Vec::new();
             match tokio::net::lookup_host(format!("{host}:{port}")).await {
                 Ok(addrs) => {
                     for addr in addrs {
@@ -1221,15 +1246,29 @@ pub(crate) async fn execute_tool(
                             return "error: URL blocked by SSRF policy (resolved to private address)"
                                 .into();
                         }
+                        vetted.push(addr);
                     }
                 }
                 Err(e) => return format!("error: DNS resolution failed: {e}"),
             }
+            if vetted.is_empty() {
+                return "error: URL blocked by SSRF policy (no addresses resolved)".into();
+            }
 
-            let client = reqwest::Client::builder()
+            // Pin the vetted addresses for this host and refuse redirects: a
+            // `302 -> http://169.254.169.254/…` (or any cross-host hop) is NOT
+            // followed, so a redirect cannot bounce the request to an internal
+            // address that was never vetted. Propagate the builder error instead
+            // of silently dropping the timeout via `unwrap_or_default`.
+            let client = match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .resolve_to_addrs(&host, &vetted)
                 .build()
-                .unwrap_or_default();
+            {
+                Ok(c) => c,
+                Err(e) => return format!("error: failed to build HTTP client: {e}"),
+            };
             let resp = match client.get(&url_str).send().await {
                 Ok(r) => r,
                 Err(e) => return format!("error: {e}"),

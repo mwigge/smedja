@@ -10,21 +10,56 @@ use russh::client;
 use russh::keys::{self, PrivateKeyWithHashAlg};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{error, info, warn};
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
-struct AcceptAllHandler;
+/// SSH client handler that verifies the server's host key against the user's
+/// `~/.ssh/known_hosts` with trust-on-first-use (TOFU) semantics.
+struct KnownHostsHandler {
+    /// Hostname used to look up recorded keys in `known_hosts`.
+    host: String,
+    /// Port, so non-22 hosts match the `[host]:port` known_hosts form.
+    port: u16,
+}
 
-impl client::Handler for AcceptAllHandler {
+impl client::Handler for KnownHostsHandler {
     type Error = anyhow::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
+        server_public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        // ponytail: accept any host key — proper known-hosts checking is future work
-        Ok(true)
+        let host = self.host.as_str();
+        let port = self.port;
+        // Returning `Ok(false)` rejects the key and aborts the handshake, so a
+        // MITM or key-rotation cannot silently succeed.
+        match keys::known_hosts::known_host_keys(host, port) {
+            // Unknown host → trust on first use: record the key, then accept.
+            Ok(existing) if existing.is_empty() => {
+                match keys::known_hosts::learn_known_hosts(host, port, server_public_key) {
+                    Ok(()) => info!(host, port, "recorded new SSH host key (trust on first use)"),
+                    Err(e) => warn!(host, port, error = %e, "failed to record SSH host key"),
+                }
+                Ok(true)
+            }
+            // Host already recorded → the presented key MUST match a stored one.
+            Ok(_) => match keys::known_hosts::check_known_hosts(host, port, server_public_key) {
+                Ok(true) => Ok(true),
+                Ok(false) | Err(_) => {
+                    error!(
+                        host,
+                        port, "SSH host key does not match known_hosts — refusing connection (possible MITM)"
+                    );
+                    Ok(false)
+                }
+            },
+            // Cannot read known_hosts → fail closed rather than trust blindly.
+            Err(e) => {
+                error!(host, port, error = %e, "cannot read known_hosts — refusing connection");
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -32,7 +67,7 @@ impl client::Handler for AcceptAllHandler {
 
 /// Active SSH session handle, sharable across async tasks.
 pub struct SshMuxClient {
-    handle: Arc<Mutex<client::Handle<AcceptAllHandler>>>,
+    handle: Arc<Mutex<client::Handle<KnownHostsHandler>>>,
 }
 
 // ── parse_host_user ───────────────────────────────────────────────────────────
@@ -63,7 +98,11 @@ pub fn parse_host_user(input: &str) -> (String, String) {
 pub async fn connect(host: &str, port: u16, username: &str) -> anyhow::Result<SshMuxClient> {
     let config = Arc::new(client::Config::default());
     let addr = format!("{host}:{port}");
-    let mut handle = client::connect(config, addr.as_str(), AcceptAllHandler)
+    let handler = KnownHostsHandler {
+        host: host.to_owned(),
+        port,
+    };
+    let mut handle = client::connect(config, addr.as_str(), handler)
         .await
         .context("TCP connect")?;
 
