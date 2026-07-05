@@ -15,7 +15,12 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump this whenever the wire contract changes in a way receivers must
 /// notice. Legacy payloads lacking a version field decode as version `0`.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+///
+/// Version 3 adds `input_tokens`, `output_tokens`, `latency_ms`, and
+/// `traceparent` to [`AgentEvent::TurnEnd`]. All four are optional and
+/// `skip_serializing_if` absent, so the wire form stays byte-compatible with
+/// v2 receivers when the daemon has no figure to report.
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// A single agent event in the push-socket stream.
 ///
@@ -79,6 +84,22 @@ pub enum AgentEvent {
         /// added in schema version 2. `None` on payloads that predate the field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         efficiency_ratio: Option<f64>,
+        /// Input (prompt) token count for the turn, added in schema version 3.
+        /// `None` when the daemon has no figure to report.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_tokens: Option<u64>,
+        /// Output (completion) token count for the turn, added in schema
+        /// version 3. `None` when the daemon has no figure to report.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_tokens: Option<u64>,
+        /// Wall-clock turn latency in milliseconds, added in schema version 3.
+        /// `None` when the daemon could not measure the turn duration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        latency_ms: Option<u64>,
+        /// W3C `traceparent` header from the turn's root span, added in schema
+        /// version 3. `None` when tracing produced no traceparent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traceparent: Option<String>,
     },
     /// An incremental chunk of streamed assistant output.
     StreamDelta {
@@ -194,6 +215,10 @@ mod tests {
             session_id: Some("s1".to_owned()),
             tokens_saved: None,
             efficiency_ratio: None,
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: None,
+            traceparent: None,
         });
     }
 
@@ -204,12 +229,31 @@ mod tests {
             session_id: Some("s1".to_owned()),
             tokens_saved: Some(123_456),
             efficiency_ratio: Some(0.42),
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: None,
+            traceparent: None,
         });
     }
 
     #[test]
-    fn schema_version_is_two() {
-        assert_eq!(CURRENT_SCHEMA_VERSION, 2);
+    fn round_trip_turn_end_with_v3_metrics() {
+        // Exercise serialization of the schema-v3 token/latency/trace fields.
+        round_trip(AgentEvent::TurnEnd {
+            turn_id: Some("t1".to_owned()),
+            session_id: Some("s1".to_owned()),
+            tokens_saved: Some(123_456),
+            efficiency_ratio: Some(0.42),
+            input_tokens: Some(412),
+            output_tokens: Some(88),
+            latency_ms: Some(4200),
+            traceparent: Some("00-abc123def456-0102030405060708-01".to_owned()),
+        });
+    }
+
+    #[test]
+    fn schema_version_is_three() {
+        assert_eq!(CURRENT_SCHEMA_VERSION, 3);
     }
 
     #[test]
@@ -226,6 +270,10 @@ mod tests {
                 session_id: Some("s1".to_owned()),
                 tokens_saved: None,
                 efficiency_ratio: None,
+                input_tokens: None,
+                output_tokens: None,
+                latency_ms: None,
+                traceparent: None,
             }
         );
     }
@@ -239,10 +287,18 @@ mod tests {
             session_id: Some("s1".to_owned()),
             tokens_saved: None,
             efficiency_ratio: None,
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: None,
+            traceparent: None,
         })
         .to_json_line();
         assert!(!line.contains("tokens_saved"));
         assert!(!line.contains("efficiency_ratio"));
+        assert!(!line.contains("input_tokens"));
+        assert!(!line.contains("output_tokens"));
+        assert!(!line.contains("latency_ms"));
+        assert!(!line.contains("traceparent"));
     }
 
     #[test]

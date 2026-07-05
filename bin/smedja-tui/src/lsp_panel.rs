@@ -97,7 +97,9 @@ impl<'a> LspPanel<'a> {
             let loc = format!("{}:{}", file_name, diag.line);
             let loc_max = w.saturating_sub(2); // severity + space
             let loc_str = if loc.len() > loc_max {
-                format!("\u{2026}{}", &loc[loc.len().saturating_sub(loc_max - 1)..])
+                let start =
+                    crate::floor_char_boundary(&loc, loc.len().saturating_sub(loc_max - 1));
+                format!("\u{2026}{}", &loc[start..])
             } else {
                 loc
             };
@@ -208,5 +210,28 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(rendered.contains("rust-analyzer") || rendered.contains("rust-anal"));
+    }
+
+    // Regression: a multibyte diagnostic path once panicked in the tail slice
+    // `&loc[start..]` when `start` landed mid-codepoint at a narrow width. The
+    // start index must now floor to a char boundary.
+    #[test]
+    fn multibyte_diag_path_renders_without_panic() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let snap = LspSnapshot {
+            servers: vec![],
+            diagnostics: vec![diag(
+                Severity::Error,
+                "café_αβγ_日本語_ελληνικά.rs",
+                4242,
+                "E0308",
+            )],
+        };
+        let panel = LspPanel::new(&snap);
+        // Narrow width forces the tail-slice truncation path.
+        let backend = TestBackend::new(14, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| panel.render(f.area(), f)).unwrap();
     }
 }

@@ -25,6 +25,44 @@ pub struct ValueSnapshot {
     pub estimated_value: &'static str,
 }
 
+/// Computes the change's USD cost in microdollars using the session's blended
+/// rate ($/token) applied to the change's own cumulative token count.
+///
+/// The session rate is `session_cost_usd / session_tokens_total`; multiplying by
+/// the change's `change_token_cost` attributes a real slice of session spend to
+/// the change. Returns 0 when there is not enough session data to derive a rate.
+#[must_use]
+pub fn blended_cost_micros(
+    session_cost_usd: f64,
+    session_tokens_total: u64,
+    change_token_cost: u64,
+) -> u64 {
+    if session_tokens_total == 0 || session_cost_usd <= 0.0 {
+        return 0;
+    }
+    #[allow(clippy::cast_precision_loss)] // token counts stay well under 2^53
+    let rate_num = change_token_cost as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let rate_den = session_tokens_total as f64;
+    let usd = session_cost_usd * (rate_num / rate_den);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let micros = (usd * 1_000_000.0) as u64;
+    micros
+}
+
+/// Maps a running-average quality score (0–100) to a coarse ROI estimate:
+/// `>=80` → `"high"`, `>=60` → `"medium"`, otherwise `"low"`.
+#[must_use]
+pub fn estimate_value(quality_avg: u8) -> &'static str {
+    if quality_avg >= 80 {
+        "high"
+    } else if quality_avg >= 60 {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
 impl ValueSnapshot {
     fn cost_dollars(&self) -> f64 {
         #[allow(clippy::cast_precision_loss)] // microdollar sums never exceed 2^53
@@ -238,5 +276,31 @@ mod tests {
         assert_eq!(high.roi_fill(), 3);
         assert_eq!(medium.roi_fill(), 2);
         assert_eq!(low.roi_fill(), 1);
+    }
+
+    #[test]
+    fn estimate_value_thresholds() {
+        assert_eq!(estimate_value(100), "high");
+        assert_eq!(estimate_value(80), "high");
+        assert_eq!(estimate_value(79), "medium");
+        assert_eq!(estimate_value(60), "medium");
+        assert_eq!(estimate_value(59), "low");
+        assert_eq!(estimate_value(0), "low");
+    }
+
+    #[test]
+    fn blended_cost_applies_session_rate_to_change_tokens() {
+        // Session: $1.00 over 1000 tokens → $0.001/token. Change used 100 tokens
+        // → $0.10 = 100_000 microdollars.
+        assert_eq!(blended_cost_micros(1.0, 1000, 100), 100_000);
+        // Whole session attributed to the change → full session cost.
+        assert_eq!(blended_cost_micros(2.5, 500, 500), 2_500_000);
+    }
+
+    #[test]
+    fn blended_cost_guards_missing_data() {
+        assert_eq!(blended_cost_micros(0.0, 1000, 100), 0, "no cost yet");
+        assert_eq!(blended_cost_micros(1.0, 0, 100), 0, "no tokens yet");
+        assert_eq!(blended_cost_micros(1.0, 1000, 0), 0, "change has no tokens");
     }
 }

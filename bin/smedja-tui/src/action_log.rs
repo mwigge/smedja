@@ -65,7 +65,7 @@ impl ActionLog {
     /// Renders the action log into `frame` at `area`.
     pub fn render(&self, area: Rect, frame: &mut Frame) {
         if !self.visible {
-            let collapsed = Paragraph::new("[ action log hidden — press A to show ]")
+            let collapsed = Paragraph::new("[ action log hidden — press Shift-A to show ]")
                 .block(Block::default().borders(Borders::ALL).title("actions"));
             frame.render_widget(collapsed, area);
             return;
@@ -150,5 +150,16 @@ mod tests {
         // "first" should have been evicted.
         assert!(log.events.front().map(|e| e.action.as_str()) != Some("first"));
         assert_eq!(log.events.back().map(|e| e.action.as_str()), Some("third"));
+    }
+
+    #[test]
+    fn visible_flag_toggles() {
+        let mut log = ActionLog::new(50);
+        assert!(log.visible, "starts visible");
+        // Mirrors the Shift-A keybinding handler: `visible = !visible`.
+        log.visible = !log.visible;
+        assert!(!log.visible, "toggled to hidden");
+        log.visible = !log.visible;
+        assert!(log.visible, "toggled back to visible");
     }
 }

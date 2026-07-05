@@ -147,11 +147,22 @@ impl App {
             };
             let cwd = pty_cwd.or_else(|| self.cwd.clone());
 
+            // Context-gauge inputs. The last turn's input (prompt) token count is
+            // the live context occupancy — it is everything the model just read —
+            // and the window is the model family's published maximum.
+            let context_used = input_tokens
+                .map(|t| usize::try_from(t).unwrap_or(0))
+                .unwrap_or(0);
+            let context_window = model
+                .as_deref()
+                .map(st_statusbar::model_context_window)
+                .unwrap_or(0);
+
             let sb_ctx = st_statusbar::ModuleContext {
                 tier,
                 model,
-                context_used: 0,
-                context_window: 0,
+                context_used,
+                context_window,
                 active_task,
                 last_exit_code,
                 input_tokens,
@@ -183,6 +194,8 @@ impl App {
                 Box::new(st_statusbar::CwdModule),
                 Box::new(st_statusbar::TierModule),
                 Box::new(st_statusbar::ModelModule),
+                Box::new(st_statusbar::ContextPctModule),
+                Box::new(st_statusbar::TaskModule),
                 Box::new(st_statusbar::TokensModule),
                 Box::new(st_statusbar::EfficiencyModule),
                 Box::new(st_statusbar::LatencyModule),

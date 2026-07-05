@@ -70,7 +70,8 @@ pub fn render_indicator(
     let spinner_style = if no_color {
         Style::default()
     } else {
-        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+        // Signature molten lava-orange for the in-flight spinner (primary accent).
+        Style::default().fg(p.molten).add_modifier(Modifier::BOLD)
     };
     let dim_style = if no_color {
         Style::default()

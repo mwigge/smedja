@@ -109,7 +109,8 @@ impl MetricsView {
             out.push("(no metrics)".to_owned());
         } else {
             for row in &self.rows {
-                let runner = &row.runner[..row.runner.len().min(7)];
+                let runner = &row.runner
+                    [..crate::floor_char_boundary(&row.runner, row.runner.len().min(7))];
                 out.push(format!(
                     "{:<7} {:>4} {:>8} {:>3}",
                     runner,
@@ -139,7 +140,8 @@ impl MetricsView {
             return out;
         }
         for row in &s.rows {
-            let source = &row.source[..row.source.len().min(12)];
+            let source = &row.source
+                [..crate::floor_char_boundary(&row.source, row.source.len().min(12))];
             out.push(format!("  {:<12} {:>7}", source, row.tokens_saved));
         }
         out
@@ -196,6 +198,32 @@ mod tests {
         assert!(joined.contains("(no metrics)"));
         // The savings section shows its own empty placeholder, not a stale value.
         assert!(joined.contains("(no savings)"));
+    }
+
+    // Regression: multibyte runner / source names once panicked in `&s[..7]` and
+    // `&s[..12]` when the cut index fell mid-codepoint. `lines()` must now floor
+    // to a char boundary and produce output without panicking.
+    #[test]
+    fn multibyte_runner_and_source_names_render_without_panic() {
+        let view = MetricsView::with_savings(
+            vec![MetricsRow {
+                runner: "café_αβγ_日本語".into(),
+                tokens: 100,
+                cost_usd: 0.01,
+                errors: 0,
+            }],
+            SavingsSnapshot {
+                rows: vec![SavingsRow {
+                    source: "café_αβγ_日本語_source".into(),
+                    tokens_saved: 42,
+                }],
+                compression_saved: 42,
+                cache_saved: 0,
+                efficiency_ratio: 0.5,
+            },
+        );
+        let lines = view.lines();
+        assert!(!lines.is_empty(), "lines produced without panic");
     }
 
     #[test]

@@ -183,12 +183,16 @@ impl PaneEvent {
             AgentEvent::TurnEnd {
                 tokens_saved,
                 efficiency_ratio,
+                input_tokens,
+                output_tokens,
+                latency_ms,
+                traceparent,
                 ..
             } => Self::TurnEnd {
-                input_tokens: 0,
-                output_tokens: 0,
-                latency_ms: 0,
-                traceparent: None,
+                input_tokens: input_tokens.unwrap_or(0),
+                output_tokens: output_tokens.unwrap_or(0),
+                latency_ms: latency_ms.unwrap_or(0),
+                traceparent,
                 tokens_saved,
                 efficiency_ratio,
             },
@@ -867,9 +871,48 @@ mod tests {
             session_id: Some("s1".into()),
             tokens_saved: None,
             efficiency_ratio: None,
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: None,
+            traceparent: None,
         });
         let event = PaneEvent::from_json_line(&line).expect("should parse");
         assert!(matches!(event, PaneEvent::TurnEnd { .. }));
+    }
+
+    #[test]
+    fn pane_event_turn_end_carries_real_token_latency_trace() {
+        // The v3 wire fields must survive the envelope → PaneEvent mapping with
+        // their exact values, not the historical 0/None placeholders.
+        let line = envelope_line(smedja_agent_events::AgentEvent::TurnEnd {
+            turn_id: Some("t1".into()),
+            session_id: Some("s1".into()),
+            tokens_saved: None,
+            efficiency_ratio: None,
+            input_tokens: Some(412),
+            output_tokens: Some(88),
+            latency_ms: Some(4200),
+            traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
+        });
+        let event = PaneEvent::from_json_line(&line).expect("should parse");
+        match event {
+            PaneEvent::TurnEnd {
+                input_tokens,
+                output_tokens,
+                latency_ms,
+                traceparent,
+                ..
+            } => {
+                assert_eq!(input_tokens, 412);
+                assert_eq!(output_tokens, 88);
+                assert_eq!(latency_ms, 4200);
+                assert_eq!(
+                    traceparent.as_deref(),
+                    Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+                );
+            }
+            other => panic!("expected TurnEnd, got {other:?}"),
+        }
     }
 
     #[test]
@@ -879,6 +922,10 @@ mod tests {
             session_id: Some("s1".into()),
             tokens_saved: Some(5000),
             efficiency_ratio: Some(0.3),
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: None,
+            traceparent: None,
         });
         let event = PaneEvent::from_json_line(&line).expect("should parse");
         match event {

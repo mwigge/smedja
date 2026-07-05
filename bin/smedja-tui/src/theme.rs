@@ -7,8 +7,8 @@
 //!   non-code UI surfaces.
 //!
 //! - **Code tokens** (`CODE_*`) — cool dark-theme tones (violet, green, cyan,
-//!   ice-blue, orange).  Used exclusively in `code_widget` and `main_panel`
-//!   syntax blocks so code content is visually distinct from chrome.
+//!   ice-blue, orange).  Used exclusively in `main_panel` syntax blocks so code
+//!   content is visually distinct from chrome.
 //!
 //! All constants use `ratatui::style::Color::Rgb` so the rendered colours are
 //! independent of the host terminal's 16-colour palette.
@@ -48,6 +48,10 @@ pub const FORGE_TEXT_BRIGHT: Color = Color::Rgb(255, 218, 156);
 pub const FORGE_TEXT_DIM: Color = Color::Rgb(182, 162, 138);
 /// Accent amber — `#ffb24a`.  In-flight spinner highlights, selected rows.
 pub const FORGE_ACCENT: Color = Color::Rgb(255, 178, 74);
+/// Molten lava-orange — `#e8521a`.  The signature forge accent the brand leads
+/// with: the primary highlight for the prompt indicator, the in-flight spinner,
+/// and the active/selected row.  Hotter and more saturated than `FORGE_ACCENT`.
+pub const FORGE_MOLTEN: Color = Color::Rgb(232, 82, 26);
 
 /// Error state — `#f07848` forge red-orange (SVG traffic-light red).
 pub const FORGE_ERROR: Color = Color::Rgb(240, 120, 72);
@@ -103,6 +107,7 @@ pub struct Palette {
     pub text_bright: Color,
     pub text_dim: Color,
     pub accent: Color,
+    pub molten: Color,
     pub error: Color,
     pub success: Color,
     pub warn: Color,
@@ -133,6 +138,7 @@ impl Default for Palette {
             text_bright: FORGE_TEXT_BRIGHT,
             text_dim: FORGE_TEXT_DIM,
             accent: FORGE_ACCENT,
+            molten: FORGE_MOLTEN,
             error: FORGE_ERROR,
             success: FORGE_SUCCESS,
             warn: FORGE_WARN,
@@ -172,6 +178,7 @@ pub struct TuiColorConfig {
     pub text_bright: Option<String>,
     pub text_dim: Option<String>,
     pub accent: Option<String>,
+    pub molten: Option<String>,
     pub error: Option<String>,
     pub success: Option<String>,
     pub warn: Option<String>,
@@ -233,6 +240,7 @@ pub fn init_palette(cfg: Option<&TuiColorConfig>) {
         apply!(text_bright);
         apply!(text_dim);
         apply!(accent);
+        apply!(molten);
         apply!(error);
         apply!(success);
         apply!(warn);
@@ -455,6 +463,24 @@ mod tests {
         assert_eq!(p.error, FORGE_ERROR);
         assert_eq!(p.success, FORGE_SUCCESS);
         assert_eq!(p.code_keyword, CODE_KEYWORD);
+        assert_eq!(p.molten, FORGE_MOLTEN);
+        assert_eq!(p.molten, Color::Rgb(232, 82, 26));
+    }
+
+    #[test]
+    fn tui_color_config_overrides_molten() {
+        let cfg = TuiColorConfig {
+            molten: Some("#123456".to_owned()),
+            ..TuiColorConfig::default()
+        };
+        let mut p = Palette::default();
+        if let Some(ref s) = cfg.molten {
+            if let Some(c) = parse_hex(s) {
+                p.molten = c;
+            }
+        }
+        assert_eq!(p.molten, Color::Rgb(0x12, 0x34, 0x56));
+        assert_eq!(p.accent, FORGE_ACCENT, "unset accent keeps default");
     }
 
     #[test]
