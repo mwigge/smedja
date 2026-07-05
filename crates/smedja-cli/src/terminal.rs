@@ -23,9 +23,30 @@ pub(crate) async fn dispatch_term(action: TermCmd) -> Result<()> {
                 .await
                 .context("install task panicked")??;
         }
-        TermCmd::ConvertWezterm => {
-            eprintln!("smj term convert-wezterm: not yet implemented");
-            std::process::exit(1);
+        TermCmd::ConvertWezterm { config } => {
+            cmd_convert_wezterm(&config)?;
+        }
+    }
+    Ok(())
+}
+
+/// Converts a `WezTerm` Lua config to a smedja TOML config via the `st-config`
+/// migration engine, writing the TOML to stdout and the summary/unsupported
+/// fields to stderr.
+fn cmd_convert_wezterm(config: &std::path::Path) -> Result<()> {
+    let lua_source = std::fs::read_to_string(config)
+        .with_context(|| format!("cannot read WezTerm config {}", config.display()))?;
+    let result = st_config::migrate::migrate_wezterm_config(&lua_source)
+        .map_err(|e| anyhow::anyhow!("failed to migrate {}: {e}", config.display()))?;
+
+    // TOML on stdout so it can be redirected to a config file; diagnostics on
+    // stderr so they never pollute the redirected output.
+    print!("{}", result.toml);
+    eprintln!("{}", result.summary);
+    if !result.unsupported.is_empty() {
+        eprintln!("\nUnsupported fields ({}):", result.unsupported.len());
+        for field in &result.unsupported {
+            eprintln!("  - {field}");
         }
     }
     Ok(())

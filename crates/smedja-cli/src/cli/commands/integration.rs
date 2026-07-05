@@ -78,7 +78,14 @@ pub(crate) enum TermCmd {
         prefix: Option<PathBuf>,
     },
     /// Convert a `WezTerm` configuration to smedja terminal integration format.
-    ConvertWezterm,
+    ///
+    /// Reads the `WezTerm` Lua config, evaluates it against a stubbed `wezterm`
+    /// API, and writes the equivalent smedja TOML to stdout. Unsupported fields
+    /// and a migration summary are reported on stderr.
+    ConvertWezterm {
+        /// Path to the `WezTerm` Lua config (e.g. `~/.config/wezterm/wezterm.lua`).
+        config: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
