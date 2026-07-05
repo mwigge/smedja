@@ -636,6 +636,175 @@ async fn parallel_one_slice_fails_outcome_is_failed_with_passed_count() {
     );
 }
 
+/// Records role runs as `(name, tier)` pairs plus the plan-phase call, so tests
+/// can assert both the plan → implement → verify → review ordering and the
+/// per-attempt tier escalation.
+#[derive(Default)]
+struct PlanRecorder {
+    roles_run: Mutex<Vec<(String, crate::role::Tier)>>,
+    /// The `existing` slice list the plan phase was handed, or `None` if unrun.
+    plan_input: Mutex<Option<Vec<String>>>,
+    /// The slice list the plan phase produces (returned from `run_plan`).
+    produced: Vec<String>,
+}
+
+impl RoleRunner for PlanRecorder {
+    async fn run_role(
+        &self,
+        role: &LoopRole,
+        _slice_index: usize,
+        _slice: &str,
+    ) -> anyhow::Result<()> {
+        self.roles_run
+            .lock()
+            .unwrap()
+            .push((role.name.clone(), role.tier));
+        Ok(())
+    }
+    async fn run_plan(&self, _role: &LoopRole, existing: &[String]) -> anyhow::Result<Vec<String>> {
+        *self.plan_input.lock().unwrap() = Some(existing.to_vec());
+        Ok(self.produced.clone())
+    }
+}
+impl StatusSink for PlanRecorder {
+    async fn set_status(&self, _state: &LoopState) {}
+    async fn set_slice(&self, _slice: i64) {}
+}
+
+#[tokio::test]
+async fn plan_phase_runs_first_and_produces_the_slice_list() {
+    let dir = TempDir::new().unwrap();
+    // A configured `plan` role opts the run into the executed plan phase.
+    let roles = r#"[
+            {"name":"plan","runner":"claude","tier":"deep","model":null,"read_only":false,"tools":[]},
+            {"name":"implementer","runner":"local","tier":"local","model":null,"read_only":false,"tools":[]},
+            {"name":"reviewer","runner":"minimax","tier":"fast","model":null,"read_only":true,"tools":[]}
+        ]"#;
+    let (cfg, path) = config_with(&dir, "true", roles);
+    let rec = PlanRecorder {
+        produced: vec!["planned-1".to_owned(), "planned-2".to_owned()],
+        ..PlanRecorder::default()
+    };
+    // The engine is handed an EMPTY slice list (no tasks.md yet); the plan phase
+    // decomposes the work and hands back two slices for the pipeline to drive.
+    let out = drive(&cfg, dir.path(), &path, "demo", &[], &rec, &rec, 0, true).await;
+
+    assert_eq!(out.final_state, LoopState::Complete);
+    assert_eq!(
+        out.slices_completed, 2,
+        "the pipeline drives exactly the slices the plan phase produced"
+    );
+    assert!(
+        rec.plan_input.lock().unwrap().is_some(),
+        "the plan phase must run first on a fresh run with a configured plan role"
+    );
+    // One implementer run per produced slice — plan → implement.
+    let names: Vec<String> = rec
+        .roles_run
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["implementer".to_owned(), "implementer".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn plan_phase_skipped_without_a_configured_plan_role() {
+    let dir = TempDir::new().unwrap();
+    // No `plan` role → behavior-compatible: slices are handed in unchanged.
+    let (cfg, path) = config_with(&dir, "true", "[]");
+    let rec = PlanRecorder {
+        produced: vec!["ignored".to_owned()],
+        ..PlanRecorder::default()
+    };
+    let out = drive(
+        &cfg,
+        dir.path(),
+        &path,
+        "demo",
+        &["given".to_owned()],
+        &rec,
+        &rec,
+        0,
+        true,
+    )
+    .await;
+    assert_eq!(out.final_state, LoopState::Complete);
+    assert_eq!(out.slices_completed, 1);
+    assert!(
+        rec.plan_input.lock().unwrap().is_none(),
+        "no plan phase without a configured plan role"
+    );
+}
+
+#[tokio::test]
+async fn plan_phase_skipped_on_resume() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join(".smedja")).unwrap();
+    let roles = r#"[
+            {"name":"plan","runner":"claude","tier":"deep","model":null,"read_only":false,"tools":[]},
+            {"name":"implementer","runner":"local","tier":"local","model":null,"read_only":false,"tools":[]},
+            {"name":"reviewer","runner":"minimax","tier":"fast","model":null,"read_only":true,"tools":[]}
+        ]"#;
+    let (cfg, path) = config_with(&dir, "true", roles);
+    let rec = PlanRecorder {
+        produced: vec!["planned".to_owned()],
+        ..PlanRecorder::default()
+    };
+    // start_slice = 1 → this is a resume; the plan phase must NOT re-run.
+    let slices = vec!["s0".to_owned(), "s1".to_owned()];
+    let _ = drive(
+        &cfg,
+        dir.path(),
+        &path,
+        "demo",
+        &slices,
+        &rec,
+        &rec,
+        1,
+        true,
+    )
+    .await;
+    assert!(
+        rec.plan_input.lock().unwrap().is_none(),
+        "resume must not re-plan — slices are already on disk"
+    );
+}
+
+#[tokio::test]
+async fn retry_escalates_the_fix_role_tier() {
+    use crate::role::Tier;
+    let dir = TempDir::new().unwrap();
+    // "false" verification fails every attempt; max_attempts = 3 exercises two retries.
+    let (cfg, path) = config_with(&dir, "false", "[]");
+    let rec = PlanRecorder::default();
+    let out = drive(
+        &cfg,
+        dir.path(),
+        &path,
+        "demo",
+        &["slice".to_owned()],
+        &rec,
+        &rec,
+        0,
+        true,
+    )
+    .await;
+    assert_eq!(out.final_state, LoopState::Failed);
+    let runs = rec.roles_run.lock().unwrap();
+    assert_eq!(runs.len(), 3, "implementer + two escalating fix retries");
+    // attempt 0: implementer at its base tier (Local by default).
+    assert_eq!(runs[0], ("implementer".to_owned(), Tier::Local));
+    // attempt 1: fix escalates one rank Local → Fast.
+    assert_eq!(runs[1], ("fix".to_owned(), Tier::Fast));
+    // attempt 2: fix escalates again Fast → Deep (capped at Deep).
+    assert_eq!(runs[2], ("fix".to_owned(), Tier::Deep));
+}
+
 #[tokio::test]
 async fn max_parallel_slices_1_degrades_to_serial() {
     let dir = TempDir::new().unwrap();

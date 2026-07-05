@@ -237,6 +237,7 @@ async fn handle_tools_call(
         ingot,
         vault,
         embedder,
+        None,
     )
     .await;
 
@@ -394,6 +395,7 @@ mod tests {
             &ingot,
             &vault,
             &embedder(),
+            None,
         )
         .await;
         assert!(

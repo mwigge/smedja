@@ -27,6 +27,20 @@ pub struct MetricsRow {
     pub errors: i64,
 }
 
+/// One per-tier (per-model) usage row for the latest window.
+///
+/// Surfaces the loop×tier split — fable-plan vs sonnet/haiku-implement vs
+/// opus-review — so per-tier token spend is legible at a glance.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TierRow {
+    /// Model id for this tier (e.g. `"claude-fable-5"`, `"claude-opus-4-8"`).
+    pub model: String,
+    /// Total input + output tokens for this model in the window.
+    pub tokens: i64,
+    /// Total cost in USD for this model in the window.
+    pub cost_usd: f64,
+}
+
 /// One per-source savings row for the latest window.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SavingsRow {
@@ -86,13 +100,31 @@ pub struct MetricsView {
     pub rows: Vec<MetricsRow>,
     /// Token-economy savings snapshot for the latest window.
     pub savings: SavingsSnapshot,
+    /// Per-tier (per-model) usage rows for the latest window, in display order.
+    pub tiers: Vec<TierRow>,
 }
 
 impl MetricsView {
-    /// Wraps `rows` and a savings `snapshot` for rendering.
+    /// Wraps `rows` and a savings `snapshot` for rendering, with no tier split.
     #[must_use]
     pub fn with_savings(rows: Vec<MetricsRow>, savings: SavingsSnapshot) -> Self {
-        Self { rows, savings }
+        Self {
+            rows,
+            savings,
+            tiers: Vec::new(),
+        }
+    }
+
+    /// Wraps `rows`, a savings `snapshot`, and per-tier usage `tiers`.
+    #[must_use]
+    pub fn with_savings_and_tiers(
+        rows: Vec<MetricsRow>,
+        savings: SavingsSnapshot,
+        tiers: Vec<TierRow>,
+    ) -> Self {
+        let mut view = Self::with_savings(rows, savings);
+        view.tiers = tiers;
+        view
     }
 
     /// Renders the panel content as text lines (header + one row per runner, or
@@ -120,7 +152,27 @@ impl MetricsView {
                 ));
             }
         }
+        out.extend(self.tier_lines());
         out.extend(self.savings_lines());
+        out
+    }
+
+    /// Renders the per-tier section: one row per model with its token spend and
+    /// cost. Omitted entirely when there is no per-tier data (keeps the rail
+    /// compact when the loop×tier split hasn't accrued yet).
+    fn tier_lines(&self) -> Vec<String> {
+        if self.tiers.is_empty() {
+            return Vec::new();
+        }
+        let mut out = vec![String::new(), "TIERS".to_owned()];
+        for row in &self.tiers {
+            // Model ids are long; show a trailing-trimmed label so the rail fits.
+            let label =
+                &row.model[..crate::floor_char_boundary(&row.model, row.model.len().min(12))];
+            out.push(format!("  {:<12} {:>5} {}", label, row.tokens, {
+                format!("${:.4}", row.cost_usd)
+            }));
+        }
         out
     }
 
@@ -329,6 +381,55 @@ mod tests {
             joined.contains("none yet"),
             "explicit empty state: {joined}"
         );
+    }
+
+    #[test]
+    fn tier_section_shows_per_model_usage() {
+        let view = MetricsView::with_savings_and_tiers(
+            vec![],
+            SavingsSnapshot::default(),
+            vec![
+                TierRow {
+                    model: "claude-fable-5".into(),
+                    tokens: 1200,
+                    cost_usd: 0.05,
+                },
+                TierRow {
+                    model: "claude-opus-4-8".into(),
+                    tokens: 800,
+                    cost_usd: 0.12,
+                },
+            ],
+        );
+        let joined = view.lines().join("\n");
+        assert!(joined.contains("TIERS"), "tier header present: {joined}");
+        // Both models' spend is surfaced (labels are trailing-trimmed to fit).
+        assert!(joined.contains("claude-fable") && joined.contains("1200"));
+        assert!(joined.contains("claude-opus") && joined.contains("$0.1200"));
+    }
+
+    #[test]
+    fn tier_section_absent_when_no_tier_data() {
+        let view = MetricsView::with_savings(vec![], SavingsSnapshot::default());
+        assert!(
+            !view.lines().join("\n").contains("TIERS"),
+            "no tier section without per-tier data"
+        );
+    }
+
+    #[test]
+    fn tier_section_handles_multibyte_model_names() {
+        let view = MetricsView::with_savings_and_tiers(
+            vec![],
+            SavingsSnapshot::default(),
+            vec![TierRow {
+                model: "モデル-αβγ-日本語".into(),
+                tokens: 10,
+                cost_usd: 0.0,
+            }],
+        );
+        // Must not panic on a mid-codepoint 12-byte cut.
+        assert!(!view.lines().is_empty());
     }
 
     #[test]

@@ -138,6 +138,7 @@ pub(crate) async fn run_audit_loop<R: ReviewTurn>(
                 ingot,
                 vault,
                 embedder,
+                None,
             )
             .await
         } else {

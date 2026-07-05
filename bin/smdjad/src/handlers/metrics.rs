@@ -75,6 +75,7 @@ fn bucket_to_json(b: &MetricsBucket) -> Value {
     json!({
         "bucket_start": b.bucket_start.as_micros(),
         "runner": b.runner,
+        "model": b.model,
         "turns": b.turns,
         "input_tok": b.input_tok,
         "output_tok": b.output_tok,

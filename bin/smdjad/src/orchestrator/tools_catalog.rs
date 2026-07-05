@@ -75,6 +75,87 @@ pub(crate) fn builtin_tools(is_sre_mode: bool) -> Vec<serde_json::Value> {
                 "required": ["name"]
             }
         }),
+        serde_json::json!({
+            "name": "lsp_definition",
+            "description": "Jump to the definition of the symbol at a source position using \
+                the language server. Prefer this over text search for precise navigation in \
+                indexed languages (Rust, Python, Go, TypeScript/JavaScript, C/C++). \
+                Returns { locations: [{ file, line, col }] } (1-based).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file": { "type": "string", "description": "workspace-relative path" },
+                    "line": { "type": "integer", "description": "1-based line" },
+                    "col": { "type": "integer", "description": "1-based column, default 1" }
+                },
+                "required": ["file", "line"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lsp_references",
+            "description": "Find all references to the symbol at a source position via the \
+                language server. Returns { references: [{ file, line, col }] } (1-based).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file": { "type": "string" },
+                    "line": { "type": "integer" },
+                    "col": { "type": "integer" }
+                },
+                "required": ["file", "line"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lsp_hover",
+            "description": "Get type/signature/doc hover text for the symbol at a source \
+                position via the language server. Returns { hover: string }.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file": { "type": "string" },
+                    "line": { "type": "integer" },
+                    "col": { "type": "integer" }
+                },
+                "required": ["file", "line"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lsp_document_symbols",
+            "description": "List the symbols (functions, types, methods, …) declared in a \
+                file via the language server. Returns { symbols: [{ name, kind, file, line }] }.",
+            "input_schema": {
+                "type": "object",
+                "properties": { "file": { "type": "string" } },
+                "required": ["file"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lsp_workspace_symbols",
+            "description": "Search project-wide symbols by name via the language server. \
+                Returns { symbols: [{ name, kind, file, line }] }.",
+            "input_schema": {
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"]
+            }
+        }),
+        serde_json::json!({
+            "name": "lsp_rename_symbol",
+            "description": "Rename the symbol at a source position across the workspace using \
+                the language server's rename support, applying the resulting edits to disk. \
+                Writes are bounded to the workspace and routed through the approval gate. \
+                Returns { renamed: true, changed_files: [..] }.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file": { "type": "string" },
+                    "line": { "type": "integer" },
+                    "col": { "type": "integer" },
+                    "new_name": { "type": "string" }
+                },
+                "required": ["file", "line", "new_name"]
+            }
+        }),
     ];
     if is_sre_mode {
         builtin_tools.push(serde_json::json!({

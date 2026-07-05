@@ -261,6 +261,7 @@ async fn reduced_output_is_teed_and_recoverable_via_marker_hash() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     assert_eq!(
@@ -334,6 +335,7 @@ async fn execute_tool_bash_path_runs_filter_and_preserves_output() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     assert!(
@@ -373,6 +375,11 @@ fn mcp_server_tools_are_exactly_the_read_safe_subset() {
         "otel_query",
         "metric_query",
         "log_tail",
+        "lsp_definition",
+        "lsp_references",
+        "lsp_hover",
+        "lsp_document_symbols",
+        "lsp_workspace_symbols",
     ];
     // The exposed subset must match the read-safe list exactly.
     let mut got = super::MCP_SERVER_TOOLS.to_vec();
@@ -532,6 +539,7 @@ async fn execute_tool_bash_returns_error_for_path_outside_workspace() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
 
@@ -577,8 +585,92 @@ async fn run_write(
         ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await
+}
+
+// ── lsp agent tools ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn lsp_rename_symbol_blocked_for_review_session() {
+    // Rename is a write tool: the least-privilege gate rejects it for a
+    // read-only (review) session before any language server is consulted.
+    let ingot = smedja_ingot::IngotHandle::new(smedja_ingot::Ingot::open_in_memory().unwrap());
+    let ws = tempfile::tempdir().unwrap();
+    let vault = std::sync::Arc::new(tokio::sync::Mutex::new(
+        smedja_vault::Vault::open_in_memory().unwrap(),
+    ));
+    let session = session_with_mode(Some("review"));
+    let input =
+        serde_json::json!({ "file": "a.rs", "line": 1, "col": 1, "new_name": "z" }).to_string();
+    let out = super::execute_tool(
+        "lsp_rename_symbol",
+        &input,
+        ws.path(),
+        Some(&session),
+        &ingot,
+        &vault,
+        &test_embedder(),
+        None,
+    )
+    .await;
+    assert!(
+        out.contains("TOOL_BLOCKED"),
+        "review session must block lsp_rename_symbol; got: {out}"
+    );
+}
+
+#[tokio::test]
+async fn lsp_tools_report_unavailable_without_manager() {
+    // With no language-server manager threaded in, the read tools degrade
+    // gracefully rather than panicking or hanging.
+    let ingot = smedja_ingot::IngotHandle::new(smedja_ingot::Ingot::open_in_memory().unwrap());
+    let ws = tempfile::tempdir().unwrap();
+    let vault = std::sync::Arc::new(tokio::sync::Mutex::new(
+        smedja_vault::Vault::open_in_memory().unwrap(),
+    ));
+    let input = serde_json::json!({ "file": "a.rs", "line": 1, "col": 1 }).to_string();
+    let out = super::execute_tool(
+        "lsp_definition",
+        &input,
+        ws.path(),
+        None,
+        &ingot,
+        &vault,
+        &test_embedder(),
+        None,
+    )
+    .await;
+    assert!(
+        out.contains("LSP tools are unavailable"),
+        "expected graceful unavailability; got: {out}"
+    );
+}
+
+#[test]
+fn lsp_read_tools_are_registered_and_read_only() {
+    for t in [
+        "lsp_definition",
+        "lsp_references",
+        "lsp_hover",
+        "lsp_document_symbols",
+        "lsp_workspace_symbols",
+    ] {
+        assert!(super::LOCAL_TOOLS.contains(&t), "{t} must be a local tool");
+        assert!(
+            super::READ_ONLY_TOOLS.contains(&t),
+            "{t} must be read-only for concurrent dispatch"
+        );
+        assert!(
+            super::MCP_SERVER_TOOLS.contains(&t),
+            "{t} must be exposed in MCP server mode"
+        );
+    }
+    // Rename is a write tool and must NOT be in the read-only / MCP subsets.
+    assert!(super::LOCAL_TOOLS.contains(&"lsp_rename_symbol"));
+    assert!(!super::READ_ONLY_TOOLS.contains(&"lsp_rename_symbol"));
+    assert!(!super::MCP_SERVER_TOOLS.contains(&"lsp_rename_symbol"));
 }
 
 #[tokio::test]
@@ -876,6 +968,7 @@ async fn secret_bearing_tool_result_records_finding_and_returns_original() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
 
@@ -929,6 +1022,7 @@ async fn clean_tool_result_records_no_finding() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     assert_eq!(result, "nothing secret here");
@@ -959,6 +1053,7 @@ async fn vault_search_returns_empty_when_no_entries() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
 
@@ -983,6 +1078,7 @@ async fn vault_store_then_search_finds_entry() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     let stored: serde_json::Value = serde_json::from_str(&store_result).unwrap();
@@ -996,6 +1092,7 @@ async fn vault_store_then_search_finds_entry() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     let v: serde_json::Value = serde_json::from_str(&search_result).unwrap();
@@ -1022,6 +1119,7 @@ async fn vault_search_respects_k_limit() {
             &ingot,
             &vault,
             &test_embedder(),
+            None,
         )
         .await;
     }
@@ -1034,6 +1132,7 @@ async fn vault_search_respects_k_limit() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     let v: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -1061,6 +1160,7 @@ async fn smedja_vault_search_returns_results_when_vault_has_matching_entries() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     let stored: serde_json::Value = serde_json::from_str(&store_result).unwrap();
@@ -1078,6 +1178,7 @@ async fn smedja_vault_search_returns_results_when_vault_has_matching_entries() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
 
@@ -1289,6 +1390,7 @@ async fn bash_blocked_pattern_match_returns_error() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     assert!(
@@ -1323,6 +1425,7 @@ async fn bash_non_blocked_command_not_affected() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     assert!(
@@ -1351,6 +1454,7 @@ async fn bash_env_blocklisted_key_rejected() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     assert!(
@@ -1499,6 +1603,7 @@ async fn fetch_web_policy_none_blocks() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     assert!(
@@ -1542,6 +1647,7 @@ async fn grep_files_finds_matching_lines() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     let v: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -1572,6 +1678,7 @@ async fn grep_files_respects_max_results() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     let v: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -1592,6 +1699,7 @@ async fn grep_files_rejects_path_outside_workspace() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     assert!(
@@ -1618,6 +1726,7 @@ async fn find_files_matches_glob_pattern() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     let v: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -1652,6 +1761,7 @@ async fn find_files_respects_max_results() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     let v: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -1672,6 +1782,7 @@ async fn find_files_rejects_path_outside_workspace() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     assert!(
@@ -1695,6 +1806,7 @@ async fn move_file_renames_within_workspace() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     let v: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -1723,6 +1835,7 @@ async fn move_file_rejects_source_outside_workspace() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     assert!(
@@ -1746,6 +1859,7 @@ async fn copy_file_copies_within_workspace() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     let v: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -1772,6 +1886,7 @@ async fn copy_file_creates_parent_dirs() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     let v: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -1797,6 +1912,7 @@ async fn copy_file_rejects_destination_outside_workspace() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     assert!(
@@ -1820,6 +1936,7 @@ async fn delete_file_removes_a_file() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     let v: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -1844,6 +1961,7 @@ async fn delete_file_rejects_path_outside_workspace() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     assert!(
@@ -1869,6 +1987,7 @@ async fn delete_file_refuses_nonempty_directory() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     assert!(
@@ -1899,6 +2018,7 @@ async fn move_copy_delete_blocked_in_review_session() {
             &ingot,
             &vault,
             &test_embedder(),
+            None,
         )
         .await;
         assert!(
@@ -1924,6 +2044,7 @@ async fn grep_find_allowed_in_review_session() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     assert!(
@@ -1939,6 +2060,7 @@ async fn grep_find_allowed_in_review_session() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     assert!(
@@ -1968,6 +2090,7 @@ async fn fetch_web_ssrf_loopback_blocked() {
         &ingot,
         &vault,
         &test_embedder(),
+        None,
     )
     .await;
     std::env::remove_var("SMEDJA_SANDBOX_NETWORK");

@@ -140,6 +140,9 @@ pub(crate) struct AppState {
     pub(crate) panels: PanelVisibility,
     /// Cached per-runner metrics snapshot for the latest rollup window.
     pub(crate) metrics_snapshot: Vec<metrics_view::MetricsRow>,
+    /// Cached per-tier (per-model) usage snapshot for the latest rollup window —
+    /// the fable-plan / sonnet-haiku-implement / opus-review split.
+    pub(crate) tier_snapshot: Vec<metrics_view::TierRow>,
     /// Cached token-economy savings snapshot for the latest rollup window.
     pub(crate) savings_snapshot: metrics_view::SavingsSnapshot,
     /// Timestamp of the last metrics panel poll (drives both the `metrics.summary`

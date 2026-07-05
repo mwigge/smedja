@@ -176,6 +176,11 @@ fn tool_kind(tool: &str) -> ToolKind {
         "otel_query",
         "metric_query",
         "log_tail",
+        "lsp_definition",
+        "lsp_references",
+        "lsp_hover",
+        "lsp_document_symbols",
+        "lsp_workspace_symbols",
     ];
     if READ.contains(&t.as_str())
         || t.starts_with("read")
@@ -199,6 +204,7 @@ fn tool_kind(tool: &str) -> ToolKind {
         "str_replace",
         "create_file",
         "delete_file",
+        "lsp_rename_symbol",
         "write",
         "edit",
         "patch",
@@ -613,6 +619,36 @@ mod tests {
         assert_eq!(
             evaluate(PermissionMode::AcceptEdits, "mystery_tool"),
             PermissionDecision::Ask
+        );
+    }
+
+    #[test]
+    fn lsp_tools_classified_as_read_or_edit() {
+        // Read-only lsp tools are never gated.
+        for t in [
+            "lsp_definition",
+            "lsp_references",
+            "lsp_hover",
+            "lsp_document_symbols",
+            "lsp_workspace_symbols",
+        ] {
+            assert_eq!(super::tool_kind(t), super::ToolKind::ReadOnly, "{t}");
+            assert_eq!(evaluate(PermissionMode::Ask, t), PermissionDecision::Allow);
+        }
+        // Rename is a mutation: auto-approved only under AcceptEdits/Auto, asked
+        // under Ask, denied under Plan.
+        assert_eq!(super::tool_kind("lsp_rename_symbol"), super::ToolKind::Edit);
+        assert_eq!(
+            evaluate(PermissionMode::AcceptEdits, "lsp_rename_symbol"),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            evaluate(PermissionMode::Ask, "lsp_rename_symbol"),
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            evaluate(PermissionMode::Plan, "lsp_rename_symbol"),
+            PermissionDecision::Deny
         );
     }
 

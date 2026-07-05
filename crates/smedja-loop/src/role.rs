@@ -99,6 +99,22 @@ impl LoopRole {
                 resume_session_id: None,
             },
             Self {
+                // Executed plan phase — runs FIRST at the plan tier and produces
+                // the slice list (writes/updates tasks.md). Bound to the owner's
+                // planner model (fable) via `LoopRole::model` at turn time; the
+                // runner here is left independent of the implementer/reviewer
+                // runners so it never affects evaluator separation.
+                name: "plan".into(),
+                runner: Runner::Claude,
+                tier: Tier::Deep,
+                model: None,
+                read_only: false,
+                tools: vec![],
+                role_id: uuid::Uuid::nil(),
+                data_access: DataAccess::default(),
+                resume_session_id: None,
+            },
+            Self {
                 name: "implementer".into(),
                 runner: Runner::Local,
                 tier: Tier::Local,
@@ -187,8 +203,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_contains_six_roles() {
-        assert_eq!(LoopRole::defaults().len(), 6);
+    fn defaults_contains_seven_roles_including_plan() {
+        let defaults = LoopRole::defaults();
+        assert_eq!(defaults.len(), 7);
+        // The executed plan phase is part of the default role table.
+        assert!(defaults.iter().any(|r| r.name == "plan"));
     }
 
     #[test]

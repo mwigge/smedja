@@ -398,21 +398,47 @@ pub(crate) const UMBRELLA_CHUNK_CHARS: usize = 800;
 /// Reads an umbrella change's intent and design detail from its `OpenSpec`
 /// directory.
 ///
-/// The *intent* (small, stable — sealed into the cached prefix) is the change's
-/// `proposal.md`; the *design detail* (large, variable — chunked into the vault
-/// for cold recall) is its `design.md`. Returns `(intent, detail)`, each empty
-/// when its file is absent — a missing umbrella file degrades to "no umbrella
-/// context" rather than failing.
+/// The *intent* (small, stable — sealed once into the cached prefix and carried
+/// across every phase/model handoff) is the change's `problemstatement.md` — the
+/// umbrella intent — falling back to `proposal.md` when the problem statement is
+/// absent. The planner's decomposition (`tasks.md`) is appended to the intent so
+/// downstream phases (implement → verify → review) inherit it from the sealed
+/// context rather than re-deriving it. The *design detail* (large, variable —
+/// chunked into the vault for cold recall) is `design.md`.
+///
+/// Returns `(intent, detail)`, each empty when its sources are absent — a missing
+/// umbrella file degrades to "no umbrella context" rather than failing.
 ///
 /// `change_dir` is the already-validated change directory (the loop resolves it
 /// through [`crate::loop_runner`]'s workspace-boundary check before calling).
 pub(crate) async fn read_umbrella_sources(change_dir: &std::path::Path) -> (String, String) {
-    let intent = tokio::fs::read_to_string(change_dir.join("proposal.md"))
+    let problem = tokio::fs::read_to_string(change_dir.join("problemstatement.md"))
+        .await
+        .unwrap_or_default();
+    let proposal = tokio::fs::read_to_string(change_dir.join("proposal.md"))
+        .await
+        .unwrap_or_default();
+    let tasks = tokio::fs::read_to_string(change_dir.join("tasks.md"))
         .await
         .unwrap_or_default();
     let detail = tokio::fs::read_to_string(change_dir.join("design.md"))
         .await
         .unwrap_or_default();
+
+    // The problem statement is the umbrella intent; proposal.md is the fallback.
+    let base_intent = if problem.trim().is_empty() {
+        proposal
+    } else {
+        problem
+    };
+    // Seal the problem statement together with the planner's decomposition so the
+    // umbrella intent AND the slice breakdown ride the cached prefix through every
+    // phase. Blank sections are dropped so the seal stays lean.
+    let intent = [base_intent.trim(), tasks.trim()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
     (intent, detail)
 }
 
@@ -793,6 +819,83 @@ mod tests {
                 .any(|(src, n)| src == LEAN_SPEC_SOURCE && *n > 0),
             "the saving must be tagged source=lean-spec; got {by_source:?}"
         );
+    }
+
+    // ── group 6: task+memory continuity (problem statement + decomposition) ──
+
+    #[tokio::test]
+    async fn read_umbrella_sources_seals_problem_statement_and_decomposition() {
+        // Continuity: the problem statement is the sealed umbrella intent, and the
+        // planner's tasks.md decomposition is carried in the sealed context so
+        // downstream phases inherit it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let change = dir.path();
+        std::fs::write(
+            change.join("problemstatement.md"),
+            "PROBLEM: realize the loop×tier vision.",
+        )
+        .unwrap();
+        std::fs::write(
+            change.join("tasks.md"),
+            "## Slices\n- [ ] Slice A: plan\n- [ ] Slice B: implement\n",
+        )
+        .unwrap();
+        std::fs::write(change.join("design.md"), "DESIGN detail body.").unwrap();
+
+        let (intent, detail) = read_umbrella_sources(change).await;
+        assert!(
+            intent.contains("PROBLEM: realize the loop×tier vision."),
+            "problem statement must be the sealed umbrella intent: {intent}"
+        );
+        assert!(
+            intent.contains("Slice A: plan") && intent.contains("Slice B: implement"),
+            "planner decomposition must be carried in the sealed context: {intent}"
+        );
+        assert!(
+            detail.contains("DESIGN detail body."),
+            "design detail is the cold-recall stratum"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_umbrella_sources_falls_back_to_proposal_when_no_problem_statement() {
+        // Behavior-compatible: with no problemstatement.md, proposal.md is the intent.
+        let dir = tempfile::TempDir::new().unwrap();
+        let change = dir.path();
+        std::fs::write(change.join("proposal.md"), "PROPOSAL intent line.").unwrap();
+        let (intent, _detail) = read_umbrella_sources(change).await;
+        assert!(
+            intent.contains("PROPOSAL intent line."),
+            "proposal.md is the fallback umbrella intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn problem_statement_present_in_sealed_prefix_across_slices() {
+        // The sealed intent (problem statement + decomposition) sits inside the
+        // cached prefix for every slice's assembled context — the continuity the
+        // loop×tier vision needs across phase/model handoffs.
+        let vault = in_memory_vault();
+        let (intent, _detail) = {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::write(dir.path().join("problemstatement.md"), "UMBRELLA PROBLEM").unwrap();
+            std::fs::write(dir.path().join("tasks.md"), "- [ ] Slice One").unwrap();
+            read_umbrella_sources(dir.path()).await
+        };
+        let pointer = SlicePointer::new("cont", 1);
+        for phase_delta in ["plan delta", "implement delta", "review delta"] {
+            let assembled =
+                assemble_slice_context(&vault, &test_embedder(), &pointer, &intent, phase_delta, 3)
+                    .await;
+            let mem = &assembled.memory;
+            let prefix = &mem.messages()[..mem.stable_prefix()];
+            assert!(
+                prefix
+                    .iter()
+                    .any(|m| m.content.contains("UMBRELLA PROBLEM")),
+                "the problem statement must be sealed across every phase"
+            );
+        }
     }
 
     #[tokio::test]

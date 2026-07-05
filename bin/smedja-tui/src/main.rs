@@ -1465,6 +1465,42 @@ fn metrics_rows_from_summary(resp: &serde_json::Value) -> Vec<metrics_view::Metr
     rows
 }
 
+/// Folds a `metrics.summary` response into one [`metrics_view::TierRow`] per
+/// model, in first-seen order.
+///
+/// Reads `resp["buckets"]`, summing `input_tok + output_tok` into `tokens` and
+/// accumulating `cost_usd` per model. Error-only rows (empty `model`, from the
+/// audit log) are skipped — they have no tier to attribute to. Missing or
+/// non-array `buckets`, and missing per-bucket fields, are treated as empty /
+/// zero, so a malformed response yields an empty `Vec` rather than a panic.
+#[must_use]
+fn tier_rows_from_summary(resp: &serde_json::Value) -> Vec<metrics_view::TierRow> {
+    let Some(buckets) = resp["buckets"].as_array() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<metrics_view::TierRow> = Vec::new();
+    for bucket in buckets {
+        let model = bucket["model"].as_str().unwrap_or("");
+        if model.is_empty() {
+            continue; // error-only rows carry no model / tier
+        }
+        let tokens =
+            bucket["input_tok"].as_i64().unwrap_or(0) + bucket["output_tok"].as_i64().unwrap_or(0);
+        let cost_usd = bucket["cost_usd"].as_f64().unwrap_or(0.0);
+        if let Some(row) = rows.iter_mut().find(|r| r.model == model) {
+            row.tokens += tokens;
+            row.cost_usd += cost_usd;
+        } else {
+            rows.push(metrics_view::TierRow {
+                model: model.to_owned(),
+                tokens,
+                cost_usd,
+            });
+        }
+    }
+    rows
+}
+
 /// Returns whether the metrics panel poll is due: true only when the panel is
 /// `visible` and `last` is unset or [`METRICS_POLL_INTERVAL`] has elapsed by
 /// `now`. The panel is never polled while hidden.
