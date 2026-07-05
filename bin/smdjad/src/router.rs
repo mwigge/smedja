@@ -171,6 +171,21 @@ pub(crate) fn build_router(
     route!(router, "task.close", state, handlers::task::close);
     route!(router, "task.parallel", state, handlers::task::parallel);
     route!(router, "task.cancel", state, handlers::task::cancel);
+    // Live shared coordination blocks for parallel fan-out roles: additive
+    // append, owner rewrite, and full read of a `fan_out_id`-keyed block.
+    route!(
+        router,
+        "task.block_append",
+        state,
+        handlers::task::block_append
+    );
+    route!(
+        router,
+        "task.block_rewrite",
+        state,
+        handlers::task::block_rewrite
+    );
+    route!(router, "task.block_read", state, handlers::task::block_read);
     route!(router, "metrics.summary", state, handlers::metrics::summary);
     route!(router, "savings.summary", state, handlers::savings::summary);
     route!(router, "cowork.set", state, handlers::audit::set);

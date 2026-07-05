@@ -573,6 +573,7 @@ async fn main() -> anyhow::Result<()> {
                 workspace: workspace_root.clone(),
                 vault: Arc::clone(&vault),
                 embedder: Arc::clone(&embedder),
+                gates: Arc::clone(&gates),
             };
             let acp_router = acp::build_acp_router(acp_state);
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
