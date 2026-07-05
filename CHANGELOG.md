@@ -6,6 +6,60 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.25.0] — 2026-07-06
+
+The universal-agent-runtime release: bring any backend (claude-cli, codex-cli,
+minimax, local) and smedja layers the same superpowers on all of them, delivered
+through three runner-agnostic rails (the shared tool catalog, the system-prompt
+block, and the MCP server) plus an ACP coordinator.
+
+### Fixed (correctness tranche)
+- claude-cli approvals now route through the real interactive cowork gate (Ask
+  prompts instead of hard-denying; Modify -> updatedInput); fail-CLOSED when a
+  gate is expected but missing.
+- codegraph 0-symbols: /index absolutizes + the daemon canonicalizes/validates
+  the path (real error instead of silent Ok(0)); one canonical spelling shares the
+  DB key with query.
+- The loop's fix role now receives the real verification output (failing tests +
+  stdout/stderr) instead of a generic "slice N failed" string.
+- claude-cli/codex-cli now receive smedja's injected skills/rules/methodology
+  (--append-system-prompt-file / managed AGENTS.md) instead of silently discarding
+  them; detect_agents_md wired both directions.
+- Tier ranking unified to Local < Fast < Deep (one source of truth), fixing a
+  failover that could rotate a Fast turn down to a weaker Local provider.
+
+### Added (runner-agnostic capabilities)
+- **Skills/rules/agents**: one normalized Bundle (collapses the two skill systems
+  + an external toolkit folder), an auto-activation selector (L1 index + selected
+  bodies), an MCP prompts/resources surface, and subagent-def materialization.
+- **LSP as agent tools**: a real LSP client (didOpen/sync + request/response), the
+  lsp_* tools (references/definition/hover/workspace-symbols/rename), and a
+  post-edit diagnostics feedback loop — on the tool-result path, so every runner
+  gets them.
+- **test_run**: language-agnostic detect -> run-all -> parse (libtest/go/jest/junit)
+  -> one TestReport, affected fast-mode; the loop reuses it.
+- **review_run**: polyglot deterministic tools (rustfmt/clippy/ruff/prettier/
+  eslint/gofmt/...) -> SARIF + an LLM layer -> a seven-dimension quality bar.
+- **spec.***: a native in-daemon OpenSpec engine (delta parser/merger,
+  create/validate/show/diff/list/archive-with-merge) + spec_* tools + a validate
+  gate before loop.run, replacing the external-binary shell-out.
+- **Loop x tier**: an executed plan phase (plan -> implement -> verify -> review),
+  the plan=fable / implement=sonnet|haiku / review=opus binding, an escalate-on-
+  failure descent ladder, per-tier token accounting, and problem-statement
+  continuity across handoffs.
+- **Memory**: an in-process ANN index (scales past full-scan), a status-surfacing
+  embedder (no silent lexical fallback), an MCP memory surface (memory_search/
+  write/list) so external clients share the vault, and live concurrently-editable
+  shared blocks for parallel agents.
+- **ACP coordinator**: session/request_permission routes into the one cowork gate;
+  session/load replays history; allow-always persists as a permission rule.
+
+### Changed
+- Single canonical git-root active repo (git-root detection; auto-index on
+  activation; real mtime incrementality replacing the dead commit_sha path).
+
+Gates: workspace build 0 warnings, clippy -D warnings clean, fmt clean, 2428 tests.
+
 ## [0.24.3] — 2026-07-05
 
 ### Changed
