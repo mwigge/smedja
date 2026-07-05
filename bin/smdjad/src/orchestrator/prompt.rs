@@ -74,6 +74,25 @@ pub(crate) fn build_base_system(
             with_skills
         }
     };
+    // The repo's own `AGENTS.md` (the convention codex-cli/other agents read) is
+    // consumed here so smedja honours it too — closing the loop in both
+    // directions. The smedja-managed section is stripped first so the block the
+    // codex adapter writes into `AGENTS.md` is never fed back into the prompt.
+    let with_skills = match smedja_memory::detect_agents_md(workspace_root) {
+        Ok(Some(body)) => {
+            let user = smedja_memory::strip_managed_agents_section(&body);
+            if user.trim().is_empty() {
+                with_skills
+            } else {
+                format!("{with_skills}\n\n<agents_md>\n{user}\n</agents_md>")
+            }
+        }
+        Ok(None) => with_skills,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read AGENTS.md; continuing without");
+            with_skills
+        }
+    };
     // Always-on, steer-first foundational discipline: the directive is
     // folded into the same cacheable system block as workspace skills so
     // it is sealed into the stable prefix before `seal_prefix()` and the
@@ -259,4 +278,67 @@ pub(crate) fn format_vault_recalled(entries: &[VaultEntry]) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n\n---\n\n");
     Some(format!("<recalled_context>\n{body}\n</recalled_context>"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_base_system;
+    use smedja_assayer::AgentRole;
+
+    fn temp_ws(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "smedja-prompt-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn build_base_system_consumes_repo_agents_md() {
+        let ws = temp_ws("agents");
+        std::fs::write(
+            ws.join("AGENTS.md"),
+            "# Repo rules\n\nNever force-push main.\n",
+        )
+        .unwrap();
+        let out = build_base_system(&ws, "", AgentRole::Impl);
+        assert!(
+            out.contains("Never force-push main."),
+            "repo AGENTS.md must be folded into the system block; got:\n{out}"
+        );
+        assert!(out.contains("<agents_md>"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn build_base_system_strips_smedja_managed_agents_section() {
+        let ws = temp_ws("agents-managed");
+        // Simulate an AGENTS.md the codex adapter has written a managed block into.
+        let body = format!(
+            "# Repo rules\n\nBe kind.\n\n{}\nYou are smedja (injected block — must NOT feed back)\n{}\n",
+            smedja_memory::AGENTS_MANAGED_BEGIN,
+            smedja_memory::AGENTS_MANAGED_END
+        );
+        std::fs::write(ws.join("AGENTS.md"), body).unwrap();
+        let out = build_base_system(&ws, "", AgentRole::Impl);
+        assert!(out.contains("Be kind."), "user content must be kept");
+        assert!(
+            !out.contains("must NOT feed back"),
+            "smedja-managed section must be stripped before injection; got:\n{out}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn build_base_system_without_agents_md_has_no_block() {
+        let ws = temp_ws("no-agents");
+        let out = build_base_system(&ws, "", AgentRole::Impl);
+        assert!(!out.contains("<agents_md>"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
 }

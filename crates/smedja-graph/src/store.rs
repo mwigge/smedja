@@ -117,6 +117,12 @@ impl GraphStore {
         workspace_id: &str,
         commit_sha: Option<&str>,
     ) -> Result<usize, GraphError> {
+        // Fail loudly on a bad root before clearing existing symbols — a
+        // nonexistent/relative-bad path must not wipe the graph and report
+        // Ok(0). (index_directory validates too; this guards the sha branch
+        // and the pre-clear step below.)
+        crate::indexer::validate_root(root)?;
+
         let Some(sha) = commit_sha else {
             // Full re-index path.
             self.clear_workspace(workspace_id)?;

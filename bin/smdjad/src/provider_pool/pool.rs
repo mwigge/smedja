@@ -199,20 +199,17 @@ impl ProviderPool {
 /// Capability rank of a [`Tier`] for rotation-compatibility comparisons.
 ///
 /// Higher means more capable (larger context window / higher quality):
-/// `Fast < Local < Deep`.
+/// `Local < Fast < Deep`. Delegates to [`Tier::capability_rank`] — the single
+/// source of truth shared with the assayer so the two orderings never diverge.
 fn tier_capability_rank(tier: Tier) -> u8 {
-    match tier {
-        Tier::Fast => 0,
-        Tier::Local => 1,
-        Tier::Deep => 2,
-    }
+    tier.capability_rank()
 }
 
 /// Returns `true` when a turn routed to `routed` may rotate to a provider of
 /// tier `candidate` for a failure of the given `kind`.
 ///
 /// Rotation must never degrade the turn below the routed tier, so `candidate`
-/// must be at least as capable as `routed` (`Fast ≤ Local ≤ Deep`). For a
+/// must be at least as capable as `routed` (`Local ≤ Fast ≤ Deep`). For a
 /// `context_length_exceeded` failure the candidate must be **strictly** more
 /// capable — an equal-window provider would hit the same limit.
 #[must_use]
@@ -223,5 +220,46 @@ pub fn tier_compatible(routed: Tier, candidate: Tier, kind: &str) -> bool {
         candidate_rank > routed_rank
     } else {
         candidate_rank >= routed_rank
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{tier_capability_rank, tier_compatible};
+    use smedja_assayer::Tier;
+
+    const TIERS: [Tier; 3] = [Tier::Local, Tier::Fast, Tier::Deep];
+
+    #[test]
+    fn tier_capability_rank_matches_canonical_source() {
+        // Derived from Tier::capability_rank — must agree tier-for-tier.
+        for tier in TIERS {
+            assert_eq!(tier_capability_rank(tier), tier.capability_rank());
+        }
+    }
+
+    #[test]
+    fn tier_capability_rank_agrees_with_assayer_descent_ladder() {
+        // The assayer's descent ladder goes Deep → Fast → Local (strongest to
+        // cheapest). The pool's rotation ranking must place them in the same
+        // relative order for every pair, or failover could pick the wrong tier.
+        for a in TIERS {
+            for b in TIERS {
+                let pool_ord = tier_capability_rank(a).cmp(&tier_capability_rank(b));
+                let canonical_ord = a.capability_rank().cmp(&b.capability_rank());
+                assert_eq!(pool_ord, canonical_ord, "disagree on {a:?} vs {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rotation_never_degrades_fast_turn_to_local() {
+        // Regression: with the old `Fast < Local` ranking, a Fast turn was
+        // allowed to rotate down to a weaker Local provider. It must not.
+        assert!(!tier_compatible(Tier::Fast, Tier::Local, "server_error"));
+        // A Fast turn may still rotate up to Deep.
+        assert!(tier_compatible(Tier::Fast, Tier::Deep, "server_error"));
+        // Same tier is fine for a non-context failure.
+        assert!(tier_compatible(Tier::Fast, Tier::Fast, "server_error"));
     }
 }

@@ -43,6 +43,26 @@ pub enum Tier {
     Deep,
 }
 
+impl Tier {
+    /// Capability rank of this tier — higher means more capable (larger context
+    /// window / higher quality). The single source of truth for every tier
+    /// capability comparison in the workspace: `Local < Fast < Deep`.
+    ///
+    /// Ordering rationale: `Deep` is the strongest hosted tier. `Fast` is a
+    /// hosted low-latency tier — still a cloud model, so more capable than a
+    /// device-bound one. `Local` runs on-device with the smallest model and is
+    /// the least capable. This matches the descending "Deep → Fast → Local"
+    /// implementation ladder used by the assayer.
+    #[must_use]
+    pub fn capability_rank(self) -> u8 {
+        match self {
+            Self::Local => 0,
+            Self::Fast => 1,
+            Self::Deep => 2,
+        }
+    }
+}
+
 /// Estimated complexity of the task being assigned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -302,6 +322,18 @@ mod tests {
             let back: Tier = serde_json::from_str(&json).expect("deserialise tier");
             assert_eq!(tier, back);
         }
+    }
+
+    #[test]
+    fn tier_capability_rank_orders_local_fast_deep() {
+        // The single source of truth: Local < Fast < Deep. Every consumer
+        // (assayer descent, provider-pool rotation) derives from this.
+        assert!(Tier::Local.capability_rank() < Tier::Fast.capability_rank());
+        assert!(Tier::Fast.capability_rank() < Tier::Deep.capability_rank());
+        // Ranks are distinct so no two tiers ever compare equal.
+        assert_eq!(Tier::Local.capability_rank(), 0);
+        assert_eq!(Tier::Fast.capability_rank(), 1);
+        assert_eq!(Tier::Deep.capability_rank(), 2);
     }
 
     #[test]

@@ -17,7 +17,18 @@ const DEFAULT_QUERY_LIMIT: usize = 50;
 
 /// Resolves the workspace root: the `workspace` param if present and non-empty,
 /// else `SMEDJA_WORKSPACE`, else the daemon's current directory.
+///
+/// The result is canonicalised (with a fall-back to the raw path when it cannot
+/// be resolved) so that `index`, `query`, and `status` all key the graph DB off
+/// **one** canonical spelling. Without this, a relative path resolved against
+/// the daemon's cwd and the session's absolute root can hash to different DBs.
 fn resolve_workspace(params: &Value) -> PathBuf {
+    let raw = resolve_workspace_raw(params);
+    raw.canonicalize().unwrap_or(raw)
+}
+
+/// The un-canonicalised workspace root (param → `SMEDJA_WORKSPACE` → cwd).
+fn resolve_workspace_raw(params: &Value) -> PathBuf {
     if let Some(ws) = params.get("workspace").and_then(Value::as_str) {
         if !ws.is_empty() {
             return PathBuf::from(ws);
@@ -87,6 +98,19 @@ fn join_err(e: &tokio::task::JoinError) -> RpcError {
 /// Returns [`codes::INTERNAL_ERROR`] when the `.smedja` directory cannot be
 /// created, the store cannot be opened, or indexing fails.
 pub(crate) async fn index(_state: HandlerState, params: Value) -> Result<Value, RpcError> {
+    // Validate against the raw request path so a nonexistent/relative-bad root
+    // fails loudly here (with the path the caller actually sent) instead of
+    // canonicalize() silently falling back and index_directory reporting Ok(0).
+    let raw = resolve_workspace_raw(&params);
+    if !raw.is_dir() {
+        return Err(RpcError::new(
+            codes::INVALID_PARAMS,
+            format!(
+                "workspace does not exist or is not a directory: {}",
+                raw.display()
+            ),
+        ));
+    }
     let workspace = resolve_workspace(&params);
     let db_path = graph_db_path(&workspace);
     let index_root = workspace.clone();
@@ -222,6 +246,11 @@ mod tests {
         let a = graph_db_path(ws1.path());
         let b = graph_db_path(ws1.path());
         let other = graph_db_path(ws2.path());
+        // Different spellings of the *same* existing workspace (plain vs. a
+        // redundant `.` component) must hash to one DB, so `/index` and
+        // `graph.query` always agree on the key. Computed under the same
+        // owned-HOME section so it never races on the HOME read.
+        let dotted = graph_db_path(&ws1.path().join("."));
 
         unsafe {
             match prev_home {
@@ -232,6 +261,8 @@ mod tests {
 
         // Same workspace → same DB path (index and query must agree).
         assert_eq!(a, b);
+        // Different spellings of one workspace → same DB path.
+        assert_eq!(a, dotted, "spellings of one workspace must share a DB key");
         // Different workspaces → different DBs.
         assert_ne!(a, other);
         // DB sits under the sandbox-writable state dir, never inside the workspace.
@@ -250,5 +281,32 @@ mod tests {
             "must not live inside the workspace: {a:?}"
         );
         assert_eq!(a.file_name().and_then(|n| n.to_str()), Some("graph.db"));
+    }
+
+    // `resolve_workspace` must collapse different spellings of the same existing
+    // directory to one canonical path. Since `graph_db_path` is a deterministic
+    // function of that path, this is what makes `/index` and `graph.query` key
+    // off the same graph DB (the key-equality itself is asserted, under a
+    // controlled HOME, in the test above). No env/cwd mutation here → parallel-safe.
+    #[test]
+    fn resolve_workspace_canonicalises_different_spellings_to_one_path() {
+        let ws = tempfile::tempdir().unwrap();
+
+        let plain = resolve_workspace(&json!({ "workspace": ws.path().to_string_lossy() }));
+        let dotted =
+            resolve_workspace(&json!({ "workspace": ws.path().join(".").to_string_lossy() }));
+
+        assert_eq!(plain, dotted);
+        assert!(plain.is_absolute(), "canonical path must be absolute");
+    }
+
+    // A relative/nonexistent workspace must NOT canonicalise to some unrelated
+    // directory: resolve_workspace falls back to the raw path, and the index
+    // handler rejects it (tested at the RPC layer). Here we assert the raw
+    // fallback is preserved so the DB key is deterministic.
+    #[test]
+    fn resolve_workspace_falls_back_to_raw_when_unresolvable() {
+        let ws = resolve_workspace(&json!({ "workspace": "definitely/not/a/real/path/xyzzy" }));
+        assert_eq!(ws, PathBuf::from("definitely/not/a/real/path/xyzzy"));
     }
 }

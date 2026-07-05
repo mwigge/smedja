@@ -61,8 +61,35 @@ pub(crate) fn workspace_files(root: &Path) -> impl Iterator<Item = walkdir::DirE
         .max_depth(MAX_INDEX_DEPTH)
         .into_iter()
         .filter_entry(|e| !is_pruned_dir(e))
-        .filter_map(std::result::Result::ok)
+        // Log rather than silently drop walk failures. A swallowed top-level
+        // error (e.g. the root does not exist) otherwise masquerades as an
+        // empty-but-successful index; `validate_root` catches that case up
+        // front, and this surfaces per-entry permission/IO errors deeper in.
+        .filter_map(|res| match res {
+            Ok(entry) => Some(entry),
+            Err(err) => {
+                tracing::warn!(error = %err, "walk error — skipping entry");
+                None
+            }
+        })
         .filter(|e| e.file_type().is_file())
+}
+
+/// Fails loudly when `root` cannot be indexed instead of walking nothing and
+/// reporting `Ok(0)`. `is_dir()` is false for both nonexistent paths and
+/// non-directory files, so one check covers both.
+///
+/// # Errors
+///
+/// Returns [`GraphError::InvalidRoot`] when `root` is not an existing directory.
+pub(crate) fn validate_root(root: &Path) -> Result<(), GraphError> {
+    if root.is_dir() {
+        Ok(())
+    } else {
+        Err(GraphError::InvalidRoot {
+            path: root.display().to_string(),
+        })
+    }
 }
 
 /// tree-sitter query for Rust source files.
@@ -319,6 +346,8 @@ pub(crate) fn index_directory(
     root: &Path,
     workspace_id: &str,
 ) -> Result<usize, GraphError> {
+    validate_root(root)?;
+
     let mut total = 0usize;
 
     for entry in workspace_files(root) {
@@ -522,6 +551,44 @@ mod tests {
         let lines: Vec<&str> = (0..20).map(|_| "x").collect();
         let snippet = build_snippet(&lines, 0, 19);
         assert_eq!(snippet.lines().count(), 10);
+    }
+
+    #[test]
+    fn index_directory_errors_on_nonexistent_root() {
+        let conn = in_memory_conn();
+        let missing = std::path::Path::new("/no/such/smedja/workspace/xyzzy");
+        let err = index_directory(&conn, missing, "ws").unwrap_err();
+        assert!(
+            matches!(err, GraphError::InvalidRoot { .. }),
+            "expected InvalidRoot, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn index_directory_errors_on_file_root() {
+        // A file (not a directory) must also fail loudly rather than Ok(0).
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "fn a() {}").unwrap();
+        let conn = in_memory_conn();
+        let err = index_directory(&conn, &file, "ws").unwrap_err();
+        assert!(matches!(err, GraphError::InvalidRoot { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn index_directory_counts_symbols_on_real_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "fn a() {}\nstruct B;\n").unwrap();
+        let conn = in_memory_conn();
+        let n = index_directory(&conn, dir.path(), "ws").unwrap();
+        assert!(n >= 2, "expected >= 2 symbols, got {n}");
+    }
+
+    #[test]
+    fn validate_root_accepts_dir_rejects_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(validate_root(dir.path()).is_ok());
+        assert!(validate_root(&dir.path().join("nope")).is_err());
     }
 
     #[test]

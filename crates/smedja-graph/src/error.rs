@@ -15,4 +15,12 @@ pub enum GraphError {
         /// The path of the file that could not be parsed.
         path: String,
     },
+
+    /// The index root does not exist or is not a directory. Returned instead of
+    /// silently reporting `Ok(0)` for a bad/relative/nonexistent workspace path.
+    #[error("index root does not exist or is not a directory: {path}")]
+    InvalidRoot {
+        /// The offending root path.
+        path: String,
+    },
 }

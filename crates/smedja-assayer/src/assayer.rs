@@ -29,12 +29,11 @@ pub fn cap_tier(tier: Tier, ceiling: Tier) -> Tier {
 }
 
 /// Capability rank for tier ordering (Local < Fast < Deep).
+///
+/// Delegates to [`Tier::capability_rank`] — the single source of truth shared
+/// with the provider pool's rotation ranking so the two never disagree.
 fn tier_rank(tier: Tier) -> u8 {
-    match tier {
-        Tier::Local => 0,
-        Tier::Fast => 1,
-        Tier::Deep => 2,
-    }
+    tier.capability_rank()
 }
 
 /// A single routing rule: optional role and optional complexity matchers, plus the
@@ -229,6 +228,27 @@ fn tier_label(tier: Tier) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tier_rank_matches_canonical_capability_order() {
+        // tier_rank must agree with Tier::capability_rank (the single source of
+        // truth the provider pool also derives from) for every tier, so
+        // failover/descent and rotation never disagree on Fast vs Local.
+        for tier in [Tier::Local, Tier::Fast, Tier::Deep] {
+            assert_eq!(tier_rank(tier), tier.capability_rank());
+        }
+        // Explicit ordering: Local < Fast < Deep.
+        assert!(tier_rank(Tier::Local) < tier_rank(Tier::Fast));
+        assert!(tier_rank(Tier::Fast) < tier_rank(Tier::Deep));
+    }
+
+    #[test]
+    fn descending_tier_ladder_is_monotonically_cheaper() {
+        // Deep (step 0) → Fast (steps 1-2) → Local (step 3+): each rung must be
+        // no more capable than the previous, matching the tier ranking.
+        assert!(tier_rank(descending_tier(0)) >= tier_rank(descending_tier(1)));
+        assert!(tier_rank(descending_tier(2)) >= tier_rank(descending_tier(3)));
+    }
 
     // ------------------------------------------------------------------ helpers
 
