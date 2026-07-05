@@ -188,6 +188,106 @@ fn table_rows_render_cells_and_delimiter_rule() {
 }
 
 #[test]
+fn block_markdown_styles_headings_quotes_rules_and_lists() {
+    // ATX heading: marker stripped, bold accent applied.
+    let h = block_markdown_spans("## Section title").unwrap();
+    let flat: String = h.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(flat, "Section title");
+    assert!(h
+        .spans
+        .iter()
+        .any(|s| s.style.add_modifier.contains(Modifier::BOLD)));
+
+    // Thematic break: a dim horizontal rule of box-drawing dashes.
+    let hr = block_markdown_spans("---").unwrap();
+    let rule: String = hr.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        rule.chars().all(|c| c == '\u{2500}'),
+        "hr is a ─ run: {rule}"
+    );
+    assert!(hr.spans[0].style.add_modifier.contains(Modifier::DIM));
+
+    // Unordered list: red-`-` bug is gone — the marker becomes a bullet.
+    let li = block_markdown_spans("- do the thing").unwrap();
+    let bullet: String = li.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(bullet.starts_with('\u{2022}'), "bullet: {bullet}");
+    assert!(bullet.contains("do the thing"));
+
+    // Ordered list keeps its number.
+    let ol = block_markdown_spans("3. third").unwrap();
+    let num: String = ol.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(num.starts_with("3. "), "ordered: {num}");
+
+    // Blockquote: gutter bar + body.
+    let q = block_markdown_spans("> quoted").unwrap();
+    let qt: String = q.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        qt.contains('\u{258d}') && qt.contains("quoted"),
+        "quote: {qt}"
+    );
+
+    // Plain prose is left to the cheap path.
+    assert!(block_markdown_spans("just a sentence").is_none());
+}
+
+#[test]
+fn push_line_renders_list_without_red_removed_style() {
+    // Regression: "- item" used to classify as a red diff removal.
+    let mut panel = MainPanel::new();
+    panel.push_line("- a bullet".into());
+    let last = panel.lines.last().unwrap();
+    assert_eq!(last.style, LineStyle::Normal, "list item is not a removal");
+    assert!(last.spans.is_some(), "list item is styled");
+    assert!(last.text.starts_with('\u{2022}'));
+}
+
+#[test]
+fn heading_is_bold_and_hr_is_dim_chrome() {
+    let mut panel = MainPanel::new();
+    panel.push_line("# Title".into());
+    panel.push_line("***".into());
+    let heading = &panel.lines[0];
+    assert!(heading
+        .spans
+        .as_ref()
+        .unwrap()
+        .spans
+        .iter()
+        .any(|s| s.style.add_modifier.contains(Modifier::BOLD)));
+    let hr = &panel.lines[1];
+    assert!(hr
+        .spans
+        .as_ref()
+        .unwrap()
+        .spans
+        .iter()
+        .all(|s| s.style.add_modifier.contains(Modifier::DIM)));
+}
+
+// Change 5 guard: the syntax highlighter must give tokens *distinct* colours,
+// not collapse to one — assert a rust sample yields >= 3 different fg styles.
+#[test]
+fn highlight_code_yields_at_least_three_distinct_styles() {
+    let src = "fn main() {\n    // greet\n    let name = \"world\";\n    let n = 42;\n}";
+    let lines = highlight_code("rust", src);
+    let mut colors = std::collections::HashSet::new();
+    for l in &lines {
+        if let Some(spans) = &l.spans {
+            for s in &spans.spans {
+                if let Some(fg) = s.style.fg {
+                    colors.insert(format!("{fg:?}"));
+                }
+            }
+        }
+    }
+    assert!(
+        colors.len() >= 3,
+        "expected >= 3 distinct token colours, got {}: {colors:?}",
+        colors.len()
+    );
+}
+
+#[test]
 fn standalone_hunk_header_is_styled() {
     let mut panel = MainPanel::new();
     panel.push_line("@@ -10,3 +10,4 @@ fn main()".into());

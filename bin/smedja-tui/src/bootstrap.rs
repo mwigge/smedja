@@ -207,25 +207,23 @@ pub(crate) async fn bootstrap() -> Result<Session> {
         prev_context_used: 0,
     };
 
-    // Connect banner — shown on every startup so the user knows what's connected.
+    // Connect banner — dim chrome so it never out-shouts the conversation.
     let banner_sock = sock.display().to_string();
-    state
-        .main_panel
-        .push_line(format!("connected to {banner_sock}"));
-    state
-        .main_panel
-        .push_line(format!("session {}", state.session_id));
-    state
-        .main_panel
-        .push_line(format!("provider: {}", state.runner));
+    crate::push_chrome_line(&mut state.main_panel, format!("connected to {banner_sock}"));
+    crate::push_chrome_line(
+        &mut state.main_panel,
+        format!("session {}", state.session_id),
+    );
+    crate::push_chrome_line(&mut state.main_panel, format!("provider: {}", state.runner));
     if let Some(ref m) = state.model {
-        state.main_panel.push_line(format!("model: {m}"));
+        crate::push_chrome_line(&mut state.main_panel, format!("model: {m}"));
     }
     let tier_str = state.tier.as_deref().unwrap_or("fast");
-    state.main_panel.push_line(format!("tier: {tier_str}"));
-    state
-        .main_panel
-        .push_line("type a message or /help for commands".into());
+    crate::push_chrome_line(&mut state.main_panel, format!("tier: {tier_str}"));
+    crate::push_chrome_line(
+        &mut state.main_panel,
+        "type a message or /help for commands",
+    );
 
     // On resume, optionally rewind to --turn and replay history into the view
     // before the event loop starts. Done before terminal setup so a transport

@@ -507,10 +507,18 @@ pub(crate) async fn submit(input: &str, state: &mut AppState, client: &mut Clien
         role: Role::User,
         text: text.clone(),
     };
-    // Author chip + message body. Reset the assistant chip latch so the next
-    // response emits its own "▌ <runner>" boundary on a fresh line.
-    let you_accent = palette().accent;
-    push_author_chip(&mut state.main_panel, "you", you_accent, state.no_color);
+    // Author chip + message body. The user identity leads with the signature
+    // molten lava-orange + a heavy `▌` bar so it is unmistakable against the
+    // amber chrome and the assistant's cooler brand colour. Reset the assistant
+    // chip latch so the next response emits its own boundary on a fresh line.
+    let you_color = palette().molten;
+    push_author_chip(
+        &mut state.main_panel,
+        "\u{258c}",
+        "you",
+        you_color,
+        state.no_color,
+    );
     state.main_panel.push_line(user_msg.text.clone());
     state.assistant_open = false;
     state.push_message(user_msg);
@@ -731,26 +739,46 @@ pub(crate) fn format_tool_detail(name: &str, full: &str) -> Vec<String> {
     lines
 }
 
-/// Builds an author chip line (`▌ you` / `▌ claude`) marking a turn boundary so
-/// messages have clear authorship. Pushed on its own line; the message body
-/// follows beneath it.
+/// Builds an author chip line (`▌ you` / `▏ codex`) marking a turn boundary so
+/// messages have clear authorship. The `glyph` is a role-specific left-gutter
+/// bar — a heavy `▌` for the user (loud, owns the turn) and a thin `▏` for the
+/// assistant (quiet, since it owns the content width). Pushed on its own line;
+/// the message body follows beneath it.
+///
 /// Pushes an author chip, preceded by a blank spacer line (a turn separator)
 /// when the panel already has content — so successive turns read as distinct
 /// blocks instead of one running mass of text.
-fn push_author_chip(panel: &mut main_panel::MainPanel, label: &str, color: Color, no_color: bool) {
+fn push_author_chip(
+    panel: &mut main_panel::MainPanel,
+    glyph: &str,
+    label: &str,
+    color: Color,
+    no_color: bool,
+) {
     if !panel.is_empty() {
         panel.push_styled_line(Line::from(""));
     }
-    panel.push_styled_line(author_chip(label, color, no_color));
+    panel.push_styled_line(author_chip(glyph, label, color, no_color));
 }
 
-fn author_chip(label: &str, color: Color, no_color: bool) -> Line<'static> {
+fn author_chip(glyph: &str, label: &str, color: Color, no_color: bool) -> Line<'static> {
     let style = if no_color {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(color).add_modifier(Modifier::BOLD)
     };
-    Line::from(Span::styled(format!("▌ {label}"), style))
+    Line::from(Span::styled(format!("{glyph} {label}"), style))
+}
+
+/// Pushes a run of dim chrome lines (startup banner, operational notices) so
+/// they never out-shout the conversation. Every line is muted per the
+/// dim-the-chrome rule.
+pub(crate) fn push_chrome_line(panel: &mut main_panel::MainPanel, text: impl Into<String>) {
+    let p = palette();
+    panel.push_styled_line(Line::from(Span::styled(
+        text.into(),
+        Style::default().fg(p.text_dim).add_modifier(Modifier::DIM),
+    )));
 }
 
 /// Builds the starship-style segmented status line: a mode pip, a runner chip
