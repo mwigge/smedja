@@ -611,6 +611,17 @@ pub(crate) struct AppState {
     show_session_peek: bool,
 }
 
+impl AppState {
+    /// Appends `msg` to the bounded message log, trimming the oldest entries
+    /// past [`MESSAGE_HISTORY_CAP`]. When entries are trimmed, `display_start_idx`
+    /// (the `/clear` watermark, an absolute index into `messages`) is shifted by
+    /// the same amount so it keeps pointing at the same logical message.
+    fn push_message(&mut self, msg: Message) {
+        let dropped = push_capped(&mut self.messages, msg, MESSAGE_HISTORY_CAP);
+        self.display_start_idx = self.display_start_idx.saturating_sub(dropped);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Socket path resolution
 // ---------------------------------------------------------------------------
@@ -823,7 +834,7 @@ pub(crate) async fn submit(input: &str, state: &mut AppState, client: &mut Clien
     push_author_chip(&mut state.main_panel, "you", you_accent, state.no_color);
     state.main_panel.push_line(user_msg.text.clone());
     state.assistant_open = false;
-    state.messages.push(user_msg);
+    state.push_message(user_msg);
     state.turn_n += 1;
     state.turn_submitted_at = Some(std::time::Instant::now());
     state.current_block = Some(blocks::TurnBlock::new(state.turn_n));
@@ -889,7 +900,7 @@ pub(crate) async fn submit(input: &str, state: &mut AppState, client: &mut Clien
             text,
         };
         state.main_panel.push_line(sys_msg.text.clone());
-        state.messages.push(sys_msg);
+        state.push_message(sys_msg);
     }
     Ok(())
 }
@@ -1013,7 +1024,7 @@ pub(crate) fn push_system_message(state: &mut AppState, text: impl Into<String>)
         });
     }
     state.main_panel.push_line(msg.text.clone());
-    state.messages.push(msg);
+    state.push_message(msg);
 }
 
 /// Formats a tool call's full arguments into overlay lines, pretty-printing the
@@ -2445,7 +2456,7 @@ async fn handle_key(
                             text: format!("task created: {}", v["id"].as_str().unwrap_or("?")),
                         };
                         state.main_panel.push_line(msg.text.clone());
-                        state.messages.push(msg);
+                        state.push_message(msg);
                     }
                 }
             } else if let Some(id) = input.trim().strip_prefix("/task done ") {
@@ -2456,7 +2467,7 @@ async fn handle_key(
                         text: format!("task {id} closed"),
                     };
                     state.main_panel.push_line(msg.text.clone());
-                    state.messages.push(msg);
+                    state.push_message(msg);
                 }
             } else if let Some(arg) = input.trim().strip_prefix("/cowork ") {
                 match arg.trim() {
@@ -2479,7 +2490,7 @@ async fn handle_key(
                                 ),
                             };
                             state.main_panel.push_line(msg.text.clone());
-                            state.messages.push(msg);
+                            state.push_message(msg);
                         }
                     }
                     "status" => {
@@ -2506,7 +2517,7 @@ async fn handle_key(
                             text: "usage: /cowork on|off|status".into(),
                         };
                         state.main_panel.push_line(msg.text.clone());
-                        state.messages.push(msg);
+                        state.push_message(msg);
                     }
                 }
             } else if let Some(rest) = input.trim().strip_prefix("/stage ") {
@@ -2521,14 +2532,14 @@ async fn handle_key(
                         text,
                     };
                     state.main_panel.push_line(msg.text.clone());
-                    state.messages.push(msg);
+                    state.push_message(msg);
                 } else {
                     let msg = Message {
                         role: Role::System,
                         text: "usage: /stage <tool> <json-args>".into(),
                     };
                     state.main_panel.push_line(msg.text.clone());
-                    state.messages.push(msg);
+                    state.push_message(msg);
                 }
             } else if let Some(rest) = input.trim().strip_prefix("/unstage") {
                 // /unstage [N]
@@ -2539,14 +2550,14 @@ async fn handle_key(
                     text,
                 };
                 state.main_panel.push_line(msg.text.clone());
-                state.messages.push(msg);
+                state.push_message(msg);
                 for item in state.staging_queue.list() {
                     let msg = Message {
                         role: Role::System,
                         text: item,
                     };
                     state.main_panel.push_line(msg.text.clone());
-                    state.messages.push(msg);
+                    state.push_message(msg);
                 }
             } else if input.trim() == "/run" {
                 let actions = state.staging_queue.drain();
@@ -2556,7 +2567,7 @@ async fn handle_key(
                         text: "no staged actions".into(),
                     };
                     state.main_panel.push_line(msg.text.clone());
-                    state.messages.push(msg);
+                    state.push_message(msg);
                 } else {
                     for action in actions {
                         let payload = json!({"tool": action.tool, "args": action.args});
@@ -2570,7 +2581,7 @@ async fn handle_key(
                             text,
                         };
                         state.main_panel.push_line(msg.text.clone());
-                        state.messages.push(msg);
+                        state.push_message(msg);
                     }
                 }
             } else if input.trim() == "/agent sre" {
@@ -2591,7 +2602,7 @@ async fn handle_key(
                     text: "SRE mode activated (tier: deep)".into(),
                 };
                 state.main_panel.push_line(msg.text.clone());
-                state.messages.push(msg);
+                state.push_message(msg);
             } else if input.trim() == "/capabilities" {
                 let text = match client.call("runner.list", json!({})).await {
                     Ok(v) => {
@@ -2609,7 +2620,7 @@ async fn handle_key(
                     text,
                 };
                 state.main_panel.push_line(msg.text.clone());
-                state.messages.push(msg);
+                state.push_message(msg);
             } else if input.trim() == "/health" {
                 // Measure RPC round-trip latency by calling session.get.
                 let start = std::time::Instant::now();
@@ -2629,7 +2640,7 @@ async fn handle_key(
                     text,
                 };
                 state.main_panel.push_line(msg.text.clone());
-                state.messages.push(msg);
+                state.push_message(msg);
             } else {
                 submit(&input, state, client).await?;
             }
@@ -4116,9 +4127,14 @@ async fn main() -> Result<()> {
                         // Record the card's line + full args for right-click
                         // expansion and the /tools inspector.
                         let line_idx = state.main_panel.len().saturating_sub(1);
-                        state
-                            .tool_details
-                            .push((line_idx, name.clone(), full_str.to_owned()));
+                        // Bounded push via the free helper (not `push_tool_detail`)
+                        // so only `tool_details` is borrowed — `state.stream_rx` is
+                        // mutably borrowed as `rx` for the duration of this match.
+                        push_capped(
+                            &mut state.tool_details,
+                            (line_idx, name.clone(), full_str.to_owned()),
+                            TOOL_DETAILS_CAP,
+                        );
                         state.pending_tool = Some((line_idx, name.clone(), input.clone()));
                         if let Some(ref mut block) = state.current_block {
                             block.push_text(&format!("▶ {name}: {input}"));
@@ -4383,7 +4399,7 @@ async fn main() -> Result<()> {
                                 block.complete(turn_ms);
                                 for line in block.render_lines(80) {
                                     state.main_panel.push_line(line.clone());
-                                    state.messages.push(Message {
+                                    state.push_message(Message {
                                         role: Role::System,
                                         text: line,
                                     });
@@ -4393,7 +4409,7 @@ async fn main() -> Result<()> {
                                 if !response.is_empty() {
                                     state.main_panel.push_delta(&response);
                                 }
-                                state.messages.push(Message {
+                                state.push_message(Message {
                                     role: Role::System,
                                     text: response,
                                 });
@@ -4480,7 +4496,7 @@ async fn main() -> Result<()> {
                             }
                         } else {
                             state.main_panel.push_line(text.clone());
-                            state.messages.push(Message {
+                            state.push_message(Message {
                                 role: Role::System,
                                 text,
                             });
@@ -4725,6 +4741,32 @@ const LATENCY_SAMPLE_CAP: usize = 50;
 /// Maximum number of entries kept in the prompt history ring.
 pub(crate) const PROMPT_HISTORY_CAP: usize = 500;
 
+/// Upper bound on retained [`AppState::messages`] scrollback entries. Older
+/// entries are dropped on push so a long-lived session cannot grow RSS without
+/// bound. The visible transcript renders from `main_panel`, and `messages` is a
+/// parallel log read only via its length, so trimming it is invisible to users.
+const MESSAGE_HISTORY_CAP: usize = 10_000;
+
+/// Upper bound on retained [`AppState::tool_details`] entries. Each entry holds
+/// a tool call's full argument JSON, so an uncapped log grows RSS forever in a
+/// long-lived session. Older entries are dropped on push. Entries store absolute
+/// `main_panel` line indices (not positions within the Vec) and are looked up by
+/// value, so dropping the oldest keeps every retained lookup correct — only tool
+/// cards scrolled far past the cap lose their right-click expansion.
+const TOOL_DETAILS_CAP: usize = 10_000;
+
+/// Pushes `item` onto `buf`, then drops the oldest entries so its length never
+/// exceeds `cap`. Returns how many front entries were dropped, so a caller
+/// holding absolute indices into `buf` can shift them accordingly.
+fn push_capped<T>(buf: &mut Vec<T>, item: T, cap: usize) -> usize {
+    buf.push(item);
+    let overflow = buf.len().saturating_sub(cap);
+    if overflow > 0 {
+        buf.drain(..overflow);
+    }
+    overflow
+}
+
 const METRICS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Window covered by the metrics fetch: the last 24h, in microseconds.
@@ -4872,6 +4914,31 @@ fn toggle_metrics_view(state: &mut AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_capped_bounds_length_and_keeps_newest() {
+        let cap = 8;
+        let mut buf: Vec<usize> = Vec::new();
+        let mut total_dropped = 0;
+        for i in 0..1000 {
+            total_dropped += push_capped(&mut buf, i, cap);
+            // Length never exceeds the cap, no matter how many are pushed.
+            assert!(buf.len() <= cap, "len {} exceeded cap {cap}", buf.len());
+        }
+        // Steady state holds exactly the last `cap` entries, oldest trimmed.
+        assert_eq!(buf.len(), cap);
+        assert_eq!(buf, (992..1000).collect::<Vec<_>>());
+        // Every entry beyond the cap was dropped from the front exactly once.
+        assert_eq!(total_dropped, 1000 - cap);
+    }
+
+    #[test]
+    fn push_capped_reports_no_drop_below_cap() {
+        let mut buf: Vec<usize> = Vec::new();
+        assert_eq!(push_capped(&mut buf, 1, 4), 0);
+        assert_eq!(push_capped(&mut buf, 2, 4), 0);
+        assert_eq!(buf, vec![1, 2]);
+    }
 
     #[test]
     fn format_memory_lists_turns_with_previews() {

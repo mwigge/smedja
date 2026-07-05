@@ -13,6 +13,12 @@ pub enum PluginsError {
     #[error("skill `{name}` not found")]
     NotFound { name: String },
 
+    /// The skill name is not a single normal path component and would escape
+    /// the registry directory (e.g. contains `/`, `..`, `.`, is absolute, or
+    /// is empty).
+    #[error("invalid skill name `{name}`: must be a single path component")]
+    InvalidName { name: String },
+
     /// The skill file at the specified path could not be parsed.
     #[error("failed to parse skill at {path}: {reason}")]
     ParseFailed { path: PathBuf, reason: String },

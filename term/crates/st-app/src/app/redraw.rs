@@ -267,11 +267,13 @@ impl App {
             }
         }
 
-        // Always request another frame — stopping on occluded caused
-        // Hyprland to show grey when the window lost focus, because
-        // the compositor shows its fallback when the app stops presenting.
-        for w in self.windows.values() {
-            w.request_redraw();
-        }
+        // A frame was presented (or attempted) above. Record it so about_to_wait
+        // can pace idle repaints, and spend one forced-redraw credit — the small
+        // bounded budget that bridges the compositor's grey fallback (Hyprland)
+        // after a resize/map/unocclusion. Re-arming the *next* redraw is now
+        // handled in about_to_wait, gated on dirty/occluded, so the app no longer
+        // spins at vsync when idle.
+        self.last_present = Some(std::time::Instant::now());
+        self.forced_redraws = self.forced_redraws.saturating_sub(1);
     }
 }

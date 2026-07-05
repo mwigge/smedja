@@ -1566,9 +1566,13 @@ impl CopyMode {
 /// An active PTY session: child shell + cell grid + dirty flag.
 pub struct PtySession {
     master: Box<dyn portable_pty::MasterPty + Send>,
-    #[allow(dead_code)] // child process handle — drop closes the PTY
+    // Child process handle; retained so teardown can hang up (SIGHUP) and
+    // reap it, and so a normal-exit child is `wait()`ed (no zombie).
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
+    /// Join handle for the background reader thread, retained so teardown can
+    /// join it instead of leaking the thread (and its cloned master fd).
+    reader: Option<std::thread::JoinHandle<()>>,
     /// The shared terminal cell grid.
     pub grid: Arc<Mutex<CellGrid>>,
     /// Set to `true` whenever the grid changes.  Renderers poll this flag.
@@ -1580,6 +1584,29 @@ pub struct PtySession {
     pub copy_mode: CopyMode,
     /// Glyph registry: maps glyph IDs to PUA codepoints.
     pub glyph_registry: Arc<Mutex<GlyphRegistry>>,
+}
+
+impl Drop for PtySession {
+    /// Full teardown so closing a split (Ctrl+W) while the child is still
+    /// running does not leak a reader thread, a master fd, and a zombie child.
+    ///
+    /// `child.kill()` sends `SIGHUP` to the child. Because `portable_pty`
+    /// spawns the child as a session leader owning the pty as its controlling
+    /// terminal, the hangup terminates the session and propagates to the
+    /// foreground process group, which closes the pty slave. The reader
+    /// thread's blocking read on the cloned master then returns EOF and the
+    /// thread exits, so the join below cannot hang. `child.wait()` reaps the
+    /// process — for both the killed child here and a child that already
+    /// exited on its own (the normal-exit path), leaving no zombie.
+    fn drop(&mut self) {
+        // Best effort: the child may already be gone, in which case kill fails
+        // harmlessly and wait returns its status immediately.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl PtySession {
@@ -1644,12 +1671,19 @@ impl PtySession {
             master: pair.master,
             child,
             writer,
+            reader: None,
             grid,
             dirty,
             exited: Arc::new(AtomicBool::new(false)),
             copy_mode: CopyMode::new(),
             glyph_registry,
         })
+    }
+
+    /// Returns the OS process id of the child, if it is still known.
+    #[must_use]
+    pub fn child_id(&self) -> Option<u32> {
+        self.child.process_id()
     }
 
     /// Sends raw bytes to the child's stdin.
@@ -1776,7 +1810,7 @@ impl PtySession {
                 return;
             }
         };
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let mut parser = vte::Parser::new();
             let mut handler = VtHandler {
                 grid,
@@ -1825,6 +1859,7 @@ impl PtySession {
             dirty.store(true, Ordering::Release);
             debug!("PTY reader thread exited");
         });
+        self.reader = Some(handle);
     }
 
     /// Enters copy mode, anchoring at the current cursor position.
@@ -3014,5 +3049,48 @@ mod tests {
             snapshot_hash(&a),
             snapshot_hash(&render_vt_snapshot(10, 2, b"world"))
         );
+    }
+
+    // Regression: closing a session while its child is still running must
+    // reap the child (no zombie) and join the reader thread (no leaked thread
+    // or master fd). Uses /proc, so it is Linux-only.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn drop_reaps_live_child_and_joins_reader() {
+        use std::time::{Duration, Instant};
+
+        // `cat` blocks reading the pty slave, so it stays alive after spawn —
+        // this reproduces the "close a split while the child is still
+        // running" path that previously leaked the reader thread, the master
+        // fd, and a zombie child.
+        let mut session = PtySession::spawn(80, 24, "cat").expect("spawn cat");
+        session.start_reader_detached();
+
+        let pid = session.child_id().expect("child pid");
+        let proc_path = format!("/proc/{pid}");
+        assert!(
+            std::path::Path::new(&proc_path).exists(),
+            "child should be alive before drop"
+        );
+        assert!(
+            !session.exited.load(Ordering::Relaxed),
+            "child should still be running before drop"
+        );
+
+        // Full teardown runs here: SIGHUP the child, wait() to reap it, then
+        // join the reader thread. A leaked/blocked reader thread would make
+        // the join hang and this test time out rather than pass.
+        drop(session);
+
+        // Once the parent has reaped the child, its /proc entry disappears.
+        // Poll briefly to avoid racing the kernel's teardown.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::path::Path::new(&proc_path).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "child pid {pid} was not reaped: zombie or still running after drop"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }

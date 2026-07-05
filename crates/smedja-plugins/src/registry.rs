@@ -105,6 +105,7 @@ impl SkillRegistry {
     /// - [`PluginsError::AlreadyExists`] when the skill directory already exists.
     /// - [`PluginsError::Io`] on filesystem errors.
     pub fn install(&self, name: &str, content: &str) -> Result<(), PluginsError> {
+        validate_name(name)?;
         let skill_dir = self.skills_dir.join(name);
 
         if skill_dir.exists() {
@@ -129,6 +130,7 @@ impl SkillRegistry {
     /// - [`PluginsError::NotFound`] when the skill directory does not exist.
     /// - [`PluginsError::Io`] on filesystem errors.
     pub fn update(&self, name: &str, content: &str) -> Result<(), PluginsError> {
+        validate_name(name)?;
         let skill_dir = self.skills_dir.join(name);
 
         if !skill_dir.exists() {
@@ -149,6 +151,7 @@ impl SkillRegistry {
     ///   `.md` file exists for the given name.
     /// - [`PluginsError::Io`] on filesystem errors.
     pub fn remove(&self, name: &str) -> Result<(), PluginsError> {
+        validate_name(name)?;
         let skill_dir = self.skills_dir.join(name);
         let flat_file = self.skills_dir.join(format!("{name}.md"));
 
@@ -261,6 +264,32 @@ impl SkillRegistry {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Returns `true` when `name` is exactly one normal path component.
+///
+/// Rejects anything that could escape the registry directory when joined:
+/// empty strings, `.`, `..`, absolute paths, and any name containing a path
+/// separator (e.g. `a/b`, `../etc`). This is the guard that keeps
+/// install/update/remove from writing or deleting outside `skills_dir`.
+fn is_single_normal_component(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
+/// Validates a skill `name`, returning [`PluginsError::InvalidName`] when it is
+/// not a single normal path component.
+fn validate_name(name: &str) -> Result<(), PluginsError> {
+    if is_single_normal_component(name) {
+        Ok(())
+    } else {
+        Err(PluginsError::InvalidName {
+            name: name.to_owned(),
+        })
+    }
+}
 
 /// Returns `true` when `path` is a skill file that should be parsed.
 ///
@@ -506,6 +535,96 @@ mod tests {
         assert!(
             matches!(err, PluginsError::NotFound { ref name } if name == "phantom"),
             "expected NotFound, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // path-traversal guard
+    // -----------------------------------------------------------------------
+
+    /// Names that must be rejected because they are not a single normal
+    /// component and could escape `skills_dir` when joined.
+    const TRAVERSAL_NAMES: &[&str] = &["../etc", "a/b", "/abs", "..", ".", ""];
+
+    #[test]
+    fn install_rejects_traversal_names() {
+        let (_dir, registry) = tmp_registry();
+        for name in TRAVERSAL_NAMES {
+            let err = registry
+                .install(name, "content")
+                .expect_err("install must reject traversal name");
+            assert!(
+                matches!(&err, PluginsError::InvalidName { name: n } if n == name),
+                "expected InvalidName for {name:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_rejects_traversal_names() {
+        let (_dir, registry) = tmp_registry();
+        for name in TRAVERSAL_NAMES {
+            let err = registry
+                .update(name, "content")
+                .expect_err("update must reject traversal name");
+            assert!(
+                matches!(&err, PluginsError::InvalidName { name: n } if n == name),
+                "expected InvalidName for {name:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn remove_rejects_traversal_names() {
+        let (_dir, registry) = tmp_registry();
+        for name in TRAVERSAL_NAMES {
+            let err = registry
+                .remove(name)
+                .expect_err("remove must reject traversal name");
+            assert!(
+                matches!(&err, PluginsError::InvalidName { name: n } if n == name),
+                "expected InvalidName for {name:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_name_still_works_through_install_update_remove() {
+        let (_dir, registry) = tmp_registry();
+        registry
+            .install("myskill", &valid_skill_content("myskill"))
+            .expect("install normal name");
+        registry
+            .update("myskill", &valid_skill_content("myskill"))
+            .expect("update normal name");
+        registry.remove("myskill").expect("remove normal name");
+    }
+
+    #[test]
+    fn traversal_name_does_not_touch_files_outside_skills_dir() {
+        // Layout: <root>/skills is the registry; <root>/outside.md is a sibling
+        // file that a `../outside` traversal would target. It must survive.
+        let root = tempfile::tempdir().expect("tempdir");
+        let skills_dir = root.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).expect("create skills_dir");
+        let outside = root.path().join("outside.md");
+        std::fs::write(&outside, "do not delete me").expect("write outside file");
+
+        let registry = SkillRegistry::new(&skills_dir);
+        let traversal = "../outside";
+
+        // install must not create/overwrite the outside file.
+        assert!(registry.install(traversal, "clobber").is_err());
+        // update must not overwrite the outside file.
+        assert!(registry.update(traversal, "clobber").is_err());
+        // remove must not delete the outside file.
+        assert!(registry.remove(traversal).is_err());
+
+        assert!(outside.exists(), "outside file must still exist");
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("read outside"),
+            "do not delete me",
+            "outside file must be untouched"
         );
     }
 

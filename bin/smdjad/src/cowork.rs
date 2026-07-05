@@ -35,6 +35,37 @@ struct PendingApproval {
     tx: oneshot::Sender<Decision>,
 }
 
+/// RAII guard that removes a pending entry from the map on **every** exit path
+/// of [`CoworkGate::intercept`] — normal resolution, timeout, sender-dropped, or
+/// future cancellation (TUI disconnect / walk-away). Without this, the timeout
+/// and sender-dropped branches returned `Deny` while leaving the map entry
+/// behind, leaking one entry per unanswered prompt forever.
+///
+/// [`CoworkGate::resolve`] may already have removed the entry on the happy path;
+/// the removal here is then a harmless no-op.
+struct PendingGuard {
+    pending: Arc<Mutex<HashMap<ApprovalId, PendingApproval>>>,
+    id: ApprovalId,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        // Fast path: uncontended lock, remove synchronously. If the map is
+        // momentarily locked (e.g. a concurrent resolve), offload the removal to
+        // the runtime so Drop never blocks. `intercept` always runs on a Tokio
+        // runtime, so `tokio::spawn` is available.
+        if let Ok(mut map) = self.pending.try_lock() {
+            map.remove(&self.id);
+        } else {
+            let pending = Arc::clone(&self.pending);
+            let id = std::mem::take(&mut self.id);
+            tokio::spawn(async move {
+                pending.lock().await.remove(&id);
+            });
+        }
+    }
+}
+
 /// Intercepts tool calls when cowork mode is active.
 ///
 /// One `CoworkGate` per session. External RPC calls (`cowork.approve`,
@@ -342,6 +373,12 @@ impl CoworkGate {
                 },
             );
         }
+        // Guarantee the pending entry is removed on every exit path below —
+        // timeout, sender-dropped, or cancellation — not just via `resolve`.
+        let _guard = PendingGuard {
+            pending: Arc::clone(&self.pending),
+            id: id.clone(),
+        };
         if let Some((dispatcher, turn_id)) = push {
             dispatcher.publish(TurnEvent::CoworkRequest {
                 approval_id: id.clone(),
@@ -684,6 +721,19 @@ mod tests {
         let gate = CoworkGate::default();
         let decision = gate.intercept(prompt(), 1, None).await;
         assert!(matches!(decision, Decision::Deny(r) if r == "timeout"));
+    }
+
+    #[tokio::test]
+    async fn timeout_removes_pending_entry() {
+        // A timed-out prompt (walk-away) must not leak an entry in the pending
+        // map: the drop-guard removes it on the timeout exit path.
+        let gate = CoworkGate::default();
+        let decision = gate.intercept(prompt(), 1, None).await;
+        assert!(matches!(decision, Decision::Deny(r) if r == "timeout"));
+        assert!(
+            gate.list_pending().await.is_empty(),
+            "timed-out approval must not leak a pending entry"
+        );
     }
 
     #[tokio::test]
