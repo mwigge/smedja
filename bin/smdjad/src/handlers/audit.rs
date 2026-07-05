@@ -191,6 +191,12 @@ async fn gate_for(state: &HandlerState, session_id: &str) -> Result<Arc<CoworkGa
 
 /// Handles `cowork.approve`.
 ///
+/// Pass `scope: "always"` to resolve with an *allow-always* scope: the approval
+/// resolves exactly as a normal approve for the native loop, but the industry-ACP
+/// `session/request_permission` bridge consulting the gate will persist a
+/// matching `[[permission.rules]]` Allow entry so the choice sticks across turns
+/// and backends. Any other `scope` (or none) is an ordinary one-shot approve.
+///
 /// # Errors
 ///
 /// Returns an error when `session_id`/`id` is missing or no gate is registered.
@@ -203,8 +209,16 @@ pub(crate) async fn approve(state: HandlerState, params: Value) -> Result<Value,
         .as_str()
         .ok_or_else(|| missing_param("id"))?
         .to_owned();
+    let always = params
+        .get("scope")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.eq_ignore_ascii_case("always"));
     let gate = gate_for(&state, &session_id).await?;
-    let found = gate.approve(&id).await;
+    let found = if always {
+        gate.approve_always(&id).await
+    } else {
+        gate.approve(&id).await
+    };
     Ok(json!({ "id": id, "resolved": found }))
 }
 

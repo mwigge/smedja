@@ -1,6 +1,9 @@
 //! Human-in-the-loop gate for tool calls in cowork mode.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use smedja_bellows::{CorrelationCtx, Dispatcher, TurnEvent};
@@ -79,6 +82,13 @@ pub struct CoworkGate {
     /// Per-session permission mode driving the gate policy (Shift+Tab cycles it
     /// from the TUI). Defaults to [`PermissionMode::Ask`].
     mode: Arc<Mutex<PermissionMode>>,
+    /// Approval ids the user resolved with an *allow-always* scope, so the
+    /// resolution site (e.g. the industry-ACP `session/request_permission`
+    /// bridge in `acp.rs`) can persist a matching `[[permission.rules]]` Allow
+    /// entry. Additive and out-of-band: the native tool loop never reads it, so
+    /// the 3-way [`Decision`] enum keeps its exact shape. An id is inserted by
+    /// [`Self::approve_always`] and consumed by [`Self::take_always`].
+    always_ids: Arc<Mutex<HashSet<ApprovalId>>>,
 }
 
 /// Per-session permission mode controlling how mutating tool calls are gated.
@@ -263,6 +273,85 @@ pub fn load_permission_rules(workspace: &std::path::Path) -> Vec<PermissionRule>
         .unwrap_or_default()
 }
 
+/// Appends an `Allow` [`PermissionRule`] to `.smedja/workspace.toml`, scoped to
+/// `tool` and — when the call carries them — the specific `path`/`command` in
+/// `args`. This is the backend-independent persistence behind an *allow-always*
+/// decision: the rule is read by [`load_permission_rules`] and honoured by
+/// [`evaluate_permission_rules`] on every future turn, whichever runner drives
+/// it.
+///
+/// The rule is appended as a fresh `[[permission.rules]]` array-of-tables block
+/// at end of file rather than round-tripping the whole document, so existing
+/// hand-written content (comments, other sections) is preserved verbatim. TOML
+/// merges every `[[permission.rules]]` block in document order into one array,
+/// so an appended block is picked up alongside the pre-existing rules.
+///
+/// # Errors
+///
+/// Returns an [`std::io::Error`] if the `.smedja` directory cannot be created or
+/// the file cannot be written.
+pub fn append_allow_rule(
+    workspace: &std::path::Path,
+    tool: &str,
+    args: &serde_json::Value,
+) -> std::io::Result<()> {
+    #[derive(Serialize)]
+    struct Wrapper {
+        permission: PermWrap,
+    }
+    #[derive(Serialize)]
+    struct PermWrap {
+        rules: Vec<PersistRule>,
+    }
+    #[derive(Serialize)]
+    struct PersistRule {
+        tool: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path_glob: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command_pattern: Option<String>,
+        mode: String,
+    }
+
+    // Scope the rule to the concrete target when the args expose one, so an
+    // allow-always is as narrow as the call the user actually approved.
+    let path_glob = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let command_pattern = args
+        .get("command")
+        .or_else(|| args.get("cmd"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+
+    let block = toml::to_string(&Wrapper {
+        permission: PermWrap {
+            rules: vec![PersistRule {
+                tool: tool.to_owned(),
+                path_glob,
+                command_pattern,
+                mode: "allow".to_owned(),
+            }],
+        },
+    })
+    .map_err(std::io::Error::other)?;
+
+    let dir = workspace.join(".smedja");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("workspace.toml");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(&block);
+    std::fs::write(&path, out)
+}
+
 /// Evaluates `rules` in order; returns the first matching rule's
 /// [`PermissionDecision`], or `None` if no rule matches (fall through to
 /// session mode).
@@ -367,6 +456,23 @@ impl CoworkGate {
         timeout_secs: u64,
         push: Option<(&Dispatcher, Option<&str>)>,
     ) -> Decision {
+        self.intercept_tracked(prompt, timeout_secs, push).await.1
+    }
+
+    /// Like [`Self::intercept`] but also returns the pending [`ApprovalId`] the
+    /// gate assigned. The id is stable for the lifetime of the request and lets a
+    /// caller correlate the resolution with out-of-band state — in particular the
+    /// industry-ACP `session/request_permission` bridge uses it to consult
+    /// [`Self::take_always`] and decide whether to persist an allow-always rule.
+    ///
+    /// [`Self::intercept`] simply discards the id, so all existing callers are
+    /// unchanged.
+    pub async fn intercept_tracked(
+        &self,
+        prompt: ApprovalPrompt,
+        timeout_secs: u64,
+        push: Option<(&Dispatcher, Option<&str>)>,
+    ) -> (ApprovalId, Decision) {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         {
@@ -403,7 +509,7 @@ impl CoworkGate {
             "cowork gate: awaiting human decision",
         );
 
-        if timeout_secs == 0 {
+        let decision = if timeout_secs == 0 {
             // Wait indefinitely; deny if the channel closes unexpectedly.
             rx.await
                 .unwrap_or_else(|_| Decision::Deny("channel closed".to_owned()))
@@ -423,7 +529,8 @@ impl CoworkGate {
                     Decision::Deny("timeout".to_owned())
                 }
             }
-        }
+        };
+        (id, decision)
     }
 
     /// Resolves a pending approval with [`Decision::Approve`].
@@ -431,6 +538,35 @@ impl CoworkGate {
     /// Returns `true` if the approval ID was found and resolved.
     pub async fn approve(&self, id: &str) -> bool {
         self.resolve(id, Decision::Approve).await
+    }
+
+    /// Resolves a pending approval with [`Decision::Approve`] **and** marks it as
+    /// an *allow-always* resolution: the user chose to allow this class of call
+    /// for the rest of the workspace, not just this once.
+    ///
+    /// The extra scope is recorded out-of-band (a set of approval ids) rather
+    /// than on the [`Decision`] enum, so the native tool loop is untouched. The
+    /// resolution site consumes it via [`Self::take_always`] to persist a
+    /// `[[permission.rules]]` Allow entry. The flag is inserted *before*
+    /// resolving so it is guaranteed visible when the suspended
+    /// [`Self::intercept_tracked`] wakes.
+    ///
+    /// Returns `true` if the approval ID was found and resolved.
+    pub async fn approve_always(&self, id: &str) -> bool {
+        self.always_ids.lock().await.insert(id.to_owned());
+        let found = self.resolve(id, Decision::Approve).await;
+        if !found {
+            // The id was unknown (already resolved / timed out): don't leak a
+            // dangling always-flag.
+            self.always_ids.lock().await.remove(id);
+        }
+        found
+    }
+
+    /// Consumes and returns whether `id` was resolved with an allow-always scope
+    /// (see [`Self::approve_always`]). Idempotent: a second call returns `false`.
+    pub async fn take_always(&self, id: &str) -> bool {
+        self.always_ids.lock().await.remove(id)
     }
 
     /// Resolves a pending approval with [`Decision::Deny`].
@@ -947,5 +1083,100 @@ mod tests {
         let args = json!({"path": "tests/foo.rs"});
         let result = super::evaluate_permission_rules(&rules, "write_file", &args);
         assert_eq!(result, None, "path outside glob must not trigger rule");
+    }
+
+    // ── allow-always scope + rule persistence ────────────────────────────────
+
+    #[tokio::test]
+    async fn approve_always_flags_id_then_take_always_consumes_it() {
+        let gate = Arc::new(CoworkGate::default());
+        let gate2 = Arc::clone(&gate);
+        let handle = tokio::spawn(async move { gate2.intercept_tracked(prompt(), 0, None).await });
+
+        // Wait for the pending entry to register.
+        let id = {
+            let mut found = None;
+            for _ in 0..1000 {
+                if let Some((id, _)) = gate.list_pending().await.first() {
+                    found = Some(id.clone());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            found.expect("pending approval should appear")
+        };
+
+        assert!(
+            gate.approve_always(&id).await,
+            "approve_always must resolve"
+        );
+        let (returned_id, decision) = handle.await.unwrap();
+        assert_eq!(returned_id, id, "intercept_tracked must return the gate id");
+        assert!(matches!(decision, Decision::Approve));
+        // The always-scope flag is readable exactly once (consumed).
+        assert!(
+            gate.take_always(&id).await,
+            "id must carry allow-always scope"
+        );
+        assert!(
+            !gate.take_always(&id).await,
+            "take_always must be idempotent (consumed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_always_unknown_id_leaves_no_dangling_flag() {
+        let gate = CoworkGate::default();
+        assert!(!gate.approve_always("no-such-id").await);
+        assert!(
+            !gate.take_always("no-such-id").await,
+            "an unresolved allow-always must not leak a flag"
+        );
+    }
+
+    #[test]
+    fn append_allow_rule_writes_readable_rule() {
+        let ws = tempfile::tempdir().unwrap();
+        super::append_allow_rule(ws.path(), "bash", &json!({"command": "git status"})).unwrap();
+
+        // The persisted rule round-trips through the loader + evaluator.
+        let rules = super::load_permission_rules(ws.path());
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].tool, "bash");
+        assert_eq!(rules[0].mode, super::RuleMode::Allow);
+        assert_eq!(
+            super::evaluate_permission_rules(&rules, "bash", &json!({"command": "git status"})),
+            Some(super::PermissionDecision::Allow),
+            "the persisted allow-always rule must allow the same call on future turns"
+        );
+    }
+
+    #[test]
+    fn append_allow_rule_preserves_existing_content_and_appends() {
+        let ws = tempfile::tempdir().unwrap();
+        let dir = ws.path().join(".smedja");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A hand-written file with a comment and an unrelated section.
+        std::fs::write(
+            dir.join("workspace.toml"),
+            "# hand written\n[embedder]\nbackend = \"fnv\"\n",
+        )
+        .unwrap();
+
+        super::append_allow_rule(ws.path(), "write_file", &json!({"path": "src/main.rs"})).unwrap();
+
+        let content = std::fs::read_to_string(dir.join("workspace.toml")).unwrap();
+        assert!(content.contains("# hand written"), "comment must survive");
+        assert!(
+            content.contains("[embedder]"),
+            "existing section must survive"
+        );
+        assert!(content.contains("[[permission.rules]]"));
+
+        // Both the pre-existing config and the appended rule parse.
+        let rules = super::load_permission_rules(ws.path());
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].tool, "write_file");
+        assert_eq!(rules[0].path_glob.as_deref(), Some("src/main.rs"));
     }
 }

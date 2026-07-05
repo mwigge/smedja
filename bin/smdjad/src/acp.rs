@@ -3,6 +3,7 @@
 //! Activated by `SMEDJA_ACP_PORT` environment variable (default: disabled).
 //! Routes proxy into smdjad's ingot and dispatcher directly.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -21,6 +22,8 @@ use smedja_vault::Vault;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::cowork::{append_allow_rule, ApprovalPrompt, CoworkGate, Decision};
+
 /// Shared state for ACP route handlers.
 #[derive(Clone)]
 pub struct AcpState {
@@ -33,6 +36,11 @@ pub struct AcpState {
     pub vault: Arc<Mutex<Vault>>,
     /// Embedding backend shared with MCP server-mode tool dispatch.
     pub embedder: Arc<dyn crate::embedder_port::Embedder>,
+    /// The ONE per-session cowork gate map, shared with the native tool loop and
+    /// the `smj tool-gate` claude hook. Industry-ACP `session/request_permission`
+    /// requests route through this same map, so a single approval widget serves
+    /// every backend.
+    pub gates: Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
 }
 
 /// Builds the ACP router with auth middleware applied to every route.
@@ -42,6 +50,15 @@ pub fn build_acp_router(state: AcpState) -> Router {
         .route("/acp/v1/session/{id}/prompt", post(submit_prompt))
         .route("/acp/v1/session/{id}/model", post(set_model))
         .route("/acp/v1/session/{id}/mode", post(set_mode))
+        // Industry-ACP (Agent Client Protocol, Zed/JetBrains) bridge routes.
+        // `request_permission` funnels a backend's permission ask into the ONE
+        // cowork gate; `load` replays a session's history as `session/update`
+        // notifications so an editor client gets true resume.
+        .route(
+            "/acp/v1/session/{id}/request_permission",
+            post(request_permission),
+        )
+        .route("/acp/v1/session/{id}/load", post(session_load))
         .route("/acp/v1/session/{id}", delete(close_session))
         // MCP server mode — JSON-RPC 2.0 over the same authenticated listener.
         .route("/mcp", post(mcp_server_endpoint))
@@ -294,6 +311,309 @@ async fn close_session(Path(id): Path<String>, State(s): State<AcpState>) -> imp
     }
 }
 
+// ── Industry-ACP `session/request_permission` bridge ─────────────────────────
+//
+// smedja is the permission authority here: an ACP-capable backend that wants to
+// run a tool sends its `{toolCall, options[]}` request, smedja routes it into the
+// ONE `CoworkGate` (surfacing it in the same TUI approval widget the native loop
+// uses), and the human's resolved `Decision` is mapped back to an ACP
+// `outcome: selected{optionId}` / `cancelled`.
+
+/// One `session/request_permission` option offered by the caller. `kind` is one
+/// of `allow_once | allow_always | reject_once | reject_always`.
+#[derive(Debug, Clone, Deserialize)]
+struct AcpPermissionOption {
+    #[serde(alias = "optionId")]
+    option_id: String,
+    kind: String,
+}
+
+/// The ACP tool call whose permission is being requested.
+#[derive(Debug, Default, Deserialize)]
+struct AcpToolCall {
+    #[serde(alias = "toolName", alias = "name")]
+    tool_name: Option<String>,
+    #[serde(alias = "rawInput", alias = "input", alias = "arguments")]
+    raw_input: Option<serde_json::Value>,
+}
+
+/// Body of `POST /acp/v1/session/{id}/request_permission`.
+#[derive(Debug, Deserialize)]
+struct RequestPermissionBody {
+    #[serde(alias = "toolCall", default)]
+    tool_call: AcpToolCall,
+    #[serde(default)]
+    options: Vec<AcpPermissionOption>,
+}
+
+/// The resolved industry-ACP permission outcome plus smedja's modify extension.
+#[derive(Debug, PartialEq, Eq)]
+enum AcpOutcome {
+    /// `outcome: selected{optionId}`. `kind` is the selected option's kind (used
+    /// to decide allow-always persistence); `updated_input`, when present, is the
+    /// modify-rewrite handed back alongside the selection.
+    Selected {
+        option_id: String,
+        kind: String,
+        updated_input: Option<serde_json::Value>,
+    },
+    /// `outcome: cancelled` — no offered option matched the decision, or the gate
+    /// timed out / closed without a human answer.
+    Cancelled,
+}
+
+/// Maps a resolved cowork [`Decision`] to an ACP permission outcome by selecting
+/// from the caller's `options`. Pure, so the mapping (including the modify and
+/// allow-always cases) is unit-testable.
+///
+/// - `Approve` selects an allow option — preferring `allow_always` when the human
+///   chose the always scope (`always == true`), else `allow_once`.
+/// - `Modify` selects an allow option and carries the rewrite as `updated_input`
+///   when the instruction parses to a JSON object; a non-object modify has no
+///   valid rewrite, so it cancels.
+/// - `Deny` selects a reject option; a gate timeout / channel close is an
+///   unanswered request and maps to `Cancelled`, not an explicit reject.
+/// - Any decision whose matching option class was not offered maps to `Cancelled`.
+fn map_decision_to_outcome(
+    decision: &Decision,
+    always: bool,
+    options: &[AcpPermissionOption],
+) -> AcpOutcome {
+    let pick = |kinds: &[&str]| -> Option<(String, String)> {
+        kinds.iter().find_map(|k| {
+            options
+                .iter()
+                .find(|o| o.kind == *k)
+                .map(|o| (o.option_id.clone(), o.kind.clone()))
+        })
+    };
+    let selected = |maybe: Option<(String, String)>, ui: Option<serde_json::Value>| match maybe {
+        Some((option_id, kind)) => AcpOutcome::Selected {
+            option_id,
+            kind,
+            updated_input: ui,
+        },
+        None => AcpOutcome::Cancelled,
+    };
+    match decision {
+        Decision::Approve => {
+            let order: &[&str] = if always {
+                &["allow_always", "allow_once"]
+            } else {
+                &["allow_once", "allow_always"]
+            };
+            selected(pick(order), None)
+        }
+        Decision::Modify(instruction) => {
+            match serde_json::from_str::<serde_json::Value>(instruction) {
+                Ok(v) if v.is_object() => selected(pick(&["allow_once", "allow_always"]), Some(v)),
+                _ => AcpOutcome::Cancelled,
+            }
+        }
+        Decision::Deny(reason) => {
+            if reason == "timeout" || reason == "channel closed" {
+                AcpOutcome::Cancelled
+            } else {
+                selected(pick(&["reject_once", "reject_always"]), None)
+            }
+        }
+    }
+}
+
+/// Serialises an [`AcpOutcome`] into the `session/request_permission` response
+/// body. `updated_input` (smedja's modify extension) rides alongside `outcome`.
+fn outcome_to_json(outcome: &AcpOutcome) -> serde_json::Value {
+    match outcome {
+        AcpOutcome::Selected {
+            option_id,
+            updated_input,
+            ..
+        } => {
+            let mut resp = json!({
+                "outcome": { "outcome": "selected", "optionId": option_id }
+            });
+            if let Some(ui) = updated_input {
+                resp["updatedInput"] = ui.clone();
+            }
+            resp
+        }
+        AcpOutcome::Cancelled => json!({ "outcome": { "outcome": "cancelled" } }),
+    }
+}
+
+/// Routes an industry-ACP `session/request_permission` into the ONE cowork gate.
+///
+/// Suspends (long-poll) on the gate until the human resolves it via the TUI
+/// (`cowork.approve`/`deny`/`modify`, up to the gate's 30-min ceiling), then maps
+/// the resolved [`Decision`] to an ACP outcome. When the resolved option is
+/// `allow_always`, a matching `[[permission.rules]]` Allow entry is persisted to
+/// `.smedja/workspace.toml` so the allowlist is backend-independent.
+async fn request_permission(
+    Path(id): Path<String>,
+    State(s): State<AcpState>,
+    Json(body): Json<RequestPermissionBody>,
+) -> impl IntoResponse {
+    let tool_name = body.tool_call.tool_name.unwrap_or_default();
+    let tool_input = body.tool_call.raw_input.unwrap_or(serde_json::Value::Null);
+
+    // Reuse the ONE per-session gate (created on demand exactly as the cowork
+    // hook path does), so ACP clients share the native approval widget.
+    let gate = {
+        let mut g = s.gates.lock().await;
+        Arc::clone(
+            g.entry(id.clone())
+                .or_insert_with(|| Arc::new(CoworkGate::default())),
+        )
+    };
+
+    // Suspend on the gate; a CoworkRequest is pushed to the TUI so the human sees
+    // the ACP client's ask in the same widget the native loop uses.
+    let (approval_id, decision) = gate
+        .intercept_tracked(
+            ApprovalPrompt {
+                step_n: 0,
+                tool: tool_name.clone(),
+                args_scrubbed: tool_input.clone(),
+                reasoning: String::new(),
+                plan_summary: String::new(),
+            },
+            30 * 60,
+            Some((s.dispatcher.as_ref(), None)),
+        )
+        .await;
+
+    // The always-scope is only meaningful for an approval; consume the flag.
+    let always = matches!(decision, Decision::Approve) && gate.take_always(&approval_id).await;
+    let outcome = map_decision_to_outcome(&decision, always, &body.options);
+
+    // Persist an allow-always rule when the resolved option is allow_always, so
+    // future turns (any backend) consult the allowlist before re-asking.
+    if let AcpOutcome::Selected { kind, .. } = &outcome {
+        if kind == "allow_always" {
+            if let Err(e) = append_allow_rule(&s.workspace, &tool_name, &tool_input) {
+                tracing::warn!(error = %e, tool = %tool_name, "failed to persist allow-always rule");
+            }
+        }
+    }
+
+    Json(outcome_to_json(&outcome)).into_response()
+}
+
+// ── Industry-ACP `session/load` = replay ─────────────────────────────────────
+
+/// Converts one stored checkpoint message (`{role, content}`) into an ACP
+/// `session/update` notification. Returns `None` for a message with no content.
+///
+/// `user` role becomes a `user_message_chunk`; every other role (assistant,
+/// system, tool) becomes an `agent_message_chunk`, matching the ACP model where
+/// the agent replays its own prior output back to the resuming client.
+fn message_to_session_update(
+    session_id: &str,
+    msg: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let content = msg.get("content")?;
+    let text = content
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| content.to_string());
+    if text.is_empty() {
+        return None;
+    }
+    let role = msg
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("assistant");
+    let update_kind = if role == "user" {
+        "user_message_chunk"
+    } else {
+        "agent_message_chunk"
+    };
+    Some(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": update_kind,
+                "content": { "type": "text", "text": text }
+            }
+        }
+    }))
+}
+
+/// Builds the ordered list of replay notifications for a `session/load`: one
+/// `session/update` per stored message, followed by a terminal
+/// `session/load_complete` so the client knows the replay ended.
+fn build_load_updates(session_id: &str, messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut updates: Vec<serde_json::Value> = messages
+        .iter()
+        .filter_map(|m| message_to_session_update(session_id, m))
+        .collect();
+    updates.push(json!({
+        "jsonrpc": "2.0",
+        "method": "session/load_complete",
+        "params": { "sessionId": session_id }
+    }));
+    updates
+}
+
+/// Emits a finite SSE stream of the given replay `updates`.
+fn build_load_sse(
+    updates: Vec<serde_json::Value>,
+) -> axum::response::Sse<
+    impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    let stream = futures_util::stream::iter(
+        updates
+            .into_iter()
+            .map(|u| Ok(Event::default().data(u.to_string()))),
+    );
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Implements industry-ACP `session/load{sessionId}` as replay: the session's
+/// latest checkpoint history is streamed back as `session/update` notifications
+/// so an editor client (Zed/Neovim/JetBrains) gets a true resume — the ACP model
+/// where the agent is the source of truth and load = replay.
+async fn session_load(Path(id): Path<String>, State(s): State<AcpState>) -> impl IntoResponse {
+    match s.ingot.get_session(&id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "session not found" })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    }
+
+    // The latest checkpoint holds the session's full message history; an absent
+    // checkpoint replays as an empty history (just the completion marker).
+    let messages = match s.ingot.latest_checkpoint(&id).await {
+        Ok(Some(cp)) => {
+            serde_json::from_str::<Vec<serde_json::Value>>(&cp.messages_json).unwrap_or_default()
+        }
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    build_load_sse(build_load_updates(&id, &messages)).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -317,6 +637,7 @@ mod tests {
                 smedja_vault::Vault::open_in_memory().expect("in-memory vault"),
             )),
             embedder: Arc::new(crate::embedder_port::FnvEmbedder::new()),
+            gates: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -735,6 +1056,343 @@ mod tests {
             json["result"]["tools"].as_array().is_some(),
             "authenticated tools/list must return a tool array; got: {json}"
         );
+    }
+
+    // ── industry-ACP permission outcome mapping (pure) ───────────────────────
+
+    use super::{
+        map_decision_to_outcome, message_to_session_update, AcpOutcome, AcpPermissionOption,
+    };
+    use crate::cowork::Decision;
+
+    fn opts() -> Vec<AcpPermissionOption> {
+        serde_json::from_value(serde_json::json!([
+            { "optionId": "a1", "kind": "allow_once" },
+            { "optionId": "a2", "kind": "allow_always" },
+            { "optionId": "r1", "kind": "reject_once" },
+        ]))
+        .unwrap()
+    }
+
+    #[test]
+    fn approve_once_selects_allow_once_option() {
+        let out = map_decision_to_outcome(&Decision::Approve, false, &opts());
+        assert_eq!(
+            out,
+            AcpOutcome::Selected {
+                option_id: "a1".into(),
+                kind: "allow_once".into(),
+                updated_input: None,
+            }
+        );
+    }
+
+    #[test]
+    fn approve_always_selects_allow_always_option() {
+        let out = map_decision_to_outcome(&Decision::Approve, true, &opts());
+        assert_eq!(
+            out,
+            AcpOutcome::Selected {
+                option_id: "a2".into(),
+                kind: "allow_always".into(),
+                updated_input: None,
+            }
+        );
+    }
+
+    #[test]
+    fn deny_selects_reject_option() {
+        let out = map_decision_to_outcome(&Decision::Deny("too risky".into()), false, &opts());
+        assert_eq!(
+            out,
+            AcpOutcome::Selected {
+                option_id: "r1".into(),
+                kind: "reject_once".into(),
+                updated_input: None,
+            }
+        );
+    }
+
+    #[test]
+    fn timeout_deny_maps_to_cancelled() {
+        // A gate timeout / close is an unanswered request, not an explicit reject.
+        assert_eq!(
+            map_decision_to_outcome(&Decision::Deny("timeout".into()), false, &opts()),
+            AcpOutcome::Cancelled
+        );
+        assert_eq!(
+            map_decision_to_outcome(&Decision::Deny("channel closed".into()), false, &opts()),
+            AcpOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn modify_object_selects_allow_and_carries_updated_input() {
+        let out = map_decision_to_outcome(
+            &Decision::Modify(r#"{"command":"ls -a"}"#.into()),
+            false,
+            &opts(),
+        );
+        match out {
+            AcpOutcome::Selected {
+                option_id,
+                updated_input,
+                ..
+            } => {
+                assert_eq!(option_id, "a1");
+                assert_eq!(updated_input.unwrap()["command"], "ls -a");
+            }
+            AcpOutcome::Cancelled => panic!("object modify must select an allow option"),
+        }
+    }
+
+    #[test]
+    fn modify_non_object_cancels() {
+        // No valid rewrite to hand back → cancelled rather than silently allowing.
+        assert_eq!(
+            map_decision_to_outcome(&Decision::Modify("just a string".into()), false, &opts()),
+            AcpOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn approve_cancels_when_no_allow_option_offered() {
+        let only_reject: Vec<AcpPermissionOption> =
+            serde_json::from_value(serde_json::json!([{ "optionId": "r", "kind": "reject_once" }]))
+                .unwrap();
+        assert_eq!(
+            map_decision_to_outcome(&Decision::Approve, false, &only_reject),
+            AcpOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn message_to_session_update_maps_roles() {
+        let u = message_to_session_update("s1", &serde_json::json!({"role":"user","content":"hi"}))
+            .unwrap();
+        assert_eq!(u["method"], "session/update");
+        assert_eq!(u["params"]["update"]["sessionUpdate"], "user_message_chunk");
+        assert_eq!(u["params"]["update"]["content"]["text"], "hi");
+
+        let a = message_to_session_update(
+            "s1",
+            &serde_json::json!({"role":"assistant","content":"yo"}),
+        )
+        .unwrap();
+        assert_eq!(
+            a["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+
+        // No content → skipped.
+        assert!(message_to_session_update("s1", &serde_json::json!({"role":"user"})).is_none());
+    }
+
+    #[tokio::test]
+    async fn request_permission_approve_routes_through_gate_to_selected() {
+        // A permission request suspends on the ONE gate; a concurrent approve
+        // (as the TUI would send) resolves it to `selected` on the allow_once id.
+        let state = test_state();
+        let session_id = "acp-perm-1".to_owned();
+        let gate = {
+            let mut g = state.gates.lock().await;
+            Arc::clone(
+                g.entry(session_id.clone())
+                    .or_insert_with(|| Arc::new(crate::cowork::CoworkGate::default())),
+            )
+        };
+        let app = build_acp_router(state.clone());
+        let body = serde_json::json!({
+            "toolCall": { "toolName": "write_file", "rawInput": {"path": "x"} },
+            "options": [
+                {"optionId": "a1", "kind": "allow_once"},
+                {"optionId": "r1", "kind": "reject_once"}
+            ]
+        });
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/acp/v1/session/{session_id}/request_permission"))
+            .header("Authorization", "Bearer test-token")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let call = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+
+        // Approve the suspended request once it appears.
+        let id = {
+            let mut found = None;
+            for _ in 0..10_000 {
+                if let Some((id, _)) = gate.list_pending().await.first() {
+                    found = Some(id.clone());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            found.expect("request_permission must suspend on the gate")
+        };
+        assert!(gate.approve(&id).await);
+
+        let resp = call.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["outcome"]["outcome"], "selected");
+        assert_eq!(json["outcome"]["optionId"], "a1");
+    }
+
+    #[tokio::test]
+    async fn request_permission_allow_always_persists_rule() {
+        // Approving with allow-always scope must both select the allow_always
+        // option AND write a [[permission.rules]] Allow entry to workspace.toml.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state();
+        state.workspace = tmp.path().to_path_buf();
+        let session_id = "acp-perm-always".to_owned();
+        let gate = {
+            let mut g = state.gates.lock().await;
+            Arc::clone(
+                g.entry(session_id.clone())
+                    .or_insert_with(|| Arc::new(crate::cowork::CoworkGate::default())),
+            )
+        };
+        let app = build_acp_router(state.clone());
+        let body = serde_json::json!({
+            "toolCall": { "toolName": "bash", "rawInput": {"command": "git status"} },
+            "options": [
+                {"optionId": "a1", "kind": "allow_once"},
+                {"optionId": "a2", "kind": "allow_always"}
+            ]
+        });
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/acp/v1/session/{session_id}/request_permission"))
+            .header("Authorization", "Bearer test-token")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let call = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+
+        let id = {
+            let mut found = None;
+            for _ in 0..10_000 {
+                if let Some((id, _)) = gate.list_pending().await.first() {
+                    found = Some(id.clone());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            found.expect("request must suspend")
+        };
+        assert!(gate.approve_always(&id).await);
+
+        let resp = call.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["outcome"]["optionId"], "a2");
+
+        // The rule was persisted and is honoured on future turns.
+        let rules = crate::cowork::load_permission_rules(tmp.path());
+        assert_eq!(rules.len(), 1, "allow-always must persist exactly one rule");
+        assert_eq!(rules[0].tool, "bash");
+        assert_eq!(
+            crate::cowork::evaluate_permission_rules(
+                &rules,
+                "bash",
+                &serde_json::json!({"command": "git status"})
+            ),
+            Some(crate::cowork::PermissionDecision::Allow)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_load_replays_history_as_session_updates() {
+        let state = test_state();
+        // Create a session and give it a checkpoint with a two-message history.
+        let session_id = uuid::Uuid::new_v4();
+        state
+            .ingot
+            .create_session(smedja_ingot::Session {
+                id: session_id,
+                mode: Some("acp".into()),
+                title: String::new(),
+                status: "active".into(),
+                task_id: None,
+                cowork_mode: false,
+                created_at: smedja_types::Timestamp::now(),
+                updated_at: smedja_types::Timestamp::now(),
+                workspace_root: None,
+                model_override: None,
+                runner_override: None,
+            })
+            .await
+            .unwrap();
+        state
+            .ingot
+            .save_checkpoint(smedja_ingot::Checkpoint {
+                id: uuid::Uuid::new_v4(),
+                session_id: session_id.to_string(),
+                turn_n: 0,
+                messages_json: r#"[{"role":"user","content":"hello there"},{"role":"assistant","content":"general kenobi"}]"#.to_owned(),
+                created_at: smedja_types::Timestamp::now(),
+                compaction_id: None,
+            })
+            .await
+            .unwrap();
+
+        let app = build_acp_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/acp/v1/session/{session_id}/load"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("session/update"),
+            "load must emit session/update notifications; got: {text}"
+        );
+        assert!(text.contains("hello there"), "user message must replay");
+        assert!(
+            text.contains("general kenobi"),
+            "assistant message must replay"
+        );
+        assert!(text.contains("user_message_chunk"));
+        assert!(text.contains("agent_message_chunk"));
+        assert!(
+            text.contains("session/load_complete"),
+            "replay must end with a completion marker; got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_load_unknown_session_returns_404() {
+        let app = build_acp_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/acp/v1/session/no-such-session/load")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

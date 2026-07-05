@@ -7,6 +7,7 @@
 //! here and retrieved on demand by semantic similarity search.
 
 mod ann;
+pub mod block;
 mod diary;
 mod embedder;
 mod entries;
@@ -15,5 +16,6 @@ pub mod similarity;
 pub mod vault;
 mod vector_search;
 
+pub use block::{BlockSegment, BlockSegmentKind, SHARED_BLOCK_NAMESPACE};
 pub use error::VaultError;
 pub use vault::{DiaryEntry, EmbedderIdentity, QueryResult, Vault, VaultEntry, LEGACY_MODEL_ID};

@@ -285,13 +285,151 @@ pub(crate) async fn parallel(state: HandlerState, params: Value) -> Result<Value
         })
         .collect();
 
+    // Live shared block: seed a durable, concurrently-editable coordination block
+    // keyed by `fan_out_id`. Unlike the warm snapshot above (a stale, pull-only
+    // copy of the parent's last checkpoints), this block is one the fan-out roles
+    // both READ and APPEND to during the run via `task.block_append`/`block_read`
+    // (or the MCP `memory_*` tools). The parent seeds the goal as the canonical
+    // value; the warm-snapshot pull path is left intact as a fallback.
+    {
+        let vt2 = Arc::clone(&vt);
+        let block_id = fan_out_id.clone();
+        let goal_seed = goal.clone();
+        let embedding = embedder.embed_query(&goal_seed).await;
+        let model_id = embedder.model_id().to_owned();
+        let dim = embedder.dim();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = vt2.blocking_lock();
+            if let Err(e) = guard.block_rewrite(
+                &block_id,
+                "task.parallel",
+                &goal_seed,
+                embedding,
+                &model_id,
+                dim,
+            ) {
+                tracing::warn!(error = %e, "task.parallel: failed to seed shared block");
+            }
+        });
+    }
+
     Ok(json!({
         "goal": goal,
         "tasks": tasks,
         "started": started,
         "fan_out_id": fan_out_id,
         "warm_context_namespace": "warm",
+        "shared_block_id": fan_out_id,
+        "shared_block_namespace": smedja_vault::SHARED_BLOCK_NAMESPACE,
     }))
+}
+
+/// Handles `task.block_append`: appends a segment to a shared coordination block.
+///
+/// Additive and concurrency-safe — every call adds a distinct segment, so
+/// parallel roles appending to the same `block_id` never clobber one another.
+///
+/// # Errors
+///
+/// Returns an error when `block_id` or `content` is missing, or the vault write
+/// fails.
+pub(crate) async fn block_append(state: HandlerState, params: Value) -> Result<Value, RpcError> {
+    block_write(state, params, false).await
+}
+
+/// Handles `task.block_rewrite`: replaces the block's single canonical segment
+/// (owner-maintained, last-writer-wins). Distinct from the append log.
+///
+/// # Errors
+///
+/// Returns an error when `block_id` or `content` is missing, or the vault write
+/// fails.
+pub(crate) async fn block_rewrite(state: HandlerState, params: Value) -> Result<Value, RpcError> {
+    block_write(state, params, true).await
+}
+
+/// Shared body for `task.block_append`/`task.block_rewrite`.
+async fn block_write(
+    state: HandlerState,
+    params: Value,
+    canonical: bool,
+) -> Result<Value, RpcError> {
+    let vt = state.vault;
+    let embedder = state.embedder;
+    let block_id = params
+        .get("block_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| missing_param("block_id"))?
+        .to_owned();
+    let content = params
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| missing_param("content"))?
+        .to_owned();
+    let author = params
+        .get("author")
+        .and_then(Value::as_str)
+        .unwrap_or("agent")
+        .to_owned();
+
+    let embedding = embedder.embed_query(&content).await;
+    let model_id = embedder.model_id().to_owned();
+    let dim = embedder.dim();
+
+    let seg = tokio::task::spawn_blocking(move || {
+        let mut guard = vt.blocking_lock();
+        if canonical {
+            guard.block_rewrite(&block_id, &author, &content, embedding, &model_id, dim)
+        } else {
+            guard.block_append(&block_id, &author, &content, embedding, &model_id, dim)
+        }
+    })
+    .await
+    .map_err(|e| RpcError::new(codes::INTERNAL_ERROR, format!("block write panicked: {e}")))?
+    .map_err(|e| RpcError::new(codes::INTERNAL_ERROR, e.to_string()))?;
+
+    Ok(json!({
+        "id": seg.id,
+        "block_id": seg.block_id,
+        "kind": seg.kind.as_str(),
+    }))
+}
+
+/// Handles `task.block_read`: returns every segment of a shared block, oldest
+/// first, so a late-joining role sees the whole coordination log.
+///
+/// # Errors
+///
+/// Returns an error when `block_id` is missing or the vault read fails.
+pub(crate) async fn block_read(state: HandlerState, params: Value) -> Result<Value, RpcError> {
+    let vt = state.vault;
+    let block_id = params
+        .get("block_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| missing_param("block_id"))?
+        .to_owned();
+
+    let segs = tokio::task::spawn_blocking(move || {
+        let guard = vt.blocking_lock();
+        guard.block_read(&block_id)
+    })
+    .await
+    .map_err(|e| RpcError::new(codes::INTERNAL_ERROR, format!("block read panicked: {e}")))?
+    .map_err(|e| RpcError::new(codes::INTERNAL_ERROR, e.to_string()))?;
+
+    let segments: Vec<Value> = segs
+        .into_iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "author": s.author,
+                "content": s.content,
+                "kind": s.kind.as_str(),
+                "created_at": s.created_at,
+            })
+        })
+        .collect();
+    Ok(json!({ "segments": segments }))
 }
 
 /// Handles `task.cancel`.
