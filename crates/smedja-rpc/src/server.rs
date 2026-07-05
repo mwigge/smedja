@@ -222,8 +222,10 @@ mod tests {
 
         let mut router = Router::new();
         router.register("ping", |_| async { Ok(json!("pong")) });
-        let sock = std::env::temp_dir()
-            .join(format!("smedja-rpc-malformed-notif-{}.sock", std::process::id()));
+        let sock = std::env::temp_dir().join(format!(
+            "smedja-rpc-malformed-notif-{}.sock",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
         tokio::spawn(Server::new(router).serve(listener));
@@ -250,7 +252,11 @@ mod tests {
         .expect("must not hang")
         .unwrap();
         let resp: Response = serde_json::from_str(line.trim_end()).unwrap();
-        assert_eq!(resp.id, Some(json!(7)), "first reply must be for the ping, not the dropped notification");
+        assert_eq!(
+            resp.id,
+            Some(json!(7)),
+            "first reply must be for the ping, not the dropped notification"
+        );
         assert_eq!(resp.result, Some(json!("pong")));
     }
 }

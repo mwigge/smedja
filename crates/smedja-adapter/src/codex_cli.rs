@@ -685,10 +685,7 @@ mod tests {
     /// Runs the mock codex (which echoes its argv) for a given permission mode
     /// and returns the joined stdout so tests can assert on the sandbox flags.
     async fn run_mock_and_capture_args(tag: &str, permission_mode: Option<&str>) -> String {
-        let tmp = std::env::temp_dir().join(format!(
-            "smedja-codex-{tag}-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("smedja-codex-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         make_mock_codex(&tmp, "#!/bin/sh\nprintf \"args: $*\\n\"\n");
 

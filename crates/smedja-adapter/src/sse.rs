@@ -227,7 +227,10 @@ mod tests {
         let boundary = full.len() - 2; // between 0xC3 and 0xA9
         let mut buf: Vec<u8> = Vec::new();
         let mut out = drain_complete_lines(&mut buf, &full[..boundary]);
-        assert!(out.is_empty(), "no complete line before the newline arrives");
+        assert!(
+            out.is_empty(),
+            "no complete line before the newline arrives"
+        );
         out.extend(drain_complete_lines(&mut buf, &full[boundary..]));
         assert_eq!(out, vec!["data: café".to_owned()]);
         assert!(!out[0].contains('\u{FFFD}'), "no replacement char");
