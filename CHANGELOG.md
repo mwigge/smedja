@@ -6,6 +6,51 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.24.0] — 2026-07-05
+
+A major hardening + terminal-UX release: closed the security holes and crash/leak
+bugs a review surfaced, overhauled the TUI visualization, and decomposed the
+god-modules.
+
+### Fixed
+- **Security (Tier-0):** Docker read-confinement escape via a `.git` symlink;
+  Landlock post-fork allocation deadlock; SSRF (DNS-rebind pinning + no unchecked
+  redirects); sandboxed children reaped on timeout; socket single-instance +
+  0600 permission window; **terminal SSH now verifies host keys (was accept-any,
+  MITM)**; pipe-deadlock + blocking-in-async on the daemon runtime; **approvals
+  fail-closed** (Ask no longer auto-allows; codex maps to `--sandbox` instead of a
+  hardcoded bypass).
+- **Panics:** 5 UTF-8 byte-slice crash sites (emoji/CJK), a statusbar
+  use-after-free, a vault `cast_slice` DoS, and boot-time `expect` panics.
+- **Data-loss/correctness:** non-transactional vault writes, loop resume
+  re-running the batch + parallel slices sharing one workspace, streaming UTF-8
+  corruption in all provider adapters, an RPC hang, an in-flight-session GC wipe,
+  a provider-key collision disabling Berget, orchestrator cap-exhaustion persisted
+  as an answer, and ingot count/migration/overflow bugs.
+- **Leaks:** PTY thread/fd/zombie on close, the approval map, stream buffers,
+  unbounded TUI vectors + colour atlas; plus skill/role path-traversal guards.
+
+### Added
+- **TUI visualization overhaul:** real status-bar telemetry (tokens/latency/trace/
+  context, previously hardcoded 0); the **molten-orange brand accent**; unified +
+  cached syntax highlighting (tree-sitter for Rust/Go/Python/TypeScript);
+  ACP-schema tool-call cards; a state-keyed **live line**; an **in-terminal OTel
+  trace-waterfall** in the obs panel; plan step-completion; a **multi-agent fleet
+  roster**; and change-detection alerts.
+
+### Changed
+- Decomposed the god-modules (executor, orchestrator, `smdjad`/`tui` main,
+  st-pty, st-render, ingot, vault) into cohesive modules; public paths preserved.
+- CLI: `term convert-wezterm` wired to the real migration engine; `session export`
+  retargeted to a registered RPC; `/agent` accepts all real roles.
+- Docs reconciled to the code (traceparent scope, compaction, vault search,
+  `/health`); disambiguated smedja's ACP (Agent Coordination Protocol) from the
+  Zed/JetBrains Agent Client Protocol.
+
+### Removed
+- `session blocks` (no daemon block store); dead `code_widget` + unused
+  statusbar modules.
+
 ## [0.23.3] — 2026-07-01
 
 ### Fixed
