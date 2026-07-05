@@ -2,11 +2,7 @@ use super::*;
 use crate::daemon::connect_or_exit;
 
 pub(crate) async fn dispatch_session(action: SessionCmd, sock: &std::path::Path) -> Result<()> {
-    if let SessionCmd::Blocks { id } = action {
-        eprintln!("smj session blocks: 'session.blocks' RPC not yet implemented");
-        eprintln!("  session: {id}");
-        std::process::exit(1);
-    } else {
+    {
         let mut client = connect_or_exit(sock).await;
         match action {
             SessionCmd::Start { cowork, task } => {
@@ -58,17 +54,22 @@ pub(crate) async fn dispatch_session(action: SessionCmd, sock: &std::path::Path)
                     }
                 }
             }
-            SessionCmd::Blocks { .. } => unreachable!(),
             SessionCmd::Export { id, format } => {
+                // Sourced from the registered `session.history` RPC: it returns
+                // the session's checkpointed turns (each with its parsed message
+                // array) plus audit events. The latest checkpoint holds the full
+                // conversation, so its message array is the complete transcript.
+                let resp = client
+                    .call("session.history", json!({ "session_id": id }))
+                    .await
+                    .context("session.history failed")?;
                 if format == "md" {
-                    let resp = client
-                        .call(
-                            "session.messages",
-                            json!({ "session_id": id, "limit": 1000 }),
-                        )
-                        .await
-                        .context("session.messages failed")?;
-                    let messages = resp["messages"].as_array().cloned().unwrap_or_default();
+                    let messages = resp["turns"]
+                        .as_array()
+                        .and_then(|turns| turns.last())
+                        .and_then(|turn| turn["messages"].as_array())
+                        .cloned()
+                        .unwrap_or_default();
                     println!("# Session {id}\n");
                     for msg in &messages {
                         let role = msg["role"].as_str().unwrap_or("unknown");
@@ -80,10 +81,6 @@ pub(crate) async fn dispatch_session(action: SessionCmd, sock: &std::path::Path)
                         }
                     }
                 } else {
-                    let resp = client
-                        .call("session.export", json!({ "id": id }))
-                        .await
-                        .context("session.export failed")?;
                     println!("{}", serde_json::to_string_pretty(&resp)?);
                 }
             }

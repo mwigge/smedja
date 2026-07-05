@@ -1,8 +1,8 @@
 use crate::types::{GateResult, MethodologyViolation};
 
 const GATE: &str = "CleanGate";
-/// The debug-output macro this gate blocks in production code. Written as an
-/// honest literal so the gate matches exactly the construct it is meant to
+/// The debug-output macro this gate blocks in production code. Written as a
+/// verbatim literal so the gate matches exactly the construct it is meant to
 /// detect (the previous `concat!`-split form could only match a runtime-
 /// reconstructed string and left the test bed never exercising the real macro).
 const PRINTLN_MARKER: &str = "println!";

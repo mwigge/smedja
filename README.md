@@ -284,17 +284,17 @@ The verification gate's wall-clock budget defaults to 300 seconds; override it w
 
 ## Session Memory and Sharing Between Agents
 
-Every session runs through three memory strata. Context budget is allocated per runner tier — a `fast` runner gets hot + top-K warm; a `deep` runner gets everything.
+Every session's working window is partitioned into memory strata **by position**: hot (the last few turns), warm (a wider recent window), then cold. A turn's stratum is derived from its distance to the end of the conversation and recomputed each turn — there is no background promotion machinery moving turns between tiers. (A fourth `Archive` stratum is declared for durable cold storage but is not produced for in-memory turns.) Context budget is allocated per runner tier — a `fast` runner gets hot + top-K warm; a `deep` runner gets everything.
 
 <div align="center">
-  <img src="assets/diagrams/readme-session-memory.png" alt="session memory strata: hot, warm, cold, and archive" width="760" />
+  <img src="assets/diagrams/readme-session-memory.png" alt="positional session memory strata: hot, warm, and cold windows" width="760" />
 </div>
 
-Compaction produces structured JSON, not a free-text summary. Each compacted turn becomes a structured object that can be expanded and replayed — `smj session rollback <id> <turn>` reconstructs any point in history. The CLI calls the daemon's `session.rollback` RPC end to end; the underlying compaction format records each turn as a structured object the rollback replays from.
+Compaction is **summary-based**: the daemon asks a fast model to condense the conversation into a short free-text summary and indexes that summary into cold storage. Point-in-time recovery is separate and exact — before compacting, smedja writes a full pre-compaction **checkpoint** (the entire conversation as JSON), and `smj session rollback <id> <turn>` reconstructs any point in history from those checkpoints. The CLI calls the daemon's `session.rollback` RPC end to end, which loads the target checkpoint's stored messages and prunes later ones in a single transaction.
 
 ### How Parallel Agents Share Memory
 
-When tasks fan out to parallel worktrees, agents share **read** access to `smedja-vault` (cold store) but write to isolated working trees. The orchestrator merges vault writes on task completion. Cold retrieval is wired end-to-end: each turn the orchestrator recalls semantically-relevant context from the vault and injects it as a bounded `<cold_context>` block, and the `smedja_vault_search` tool embeds the query, runs hybrid cosine + keyword + recency search over the named namespace, and returns ranked results (an empty `results` array on no match).
+When tasks fan out to parallel worktrees, agents share **read** access to `smedja-vault` (cold store) but write to isolated working trees. The orchestrator merges vault writes on task completion. Cold retrieval is wired end-to-end: each turn the orchestrator recalls relevant context from the vault and injects it as a bounded `<cold_context>` block, and the `smedja_vault_search` tool embeds the query, runs hybrid cosine + keyword + recency search over the named namespace, and returns ranked results (an empty `results` array on no match). Retrieval is **semantic when a learned embedding backend is configured** — an OpenAI-compatible `/v1/embeddings` endpoint. The zero-config default embedder is a deterministic FNV bag-of-words hash, so out of the box the cosine component is lexical rather than semantic; the learned path also degrades to that same hash if its endpoint is unreachable.
 
 <div align="center">
   <img src="assets/diagrams/readme-parallel-memory.png" alt="parallel agents share read access to smedja-vault while writing to isolated worktrees" width="760" />
@@ -306,7 +306,7 @@ Both agents pull from the same cold memory — they know what was decided in pre
 
 ## Context Budget Control
 
-**SmartCrusher** (`smedja-adapter`) strips JSON nulls, zero-value arrays, and repeated keys from tool results before serialisation. Tool-heavy sessions see 30–60% token reduction on tool_result content alone. Implemented and tested.
+**SmartCrusher** (`smedja-adapter`) recursively strips JSON `null` fields and empty arrays from tool results before serialisation. Tool-heavy sessions see 30–60% token reduction on tool_result content alone. Implemented and tested.
 
 **Stable-prefix** (`smedja-memory`) tracks a `stable_prefix` boundary in the working window. `seal_prefix()` marks turns below the compaction line so they are never reordered or discarded, and the sealed-prefix length is passed through to the provider on the live turn path: for the Anthropic runner the orchestrator derives `stable_prefix_len` from the sealed prefix and the adapter applies the corresponding KV-cache hints. Cross-provider cache alignment beyond Anthropic's stable-prefix hints is on the roadmap.
 
@@ -341,7 +341,7 @@ TOML-configured, Starship-compatible module format. The milliways-specific modul
 **Stop and check.** Mutating tool calls (write/edit/shell) gate by default — *ask-on-mutation* — for **every** client, gated where each one actually executes its tools:
 
 - **claude** — a `PreToolUse` hook (`--settings` → `smj tool-gate` → the daemon) gates each tool; disable with `SMEDJA_TOOL_GATE=off`.
-- **codex** — the permission mode maps to its `--sandbox` level (read-only / workspace-write / full).
+- **codex** — the permission mode maps to its `--sandbox` level: `plan` → `read-only`, `ask`/`accept_edits`/`none` → `workspace-write`, and `auto` → full bypass (`--dangerously-bypass-approvals-and-sandbox`, matching auto-mode's own allowlists).
 - **minimax / local / API** — gated in-process at the orchestrator's tool loop.
 
 <div align="center">
@@ -368,7 +368,7 @@ Green < 60%, yellow 60–80%, red > 80%. The slot breakdown matches the `stableP
 
 ## Observability
 
-Every span follows `gen_ai.*` semantic conventions. Every outbound HTTP request — provider API calls, MCP server requests, ACP callbacks — carries a W3C `traceparent`. You can follow a user message from the TUI keystroke through model inference and back to the audit log in a single trace.
+Every span follows `gen_ai.*` semantic conventions. Outbound **provider API calls** (Anthropic, OpenAI, Gemini) inject a W3C `traceparent` header, so model inference joins the same trace as the turn that issued it; the MCP HTTP client and the ACP session API do not yet propagate the header. Inbound trace context is honoured, and the TUI status bar's Trace segment surfaces the real `traceparent` of the most recently completed turn. You can follow a user message from the TUI keystroke through model inference and back to the audit log in a single trace.
 
 <div align="center">
   <img src="assets/diagrams/readme-observability.png" alt="observability trace from TUI keystroke through model inference and audit log" width="900" />
@@ -395,7 +395,7 @@ Five fixed tiers bucket each source timestamp to a UTC grid: `raw` (per-entry gr
 
 Neither is implemented in terms of the other; pick local rollups for offline ledger accounting and the SRE OTel path when you run a real metrics backend.
 
-On startup the daemon signals readiness to the service manager via `sd_notify(READY=1)` (honoured by `Type=notify` systemd units) and exposes an unauthenticated `/health` readiness probe that returns `200` once the daemon is serving — suitable for liveness checks and container orchestration.
+On startup the daemon signals readiness to the service manager via `sd_notify(READY=1)` (honoured by `Type=notify` systemd units) on every launch. The default daemon serves its RPC over a Unix domain socket and has **no HTTP health endpoint**; an unauthenticated `/health` readiness probe that returns `200` is exposed only when the ACP HTTP surface is enabled with `SMEDJA_ACP_PORT`. For container liveness, enable `SMEDJA_ACP_PORT` and probe `/health`, or check the daemon socket / process directly.
 
 ---
 
@@ -443,7 +443,7 @@ SMEDJA_SANDBOX_READ_PATHS=/Users/me/.cargo:/Users/me/.rustup
 - `allowlist` — egress only to destinations not rejected by the daemon's SSRF guard (`is_blocked_ip`), so private/loopback/IMDS ranges stay blocked.
 - `open` — general egress, but the same SSRF floor keeps private/loopback/IMDS ranges (including `169.254.169.254`) unreachable.
 
-¹ **Subprocess limitation (honest):** the `is_blocked_ip` SSRF floor runs inside smedja's *own* HTTP clients, not the child process's sockets. A raw subprocess cannot be per-destination IP-filtered without a filtering proxy, so for a subprocess **`allowlist` is treated as `open`-minus-blocked-ranges** — per-host allow-listing is not enforced for subprocesses in this change. Use `none` (full network isolation) or Docker for stronger guarantees.
+¹ **Subprocess limitation:** the `is_blocked_ip` SSRF floor runs inside smedja's *own* HTTP clients, not the child process's sockets. A raw subprocess cannot be per-destination IP-filtered without a filtering proxy, so for a subprocess **`allowlist` is treated as `open`-minus-blocked-ranges** — per-host allow-listing is not enforced for subprocesses in this change. Use `none` (full network isolation) or Docker for stronger guarantees.
 
 On Linux, when `none` is requested but a network namespace cannot be created (no `unshare`, no `CAP_NET_ADMIN`, no unprivileged user namespaces), the backend fails closed rather than silently granting egress: under `SMEDJA_SANDBOX_MODE=required` the tool call errors naming the missing capability; under `auto` it falls back to the host with the unconfined marker. The `smedja.sandbox.exec` span records `net_confined=false` in that case.
 
@@ -513,6 +513,8 @@ smj security sbom [--lockfile …]    # emit a CycloneDX-style SBOM from the res
 ---
 
 ## MCP Server Mode
+
+> **Naming note:** smedja's **ACP** is its own **Agent *Coordination* Protocol** — an optional HTTP session API (`/acp/v1/…`, enabled by `SMEDJA_ACP_PORT`). It is distinct from the industry **Agent *Client* Protocol** (the Zed/JetBrains editor↔agent standard), which smedja does not implement.
 
 smedja is co-mounted as an **MCP server** on the authenticated ACP HTTP listener. The `/mcp` endpoint speaks JSON-RPC 2.0 and routes `tools/call` into the executor under an effective `review`-mode (read-only) session, so the least-privilege guard rejects mutating tools. ACP turn events are forwarded over SSE.
 

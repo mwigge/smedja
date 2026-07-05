@@ -34,18 +34,49 @@ pub(crate) fn apply_tier(args: &str, state: &mut AppState) -> String {
     }
 }
 
+/// Agent-mode usage string, listing every role the daemon can route
+/// (`parse_session_mode_to_role`), grouped for readability.
+pub(crate) const AGENT_MODE_USAGE: &str =
+    "usage: /agent impl|plan|research|debug|ask|review|test|sre|data|iac|orchestrator";
+
+/// Returns whether `mode` is a role the daemon's router accepts. Kept in sync
+/// with `parse_session_mode_to_role` in the daemon (canonical names + aliases).
+#[must_use]
+pub(crate) fn is_known_agent_mode(mode: &str) -> bool {
+    matches!(
+        mode,
+        "impl"
+            | "code"
+            | "plan"
+            | "research"
+            | "debug"
+            | "ask"
+            | "explain"
+            | "test"
+            | "review"
+            | "sre"
+            | "data"
+            | "sql"
+            | "iac"
+            | "infra"
+            | "orchestrator"
+            | "search"
+    )
+}
+
 /// Sets the agent mode on `state` and returns a status string.
 pub(crate) fn apply_agent(args: &str, state: &mut AppState) -> String {
-    match args {
-        "impl" | "review" | "test" | "sre" | "explain" => {
-            state.mode = Some(args.to_owned());
-            if args == "sre" {
-                state.tier = Some("deep".to_owned());
-            }
-            format!("agent mode set to {args}")
+    if args.is_empty() {
+        return AGENT_MODE_USAGE.to_owned();
+    }
+    if is_known_agent_mode(args) {
+        state.mode = Some(args.to_owned());
+        if args == "sre" {
+            state.tier = Some("deep".to_owned());
         }
-        "" => "usage: /agent impl|review|test|sre|explain".to_owned(),
-        other => format!("unknown agent mode: {other}"),
+        format!("agent mode set to {args}")
+    } else {
+        format!("unknown agent mode: {args}\n{AGENT_MODE_USAGE}")
     }
 }
 
@@ -466,7 +497,7 @@ pub(crate) async fn dispatch_slash(
                 push_system_message(state, text);
             } else {
                 let text = apply_agent(args, state);
-                if matches!(args, "impl" | "review" | "test" | "sre" | "explain") {
+                if is_known_agent_mode(args) {
                     let session_id = state.session_id.clone();
                     let _ = client
                         .call(

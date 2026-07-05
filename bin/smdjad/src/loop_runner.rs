@@ -729,7 +729,7 @@ mod tests {
             3,
             "each slice maps to exactly one iteration"
         );
-        // Tier/Runner enums are referenced to keep the import surface honest.
+        // Tier/Runner enums are referenced to keep the import surface used.
         let _ = (Tier::Deep, Runner::Claude);
     }
 

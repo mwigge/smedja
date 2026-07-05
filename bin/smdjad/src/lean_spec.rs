@@ -19,8 +19,8 @@
 //!   the vault via [`smedja_memory::WorkingMemory::cold_context`] with the
 //!   cold-query namespace set to the umbrella namespace.
 //!
-//! Honest caveat: the vault embedder is FNV-1a bag-of-words (`DIM = 128`,
-//! [`crate::embedder`]) — semantic recall is weak. The hybrid keyword + recency
+//! Caveat: the default vault embedder is FNV-1a bag-of-words (`DIM = 128`,
+//! [`crate::embedder`]) — without a learned embedder, semantic recall is weak. The hybrid keyword + recency
 //! boost in [`smedja_vault::Vault::search`] partially compensates, and the
 //! umbrella intent that matters most lives in the *exact*, always-present cached
 //! prefix rather than in cold recall. Retrieval-linking the umbrella detail is a

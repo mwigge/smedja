@@ -129,7 +129,7 @@ struct Cli {
     #[arg(long, env = "SMEDJA_SOCK")]
     sock: Option<PathBuf>,
 
-    /// Agent mode (impl|review|test|sre|explain)
+    /// Agent role (impl|plan|research|debug|ask|review|test|sre|data|iac|orchestrator)
     #[arg(long, short = 'm')]
     mode: Option<String>,
 
@@ -277,7 +277,7 @@ const SLASH_COMPLETIONS: &[&str] = &[
 
 pub(crate) const HELP_TEXT: &str = "\
 slash commands:
-  /agent [id]        — run named agent (omit id to list available agents)
+  /agent [role]      — set the session role (impl|plan|research|debug|ask|review|test|sre|data|iac|orchestrator); omit to list runners
   /approve [id]      — approve a cowork item (omit id to list pending approvals)
   /briefing          — show session briefing
   /clear             — clear message display (keeps session data)

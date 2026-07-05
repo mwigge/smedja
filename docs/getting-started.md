@@ -74,7 +74,7 @@ smdjad will automatically detect and use a configured provider. If no provider i
 smdjad
 ```
 
-The daemon binds a UDS socket at `$XDG_RUNTIME_DIR/smdjad.sock` (falls back to `/tmp/smdjad.sock`). It signals readiness via `sd_notify(READY=1)` for systemd's `Type=notify`, and exposes a `/health` HTTP readiness probe once serving.
+The daemon binds a UDS socket at `$XDG_RUNTIME_DIR/smdjad.sock` (falls back to `/tmp/smdjad.sock`). It signals readiness via `sd_notify(READY=1)` for systemd's `Type=notify`. There is no HTTP health endpoint on the default UDS path; an unauthenticated `/health` readiness probe is served only when the ACP HTTP surface is enabled with `SMEDJA_ACP_PORT`.
 
 Override the socket path with `--sock` or `SMEDJA_SOCK`.
 

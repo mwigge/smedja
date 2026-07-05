@@ -33,9 +33,8 @@ smj session list                                  # list all sessions
 smj session show <id>                             # show session metadata
 smj session fork <id> [--turn <n>]               # fork a session at an optional turn
 smj session rollback <id> <turn>                 # rewind a session (destructive)
-smj session blocks <id>                          # list stored TurnBlocks
 smj session checkpoint <id>                      # list checkpoints
-smj session export <id>                          # export cost lineage as JSON
+smj session export <id> [--format json|md]       # export turns + audit (json) or a transcript (md)
 smj session compact <id>                         # compact the conversation history
 smj session tokens <id>                          # per-turn token usage
 ```
@@ -180,7 +179,7 @@ smj mcp remove <name>
 smj mcp refresh [<name>]
 ```
 
-Registered MCP servers are available to agent tool calls. The `/mcp` HTTP endpoint on the daemon's ACP listener also exposes smedja as an MCP server (read-only, OAuth 2.0).
+Registered MCP servers are available to agent tool calls. The `/mcp` HTTP endpoint on the daemon's ACP listener also exposes smedja as an MCP server (read-only, OAuth 2.0). Here "ACP" is smedja's own Agent *Coordination* Protocol (its optional `/acp/v1/…` HTTP session API, enabled by `SMEDJA_ACP_PORT`), not the Zed/JetBrains Agent *Client* Protocol, which smedja does not implement.
 
 ---
 

@@ -94,15 +94,11 @@ pub(crate) enum SessionCmd {
         id: String,
         turn: u32,
     },
-    /// List stored blocks for a session
-    Blocks {
-        id: String,
-    },
     /// List checkpoints for a session
     Checkpoint {
         id: String,
     },
-    /// Export session cost lineage or messages
+    /// Export a session: checkpointed turns + audit events (json) or a transcript (md)
     Export {
         /// Session ID to export
         id: String,
