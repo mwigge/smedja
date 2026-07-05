@@ -13,3 +13,6 @@ Cargo.lock
 /DELIVERY.md
 /review_*.md
 /docs/checklist-*.md
+.claude/
+assets/*.pkg.tar.zst
+assets/*.tar.gz
