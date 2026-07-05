@@ -269,8 +269,6 @@ pub(crate) struct AppState {
     pub(crate) history_search_mode: bool,
     /// Query string for the active reverse history search.
     pub(crate) history_search_query: String,
-    /// Resolved path to the `openspec` binary, or `None` if not installed.
-    pub(crate) openspec_bin: Option<PathBuf>,
     /// Instant of last `lsp.status` / `lsp.diagnostics` RPC poll; `None` before first poll.
     pub(crate) lsp_last_poll: Option<std::time::Instant>,
     /// Most recent LSP snapshot (updated from RPC polls every 5 s).

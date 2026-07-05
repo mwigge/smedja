@@ -73,10 +73,7 @@ pub(crate) use terminal_guard::TerminalGuard;
 #[allow(unused_imports)]
 pub(crate) use tool_call::tool_call_card;
 #[allow(unused_imports)]
-pub(crate) use upgrade::{
-    fetch_latest_version, format_openspec_list, format_openspec_status, is_newer, run_openspec,
-    run_upgrade, VERSION,
-};
+pub(crate) use upgrade::{fetch_latest_version, is_newer, run_upgrade, VERSION};
 
 use std::collections::VecDeque;
 use std::io::stdout;
@@ -231,7 +228,7 @@ const SLASH_COMMAND_DESCRIPTIONS: &[(&str, &str)] = &[
     ("/review", "send git diff for review"),
     ("/session", "manage sessions"),
     ("/skills", "list loaded skills"),
-    ("/spec", "browse OpenSpec changes"),
+    ("/spec", "author/validate/archive OpenSpec changes"),
     ("/switch", "switch active session"),
     ("/takeover", "take over agent output"),
     ("/test", "run test suite"),
@@ -301,7 +298,7 @@ slash commands:
   /quota             — show usage quota
   /resume [id [turn]] — resume a session (omit id for interactive picker; turn rewinds)
   /review            — send git diff for review
-  /spec              — browse OpenSpec changes
+  /spec [list|status [name]|new <name>|validate <name>|show <name>|diff <name>|archive <name>]
   /skills [add <dir>] — list skills (~/.claude/skills + .smedja/skills) or add a directory
   /switch [runner]   — switch AI runner (omit for interactive picker)
   /takeover <runner> — fork session to new runner

@@ -176,7 +176,6 @@ pub(crate) async fn bootstrap() -> Result<Session> {
         saved_input: String::new(),
         history_search_mode: false,
         history_search_query: String::new(),
-        openspec_bin: which::which("openspec").ok(),
         lsp_last_poll: None,
         lsp_snapshot: smedja_lsp::LspSnapshot::default(),
         obs_snapshot: obs_panel::ObsSnapshot::default(),

@@ -14,6 +14,7 @@ pub(crate) mod fs;
 pub(crate) mod graph;
 pub(crate) mod lsp;
 pub(crate) mod review;
+pub(crate) mod spec;
 pub(crate) mod sre;
 pub(crate) mod test;
 pub(crate) mod vault;

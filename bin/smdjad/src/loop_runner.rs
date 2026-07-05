@@ -373,11 +373,9 @@ async fn read_pending_slices(workspace_root: &Path, change_name: &str) -> Vec<St
         return Vec::new();
     };
     match tokio::fs::read_to_string(&tasks_path).await {
-        Ok(content) => content
-            .lines()
-            .filter(|l| l.starts_with("- [ ] "))
-            .map(|l| l.trim_start_matches("- [ ] ").to_owned())
-            .collect(),
+        // Route slice parsing through the native spec engine so the loop and the
+        // engine agree on what counts as a pending slice (one code path).
+        Ok(content) => smedja_spec::parse_pending_slices(&content),
         Err(_) => Vec::new(),
     }
 }

@@ -192,6 +192,84 @@ pub(crate) fn builtin_tools(is_sre_mode: bool) -> Vec<serde_json::Value> {
                 }
             }
         }),
+        serde_json::json!({
+            "name": "spec_create",
+            "description": "Scaffold a new OpenSpec change: creates \
+                openspec/changes/<change>/{proposal,design,tasks}.md. Author delta specs \
+                afterwards with write_file at openspec/changes/<change>/specs/<capability>/spec.md \
+                using the ## ADDED/MODIFIED/REMOVED Requirements format, then spec_validate. \
+                why/what seed the proposal.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "change": { "type": "string", "description": "change name (no path separators)" },
+                    "why": { "type": "string", "description": "the problem the change solves" },
+                    "what": { "type": "string", "description": "what the change does" }
+                },
+                "required": ["change"]
+            }
+        }),
+        serde_json::json!({
+            "name": "spec_validate",
+            "description": "Structurally validate an OpenSpec change: every requirement has a \
+                scenario, MODIFIED/REMOVED deltas reference real capabilities/requirements, and \
+                (under strict) every requirement asserts SHALL/MUST and tasks.md is well-formed. \
+                Returns { valid, errors, warnings }. Run with strict:true before implementing.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "change": { "type": "string" },
+                    "strict": { "type": "boolean", "description": "fold quality checks into hard errors" }
+                },
+                "required": ["change"]
+            }
+        }),
+        serde_json::json!({
+            "name": "spec_show",
+            "description": "Render a human-readable summary of an OpenSpec change: its proposal, \
+                delta capabilities, and validation result.",
+            "input_schema": {
+                "type": "object",
+                "properties": { "change": { "type": "string" } },
+                "required": ["change"]
+            }
+        }),
+        serde_json::json!({
+            "name": "spec_diff",
+            "description": "Render an OpenSpec change's delta specs (ADDED/MODIFIED/REMOVED \
+                requirements) as markdown, capability by capability.",
+            "input_schema": {
+                "type": "object",
+                "properties": { "change": { "type": "string" } },
+                "required": ["change"]
+            }
+        }),
+        serde_json::json!({
+            "name": "spec_list",
+            "description": "List OpenSpec active changes, archived changes, and known capability \
+                specs. Returns { changes, archived, specs }.",
+            "input_schema": { "type": "object", "properties": {} }
+        }),
+        serde_json::json!({
+            "name": "spec_status",
+            "description": "Report an OpenSpec change's status (proposal/design/tasks present, \
+                delta capabilities, task counts, validity). Omit change for all active changes.",
+            "input_schema": {
+                "type": "object",
+                "properties": { "change": { "type": "string" } }
+            }
+        }),
+        serde_json::json!({
+            "name": "spec_archive",
+            "description": "Archive a completed OpenSpec change: merge its deltas into the source \
+                specs (ADDED appended, MODIFIED replaces, REMOVED deleted) under openspec/specs/, \
+                then move the change into openspec/changes/archive/.",
+            "input_schema": {
+                "type": "object",
+                "properties": { "change": { "type": "string" } },
+                "required": ["change"]
+            }
+        }),
     ];
     if is_sre_mode {
         builtin_tools.push(serde_json::json!({

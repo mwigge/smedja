@@ -20,6 +20,7 @@ members = [
     "crates/smedja-review",
     "crates/smedja-rpc",
     "crates/smedja-security",
+    "crates/smedja-spec",
     "crates/smedja-testkit",
     "crates/smedja-sre",
     "crates/smedja-telemetry",
