@@ -9,27 +9,27 @@
 threshold = 600
 
 [files]
-"bin/smdjad/src/acp.rs" = 1858
+"bin/smdjad/src/acp.rs" = 1855
 "bin/smdjad/src/common.rs" = 655
 "bin/smdjad/src/cowork.rs" = 1182
 "bin/smdjad/src/executor/tests.rs" = 2285
 "bin/smdjad/src/fragments.rs" = 831
-"bin/smdjad/src/handlers/session/lifecycle.rs" = 694
+"bin/smdjad/src/handlers/session/lifecycle.rs" = 697
 "bin/smdjad/src/lean_spec.rs" = 938
 "bin/smdjad/src/loop_runner.rs" = 1042
 "bin/smdjad/src/main.rs" = 745
 "bin/smdjad/src/mcp_oauth.rs" = 683
 "bin/smdjad/src/mcp_server.rs" = 1064
-"bin/smdjad/src/orchestrator/mod.rs" = 1626
+"bin/smdjad/src/orchestrator/mod.rs" = 1625
+"bin/smdjad/src/orchestrator/turn_run.rs" = 1979
 "bin/smdjad/src/tests.rs" = 880
 "bin/smedja-tui/src/input.rs" = 1324
 "bin/smedja-tui/src/main_panel.rs" = 718
-"bin/smedja-tui/src/main_panel/tests.rs" = 859
-"bin/smedja-tui/src/main.rs" = 1527
+"bin/smedja-tui/src/main_panel/tests.rs" = 871
+"bin/smedja-tui/src/main.rs" = 1506
 "bin/smedja-tui/src/render.rs" = 692
 "bin/smedja-tui/src/run_loop.rs" = 610
-"bin/smedja-tui/src/slash.rs" = 1377
-"bin/smedja-tui/src/tests.rs" = 3814
+"bin/smedja-tui/src/slash.rs" = 1386
 "bin/smedja-tui/src/theme.rs" = 651
 "crates/smedja-adapter/src/anthropic.rs" = 633
 "crates/smedja-adapter/src/claude_cli.rs" = 892
