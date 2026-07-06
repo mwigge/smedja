@@ -6,6 +6,18 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.25.2] — 2026-07-06
+
+### Fixed
+- **/review timed out at 30s** — audit.run is a minutes-long blocking auditor loop
+  that the 0.25.0 default 30s client RPC timeout killed. It now runs under a 30-min
+  long-timeout with a "reviewing…" progress message; ordinary RPCs keep the 30s
+  guard.
+
+### Changed
+- Split the 3,818-line smedja-tui tests.rs into a per-feature tests/ directory +
+  a shared test_support module; dropped the test-only main.rs re-exports.
+
 ## [0.25.1] — 2026-07-06
 
 ### Added
