@@ -6,6 +6,18 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.25.3] — 2026-07-06
+
+### Added
+- **/review streams live progress** — the auditor now spawns and streams
+  AuditProgress (iteration N/M, current activity, running finding count) + a final
+  report, rendered live, instead of blocking silently for minutes.
+
+### Fixed
+- Slash-command feedback gaps: /agent surfaces a rejected mode change (was a silent
+  no-op), /briefing shows a "summarizing…" working line, /version shows "checking
+  for updates…", and /metrics surfaces RPC errors instead of showing zeros.
+
 ## [0.25.2] — 2026-07-06
 
 ### Fixed
