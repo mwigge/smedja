@@ -24,6 +24,9 @@ else
   echo "  (cargo-sort not installed — skipping; run: cargo install cargo-sort)"
 fi
 
+# clippy::too_many_lines is intentionally NOT blanket-disabled here: long
+# functions are scoped with a per-function #[allow(clippy::too_many_lines)]
+# (the repo convention), so any NEW over-long function is caught.
 run_check "cargo clippy" cargo clippy \
   --workspace --all-targets --all-features \
   -- -D warnings -W clippy::pedantic \
@@ -33,7 +36,6 @@ run_check "cargo clippy" cargo clippy \
      -A clippy::cast_possible_truncation \
      -A clippy::cast_sign_loss \
      -A clippy::cast_possible_wrap \
-     -A clippy::too_many_lines \
      -A clippy::missing_panics_doc \
      -A clippy::many_single_char_names \
      -A clippy::similar_names \
@@ -48,6 +50,11 @@ run_check "cargo clippy" cargo clippy \
      -A clippy::trivially_copy_pass_by_ref
 
 run_check "cargo test" cargo test --workspace --quiet
+
+# Ratcheting file-size gate: BLOCKS a staged file that crosses the threshold
+# without being baselined, or that grew past its grandfathered ceiling. Existing
+# oversized files are tolerated at their recorded size; growth is not.
+run_check "file-size gate" "$ROOT/scripts/file-size-gate.sh" --staged
 
 if command -v cargo-machete &>/dev/null; then
   echo "  checking: cargo machete (advisory)"

@@ -1,0 +1,59 @@
+# File-size gate baseline — grandfathered oversized files.
+#
+# GENERATED FILE. Do not edit by hand. Regenerate with:
+#     scripts/file-size-gate.sh --regenerate
+#
+# The gate ALLOWS each listed file at or below its recorded line count and
+# FAILS if it grows past it. Any file NOT listed here that crosses `threshold`
+# also FAILS. The baseline is a ceiling that only ratchets DOWN.
+threshold = 600
+
+[files]
+"bin/smdjad/src/acp.rs" = 1858
+"bin/smdjad/src/common.rs" = 655
+"bin/smdjad/src/cowork.rs" = 1182
+"bin/smdjad/src/executor/tests.rs" = 2285
+"bin/smdjad/src/fragments.rs" = 831
+"bin/smdjad/src/handlers/session/lifecycle.rs" = 694
+"bin/smdjad/src/lean_spec.rs" = 938
+"bin/smdjad/src/loop_runner.rs" = 1042
+"bin/smdjad/src/main.rs" = 745
+"bin/smdjad/src/mcp_oauth.rs" = 683
+"bin/smdjad/src/mcp_server.rs" = 1064
+"bin/smdjad/src/orchestrator/mod.rs" = 1626
+"bin/smdjad/src/tests.rs" = 880
+"bin/smedja-tui/src/input.rs" = 1324
+"bin/smedja-tui/src/main_panel.rs" = 718
+"bin/smedja-tui/src/main_panel/tests.rs" = 859
+"bin/smedja-tui/src/main.rs" = 1527
+"bin/smedja-tui/src/render.rs" = 692
+"bin/smedja-tui/src/run_loop.rs" = 610
+"bin/smedja-tui/src/slash.rs" = 1377
+"bin/smedja-tui/src/tests.rs" = 3814
+"bin/smedja-tui/src/theme.rs" = 651
+"crates/smedja-adapter/src/anthropic.rs" = 633
+"crates/smedja-adapter/src/claude_cli.rs" = 892
+"crates/smedja-adapter/src/codex_cli.rs" = 965
+"crates/smedja-adapter/src/local.rs" = 691
+"crates/smedja-assayer/src/assayer.rs" = 633
+"crates/smedja-bellows/src/event.rs" = 884
+"crates/smedja-graph/src/indexer.rs" = 616
+"crates/smedja-ingot/src/checkpoint.rs" = 694
+"crates/smedja-ingot/src/cost.rs" = 754
+"crates/smedja-ingot/src/lib.rs" = 822
+"crates/smedja-ingot/src/metrics_rollup.rs" = 776
+"crates/smedja-ingot/src/session.rs" = 948
+"crates/smedja-loop/src/engine/tests.rs" = 841
+"crates/smedja-lsp/src/client.rs" = 666
+"crates/smedja-lsp/src/manager.rs" = 917
+"crates/smedja-plugins/src/registry.rs" = 775
+"crates/smedja-spec/src/engine.rs" = 759
+"crates/smedja-vault/src/vault.rs" = 854
+"crates/smedja-vault/src/vector_search.rs" = 700
+"term/crates/st-config/src/lib.rs" = 618
+"term/crates/st-glyph/src/lib.rs" = 850
+"term/crates/st-pty/src/grid.rs" = 681
+"term/crates/st-pty/src/tests.rs" = 1124
+"term/crates/st-pty/src/vt.rs" = 629
+"term/crates/st-render/src/lib.rs" = 1872
+"term/crates/st-render/src/vertices.rs" = 751
