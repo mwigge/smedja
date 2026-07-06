@@ -183,6 +183,7 @@ pub(crate) async fn bootstrap() -> Result<Session> {
         plan_steps: Vec::new(),
         consecutive_low_quality: 0,
         quality_review_in_progress: false,
+        audit_progress_line: None,
         ctrl_q_pressed_at: None,
         value_snapshot: value_panel::ValueSnapshot::default(),
         latency_samples: VecDeque::new(),

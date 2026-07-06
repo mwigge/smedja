@@ -334,6 +334,54 @@ pub enum TurnEvent {
         #[serde(flatten)]
         correlation: CorrelationCtx,
     },
+
+    /// Progress heartbeat from the read-only repo/PR auditor's exploration loop.
+    ///
+    /// Published once per loop iteration so a streaming client (the TUI `/review`
+    /// path) can render a live "reviewing… iteration N/M · examining X · Y
+    /// findings" status instead of freezing for the minutes the loop runs. The
+    /// `turn_id` carries the audit session id so the stream server routes it to
+    /// the subscribing client. Advisory-only: never affects the loop.
+    AuditProgress {
+        /// 1-based index of the iteration this heartbeat was emitted for.
+        iteration: u32,
+        /// Upper bound on iterations for this run (the loop's `max_iterations`).
+        total: u32,
+        /// Short description of what the auditor is currently examining
+        /// (e.g. `"read_file src/main.rs"` or `"compiling findings"`).
+        activity: String,
+        /// Running count of findings gathered so far.
+        findings_so_far: u32,
+        /// Audit session id; routes the event to the subscribing stream client.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        /// Correlation context (trace, conversation, agent, status).
+        #[serde(flatten)]
+        correlation: CorrelationCtx,
+    },
+
+    /// Terminal audit result: the rendered findings report and severity counts.
+    ///
+    /// Mirrors how [`TurnEvent::QualitySnapshot`] flows — a single terminal event
+    /// the TUI renders as the review report. Published once, after the audit loop
+    /// finishes and findings are persisted; it ends the audit stream.
+    AuditReport {
+        /// The rendered markdown report (the same body the blocking RPC returns).
+        report: String,
+        /// Per-severity counts, keyed by severity slug
+        /// (`{critical, high, medium, low, info}`).
+        #[serde(default)]
+        counts: serde_json::Value,
+        /// Path the report was written to, when `--report` was requested.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report_path: Option<String>,
+        /// Audit session id; routes the event to the subscribing stream client.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        /// Correlation context (trace, conversation, agent, status).
+        #[serde(flatten)]
+        correlation: CorrelationCtx,
+    },
 }
 
 // ── Constructors ──────────────────────────────────────────────────────────────
@@ -803,6 +851,70 @@ mod tests {
             assert_eq!(summary_tokens, 512);
         } else {
             panic!("wrong variant");
+        }
+    }
+
+    // --- Audit progress + report stream ---
+
+    #[test]
+    fn audit_progress_roundtrips_and_omits_none_turn_id() {
+        let ev = TurnEvent::AuditProgress {
+            iteration: 3,
+            total: 12,
+            activity: "read_file src/main.rs".into(),
+            findings_so_far: 2,
+            turn_id: None,
+            correlation: CorrelationCtx::default(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("AuditProgress"), "variant tag; got: {json}");
+        assert!(
+            !json.contains("turn_id"),
+            "None turn_id must be omitted; got: {json}"
+        );
+        let decoded: TurnEvent = serde_json::from_str(&json).unwrap();
+        if let TurnEvent::AuditProgress {
+            iteration,
+            total,
+            activity,
+            findings_so_far,
+            ..
+        } = decoded
+        {
+            assert_eq!(iteration, 3);
+            assert_eq!(total, 12);
+            assert_eq!(activity, "read_file src/main.rs");
+            assert_eq!(findings_so_far, 2);
+        } else {
+            panic!("wrong variant after roundtrip");
+        }
+    }
+
+    #[test]
+    fn audit_report_roundtrips_with_counts_and_path() {
+        let ev = TurnEvent::AuditReport {
+            report: "# Audit Report\n\n## Summary\n".into(),
+            counts: serde_json::json!({"critical": 1, "low": 2}),
+            report_path: Some("/tmp/report.md".into()),
+            turn_id: Some("audit-1".into()),
+            correlation: CorrelationCtx::default(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let decoded: TurnEvent = serde_json::from_str(&json).unwrap();
+        if let TurnEvent::AuditReport {
+            report,
+            counts,
+            report_path,
+            turn_id,
+            ..
+        } = decoded
+        {
+            assert!(report.contains("## Summary"));
+            assert_eq!(counts["critical"], 1);
+            assert_eq!(report_path.as_deref(), Some("/tmp/report.md"));
+            assert_eq!(turn_id.as_deref(), Some("audit-1"));
+        } else {
+            panic!("wrong variant after roundtrip");
         }
     }
 

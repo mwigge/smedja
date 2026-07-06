@@ -164,6 +164,37 @@ pub(crate) fn turn_event_to_ndjson(
             });
             (turn_id.clone(), line, false)
         }
+        TurnEvent::AuditProgress {
+            iteration,
+            total,
+            activity,
+            findings_so_far,
+            turn_id,
+            ..
+        } => {
+            let line = ser(&StreamEvent::AuditProgress {
+                iteration: *iteration,
+                total: *total,
+                activity: activity.clone(),
+                findings_so_far: *findings_so_far,
+            });
+            (turn_id.clone(), line, false)
+        }
+        TurnEvent::AuditReport {
+            report,
+            counts,
+            report_path,
+            turn_id,
+            ..
+        } => {
+            let line = ser(&StreamEvent::AuditReport {
+                report: report.clone(),
+                counts: counts.clone(),
+                report_path: report_path.clone(),
+            });
+            // Terminal: the audit stream ends once the report is delivered.
+            (turn_id.clone(), line, true)
+        }
         TurnEvent::HistoryReplaced { turn_id, .. } => (Some(turn_id.clone()), String::new(), false),
     }
 }
@@ -280,6 +311,44 @@ mod tests {
             "thinking content must appear in NDJSON; got: {line}"
         );
         assert!(!terminal, "thinking delta must not be a terminal event");
+    }
+
+    #[test]
+    fn turn_event_to_ndjson_audit_progress_is_non_terminal_and_routed() {
+        let event = TurnEvent::AuditProgress {
+            iteration: 2,
+            total: 12,
+            activity: "read_file src/x.rs".into(),
+            findings_so_far: 0,
+            turn_id: Some("audit-9".into()),
+            correlation: CorrelationCtx::default(),
+        };
+        let (tid, line, terminal) = turn_event_to_ndjson(&event, "audit-9");
+        assert_eq!(tid.as_deref(), Some("audit-9"));
+        assert!(
+            line.contains(r#""type":"audit_progress""#),
+            "must map to audit_progress; got: {line}"
+        );
+        assert!(line.contains("read_file src/x.rs"), "activity; got: {line}");
+        assert!(!terminal, "progress heartbeats never terminate the stream");
+    }
+
+    #[test]
+    fn turn_event_to_ndjson_audit_report_is_terminal() {
+        let event = TurnEvent::AuditReport {
+            report: "# Audit Report\n".into(),
+            counts: serde_json::json!({"critical": 1}),
+            report_path: None,
+            turn_id: Some("audit-9".into()),
+            correlation: CorrelationCtx::default(),
+        };
+        let (tid, line, terminal) = turn_event_to_ndjson(&event, "audit-9");
+        assert_eq!(tid.as_deref(), Some("audit-9"));
+        assert!(
+            line.contains(r#""type":"audit_report""#),
+            "must map to audit_report; got: {line}"
+        );
+        assert!(terminal, "the report terminates the audit stream");
     }
 
     #[test]

@@ -297,6 +297,54 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                             evict_and_push(buf, line);
                         }
                     }
+                    TurnEvent::AuditProgress {
+                        iteration,
+                        total,
+                        ref activity,
+                        findings_so_far,
+                        ref turn_id,
+                        ..
+                    } => {
+                        let Some(tid) = turn_id else { continue };
+                        // The auditor emits no `Started`, so create the buffer on
+                        // the first progress heartbeat — otherwise a late-connecting
+                        // client could not replay it.
+                        let buf = store
+                            .entry(tid.clone())
+                            .or_insert_with(TurnBuffer::new)
+                            .touch();
+                        let line = json!({
+                            "type": "audit_progress",
+                            "iteration": iteration,
+                            "total": total,
+                            "activity": activity,
+                            "findings_so_far": findings_so_far,
+                        })
+                        .to_string();
+                        evict_and_push(buf, line);
+                    }
+                    TurnEvent::AuditReport {
+                        ref report,
+                        ref counts,
+                        ref report_path,
+                        ref turn_id,
+                        ..
+                    } => {
+                        let Some(tid) = turn_id else { continue };
+                        let buf = store
+                            .entry(tid.clone())
+                            .or_insert_with(TurnBuffer::new)
+                            .touch();
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("type".into(), json!("audit_report"));
+                        obj.insert("report".into(), json!(report));
+                        obj.insert("counts".into(), counts.clone());
+                        if let Some(p) = report_path {
+                            obj.insert("report_path".into(), json!(p));
+                        }
+                        buf.push_back(serde_json::Value::Object(obj).to_string());
+                        cleanup_tid = Some(tid.clone());
+                    }
                     TurnEvent::HistoryReplaced {
                         ref session_id,
                         ref turn_id,

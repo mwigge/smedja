@@ -232,6 +232,8 @@ fn turn_event_to_agent_event(event: &TurnEvent) -> Option<AgentEvent> {
         | TurnEvent::TokenUsage { .. }
         | TurnEvent::ToolCallChunk { .. }
         | TurnEvent::ToolCallUpdate { .. }
+        | TurnEvent::AuditProgress { .. }
+        | TurnEvent::AuditReport { .. }
         | TurnEvent::HistoryReplaced { .. } => None,
     }
 }

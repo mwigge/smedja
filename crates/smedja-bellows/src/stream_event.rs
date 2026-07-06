@@ -97,16 +97,41 @@ pub enum StreamEvent {
         content: Vec<crate::event::ToolCallContent>,
     },
 
+    /// Progress heartbeat from the `/review` auditor loop (display only).
+    ///
+    /// The TUI renders a live "reviewing… iteration N/M · examining X · Y
+    /// findings" status while the read-only audit loop runs.
+    AuditProgress {
+        iteration: u32,
+        total: u32,
+        activity: String,
+        findings_so_far: u32,
+    },
+
+    /// Terminal `/review` result: the rendered findings report and counts.
+    ///
+    /// Ends the audit stream, mirroring how `Quality` closes a turn's stream.
+    AuditReport {
+        report: String,
+        #[serde(default)]
+        counts: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report_path: Option<String>,
+    },
+
     /// Catchall for unknown future event types — never matched by the TUI.
     #[serde(other)]
     Unknown,
 }
 
 impl StreamEvent {
-    /// Returns `true` if this event signals the end of a turn.
+    /// Returns `true` if this event signals the end of a turn or audit stream.
     #[must_use]
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Done { .. } | Self::Error { .. })
+        matches!(
+            self,
+            Self::Done { .. } | Self::Error { .. } | Self::AuditReport { .. }
+        )
     }
 }
 
@@ -344,6 +369,37 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         assert!(!json.contains("content"), "{json}");
         assert_eq!(roundtrip(&ev), ev);
+    }
+
+    #[test]
+    fn audit_progress_roundtrips() {
+        let ev = StreamEvent::AuditProgress {
+            iteration: 4,
+            total: 12,
+            activity: "graph_query auth".into(),
+            findings_so_far: 1,
+        };
+        assert_eq!(roundtrip(&ev), ev);
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""type":"audit_progress""#), "{json}");
+        assert!(!ev.is_terminal(), "progress is not terminal");
+    }
+
+    #[test]
+    fn audit_report_roundtrips_and_is_terminal() {
+        let ev = StreamEvent::AuditReport {
+            report: "# Audit Report\n".into(),
+            counts: serde_json::json!({"critical": 0, "low": 1}),
+            report_path: None,
+        };
+        assert_eq!(roundtrip(&ev), ev);
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""type":"audit_report""#), "{json}");
+        assert!(
+            !json.contains("report_path"),
+            "None report_path must be omitted; got: {json}"
+        );
+        assert!(ev.is_terminal(), "the report ends the audit stream");
     }
 
     #[test]
