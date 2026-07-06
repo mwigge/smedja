@@ -91,6 +91,53 @@ pub fn load_file_size_threshold(workspace_root: &Path) -> usize {
     }
 }
 
+/// Loads the ratcheting file-size baseline from
+/// `<workspace>/.smedja/file-size-baseline.toml`.
+///
+/// An absent or unparseable baseline resolves to an empty baseline — which is
+/// the strict interpretation: with nothing grandfathered, every file over the
+/// threshold blocks.
+#[must_use]
+pub fn load_file_size_baseline(workspace_root: &Path) -> smedja_methodology::Baseline {
+    let path = workspace_root
+        .join(".smedja")
+        .join("file-size-baseline.toml");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return smedja_methodology::Baseline::default();
+    };
+    match smedja_methodology::Baseline::from_toml_str(&content) {
+        Ok(baseline) => baseline,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "invalid file-size baseline; treating as empty");
+            smedja_methodology::Baseline::default()
+        }
+    }
+}
+
+/// Runs the enforcing, ratcheting file-size gate over the changed set.
+///
+/// Returns the blocking violations: changed files that cross `threshold`
+/// without being baselined, or that grew past their grandfathered ceiling.
+/// Paths are relativised to `workspace_root` so they match the baseline keys.
+#[must_use]
+pub fn enforce_file_size(
+    workspace_root: &Path,
+    threshold: usize,
+) -> Vec<smedja_methodology::FileSizeViolation> {
+    let baseline = load_file_size_baseline(workspace_root);
+    let changed: Vec<(PathBuf, usize)> = changed_file_sizes(workspace_root)
+        .into_iter()
+        .map(|(abs, lines)| {
+            let rel = abs
+                .strip_prefix(workspace_root)
+                .unwrap_or(&abs)
+                .to_path_buf();
+            (rel, lines)
+        })
+        .collect();
+    smedja_methodology::file_size::enforce(&changed, threshold, &baseline)
+}
+
 fn parse_quality_toml(content: &str) -> Option<usize> {
     // Minimal TOML parse: look for `file_size_threshold = <N>`.
     for line in content.lines() {
@@ -175,11 +222,24 @@ pub fn run_after_turn(
         Some(file_size_threshold),
     );
 
-    let file_advisories: Vec<String> =
+    // Per-turn advisory over every changed file (unchanged behaviour).
+    let mut file_advisories: Vec<String> =
         smedja_methodology::file_size::check(&changed_files, file_size_threshold)
             .iter()
             .map(smedja_methodology::FileSizeAdvisory::summary)
             .collect();
+
+    // Enforcing, ratcheting gate: growth past the baseline (or a new oversized
+    // file) is a hard BLOCK. The commit-time backstop (scripts/file-size-gate.sh
+    // via pre-commit) is what actually fails the commit; here we surface the
+    // same verdict in the turn snapshot and log it so it is visible mid-session.
+    let violations = enforce_file_size(&workspace_root, file_size_threshold);
+    if !violations.is_empty() {
+        for v in &violations {
+            tracing::warn!(gate = v.gate(), "file-size gate BLOCK: {}", v.summary());
+        }
+        file_advisories.extend(violations.iter().map(|v| format!("BLOCK {}", v.summary())));
+    }
 
     let skill_advisories: Vec<String> =
         smedja_methodology::skill_inject::check(&diff, &session_skills)
@@ -240,6 +300,38 @@ mod tests {
         std::fs::create_dir_all(&smedja).unwrap();
         std::fs::write(smedja.join("quality.toml"), "file_size_threshold = 1200\n").unwrap();
         assert_eq!(load_file_size_threshold(dir.path()), 1200);
+    }
+
+    #[test]
+    fn load_file_size_baseline_defaults_to_empty_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = load_file_size_baseline(dir.path());
+        assert!(baseline.is_empty());
+        assert_eq!(baseline.threshold(), 600);
+    }
+
+    #[test]
+    fn load_file_size_baseline_reads_ceilings_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let smedja = dir.path().join(".smedja");
+        std::fs::create_dir_all(&smedja).unwrap();
+        std::fs::write(
+            smedja.join("file-size-baseline.toml"),
+            "threshold = 600\n[files]\n\"bin/a.rs\" = 900\n",
+        )
+        .unwrap();
+        let baseline = load_file_size_baseline(dir.path());
+        assert_eq!(baseline.ceiling("bin/a.rs"), Some(900));
+        assert_eq!(baseline.len(), 1);
+    }
+
+    #[test]
+    fn load_file_size_baseline_falls_back_on_bad_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let smedja = dir.path().join(".smedja");
+        std::fs::create_dir_all(&smedja).unwrap();
+        std::fs::write(smedja.join("file-size-baseline.toml"), "not = [valid").unwrap();
+        assert!(load_file_size_baseline(dir.path()).is_empty());
     }
 
     #[test]

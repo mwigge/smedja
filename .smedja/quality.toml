@@ -1,0 +1,7 @@
+# Deterministic Tier-1 quality-gate configuration.
+#
+# file_size_threshold — maximum line count for any single source file. New
+# files must stay at or below this. Files already over it are grandfathered in
+# .smedja/file-size-baseline.toml and may only shrink, never grow (see
+# scripts/file-size-gate.sh).
+file_size_threshold = 600

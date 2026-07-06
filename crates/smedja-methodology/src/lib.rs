@@ -24,7 +24,7 @@ pub mod tdd;
 pub mod types;
 
 pub use config::{MethodologyConfig, MethodologyConfigError};
-pub use file_size::FileSizeAdvisory;
+pub use file_size::{Baseline, BaselineError, FileSizeAdvisory, FileSizeViolation};
 pub use quality::evaluate as quality_evaluate;
 pub use skill_inject::SkillAdvisory;
 pub use types::{GateResult, MethodologyViolation, Mode, QualityScore, SessionConfig};
