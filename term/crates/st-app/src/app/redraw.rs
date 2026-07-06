@@ -245,18 +245,35 @@ impl App {
             // full-screen app owns the alt screen (smedja-tui, vim, less),
             // it owns every cell — the overlay would corrupt its top rows.
             // Suppress it there.
-            let alt_screen = pty.grid.lock().alt_screen;
+            let (alt_screen, grid_cols) = {
+                let g = pty.grid.lock();
+                (g.alt_screen, usize::from(g.cols))
+            };
             if let Ok(mgr) = self.agent_manager.0.try_lock() {
                 let blocks: Vec<st_render::AgentBlockView> = if alt_screen {
                     Vec::new()
                 } else {
                     mgr.sessions()
                         .enumerate()
-                        .map(|(i, session)| st_render::AgentBlockView {
-                            start_row: u16::try_from(i * 4).unwrap_or(u16::MAX),
-                            model: session.model.clone(),
-                            content_lines: session.content_lines(),
-                            approval_pending: session.approval == st_agent::ApprovalState::Pending,
+                        .map(|(i, session)| {
+                            // Hanging-indent margin: the author label occupies it,
+                            // body lines shift right by it (render geometry only —
+                            // the content strings are never padded, so copy stays
+                            // clean). Cap at half the grid width so a long model
+                            // name can't squeeze the body away.
+                            let header = st_render::agent_header(&session.model);
+                            let max_margin = (grid_cols / 2).max(1);
+                            st_render::AgentBlockView {
+                                start_row: u16::try_from(i * 4).unwrap_or(u16::MAX),
+                                model: session.model.clone(),
+                                content_lines: session.content_lines(),
+                                approval_pending: session.approval
+                                    == st_agent::ApprovalState::Pending,
+                                left_margin_cols: st_render::hanging_margin_cols(
+                                    header.chars().count(),
+                                    max_margin,
+                                ),
+                            }
                         })
                         .collect()
                 };

@@ -15,8 +15,8 @@ use axum::Json;
 use axum::Router;
 use serde::Deserialize;
 use serde_json::json;
-use smedja_bellows::{Dispatcher, TurnEvent, TurnHandle};
-use smedja_ingot::{IngotHandle, Session, Task};
+use smedja_bellows::{Dispatcher, ToolCallContent, TurnEvent, TurnHandle};
+use smedja_ingot::{IngotHandle, McpServer, Session, Task};
 use smedja_types::Timestamp;
 use smedja_vault::Vault;
 use tokio::sync::Mutex;
@@ -118,7 +118,93 @@ async fn mcp_server_endpoint(
     Json(response)
 }
 
-async fn create_session(State(s): State<AcpState>) -> impl IntoResponse {
+/// One MCP server entry supplied to `session/new` for per-session attachment.
+///
+/// Accepts both the network shape (`url`) and Zed's stdio shape (`command`); when
+/// no `transport` is given it is inferred from the URL scheme. Optional `tools`
+/// (pre-known descriptors) make the server's tools immediately dispatchable
+/// without a live `tools/list` refresh.
+#[derive(Debug, Default, Deserialize)]
+struct AcpMcpServer {
+    #[serde(default)]
+    name: String,
+    #[serde(default, alias = "command")]
+    url: String,
+    #[serde(default)]
+    transport: Option<String>,
+    #[serde(default)]
+    tools: Option<serde_json::Value>,
+}
+
+/// Body of `POST /acp/v1/session/new` — an optional list of per-session MCP
+/// servers to attach. An empty body creates a session with no extra servers.
+#[derive(Debug, Default, Deserialize)]
+struct CreateSessionBody {
+    #[serde(default, alias = "mcpServers")]
+    mcp_servers: Vec<AcpMcpServer>,
+}
+
+/// Registers the per-session MCP servers from `session/new` into the ingot
+/// registry, keyed by a session-scoped id (`acp-session:{session}:{name}`) so the
+/// entries are strictly additive to — and never clobber — the global MCP config.
+/// Returns the names successfully attached.
+///
+/// A server's `tools` (when supplied) are stored verbatim so its tools are
+/// immediately reachable via `find_mcp_server_for_tool`; otherwise the daemon
+/// picks them up on the next `mcp.refresh`. A network server whose URL is not a
+/// permitted outbound target is skipped (logged), matching `mcp.register`.
+async fn attach_session_mcp_servers(
+    ingot: &IngotHandle,
+    session_id: &str,
+    servers: &[AcpMcpServer],
+) -> Vec<String> {
+    let mut attached = Vec::new();
+    for s in servers {
+        if s.name.is_empty() {
+            continue;
+        }
+        let transport = s.transport.clone().unwrap_or_else(|| {
+            if s.url.starts_with("http") {
+                "http".to_owned()
+            } else {
+                "stdio".to_owned()
+            }
+        });
+        // Network transports must clear the outbound URL gate; stdio commands do not.
+        if transport != "stdio" && !crate::is_safe_mcp_url(&s.url) {
+            tracing::warn!(server = %s.name, "session/new: skipping MCP server with disallowed url");
+            continue;
+        }
+        let tools_json = s
+            .tools
+            .as_ref()
+            .map_or_else(|| "[]".to_owned(), ToString::to_string);
+        let server = McpServer {
+            id: format!("acp-session:{session_id}:{}", s.name),
+            name: s.name.clone(),
+            url: s.url.clone(),
+            transport,
+            tools_json,
+            last_refresh: 0.0,
+        };
+        if let Err(e) = ingot.register_mcp_server(server).await {
+            tracing::warn!(server = %s.name, error = %e, "session/new: failed to attach MCP server");
+            continue;
+        }
+        attached.push(s.name.clone());
+    }
+    attached
+}
+
+async fn create_session(State(s): State<AcpState>, body: axum::body::Bytes) -> impl IntoResponse {
+    // The body is optional: an empty POST creates a bare session, while a JSON
+    // body may carry `mcpServers` to attach for this session only.
+    let cfg: CreateSessionBody = if body.is_empty() {
+        CreateSessionBody::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
+
     let id = Uuid::new_v4();
     let now = Timestamp::now();
     let session = Session {
@@ -135,7 +221,11 @@ async fn create_session(State(s): State<AcpState>) -> impl IntoResponse {
         runner_override: None,
     };
     match s.ingot.create_session(session).await {
-        Ok(()) => Json(json!({ "session_id": id })).into_response(),
+        Ok(()) => {
+            let attached =
+                attach_session_mcp_servers(&s.ingot, &id.to_string(), &cfg.mcp_servers).await;
+            Json(json!({ "session_id": id, "mcpServers": attached })).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
@@ -157,6 +247,7 @@ fn turn_id_of(event: &TurnEvent) -> Option<&str> {
         | TurnEvent::QualitySnapshot { turn_id, .. }
         | TurnEvent::CoworkRequest { turn_id, .. }
         | TurnEvent::TokenUsage { turn_id, .. }
+        | TurnEvent::ToolCallUpdate { turn_id, .. }
         | TurnEvent::ToolCallChunk { turn_id, .. } => turn_id.as_deref(),
     }
 }
@@ -170,11 +261,95 @@ fn is_terminal_for(event: &TurnEvent, turn_id: &str) -> bool {
     )
 }
 
+/// Maps a tool-lifecycle [`TurnEvent`] to an industry-ACP `session/update`
+/// notification, or `None` for any non-tool event.
+///
+/// - [`TurnEvent::ToolCalled`] → `sessionUpdate: "tool_call"` (status `pending`),
+///   carrying the tool name as the title and its input summary as `rawInput`.
+/// - [`TurnEvent::ToolCallUpdate`] → `sessionUpdate: "tool_call_update"` with the
+///   mapped status (`pending | in_progress | completed | failed`) and, for edit
+///   tools, a `content: [{type:"diff", path, oldText, newText}]` item so a Zed
+///   client can render the proposed change inline for modify-then-approve.
+///
+/// Pure, so the shaping (including the diff content) is unit-testable.
+fn tool_event_to_session_update(session_id: &str, event: &TurnEvent) -> Option<serde_json::Value> {
+    match event {
+        TurnEvent::ToolCalled {
+            tool_name,
+            input_summary,
+            tool_call_id,
+            ..
+        } => Some(json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": tool_call_id.clone().unwrap_or_default(),
+                    "title": tool_name,
+                    "status": "pending",
+                    "rawInput": input_summary,
+                }
+            }
+        })),
+        TurnEvent::ToolCallUpdate {
+            tool_call_id,
+            status,
+            content,
+            ..
+        } => {
+            let content_json: Vec<serde_json::Value> = content
+                .iter()
+                .map(|c| match c {
+                    ToolCallContent::Diff {
+                        path,
+                        old_text,
+                        new_text,
+                    } => json!({
+                        "type": "diff",
+                        "path": path,
+                        "oldText": old_text,
+                        "newText": new_text,
+                    }),
+                })
+                .collect();
+            let mut update = json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": tool_call_id,
+                "status": status.as_acp_str(),
+            });
+            if !content_json.is_empty() {
+                update["content"] = serde_json::Value::Array(content_json);
+            }
+            Some(json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": { "sessionId": session_id, "update": update }
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// Renders one forwarded [`TurnEvent`] as the SSE data payload for `session_id`.
+///
+/// Tool-lifecycle events are reshaped into industry-ACP `session/update`
+/// notifications (`tool_call` / `tool_call_update`); every other event is carried
+/// as its raw serialised form, matching the historical wire shape.
+fn event_to_sse_data(session_id: &str, event: &TurnEvent) -> String {
+    tool_event_to_session_update(session_id, event)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| serde_json::to_string(event).unwrap_or_default())
+}
+
 /// Builds an SSE response that forwards every [`TurnEvent`] for `turn_id` from
 /// `receiver`, terminating after the turn's terminal event. A keep-alive
-/// heartbeat prevents idle-timeout disconnects.
+/// heartbeat prevents idle-timeout disconnects. Tool-call events are reshaped
+/// into ACP `tool_call` / `tool_call_update` notifications for `session_id`.
 fn build_turn_sse(
     receiver: tokio::sync::broadcast::Receiver<TurnEvent>,
+    session_id: String,
     turn_id: String,
 ) -> axum::response::Sse<
     impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
@@ -182,8 +357,8 @@ fn build_turn_sse(
     use axum::response::sse::{Event, KeepAlive, Sse};
 
     let stream = futures_util::stream::unfold(
-        (receiver, turn_id, false),
-        |(mut rx, turn_id, finished)| async move {
+        (receiver, session_id, turn_id, false),
+        |(mut rx, session_id, turn_id, finished)| async move {
             if finished {
                 return None;
             }
@@ -197,10 +372,9 @@ fn build_turn_sse(
                             _ => continue,
                         }
                         let terminal = is_terminal_for(&event, &turn_id);
-                        // The event is already JSON; carry it as the SSE data.
-                        let data = serde_json::to_string(&event).unwrap_or_default();
+                        let data = event_to_sse_data(&session_id, &event);
                         let sse_event = Event::default().data(data);
-                        return Some((Ok(sse_event), (rx, turn_id, terminal)));
+                        return Some((Ok(sse_event), (rx, session_id, turn_id, terminal)));
                     }
                     // A lagged subscriber skips dropped events and re-loops.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -246,7 +420,7 @@ async fn submit_prompt(
                 turn_id.to_string(),
                 Arc::clone(&s.dispatcher),
             );
-            build_turn_sse(receiver, turn_id.to_string()).into_response()
+            build_turn_sse(receiver, session_id, turn_id.to_string()).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -916,7 +1090,7 @@ mod tests {
             correlation: CorrelationCtx::default(),
         });
 
-        let sse = super::build_turn_sse(rx, turn_id);
+        let sse = super::build_turn_sse(rx, "s".to_owned(), turn_id);
         let resp = sse.into_response();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -959,7 +1133,7 @@ mod tests {
             correlation: CorrelationCtx::default(),
         });
 
-        let sse = super::build_turn_sse(rx, turn_id);
+        let sse = super::build_turn_sse(rx, "s".to_owned(), turn_id);
         let resp = sse.into_response();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -1055,6 +1229,229 @@ mod tests {
         assert!(
             json["result"]["tools"].as_array().is_some(),
             "authenticated tools/list must return a tool array; got: {json}"
+        );
+    }
+
+    // ── per-session mcpServers (Item A part 1) ───────────────────────────────
+
+    #[tokio::test]
+    async fn session_new_with_mcp_servers_attaches_them() {
+        let state = test_state();
+        let app = build_acp_router(state.clone());
+        let body = serde_json::json!({
+            "mcpServers": [
+                {
+                    "name": "gh",
+                    "url": "https://example.com/mcp",
+                    "transport": "http",
+                    "tools": [{ "name": "gh_search" }]
+                }
+            ]
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/acp/v1/session/new")
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["mcpServers"][0], "gh",
+            "response must echo the attached server names; got: {json}"
+        );
+
+        // The server is registered (additive to the global config) and its tool
+        // is now dispatchable for the session.
+        let servers = state.ingot.list_mcp_servers().await.unwrap();
+        assert!(
+            servers.iter().any(|s| s.name == "gh"),
+            "per-session MCP server must be registered"
+        );
+        let owner = state
+            .ingot
+            .find_mcp_server_for_tool("gh_search")
+            .await
+            .unwrap();
+        assert_eq!(
+            owner.map(|s| s.name).as_deref(),
+            Some("gh"),
+            "the attached server's tool must resolve to it"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_without_body_still_creates_session() {
+        // Back-compat: an empty POST body must still create a bare session.
+        let app = build_acp_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/acp/v1/session/new")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json.get("session_id").is_some());
+        assert_eq!(json["mcpServers"], serde_json::json!([]));
+    }
+
+    // ── ACP tool-call status stream + diff content (Item A part 2) ────────────
+
+    #[test]
+    fn tool_call_lifecycle_maps_to_acp_session_updates() {
+        use smedja_bellows::event::CorrelationCtx;
+        use smedja_bellows::{ToolCallStatus, TurnEvent};
+
+        let start = TurnEvent::ToolCalled {
+            tool_name: "edit_file".into(),
+            input_summary: "edit x".into(),
+            full_input: None,
+            turn_id: Some("t".into()),
+            correlation: CorrelationCtx::default(),
+            tool_call_id: Some("c1".into()),
+        };
+        let v = super::tool_event_to_session_update("s", &start).unwrap();
+        assert_eq!(v["params"]["update"]["sessionUpdate"], "tool_call");
+        assert_eq!(v["params"]["update"]["status"], "pending");
+        assert_eq!(v["params"]["update"]["toolCallId"], "c1");
+
+        for (st, want) in [
+            (ToolCallStatus::InProgress, "in_progress"),
+            (ToolCallStatus::Completed, "completed"),
+            (ToolCallStatus::Failed, "failed"),
+        ] {
+            let upd = TurnEvent::ToolCallUpdate {
+                tool_call_id: "c1".into(),
+                tool_name: "edit_file".into(),
+                status: st,
+                content: vec![],
+                turn_id: Some("t".into()),
+                correlation: CorrelationCtx::default(),
+            };
+            let v = super::tool_event_to_session_update("s", &upd).unwrap();
+            assert_eq!(v["params"]["update"]["sessionUpdate"], "tool_call_update");
+            assert_eq!(v["params"]["update"]["status"], want);
+            assert_eq!(v["params"]["update"]["toolCallId"], "c1");
+        }
+    }
+
+    #[test]
+    fn tool_call_update_with_edit_emits_diff_content() {
+        use smedja_bellows::event::CorrelationCtx;
+        use smedja_bellows::{ToolCallContent, ToolCallStatus, TurnEvent};
+
+        let upd = TurnEvent::ToolCallUpdate {
+            tool_call_id: "c1".into(),
+            tool_name: "edit_file".into(),
+            status: ToolCallStatus::Completed,
+            content: vec![ToolCallContent::Diff {
+                path: "src/lib.rs".into(),
+                old_text: "fn a() {}".into(),
+                new_text: "fn a() { b(); }".into(),
+            }],
+            turn_id: Some("t".into()),
+            correlation: CorrelationCtx::default(),
+        };
+        let v = super::tool_event_to_session_update("s", &upd).unwrap();
+        let content = &v["params"]["update"]["content"][0];
+        assert_eq!(content["type"], "diff");
+        assert_eq!(content["path"], "src/lib.rs");
+        assert_eq!(content["oldText"], "fn a() {}");
+        assert_eq!(content["newText"], "fn a() { b(); }");
+    }
+
+    #[tokio::test]
+    async fn submit_prompt_sse_reshapes_tool_events_to_acp() {
+        // A tool lifecycle published to the dispatcher is reshaped into ACP
+        // tool_call / tool_call_update session/update notifications on the stream,
+        // ending on the turn's terminal event.
+        use smedja_bellows::event::CorrelationCtx;
+        use smedja_bellows::{ToolCallContent, ToolCallStatus, TurnEvent};
+
+        let dispatcher = Dispatcher::new(64);
+        let turn_id = "t-tools".to_owned();
+        let rx = dispatcher.subscribe();
+
+        dispatcher.publish(TurnEvent::ToolCalled {
+            tool_name: "edit_file".into(),
+            input_summary: "edit".into(),
+            full_input: None,
+            turn_id: Some(turn_id.clone()),
+            correlation: CorrelationCtx::default(),
+            tool_call_id: Some("c1".into()),
+        });
+        dispatcher.publish(TurnEvent::ToolCallUpdate {
+            tool_call_id: "c1".into(),
+            tool_name: "edit_file".into(),
+            status: ToolCallStatus::InProgress,
+            content: vec![],
+            turn_id: Some(turn_id.clone()),
+            correlation: CorrelationCtx::default(),
+        });
+        dispatcher.publish(TurnEvent::ToolCallUpdate {
+            tool_call_id: "c1".into(),
+            tool_name: "edit_file".into(),
+            status: ToolCallStatus::Completed,
+            content: vec![ToolCallContent::Diff {
+                path: "a.rs".into(),
+                old_text: "x".into(),
+                new_text: "y".into(),
+            }],
+            turn_id: Some(turn_id.clone()),
+            correlation: CorrelationCtx::default(),
+        });
+        dispatcher.publish(TurnEvent::Completed {
+            session_id: "s".into(),
+            turn_id: turn_id.clone(),
+            output_tokens: 1,
+            input_tokens: None,
+            traceparent: None,
+            correlation: CorrelationCtx::default(),
+        });
+
+        let sse = super::build_turn_sse(rx, "s".to_owned(), turn_id);
+        let resp = sse.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains(r#""sessionUpdate":"tool_call""#),
+            "start must map to tool_call; got: {text}"
+        );
+        assert!(
+            text.contains(r#""sessionUpdate":"tool_call_update""#),
+            "updates must map to tool_call_update; got: {text}"
+        );
+        assert!(
+            text.contains(r#""status":"in_progress""#),
+            "in_progress transition must appear; got: {text}"
+        );
+        assert!(
+            text.contains(r#""status":"completed""#),
+            "completed transition must appear; got: {text}"
+        );
+        assert!(
+            text.contains(r#""type":"diff""#) && text.contains("oldText"),
+            "edit must carry diff content; got: {text}"
         );
     }
 

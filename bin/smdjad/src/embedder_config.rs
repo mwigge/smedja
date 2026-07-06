@@ -6,16 +6,27 @@
 //! resolved config then drives [`resolve_embedder`], which probes a configured
 //! learned endpoint and degrades to the FNV backend when it is unreachable.
 //!
-//! # Recall quality: prefer a local semantic endpoint
+//! # Recall quality: semantic by default
 //!
-//! The FNV bag-of-words backend is the *offline safety net*, not a good default
-//! for recall — it is lexical (keyword overlap), so "semantic" recall over it is
-//! keyword search. The **recommended** production configuration points at a
-//! local, OpenAI-compatible embeddings server (e.g. a bge-small / MiniLM served
-//! by llama.cpp, Ollama, or text-embeddings-inference on localhost):
+//! The default backend is `local` — the bundled in-process semantic model
+//! ([`crate::local_embedder`], all-MiniLM / bge-small, 384-dim), downloaded on
+//! first use into `~/.local/share/smedja/models/`. Out of the box, vault recall
+//! is genuinely semantic with no sidecar server. If the model cannot be fetched
+//! or loaded (offline, uncached), it degrades to a *flagged* lexical FNV backend
+//! ([`Embedder::status`](crate::embedder_port::Embedder::status) reports
+//! `semantic = false, degraded = true`) rather than silently becoming keyword
+//! search.
+//!
+//! Two other backends are selectable:
 //!
 //! ```toml
 //! # <workspace>/.smedja/config.toml
+//!
+//! # Explicit lexical-only, no download:
+//! [embedder]
+//! backend = "fnv"
+//!
+//! # Or an external OpenAI-compatible embeddings server:
 //! [embedder]
 //! backend  = "learned"
 //! endpoint = "http://127.0.0.1:9090"   # local /v1/embeddings server
@@ -23,24 +34,9 @@
 //! dim      = 384
 //! ```
 //!
-//! With this set, recall is genuinely semantic; FNV only takes over if the
-//! endpoint is unreachable, and that degradation is now *surfaced* (a WARN plus
-//! [`Embedder::status`](crate::embedder_port::Embedder::status)) rather than
-//! silent.
-//!
-//! # Seam: bundling a local model next
-//!
-//! The clean next step is an in-process semantic embedder (a bge-small / MiniLM
-//! via `candle` or an ONNX runtime) so semantic recall needs no sidecar server.
-//! It was deliberately *not* bundled here: the model weights (~90 MB) plus a
-//! candle/ONNX + tokenizer dependency stack are too heavy and supply-chain-risky
-//! to add well in a single pass. The seam is already in place — implement
-//! [`Embedder`](crate::embedder_port::Embedder) for the bundled model (its
-//! `status().semantic` returns `true`), then add a `EmbedderBackend::Local` arm
-//! to [`resolve_embedder`] that constructs it and falls back to
-//! [`FnvEmbedder`] on load failure, exactly as the learned arm falls back today.
-//! No call site changes: every embedding flows through the resolved
-//! `Arc<dyn Embedder>`.
+//! Every embedding flows through the resolved `Arc<dyn Embedder>`, so the backend
+//! choice and the `model_id`/`dim` pairing live entirely in [`resolve_embedder`];
+//! no call site changes when the backend changes.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -48,7 +44,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::embedder_port::{Embedder, FnvEmbedder, LearnedEmbedder};
+use crate::embedder_port::{Embedder, FnvEmbedder, LearnedEmbedder, LocalFallbackEmbedder};
 
 /// Health-check deadline for a learned endpoint at startup, mirroring the
 /// local-runner 500 ms pre-flight.
@@ -58,8 +54,13 @@ const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_millis(500);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EmbedderBackend {
-    /// The FNV-1a bag-of-words default (offline, always available).
+    /// The bundled local semantic model (all-MiniLM / bge-small, 384-dim) —
+    /// the default. Downloaded on first use into a cache; falls back to a
+    /// *degraded* FNV backend if it cannot be fetched or loaded.
     #[default]
+    Local,
+    /// The FNV-1a bag-of-words backend (lexical, offline, always available).
+    /// Select this explicitly for a no-download, keyword-only setup.
     Fnv,
     /// A learned `/v1/embeddings` backend selected by `endpoint`/`model`/`dim`.
     Learned,
@@ -67,28 +68,48 @@ pub enum EmbedderBackend {
 
 /// Resolved `[embedder]` configuration.
 ///
-/// Defaults to the FNV backend, so an absent block leaves the daemon on the
-/// offline default.
+/// Defaults to the bundled local semantic backend, so an absent block gives
+/// out-of-the-box semantic recall (downloaded on first use), degrading to FNV
+/// only if the model cannot be fetched or loaded.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct EmbedderConfig {
-    /// Selected backend (`fnv` | `learned`).
+    /// Selected backend (`local` | `fnv` | `learned`).
     pub backend: EmbedderBackend,
     /// Learned endpoint base URL (e.g. `http://127.0.0.1:9090`).
     pub endpoint: Option<String>,
-    /// Learned model id sent in `/v1/embeddings` requests and tagged on rows.
+    /// Model name. For `local`, the bundled model (default `all-minilm-l6-v2`);
+    /// for `learned`, the model id sent in `/v1/embeddings` requests. Tagged on
+    /// every produced row.
     pub model: Option<String>,
-    /// Vector dimension the learned model produces.
+    /// Vector dimension the learned model produces. Ignored for `local`, whose
+    /// dimension is fixed by the chosen bundled model.
     pub dim: Option<usize>,
 }
 
 impl Default for EmbedderConfig {
     fn default() -> Self {
         Self {
-            backend: EmbedderBackend::Fnv,
+            backend: EmbedderBackend::Local,
             endpoint: None,
             model: None,
             dim: None,
+        }
+    }
+}
+
+impl EmbedderConfig {
+    /// Builds the [`LocalModelSpec`](crate::local_embedder::LocalModelSpec) for
+    /// the `local` backend: the configured (or default) model name plus the
+    /// on-disk cache directory weights are downloaded into.
+    #[must_use]
+    pub fn local_spec(&self) -> crate::local_embedder::LocalModelSpec {
+        crate::local_embedder::LocalModelSpec {
+            model: self
+                .model
+                .clone()
+                .unwrap_or_else(|| crate::local_embedder::DEFAULT_LOCAL_MODEL.to_owned()),
+            cache_dir: crate::local_embedder::default_model_cache_dir(),
         }
     }
 }
@@ -133,16 +154,54 @@ pub fn load_embedder_config(workspace_root: &Path) -> EmbedderConfig {
 
 /// Resolves a single `Arc<dyn Embedder>` from `config` and runtime availability.
 ///
-/// - `backend = "fnv"` (or any incomplete learned config) resolves the
-///   [`FnvEmbedder`] default.
+/// - `backend = "local"` (the default) resolves the bundled semantic model,
+///   downloading it on first use; on any load failure it falls back to a
+///   *degraded* [`LocalFallbackEmbedder`] (lexical FNV, flagged so the
+///   degradation is visible).
+/// - `backend = "fnv"` resolves the plain [`FnvEmbedder`] (intentional lexical).
 /// - `backend = "learned"` resolves the [`LearnedEmbedder`] only when its
 ///   endpoint passes a startup health check; otherwise it falls back to the FNV
-///   default (Decision 2/4). This never blocks startup and never errors.
+///   default. This never blocks startup and never errors.
 pub async fn resolve_embedder(config: &EmbedderConfig) -> Arc<dyn Embedder> {
-    if config.backend != EmbedderBackend::Learned {
-        return Arc::new(FnvEmbedder::new());
+    match config.backend {
+        EmbedderBackend::Local => resolve_local(config).await,
+        EmbedderBackend::Fnv => Arc::new(FnvEmbedder::new()),
+        EmbedderBackend::Learned => resolve_learned(config).await,
     }
+}
 
+/// Resolves the bundled local semantic model, degrading to a flagged FNV
+/// fallback if it cannot be fetched or loaded. Never errors, never blocks
+/// startup beyond the (bounded) load attempt.
+async fn resolve_local(config: &EmbedderConfig) -> Arc<dyn Embedder> {
+    let spec = config.local_spec();
+    let model = spec.model.clone();
+    let cache = spec.cache_dir.clone();
+    match crate::local_embedder::load(spec).await {
+        Ok(embedder) => {
+            tracing::info!(
+                model = %model,
+                dim = embedder.dim(),
+                cache = %cache.display(),
+                "local semantic embedder resolved"
+            );
+            embedder
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                model = %model,
+                "local semantic embedder unavailable (offline, uncached, or feature-disabled); vault recall DEGRADED to lexical FNV until the model can be fetched"
+            );
+            Arc::new(LocalFallbackEmbedder::new())
+        }
+    }
+}
+
+/// Resolves the learned `/v1/embeddings` backend behind a startup health check,
+/// falling back to the FNV default when its endpoint is unreachable or its
+/// config is incomplete.
+async fn resolve_learned(config: &EmbedderConfig) -> Arc<dyn Embedder> {
     let (Some(endpoint), Some(model), Some(dim)) = (&config.endpoint, &config.model, config.dim)
     else {
         tracing::warn!(
@@ -188,18 +247,22 @@ mod tests {
     }
 
     #[test]
-    fn missing_config_resolves_to_fnv_default() {
+    fn missing_config_resolves_to_local_default() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = load_embedder_config(dir.path());
-        assert_eq!(cfg.backend, EmbedderBackend::Fnv);
+        assert_eq!(
+            cfg.backend,
+            EmbedderBackend::Local,
+            "the default backend is the bundled local semantic model"
+        );
     }
 
     #[test]
-    fn unparseable_config_resolves_to_fnv_default() {
+    fn unparseable_config_resolves_to_local_default() {
         let dir = tempfile::tempdir().unwrap();
         write_config(dir.path(), "[embedder\nbackend = ");
         let cfg = load_embedder_config(dir.path());
-        assert_eq!(cfg.backend, EmbedderBackend::Fnv);
+        assert_eq!(cfg.backend, EmbedderBackend::Local);
     }
 
     #[test]
@@ -208,6 +271,26 @@ mod tests {
         write_config(dir.path(), "[embedder]\nbackend = \"fnv\"\n");
         let cfg = load_embedder_config(dir.path());
         assert_eq!(cfg.backend, EmbedderBackend::Fnv);
+    }
+
+    #[test]
+    fn local_backend_block_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            "[embedder]\nbackend = \"local\"\nmodel = \"bge-small-en-v1.5\"\n",
+        );
+        let cfg = load_embedder_config(dir.path());
+        assert_eq!(cfg.backend, EmbedderBackend::Local);
+        assert_eq!(cfg.model.as_deref(), Some("bge-small-en-v1.5"));
+    }
+
+    #[test]
+    fn local_spec_defaults_model_and_targets_smedja_cache() {
+        let cfg = EmbedderConfig::default();
+        let spec = cfg.local_spec();
+        assert_eq!(spec.model, "all-minilm-l6-v2");
+        assert!(spec.cache_dir.ends_with("smedja/models"));
     }
 
     #[test]
@@ -226,10 +309,45 @@ mod tests {
 
     #[tokio::test]
     async fn fnv_config_resolves_to_fnv_embedder() {
-        let cfg = EmbedderConfig::default();
+        let cfg = EmbedderConfig {
+            backend: EmbedderBackend::Fnv,
+            ..EmbedderConfig::default()
+        };
         let e = resolve_embedder(&cfg).await;
         assert_eq!(e.model_id(), FNV_MODEL_ID);
         assert_eq!(e.dim(), 128);
+        assert!(!e.status().semantic);
+        assert!(
+            !e.status().degraded,
+            "explicit FNV is intentional, not a degradation"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_backend_with_unloadable_model_resolves_to_degraded_fnv() {
+        // An unknown model name fails to load *without touching the network*, so
+        // this exercises the exact offline/load-failure fallback path
+        // deterministically: resolve must hand back a lexical FNV backend that is
+        // flagged degraded (semantic=false, degraded=true), never a silent swap
+        // and never a download in the test gate.
+        let cfg = EmbedderConfig {
+            backend: EmbedderBackend::Local,
+            model: Some("definitely-not-a-real-model".to_owned()),
+            ..EmbedderConfig::default()
+        };
+        let e = resolve_embedder(&cfg).await;
+        let s = e.status();
+        assert_eq!(
+            e.model_id(),
+            FNV_MODEL_ID,
+            "an unloadable local model must resolve to the FNV fallback"
+        );
+        assert_eq!(e.dim(), 128);
+        assert!(!s.semantic, "fallback recall is lexical");
+        assert!(
+            s.degraded,
+            "the local-model load failure must be surfaced as degraded, not silent"
+        );
     }
 
     #[tokio::test]

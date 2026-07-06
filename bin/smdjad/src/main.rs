@@ -12,6 +12,7 @@ pub mod filters;
 pub mod fragments;
 pub mod handlers;
 pub mod lean_spec;
+pub mod local_embedder;
 pub mod local_provider;
 pub mod loop_runner;
 pub mod mcp_http;
@@ -385,10 +386,17 @@ async fn main() -> anyhow::Result<()> {
                 dim = status.dim,
                 "vault recall: semantic embedder active"
             );
+        } else if status.degraded {
+            // A semantic backend was configured but could not be loaded — recall
+            // is lexical against intent, not by choice. Never silent.
+            tracing::warn!(
+                model = %status.model_id,
+                "vault recall is DEGRADED to LEXICAL (FNV keyword overlap): a local semantic model was configured but could not be fetched or loaded (offline or not yet cached). Recall stays keyword-only until the model can be downloaded to ~/.local/share/smedja/models/"
+            );
         } else {
             tracing::warn!(
                 model = %status.model_id,
-                "vault recall is LEXICAL (FNV keyword overlap), not semantic — set [embedder] backend = \"learned\" with a local /v1/embeddings endpoint in .smedja/config.toml for semantic recall"
+                "vault recall is LEXICAL (FNV keyword overlap), not semantic — set [embedder] backend = \"local\" (bundled model) or \"learned\" (local /v1/embeddings endpoint) in .smedja/config.toml for semantic recall"
             );
         }
     }

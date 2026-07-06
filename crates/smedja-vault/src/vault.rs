@@ -692,6 +692,47 @@ mod tests {
     }
 
     #[test]
+    fn mixed_fnv_and_semantic_store_returns_only_same_model_rows() {
+        // A store built with the FNV default (128-dim, `fnv-bow-128`) that is
+        // later written to by the semantic default (384-dim, `all-minilm-l6-v2`)
+        // must keep both readable: an FNV query returns only the FNV row, and a
+        // semantic query only the semantic row — the migration/identity invariant
+        // that makes the zero-downtime default swap safe.
+        let mut vault = Vault::open_in_memory().unwrap();
+
+        let mut fnv = entry("legacy-fnv", vec![1.0_f32; 128]);
+        fnv.namespace = "mem".to_string();
+        fnv.content = "shared token".to_string();
+        fnv.embedder_model_id = LEGACY_MODEL_ID.to_string(); // fnv-bow-128
+        fnv.dim = 128;
+        vault.upsert(&fnv).unwrap();
+
+        let mut sem = entry("new-semantic", vec![0.5_f32; 384]);
+        sem.namespace = "mem".to_string();
+        sem.content = "shared token".to_string();
+        sem.embedder_model_id = "all-minilm-l6-v2".to_string();
+        sem.dim = 384;
+        vault.upsert(&sem).unwrap();
+
+        // FNV query (128-dim): only the pre-existing FNV row is a candidate; the
+        // 384-dim semantic row is excluded, never compared, never errors.
+        let fnv_hits = vault
+            .search(&[1.0_f32; 128], "shared", "mem", 5, LEGACY_MODEL_ID, 128)
+            .unwrap();
+        assert_eq!(fnv_hits.len(), 1);
+        assert_eq!(fnv_hits[0].id, "legacy-fnv");
+        assert_eq!(fnv_hits[0].embedder_model_id, LEGACY_MODEL_ID);
+
+        // Semantic query (384-dim): only the new semantic row is returned.
+        let sem_hits = vault
+            .search(&[0.5_f32; 384], "shared", "mem", 5, "all-minilm-l6-v2", 384)
+            .unwrap();
+        assert_eq!(sem_hits.len(), 1);
+        assert_eq!(sem_hits[0].id, "new-semantic");
+        assert_eq!(sem_hits[0].dim, 384);
+    }
+
+    #[test]
     fn query_excludes_mismatched_dimension_without_error() {
         let mut vault = Vault::open_in_memory().unwrap();
 

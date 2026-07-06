@@ -138,6 +138,60 @@ impl Embedder for FnvEmbedder {
     }
 }
 
+/// FNV fallback for a *failed local semantic embedder* — lexical, and flagged.
+///
+/// Produced by [`resolve_embedder`](crate::embedder_config::resolve_embedder)
+/// when `backend = "local"` was selected but the bundled model could not be
+/// loaded (offline with no cached copy, a corrupt cache, or the feature compiled
+/// out). Its output is byte-identical to [`FnvEmbedder`] — it tags rows with the
+/// FNV id/dim so they still interoperate with existing FNV rows — but its
+/// [`status`](Embedder::status) reports `semantic = false, degraded = true`.
+///
+/// That degraded flag is the whole point: unlike the plain [`FnvEmbedder`]
+/// default (whose lexical output is *intended*), this backend is lexical *against
+/// the operator's configured intent*, so it must never be silently mistaken for
+/// working semantic recall.
+#[derive(Debug, Clone, Default)]
+pub struct LocalFallbackEmbedder {
+    inner: FnvEmbedder,
+}
+
+impl LocalFallbackEmbedder {
+    /// Creates the degraded FNV fallback for an unavailable local model.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: FnvEmbedder::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl Embedder for LocalFallbackEmbedder {
+    fn embed(&self, text: &str) -> Vec<f32> {
+        self.inner.embed(text)
+    }
+
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+
+    fn status(&self) -> EmbedderStatus {
+        EmbedderStatus {
+            model_id: self.inner.model_id().to_owned(),
+            dim: self.inner.dim(),
+            // Lexical recall, and *not* by design: a semantic model was asked for.
+            semantic: false,
+            degraded: true,
+            fallback_count: 0,
+        }
+    }
+}
+
 /// Learned backend — a local OpenAI-compatible `/v1/embeddings` client.
 ///
 /// Issues `POST {endpoint}/v1/embeddings` with `{ "model", "input" }` and uses
@@ -344,6 +398,36 @@ mod tests {
         assert_eq!(e.model_id(), "fnv-bow-128");
         assert_eq!(e.dim(), 128);
         assert_eq!(e.embed("x").len(), 128);
+    }
+
+    // ── local-model FNV fallback (degraded, not intentional) ──────────────────
+
+    #[test]
+    fn local_fallback_is_byte_identical_fnv_output() {
+        let e = LocalFallbackEmbedder::new();
+        for text in ["hello world", "rust async tokio", "", "Mixed CASE"] {
+            assert_eq!(e.embed(text), crate::embedder::embed(text));
+        }
+        assert_eq!(e.model_id(), FNV_MODEL_ID);
+        assert_eq!(e.dim(), 128);
+    }
+
+    #[test]
+    fn local_fallback_status_is_lexical_and_degraded() {
+        // Distinguishes an unavailable-semantic-model fallback from the intended
+        // FNV default: same lexical output, but flagged degraded so recall is
+        // never silently mistaken for working semantic recall.
+        let s = LocalFallbackEmbedder::new().status();
+        assert!(!s.semantic, "fallback recall is lexical");
+        assert!(
+            s.degraded,
+            "unlike the intentional FNV default, this fallback is a degradation"
+        );
+        assert_eq!(
+            s.model_id, FNV_MODEL_ID,
+            "rows still tagged FNV to interoperate"
+        );
+        assert_eq!(s.dim, 128);
     }
 
     // ── learned backend ───────────────────────────────────────────────────────

@@ -31,6 +31,34 @@ pub(crate) fn is_diff_marker(text: &str) -> bool {
     false
 }
 
+/// True for a transcript line that is *chrome* — external-runner tool echo,
+/// execute banner, or clipboard notice — and must recede to dim so the
+/// assistant's answer body reads brighter than the scaffolding around it.
+///
+/// External CLI runners (codex, claude) print these flat, full-weight lines
+/// around their answer; without this they render at the same weight as the
+/// content. Native runners emit tool *cards* (already dim, via
+/// `push_styled_line`), so this only ever fires on passthrough text lines.
+///
+/// - `↳ ok · …` / `↳ error · …` tool-result echo and the `↳ N↑ M↓ · trace: …`
+///   turn footer.
+/// - `⏵ execute · <cmd> · ✓ 0ms` execute banner.
+/// - `✓ 63 lines copied to clipboard` (and `✗ …`) clipboard notices.
+pub(crate) fn is_dim_chrome(text: &str) -> bool {
+    let t = text.trim_start();
+    if t.starts_with('\u{21b3}') {
+        return true; // ↳ result echo / turn footer
+    }
+    if t.starts_with('\u{23f5}') {
+        return true; // ⏵ execute banner
+    }
+    if (t.starts_with('\u{2713}') || t.starts_with('\u{2717}')) && t.contains("copied to clipboard")
+    {
+        return true; // ✓/✗ clipboard notice
+    }
+    false
+}
+
 /// Parses inline markdown in a prose line — `` `code` ``, `**bold**`, `*italic*`
 /// — into styled spans, returning `None` when there is no markup (so the common
 /// path stays a cheap plain line). Conservative to avoid false positives: emphasis
@@ -51,6 +79,39 @@ pub(crate) fn inline_markdown_spans(text: &str) -> Option<Line<'static>> {
 
     while i < n {
         let c = chars[i];
+        // [label](url) link → label reads as an accent-underlined anchor and the
+        // url recedes to dim, so a link gains hierarchy without shouting the
+        // (often long) target.
+        if c == '[' {
+            if let Some(close_br) = (i + 1..n).find(|&j| chars[j] == ']') {
+                let has_paren = close_br > i + 1 && close_br + 1 < n && chars[close_br + 1] == '(';
+                let close_par = if has_paren {
+                    (close_br + 2..n).find(|&j| chars[j] == ')')
+                } else {
+                    None
+                };
+                if let Some(close_par) = close_par {
+                    if !buf.is_empty() {
+                        spans.push(Span::raw(std::mem::take(&mut buf)));
+                    }
+                    let label: String = chars[i + 1..close_br].iter().collect();
+                    let url: String = chars[close_br + 2..close_par].iter().collect();
+                    spans.push(Span::styled(
+                        label,
+                        Style::default()
+                            .fg(p.accent)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ));
+                    spans.push(Span::styled(
+                        format!(" ({url})"),
+                        Style::default().fg(p.text_dim).add_modifier(Modifier::DIM),
+                    ));
+                    i = close_par + 1;
+                    found = true;
+                    continue;
+                }
+            }
+        }
         // `inline code`
         if c == '`' {
             if let Some(close) = (i + 1..n).find(|&j| chars[j] == '`') {
@@ -196,8 +257,11 @@ pub(crate) fn block_markdown_spans(text: &str) -> Option<Line<'static>> {
         return Some(Line::from(spans));
     }
 
-    // Unordered list item: '- ', '* ', or '+ ' after optional indent.
-    for marker in ['-', '*', '+'] {
+    // Unordered list item: '- ', '* ', or '+ ' after optional indent — plus the
+    // already-rendered bullet glyphs ('•', '◦', '‣') an external CLI (codex,
+    // claude) prints for its own lists, so its bullets gain the same aligned
+    // treatment as raw-markdown ones instead of reading as flat prose.
+    for marker in ['-', '*', '+', '\u{2022}', '\u{25e6}', '\u{2023}'] {
         let pre = format!("{marker} ");
         if let Some(rest) = trimmed.strip_prefix(&pre) {
             let mut spans = vec![

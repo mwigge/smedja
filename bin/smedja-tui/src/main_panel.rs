@@ -14,8 +14,8 @@ mod highlight;
 #[cfg(test)]
 use blocks::table_cells;
 use blocks::{
-    block_markdown_spans, diff_line_spans, inline_markdown_spans, is_diff_marker, is_table_row,
-    render_math, table_row_spans,
+    block_markdown_spans, diff_line_spans, inline_markdown_spans, is_diff_marker, is_dim_chrome,
+    is_table_row, render_math, table_row_spans,
 };
 pub(crate) use highlight::highlight_code;
 #[cfg(test)]
@@ -200,9 +200,12 @@ impl MainPanel {
     ///
     /// Auto-scrolls to follow new content when the view is already at the bottom.
     pub fn push_line(&mut self, text: String) {
-        // Tool-result meta lines ("↳ ok · …") render dim and on their own line,
-        // never as code/diff — short-circuit before fence/prefix classification.
-        if !self.in_code_block && text.starts_with('↳') {
+        // External-runner chrome — tool-result echoes ("↳ ok · …"), execute
+        // banners ("⏵ execute · … · ✓"), and clipboard notices ("✓ N lines
+        // copied…") — renders dim and on its own line, never as code/diff, so
+        // the answer body reads brighter than the scaffolding. Short-circuit
+        // before fence/prefix classification.
+        if !self.in_code_block && is_dim_chrome(&text) {
             let spans = Line::from(Span::styled(
                 text.clone(),
                 Style::default().add_modifier(Modifier::DIM),
@@ -443,6 +446,14 @@ impl MainPanel {
             }
         };
 
+        // Clamp the anchor into `[display_start, last_line]` so it is always
+        // locatable while wrapping. An out-of-range anchor (from an over-scroll or
+        // a shrink) would otherwise leave `scroll_visual_start` at its 0 default
+        // and silently snap the view to the top instead of the nearest valid
+        // window.
+        let last_line = self.lines.len().saturating_sub(1);
+        self.scroll = self.scroll.clamp(self.display_start, last_line);
+
         // Wrap every visible logical line into visual rows, tracking the visual
         // offset at which the `scroll` anchor line begins (used when not
         // following the bottom) and the logical line behind each visual row (for
@@ -475,6 +486,21 @@ impl MainPanel {
         };
         let end = (start + inner_h).min(total);
         let window: Vec<Line<'static>> = visual.get(start..end).unwrap_or(&[]).to_vec();
+
+        // Reconcile the `scroll` anchor with what is actually drawn. `scroll` is a
+        // logical-line index, but its visual position depends on wrapping/height —
+        // only known here. Syncing it to the top logical line of the drawn window
+        // keeps a following view's anchor at the true top (so the first
+        // `scroll_up` after detaching moves immediately instead of stalling for a
+        // screenful), and self-corrects an over-scrolled anchor back to the last
+        // shown line. Reaching the bottom (`start == max_off`) re-arms follow so
+        // new content tracks again.
+        if let Some(&top_line) = visual_logical.get(start) {
+            self.scroll = top_line;
+        }
+        if start >= max_off {
+            self.follow = true;
+        }
 
         // Cache the inner rect and the per-visual-row → logical-line map so a
         // later mouse click can resolve which message line it landed on.

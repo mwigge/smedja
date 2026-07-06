@@ -120,6 +120,41 @@ pub struct AgentBlockView {
     pub content_lines: Vec<String>,
     /// Whether an approval prompt is visible.
     pub approval_pending: bool,
+    /// Hanging-indent left margin, in cell columns.
+    ///
+    /// The author label (`[ model ]`) occupies this margin on the block's first
+    /// row; every body line is shifted right by this many columns so wrapped
+    /// body lines align under the content rather than under the gutter glyph.
+    /// This is applied purely as render geometry — the cell/content strings are
+    /// never modified, so selection and copy yield the raw unindented text.
+    ///
+    /// Derive it with [`hanging_margin_cols`] from the author-label width.
+    pub left_margin_cols: u16,
+}
+
+/// The author-label header rendered for an agent block, e.g. `[ claude ]`.
+///
+/// Single source of truth for the label so the rendered glyphs and the
+/// hanging-indent margin derivation ([`hanging_margin_cols`]) stay in sync.
+#[must_use]
+pub fn agent_header(model: &str) -> String {
+    format!("[ {model} ]")
+}
+
+/// Left-margin width, in cell columns, for an agent block's hanging indent.
+///
+/// `label_cols` is the display width (in columns) of the author label; body
+/// lines hang one column past it. The result is capped at `max_cols` so a very
+/// long label can never squeeze the usable body width to nothing — callers
+/// should pass roughly half the grid width. `max_cols` is floored at 1.
+///
+/// This is the pure geometry helper: it inserts no spaces into any string, it
+/// only yields the column offset the renderer shifts glyph vertices by.
+#[must_use]
+pub fn hanging_margin_cols(label_cols: usize, max_cols: usize) -> u16 {
+    let want = label_cols.saturating_add(1);
+    let capped = want.min(max_cols.max(1));
+    u16::try_from(capped).unwrap_or(u16::MAX)
 }
 
 // ── Background configuration ───────────────────────────────────────────────
@@ -1447,6 +1482,49 @@ mod tests {
             selected: false,
         };
         assert_eq!(d.end_row, 5);
+    }
+
+    #[test]
+    fn agent_header_wraps_model_name() {
+        assert_eq!(agent_header("claude"), "[ claude ]");
+        assert_eq!(agent_header(""), "[  ]");
+    }
+
+    #[test]
+    fn hanging_margin_is_label_width_plus_one_gap() {
+        // "[ claude ]" is 10 columns; body hangs one column past it.
+        let label = agent_header("claude");
+        assert_eq!(
+            hanging_margin_cols(label.chars().count(), 100),
+            11,
+            "margin = label width + 1 gap column"
+        );
+    }
+
+    #[test]
+    fn hanging_margin_is_capped_to_preserve_body_width() {
+        // A very long label must not push the body past the cap (half the grid).
+        assert_eq!(hanging_margin_cols(500, 40), 40);
+        // The cap floors at 1 so a degenerate max never yields 0.
+        assert_eq!(hanging_margin_cols(500, 0), 1);
+    }
+
+    #[test]
+    fn hanging_margin_uncapped_short_label() {
+        // Below the cap the label width + gap is returned verbatim.
+        assert_eq!(hanging_margin_cols(3, 40), 4);
+    }
+
+    #[test]
+    fn agent_block_view_carries_left_margin() {
+        let v = AgentBlockView {
+            start_row: 2,
+            model: "gpt".into(),
+            content_lines: vec!["hi".into()],
+            approval_pending: false,
+            left_margin_cols: 6,
+        };
+        assert_eq!(v.left_margin_cols, 6);
     }
 
     #[test]

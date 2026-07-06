@@ -174,7 +174,10 @@ impl Renderer {
             let pw = self.size.width as f32;
             for block in &self.agent_blocks {
                 let row_offset = f32::from(block.start_row);
-                let row_count = (block.content_lines.len() + 1) as f32; // +1 for header
+                // The author label shares the first body row (hanging indent), so
+                // the panel spans one row per body line, or a single row when the
+                // block has no body yet (label only).
+                let row_count = block.content_lines.len().max(1) as f32;
                 let py0 = row_offset * ch;
                 let py1 = py0 + row_count * ch;
                 let (x0, y0, x1, y1) = self.px_to_ndc(0.0, py0, pw, py1);
@@ -581,82 +584,92 @@ impl Renderer {
             let agent_header_color: [f32; 4] = [0.4, 0.8, 1.0, 1.0]; // light-blue header
             let agent_text_color: [f32; 4] = [0.9, 0.9, 0.9, 1.0]; // near-white body
 
-            // Helper closure: emit glyph quads for one line of text.
-            let emit_line =
-                |verts: &mut Vec<GlyphVertex>, text: &str, line_row: u16, color: [f32; 4]| {
-                    let mut col = 0u16;
-                    for glyph_ch in text.chars() {
-                        if glyph_ch == ' ' {
-                            col += 1;
-                            continue;
-                        }
-                        let Some(&entry) =
-                            self.atlas
-                                .glyphs
-                                .get(&(glyph_ch, false, false, eff_font_key))
-                        else {
-                            col += 1;
-                            continue;
-                        };
-                        let u0 = entry.x as f32 / atlas_size_f;
-                        let v0 = entry.y as f32 / atlas_size_f;
-                        let u1 = (entry.x + entry.w) as f32 / atlas_size_f;
-                        let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
-                        let baseline_y = f32::from(line_row) * ch + ch * (2.0 / 3.0);
-                        let glyph_top = baseline_y - entry.bearing_y as f32;
-                        let glyph_left = f32::from(col) * cw + (cw - entry.w as f32) / 2.0;
-                        let (x0, y0, x1, y1) = self.px_to_ndc(
-                            glyph_left,
-                            glyph_top,
-                            glyph_left + entry.w as f32,
-                            glyph_top + entry.h as f32,
-                        );
-                        verts.extend_from_slice(&[
-                            GlyphVertex {
-                                position: [x0, y0],
-                                tex_coords: [u0, v0],
-                                color,
-                            },
-                            GlyphVertex {
-                                position: [x1, y0],
-                                tex_coords: [u1, v0],
-                                color,
-                            },
-                            GlyphVertex {
-                                position: [x0, y1],
-                                tex_coords: [u0, v1],
-                                color,
-                            },
-                            GlyphVertex {
-                                position: [x1, y0],
-                                tex_coords: [u1, v0],
-                                color,
-                            },
-                            GlyphVertex {
-                                position: [x1, y1],
-                                tex_coords: [u1, v1],
-                                color,
-                            },
-                            GlyphVertex {
-                                position: [x0, y1],
-                                tex_coords: [u0, v1],
-                                color,
-                            },
-                        ]);
+            // Helper closure: emit glyph quads for one line of text, starting at
+            // `start_col`. The starting column is a pure render-geometry offset —
+            // the text string itself is never padded, so selection/copy of the
+            // underlying content stays unindented.
+            let emit_line = |verts: &mut Vec<GlyphVertex>,
+                             text: &str,
+                             line_row: u16,
+                             start_col: u16,
+                             color: [f32; 4]| {
+                let mut col = start_col;
+                for glyph_ch in text.chars() {
+                    if glyph_ch == ' ' {
                         col += 1;
+                        continue;
                     }
-                };
+                    let Some(&entry) =
+                        self.atlas
+                            .glyphs
+                            .get(&(glyph_ch, false, false, eff_font_key))
+                    else {
+                        col += 1;
+                        continue;
+                    };
+                    let u0 = entry.x as f32 / atlas_size_f;
+                    let v0 = entry.y as f32 / atlas_size_f;
+                    let u1 = (entry.x + entry.w) as f32 / atlas_size_f;
+                    let v1 = (entry.y + entry.h) as f32 / atlas_size_f;
+                    let baseline_y = f32::from(line_row) * ch + ch * (2.0 / 3.0);
+                    let glyph_top = baseline_y - entry.bearing_y as f32;
+                    let glyph_left = f32::from(col) * cw + (cw - entry.w as f32) / 2.0;
+                    let (x0, y0, x1, y1) = self.px_to_ndc(
+                        glyph_left,
+                        glyph_top,
+                        glyph_left + entry.w as f32,
+                        glyph_top + entry.h as f32,
+                    );
+                    verts.extend_from_slice(&[
+                        GlyphVertex {
+                            position: [x0, y0],
+                            tex_coords: [u0, v0],
+                            color,
+                        },
+                        GlyphVertex {
+                            position: [x1, y0],
+                            tex_coords: [u1, v0],
+                            color,
+                        },
+                        GlyphVertex {
+                            position: [x0, y1],
+                            tex_coords: [u0, v1],
+                            color,
+                        },
+                        GlyphVertex {
+                            position: [x1, y0],
+                            tex_coords: [u1, v0],
+                            color,
+                        },
+                        GlyphVertex {
+                            position: [x1, y1],
+                            tex_coords: [u1, v1],
+                            color,
+                        },
+                        GlyphVertex {
+                            position: [x0, y1],
+                            tex_coords: [u0, v1],
+                            color,
+                        },
+                    ]);
+                    col += 1;
+                }
+            };
 
             for block in self.agent_blocks.clone() {
-                let mut line_row = block.start_row;
-                // Header line: model name.
-                let header = format!("[ {} ]", block.model);
-                emit_line(&mut verts, &header, line_row, agent_header_color);
-                line_row += 1;
-                // Content lines.
-                for line_text in &block.content_lines {
-                    emit_line(&mut verts, line_text, line_row, agent_text_color);
-                    line_row += 1;
+                let start_row = block.start_row;
+                let margin = block.left_margin_cols;
+                // Author label: rendered in the left margin on the block's first
+                // row. It stays put at column 0 while the body hangs to its right.
+                let header = crate::agent_header(&block.model);
+                emit_line(&mut verts, &header, start_row, 0, agent_header_color);
+                // Body lines are shifted right by the hanging-indent margin so the
+                // first body line sits beside the label and wrapped continuations
+                // align under the content, not under the gutter glyph. The shift is
+                // geometry only — content strings carry no indent.
+                for (i, line_text) in block.content_lines.iter().enumerate() {
+                    let row = start_row.saturating_add(u16::try_from(i).unwrap_or(u16::MAX));
+                    emit_line(&mut verts, line_text, row, margin, agent_text_color);
                 }
             }
         }

@@ -71,8 +71,21 @@ assets = [
 name = "smdjad"
 path = "src/main.rs"
 
+[features]
+# The bundled local semantic embedder (fastembed / ONNX Runtime + bge/MiniLM).
+# ON by default so `smedja`'s out-of-the-box vault recall is genuinely semantic.
+# Disable (`--no-default-features`) for a lean build with no ONNX toolchain: the
+# `local` backend then resolves to the lexical FNV fallback (surfaced as degraded)
+# and the daemon still compiles and runs.
+default = ["local-embedder"]
+local-embedder = ["dep:fastembed"]
+
 [dependencies]
 anyhow             = { workspace = true }
+# Local semantic embedder: bundles ONNX Runtime + tokenizers and handles
+# download-on-first-use of bge-small / all-MiniLM weights into a cache dir.
+# rustls (not native-tls) so no system OpenSSL is required to build.
+fastembed          = { version = "5", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
 async-trait        = { workspace = true }
 axum               = { workspace = true }
 base64             = { workspace = true }

@@ -487,26 +487,18 @@ pub(crate) async fn takeover(state: HandlerState, params: Value) -> Result<Value
         let model_id = embedder.model_id().to_owned();
         let dim = embedder.dim();
         tokio::task::spawn_blocking(move || {
-            let entry = VaultEntry {
-                id: hid.clone(),
-                embedding,
-                payload: serde_json::json!({
-                    "from_session_id": from_sid,
-                    "to_session_id": to_sid,
-                    "runner": runner_str,
-                }),
-                namespace: "handoff".to_owned(),
-                content: messages,
-                source_file: None,
-                added_by: Some("session.takeover".to_owned()),
-                chunk_index: None,
-                parent_id: None,
-                created_at: 0.0,
-                embedder_model_id: model_id,
-                dim,
-            };
             let mut guard = vt.blocking_lock();
-            let _ = guard.upsert(&entry);
+            seed_handoff_context(
+                &mut guard,
+                &hid,
+                &from_sid,
+                &to_sid,
+                &runner_str,
+                &messages,
+                embedding,
+                &model_id,
+                dim,
+            );
         });
     }
 
@@ -517,12 +509,147 @@ pub(crate) async fn takeover(state: HandlerState, params: Value) -> Result<Value
         "has_checkpoint": has_checkpoint,
         "context_namespace": "handoff",
         "context_id": handoff_context_id,
+        // The live shared block the receiver reads AND appends to (keyed by the
+        // handoff id); the `handoff` namespace snapshot above remains as fallback.
+        "shared_block_id": handoff_context_id,
     }))
+}
+
+/// Seeds the handoff context for a session takeover.
+///
+/// Writes BOTH surfaces, additively:
+///
+/// * A **live shared block** (Letta-style, keyed by `handoff_id`) via
+///   [`Vault::block_rewrite`](smedja_vault::Vault::block_rewrite): the receiving
+///   session/runner reads the seed AND can [`block_append`] its own progress to
+///   the same block *during* the handoff, so coordination is not frozen at
+///   snapshot time.
+/// * The existing **`handoff`-namespace snapshot** via
+///   [`Vault::upsert`](smedja_vault::Vault::upsert): the pull-based fallback that
+///   `smedja_vault_search` (namespace `"handoff"`) already retrieves.
+///
+/// [`block_append`]: smedja_vault::Vault::block_append
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn seed_handoff_context(
+    vault: &mut smedja_vault::Vault,
+    handoff_id: &str,
+    from_session_id: &str,
+    to_session_id: &str,
+    runner: &str,
+    messages: &str,
+    embedding: Vec<f32>,
+    model_id: &str,
+    dim: usize,
+) {
+    // Live shared block: the seed is the canonical segment; the receiver appends
+    // its own segments alongside it.
+    if let Err(e) = vault.block_rewrite(
+        handoff_id,
+        "session.takeover",
+        messages,
+        embedding.clone(),
+        model_id,
+        dim,
+    ) {
+        tracing::warn!(error = %e, "handoff: failed to seed shared block");
+    }
+
+    // Snapshot fallback in the `handoff` namespace (pull-based retrieval).
+    let entry = VaultEntry {
+        id: handoff_id.to_owned(),
+        embedding,
+        payload: serde_json::json!({
+            "from_session_id": from_session_id,
+            "to_session_id": to_session_id,
+            "runner": runner,
+        }),
+        namespace: "handoff".to_owned(),
+        content: messages.to_owned(),
+        source_file: None,
+        added_by: Some("session.takeover".to_owned()),
+        chunk_index: None,
+        parent_id: None,
+        created_at: 0.0,
+        embedder_model_id: model_id.to_owned(),
+        dim,
+    };
+    if let Err(e) = vault.upsert(&entry) {
+        tracing::warn!(error = %e, "handoff: failed to write snapshot fallback");
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{graph_is_stale, index_marker_path, marker_is_stale};
+    use super::{graph_is_stale, index_marker_path, marker_is_stale, seed_handoff_context};
+
+    fn emb() -> Vec<f32> {
+        vec![0.1_f32, 0.2, 0.3]
+    }
+
+    #[test]
+    fn seed_handoff_context_seeds_block_receiver_can_read_and_append() {
+        let mut vault = smedja_vault::Vault::open_in_memory().unwrap();
+        let handoff_id = "handoff:sess-A:sess-B";
+        seed_handoff_context(
+            &mut vault,
+            handoff_id,
+            "sess-A",
+            "sess-B",
+            "codex",
+            "prior conversation history",
+            emb(),
+            "m",
+            3,
+        );
+
+        // The receiver reads the seeded block.
+        let segs = vault.block_read(handoff_id).unwrap();
+        assert_eq!(segs.len(), 1, "the seed canonical segment must be present");
+        assert_eq!(segs[0].content, "prior conversation history");
+        assert_eq!(
+            segs[0].kind,
+            smedja_vault::block::BlockSegmentKind::Canonical
+        );
+
+        // The receiver appends its own progress to the same live block.
+        vault
+            .block_append(handoff_id, "codex", "took over; continuing", emb(), "m", 3)
+            .unwrap();
+        let segs = vault.block_read(handoff_id).unwrap();
+        assert_eq!(segs.len(), 2, "the receiver's append must be visible");
+        assert!(
+            segs.iter().any(|s| s.content == "took over; continuing"),
+            "the appended segment must be readable"
+        );
+    }
+
+    #[test]
+    fn seed_handoff_context_keeps_snapshot_fallback_intact() {
+        let mut vault = smedja_vault::Vault::open_in_memory().unwrap();
+        let handoff_id = "handoff:sess-A:sess-B";
+        seed_handoff_context(
+            &mut vault,
+            handoff_id,
+            "sess-A",
+            "sess-B",
+            "codex",
+            "prior conversation history",
+            emb(),
+            "m",
+            3,
+        );
+
+        // The `handoff`-namespace snapshot remains as the pull-based fallback.
+        let snapshot = vault.list_namespace("handoff").unwrap();
+        let entry = snapshot
+            .iter()
+            .find(|e| e.id == handoff_id)
+            .expect("handoff snapshot must exist as fallback");
+        assert_eq!(entry.content, "prior conversation history");
+        assert_eq!(entry.payload["from_session_id"], "sess-A");
+        assert_eq!(entry.payload["to_session_id"], "sess-B");
+        assert_eq!(entry.payload["runner"], "codex");
+    }
 
     #[test]
     fn marker_absent_is_stale_no_workspace_toml_required() {
