@@ -51,6 +51,55 @@ impl Default for LoopBudget {
     }
 }
 
+/// Publishes [`smedja_bellows::TurnEvent::AuditProgress`] heartbeats from the
+/// audit loop so a streaming client (the TUI `/review` path) can render live
+/// progress. Passing `None` to [`run_audit_loop`] disables progress — the
+/// blocking CLI path and the unit tests do not need it.
+pub(crate) struct AuditProgressSink<'a> {
+    /// The dispatcher progress events are published on.
+    pub(crate) dispatcher: &'a Dispatcher,
+    /// Audit session id; routes each event to the subscribing stream client.
+    pub(crate) turn_id: &'a str,
+}
+
+impl AuditProgressSink<'_> {
+    /// Publishes one progress heartbeat.
+    fn emit(&self, iteration: u32, total: u32, activity: impl Into<String>, findings_so_far: u32) {
+        self.dispatcher
+            .publish(smedja_bellows::TurnEvent::AuditProgress {
+                iteration,
+                total,
+                activity: activity.into(),
+                findings_so_far,
+                turn_id: Some(self.turn_id.to_owned()),
+                correlation: CorrelationCtx::default(),
+            });
+    }
+}
+
+/// Describes the activity a tool call represents for a progress heartbeat,
+/// preferring the most identifying argument (`path` → `query` → `symbol`).
+///
+/// `input` is the raw tool-input JSON string as produced by `parse_tool_call`;
+/// a malformed or argument-less input degrades to just the tool name.
+fn describe_activity(tool: &str, input: &str) -> String {
+    let target = serde_json::from_str::<Value>(input)
+        .ok()
+        .and_then(|v| {
+            v.get("path")
+                .or_else(|| v.get("query"))
+                .or_else(|| v.get("symbol"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    if target.is_empty() {
+        tool.to_owned()
+    } else {
+        format!("{tool} {target}")
+    }
+}
+
 /// The system prompt steering the read-only auditor.
 fn audit_system_prompt() -> String {
     format!(
@@ -89,6 +138,7 @@ pub(crate) async fn run_audit_loop<R: ReviewTurn>(
     vault: &Arc<Mutex<Vault>>,
     embedder: &Arc<dyn crate::embedder_port::Embedder>,
     budget: &LoopBudget,
+    progress: Option<&AuditProgressSink<'_>>,
 ) -> Result<Vec<AuditFinding>, RpcError> {
     debug_assert_eq!(
         session.mode.as_deref(),
@@ -102,10 +152,27 @@ pub(crate) async fn run_audit_loop<R: ReviewTurn>(
     ];
     let mut spent_tokens = 0u64;
     let mut findings = Vec::new();
+    let total = budget.max_iterations;
 
-    for _iteration in 0..budget.max_iterations {
+    // Announce the run before the first (slow) model turn so the client shows a
+    // live status immediately instead of a frozen line.
+    if let Some(p) = progress {
+        p.emit(0, total, "examining scope", 0);
+    }
+
+    for iteration in 0..budget.max_iterations {
         if spent_tokens >= budget.token_budget {
             break;
+        }
+        // 1-based iteration number for display (`N/M`).
+        let n = iteration.saturating_add(1);
+        if let Some(p) = progress {
+            p.emit(
+                n,
+                total,
+                "analyzing",
+                u32::try_from(findings.len()).unwrap_or(u32::MAX),
+            );
         }
         let output = runner.run_turn(&transcript).await?;
         spent_tokens = spent_tokens.saturating_add(output.input_tokens);
@@ -115,6 +182,14 @@ pub(crate) async fn run_audit_loop<R: ReviewTurn>(
         // Any parseable findings array terminates the loop.
         let parsed = parse_findings(&response);
         if !parsed.is_empty() {
+            if let Some(p) = progress {
+                p.emit(
+                    n,
+                    total,
+                    "compiling findings",
+                    u32::try_from(parsed.len()).unwrap_or(u32::MAX),
+                );
+            }
             findings = parsed;
             break;
         }
@@ -125,6 +200,16 @@ pub(crate) async fn run_audit_loop<R: ReviewTurn>(
             // No tool call and no findings: nothing more to explore.
             break;
         };
+
+        // Report the specific file/query the auditor is examining this turn.
+        if let Some(p) = progress {
+            p.emit(
+                n,
+                total,
+                describe_activity(&tool_name, &tool_input),
+                u32::try_from(findings.len()).unwrap_or(u32::MAX),
+            );
+        }
 
         // Read-only allowlist: reject anything outside AUDIT_TOOLS without
         // executing it, and feed the rejection back as an observation. A write

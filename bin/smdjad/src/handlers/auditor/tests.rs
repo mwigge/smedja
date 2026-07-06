@@ -394,6 +394,7 @@ async fn loop_rejects_non_allowlisted_tool_as_error_observation() {
         &vault(),
         &embedder(),
         &LoopBudget::default(),
+        None,
     )
     .await
     .unwrap();
@@ -429,6 +430,7 @@ async fn loop_dispatches_allowlisted_tool() {
         &vault(),
         &embedder(),
         &LoopBudget::default(),
+        None,
     )
     .await
     .unwrap();
@@ -463,6 +465,7 @@ async fn loop_halts_at_max_iterations() {
         &vault(),
         &embedder(),
         &budget,
+        None,
     )
     .await
     .unwrap();
@@ -565,6 +568,7 @@ async fn full_pipeline_loop_persist_render_produces_markdown_report() {
         &vault(),
         &embedder(),
         &LoopBudget::default(),
+        None,
     )
     .await
     .unwrap();
@@ -581,6 +585,155 @@ async fn full_pipeline_loop_persist_render_produces_markdown_report() {
     assert!(report.contains("Critical: 1"));
     assert!(report.contains("## Critical"));
     assert!(report.contains("`src/db.rs:7` — **sql-injection**"));
+}
+
+// ── streaming progress + report ────────────────────────────────────────────
+
+#[tokio::test]
+async fn loop_emits_progress_heartbeats_with_activity_and_route() {
+    use smedja_bellows::TurnEvent;
+
+    let dispatcher = Arc::new(smedja_bellows::Dispatcher::new(64));
+    let mut rx = dispatcher.subscribe();
+    // First turn explores a file; second surfaces findings.
+    let runner = ScriptedRunner::new(vec![
+        r#"{"tool":"read_file","input":{"path":"src/a.rs"}}"#,
+        r#"[{"severity":"low","file":"src/a.rs","rule":"r","rationale":"x"}]"#,
+    ]);
+    let session = review_session();
+    let ws = tempfile::tempdir().unwrap();
+    let sink = AuditProgressSink {
+        dispatcher: &dispatcher,
+        turn_id: "audit-1",
+    };
+
+    let findings = run_audit_loop(
+        &runner,
+        "seed",
+        ws.path(),
+        &session,
+        &ingot(),
+        &vault(),
+        &embedder(),
+        &LoopBudget::default(),
+        Some(&sink),
+    )
+    .await
+    .unwrap();
+    assert_eq!(findings.len(), 1);
+
+    let mut progresses = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let TurnEvent::AuditProgress {
+            iteration,
+            total,
+            activity,
+            findings_so_far,
+            turn_id,
+            ..
+        } = ev
+        {
+            progresses.push((iteration, total, activity, findings_so_far, turn_id));
+        }
+    }
+
+    assert!(
+        !progresses.is_empty(),
+        "the loop must emit progress heartbeats"
+    );
+    assert!(
+        progresses.iter().all(|p| p.4.as_deref() == Some("audit-1")),
+        "every heartbeat must carry the audit task id for routing"
+    );
+    assert!(
+        progresses.iter().all(|p| p.1 == DEFAULT_MAX_ITERATIONS),
+        "total must be the iteration budget"
+    );
+    assert!(
+        progresses
+            .iter()
+            .any(|p| p.2.contains("read_file src/a.rs")),
+        "an activity must name the file being examined; got: {progresses:?}"
+    );
+    assert!(
+        progresses
+            .iter()
+            .any(|p| p.2.contains("compiling findings")),
+        "the terminal turn must report finding compilation; got: {progresses:?}"
+    );
+}
+
+#[tokio::test]
+async fn publish_audit_report_emits_terminal_report_with_counts() {
+    use smedja_bellows::TurnEvent;
+
+    let dispatcher = Arc::new(smedja_bellows::Dispatcher::new(64));
+    let mut rx = dispatcher.subscribe();
+    let ig = ingot();
+    let ws = tempfile::tempdir().unwrap();
+
+    publish_audit_report(
+        &dispatcher,
+        &ig,
+        "audit-2",
+        ws.path(),
+        &None,
+        Ok(sample_findings()),
+    )
+    .await;
+
+    let ev = rx.try_recv().expect("a terminal event must be published");
+    if let TurnEvent::AuditReport {
+        report,
+        counts,
+        report_path,
+        turn_id,
+        ..
+    } = ev
+    {
+        assert!(report.contains("## Summary"), "rendered report body");
+        assert_eq!(counts["critical"], 1);
+        assert_eq!(counts["low"], 1);
+        assert!(report_path.is_none(), "no path requested → inline report");
+        assert_eq!(turn_id.as_deref(), Some("audit-2"));
+    } else {
+        panic!("expected AuditReport, got {ev:?}");
+    }
+
+    // Findings must also have been persisted under the audit task id.
+    let events = ig.list_audit_events("audit-2").await.unwrap();
+    assert!(events.iter().any(|e| e.action_type == "audit_finding"));
+}
+
+#[tokio::test]
+async fn publish_audit_report_surfaces_loop_error_as_failed() {
+    use smedja_bellows::TurnEvent;
+
+    let dispatcher = Arc::new(smedja_bellows::Dispatcher::new(64));
+    let mut rx = dispatcher.subscribe();
+    let ig = ingot();
+    let ws = tempfile::tempdir().unwrap();
+
+    publish_audit_report(
+        &dispatcher,
+        &ig,
+        "audit-3",
+        ws.path(),
+        &None,
+        Err(RpcError::new(codes::INTERNAL_ERROR, "no provider")),
+    )
+    .await;
+
+    let ev = rx.try_recv().expect("an event must be published on error");
+    match ev {
+        TurnEvent::Failed {
+            reason, turn_id, ..
+        } => {
+            assert!(reason.contains("no provider"), "reason forwarded: {reason}");
+            assert_eq!(turn_id, "audit-3");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
 }
 
 #[test]

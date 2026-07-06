@@ -286,6 +286,10 @@ pub(crate) struct AppState {
     pub(crate) value_snapshot: value_panel::ValueSnapshot,
     /// Whether a Tier-2 LLM quality review is in flight.
     pub(crate) quality_review_in_progress: bool,
+    /// Main-panel line index of the live `/review` audit progress line, if any.
+    /// Set when the first `AuditProgress` heartbeat arrives so subsequent
+    /// heartbeats replace the line in place; cleared on the terminal report.
+    pub(crate) audit_progress_line: Option<usize>,
     /// When Ctrl-Q was first pressed; used to detect hold ≥ 500ms.
     pub(crate) ctrl_q_pressed_at: Option<std::time::Instant>,
     /// Last 50 turn round-trip latencies in ms, used for p95/p99 computation.

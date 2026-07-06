@@ -109,6 +109,58 @@ pub(crate) async fn run(state: HandlerState, params: Value) -> Result<Value, Rpc
         model_override: None,
     };
 
+    // Streaming path (the TUI `/review`): the read-only loop runs for minutes, so
+    // block-and-return would freeze the UI. Instead spawn the loop, return
+    // immediately with the audit task id, and publish `AuditProgress` heartbeats
+    // plus a terminal `AuditReport` on the dispatcher — the same spawn-and-stream
+    // shape `quality.review` uses. `smj audit run` (the CLI) omits `stream`, so it
+    // keeps the blocking path below and its long-timeout contract.
+    let stream = params
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if stream {
+        let report_path = params
+            .get("report")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let task_id = session_id.to_string();
+        let ingot = state.ingot.clone();
+        let vault = Arc::clone(&state.vault);
+        let embedder = Arc::clone(&state.embedder);
+        let dispatcher = Arc::clone(&state.dispatcher);
+        let spawn_task_id = task_id.clone();
+        tokio::spawn(async move {
+            let sink = AuditProgressSink {
+                dispatcher: &dispatcher,
+                turn_id: &spawn_task_id,
+            };
+            let outcome = run_audit_loop(
+                &runner,
+                &seed,
+                &workspace,
+                &session,
+                &ingot,
+                &vault,
+                &embedder,
+                &budget,
+                Some(&sink),
+            )
+            .await;
+            publish_audit_report(
+                &dispatcher,
+                &ingot,
+                &spawn_task_id,
+                &workspace,
+                &report_path,
+                outcome,
+            )
+            .await;
+        });
+        return Ok(json!({ "status": "review_started", "task_id": task_id }));
+    }
+
     let findings = run_audit_loop(
         &runner,
         &seed,
@@ -118,12 +170,74 @@ pub(crate) async fn run(state: HandlerState, params: Value) -> Result<Value, Rpc
         &state.vault,
         &state.embedder,
         &budget,
+        None,
     )
     .await?;
 
     persist_findings(&state.ingot, &session_id.to_string(), &findings).await?;
 
     respond(&params, &findings, &workspace).await
+}
+
+/// Persists findings, renders the report (writing it to `report_path` when set),
+/// and publishes the terminal [`TurnEvent::AuditReport`] that ends the stream.
+///
+/// A loop error is surfaced as a `Failed` event carrying the reason, so the TUI
+/// renders the failure instead of hanging on a stream that never terminates.
+async fn publish_audit_report(
+    dispatcher: &Dispatcher,
+    ingot: &IngotHandle,
+    task_id: &str,
+    workspace: &Path,
+    report_path: &Option<String>,
+    outcome: Result<Vec<AuditFinding>, RpcError>,
+) {
+    use smedja_bellows::TurnEvent;
+
+    let findings = match outcome {
+        Ok(f) => f,
+        Err(e) => {
+            dispatcher.publish(TurnEvent::Failed {
+                session_id: task_id.to_owned(),
+                turn_id: task_id.to_owned(),
+                reason: format!("audit failed: {e}"),
+                correlation: CorrelationCtx::default(),
+            });
+            return;
+        }
+    };
+
+    // Best-effort persistence; a failure here must not sink the report event.
+    if let Err(e) = persist_findings(ingot, task_id, &findings).await {
+        tracing::warn!(error = %e, "audit finding persistence failed");
+    }
+
+    let counts = severity_counts(&findings);
+    let report = render_report(&findings);
+    let written_path = match report_path {
+        Some(rp) if !rp.is_empty() => match crate::executor::audit_report_path(workspace, rp) {
+            Ok(full) => match tokio::fs::write(&full, &report).await {
+                Ok(()) => Some(full.display().to_string()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "audit report write failed");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "invalid audit report path");
+                None
+            }
+        },
+        _ => None,
+    };
+
+    dispatcher.publish(TurnEvent::AuditReport {
+        report,
+        counts,
+        report_path: written_path,
+        turn_id: Some(task_id.to_owned()),
+        correlation: CorrelationCtx::default(),
+    });
 }
 
 /// Builds the `audit.run` response, writing the report to `--report` when given.

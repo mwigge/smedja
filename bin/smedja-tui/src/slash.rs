@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde_json::{json, Value};
-use smedja_rpc::client::{Client, LONG_REQUEST_TIMEOUT};
+use smedja_rpc::client::Client;
 
 use crate::{
     fetch_latest_version, format_gov_list, format_resume_rows, format_token_count, gov_create,
@@ -273,7 +273,9 @@ pub(crate) async fn dispatch_slash(
                 let text = apply_agent(args, state);
                 if is_known_agent_mode(args) {
                     let session_id = state.session_id.clone();
-                    let _ = client
+                    // Surface a daemon rejection instead of silently claiming the
+                    // mode switched: the local `apply_agent` optimistically set it.
+                    if let Err(e) = client
                         .call(
                             "session.set_mode",
                             json!({
@@ -281,7 +283,10 @@ pub(crate) async fn dispatch_slash(
                                 "mode": args,
                             }),
                         )
-                        .await;
+                        .await
+                    {
+                        push_system_message(state, format!("session.set_mode error: {e}"));
+                    }
                 }
                 push_system_message(state, text);
             }
@@ -657,6 +662,15 @@ pub(crate) async fn dispatch_slash(
             let cost_result = client
                 .call("session.cost", json!({ "session_id": &state.session_id }))
                 .await;
+            // format_metrics degrades an errored RPC to zeros, which reads as
+            // "no usage yet" — surface the actual error so a failed poll is not
+            // silently indistinguishable from an idle session.
+            if let Err(e) = &usage_result {
+                push_system_message(state, format!("metrics: session.token_usage error: {e}"));
+            }
+            if let Err(e) = &cost_result {
+                push_system_message(state, format!("metrics: session.cost error: {e}"));
+            }
             let text = format_metrics(&usage_result, &cost_result, &state.session_id);
             push_system_message(state, text);
             Ok(true)
@@ -734,6 +748,16 @@ pub(crate) async fn dispatch_slash(
                 }
             }
 
+            // Refuse to start a second audit while one (or a turn) is streaming —
+            // both drive the single `stream_rx` channel.
+            if state.stream_rx.is_some() {
+                push_system_message(
+                    state,
+                    "a review or turn is already in progress — wait for it to finish",
+                );
+                return Ok(true);
+            }
+
             // The audit runs under the read-only Review role; set review mode.
             let session_id = state.session_id.clone();
             let _ = client
@@ -744,19 +768,37 @@ pub(crate) async fn dispatch_slash(
                 .await;
 
             // The audit is a bounded read-only LLM exploration loop (~12
-            // iterations / 200k-token budget) that blocks until it finishes —
-            // minutes, not seconds. It must use the long RPC timeout, or the 30s
-            // default kills it mid-loop (JSON-RPC -32001). Show a progress line so
-            // the wait doesn't look hung.
-            push_system_message(state, "reviewing\u{2026} (this can take a few minutes)");
-            match client
-                .call_with_timeout("audit.run", params, LONG_REQUEST_TIMEOUT)
-                .await
-            {
+            // iterations / 200k-token budget) that runs for minutes. Rather than
+            // block the RPC, ask the daemon to spawn it (`stream: true`) and return
+            // an audit task id at once; progress + the final report then arrive as
+            // stream events, exactly like a turn. This keeps the UI responsive and
+            // shows live "reviewing… iteration N/M · …" motion.
+            if let Some(obj) = params.as_object_mut() {
+                obj.insert("stream".to_owned(), json!(true));
+            }
+            state.audit_progress_line = None;
+            match client.call("audit.run", params).await {
                 Ok(resp) => {
-                    let counts = resp.get("counts").cloned().unwrap_or_else(|| json!({}));
-                    let report_path = resp.get("report_path").and_then(serde_json::Value::as_str);
-                    push_system_message(state, render_findings_summary(&counts, report_path));
+                    let Some(task_id) = resp
+                        .get("task_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                    else {
+                        // A daemon without streaming support returned the blocking
+                        // shape — render its findings directly.
+                        let counts = resp.get("counts").cloned().unwrap_or_else(|| json!({}));
+                        let report_path =
+                            resp.get("report_path").and_then(serde_json::Value::as_str);
+                        push_system_message(state, render_findings_summary(&counts, report_path));
+                        return Ok(true);
+                    };
+                    push_system_message(state, "reviewing\u{2026} (streaming live progress)");
+                    // Subscribe to the audit stream via the same channel a turn
+                    // uses; `apply_stream_event` renders AuditProgress/AuditReport.
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    state.stream_rx = Some(rx);
+                    let sock = state.stream_sock_path.clone();
+                    tokio::spawn(crate::start_stream_reader(sock, task_id, tx));
                 }
                 Err(e) => push_system_message(state, format!("audit.run error: {e}")),
             }
@@ -795,6 +837,9 @@ pub(crate) async fn dispatch_slash(
         }
         "briefing" => {
             let session_id = state.session_id.clone();
+            // session.compact runs an LLM summariser (seconds), so show a working
+            // line first — otherwise the command looks frozen until it returns.
+            push_system_message(state, "summarizing session\u{2026}");
             let result = client
                 .call("session.compact", json!({ "session_id": session_id }))
                 .await;
@@ -1215,6 +1260,9 @@ pub(crate) async fn dispatch_slash(
         }
         "version" => {
             push_system_message(state, format!("smedja v{VERSION}"));
+            // The release check hits the network; note it so the pause reads as
+            // work, not a hang.
+            push_system_message(state, "checking for updates\u{2026}");
             match fetch_latest_version().await {
                 Some(ref tag) if is_newer(tag, VERSION) => {
                     push_system_message(

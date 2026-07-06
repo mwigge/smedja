@@ -248,6 +248,8 @@ fn turn_id_of(event: &TurnEvent) -> Option<&str> {
         | TurnEvent::CoworkRequest { turn_id, .. }
         | TurnEvent::TokenUsage { turn_id, .. }
         | TurnEvent::ToolCallUpdate { turn_id, .. }
+        | TurnEvent::AuditProgress { turn_id, .. }
+        | TurnEvent::AuditReport { turn_id, .. }
         | TurnEvent::ToolCallChunk { turn_id, .. } => turn_id.as_deref(),
     }
 }

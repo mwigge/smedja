@@ -68,8 +68,10 @@ pub(crate) async fn start_stream_reader(
                     let is_quality = matches!(ev, StreamEvent::Quality { .. });
                     let is_error = matches!(ev, StreamEvent::Error { .. });
                     let is_done = matches!(ev, StreamEvent::Done { .. });
+                    // The `/review` audit stream terminates on its report event.
+                    let is_audit_report = matches!(ev, StreamEvent::AuditReport { .. });
                     let _ = tx.send(ev);
-                    if is_quality || is_error {
+                    if is_quality || is_error || is_audit_report {
                         break;
                     }
                     if is_done {
@@ -511,6 +513,61 @@ pub(crate) fn apply_stream_event(
                 .session_tokens_out
                 .saturating_add(state.turn_tokens_out);
         }
+        StreamEvent::AuditProgress {
+            iteration,
+            total,
+            activity,
+            findings_so_far,
+        } => {
+            // A single live status line, replaced in place each heartbeat, so the
+            // `/review` wait shows motion instead of a frozen "reviewing…" line.
+            let p = palette();
+            let counter = if iteration == 0 {
+                String::new()
+            } else {
+                format!("{iteration}/{total} \u{00b7} ")
+            };
+            let text = format!(
+                "\u{25c6} reviewing\u{2026} {counter}{activity} \u{00b7} {findings_so_far} finding(s)"
+            );
+            let color = if state.no_color { p.text_dim } else { p.molten };
+            let line = Line::from(Span::styled(text, Style::default().fg(color)));
+            match state.audit_progress_line {
+                Some(idx) => state.main_panel.replace_styled_line(idx, line),
+                None => {
+                    state.main_panel.push_styled_line(line);
+                    state.audit_progress_line = Some(state.main_panel.len().saturating_sub(1));
+                }
+            }
+        }
+        StreamEvent::AuditReport {
+            report,
+            counts,
+            report_path,
+        } => {
+            // Settle the live progress line into a dim "complete" marker, then
+            // render the findings summary (and the full report when inline).
+            if let Some(idx) = state.audit_progress_line.take() {
+                let p = palette();
+                let done = Line::from(Span::styled(
+                    "\u{25c6} review complete".to_owned(),
+                    Style::default().fg(p.text_dim),
+                ));
+                state.main_panel.replace_styled_line(idx, done);
+            }
+            let summary = render_findings_summary(&counts, report_path.as_deref());
+            for line in summary.lines() {
+                state.main_panel.push_line(line.to_owned());
+            }
+            // With no report file, surface the full markdown body so the findings
+            // are visible in the transcript rather than lost.
+            if report_path.is_none() && !report.trim().is_empty() {
+                for line in report.lines() {
+                    state.main_panel.push_line(line.to_owned());
+                }
+            }
+            turn_done = true;
+        }
         StreamEvent::Unknown
         | StreamEvent::ToolCallChunk { .. }
         | StreamEvent::ToolCallUpdate { .. } => {}
@@ -535,6 +592,118 @@ fn strip_ok_result_echo(text: &str) -> std::borrow::Cow<'_, str> {
         out.push_str(seg);
     }
     std::borrow::Cow::Owned(out)
+}
+
+#[cfg(test)]
+mod audit_stream_tests {
+    use super::apply_stream_event;
+    use crate::test_support::make_state;
+    use smedja_bellows::StreamEvent;
+
+    #[test]
+    fn audit_progress_creates_then_replaces_one_live_line() {
+        let mut state = make_state("s-audit");
+        let before = state.main_panel.len();
+        let mut save = None;
+
+        let done = apply_stream_event(
+            &mut state,
+            StreamEvent::AuditProgress {
+                iteration: 1,
+                total: 12,
+                activity: "read_file src/x.rs".into(),
+                findings_so_far: 0,
+            },
+            &mut save,
+        );
+        assert!(!done, "progress does not end the stream");
+        assert_eq!(
+            state.main_panel.len(),
+            before + 1,
+            "first heartbeat pushes exactly one live line"
+        );
+        let idx = state
+            .audit_progress_line
+            .expect("progress line index recorded");
+
+        // A later heartbeat replaces the line in place — no new line accrues.
+        apply_stream_event(
+            &mut state,
+            StreamEvent::AuditProgress {
+                iteration: 2,
+                total: 12,
+                activity: "graph_query foo".into(),
+                findings_so_far: 3,
+            },
+            &mut save,
+        );
+        assert_eq!(
+            state.main_panel.len(),
+            before + 1,
+            "second heartbeat replaces rather than appends"
+        );
+        assert_eq!(state.audit_progress_line, Some(idx));
+        let text = state.main_panel.lines_text(idx, idx + 1).join("");
+        assert!(
+            text.contains("2/12"),
+            "shows iteration counter; got: {text}"
+        );
+        assert!(
+            text.contains("graph_query foo"),
+            "shows activity; got: {text}"
+        );
+        assert!(
+            text.contains("3 finding"),
+            "shows finding count; got: {text}"
+        );
+    }
+
+    #[test]
+    fn audit_report_renders_summary_and_terminates() {
+        let mut state = make_state("s-audit");
+        let mut save = None;
+        // Seed a progress line so the report has one to settle.
+        apply_stream_event(
+            &mut state,
+            StreamEvent::AuditProgress {
+                iteration: 1,
+                total: 12,
+                activity: "analyzing".into(),
+                findings_so_far: 0,
+            },
+            &mut save,
+        );
+
+        let done = apply_stream_event(
+            &mut state,
+            StreamEvent::AuditReport {
+                report: "# Audit Report\n\n## Summary\n- Critical: 1\n".into(),
+                counts: serde_json::json!({"critical":1,"high":0,"medium":2,"low":0,"info":0}),
+                report_path: None,
+            },
+            &mut save,
+        );
+        assert!(done, "the report event terminates the audit stream");
+        assert!(
+            state.audit_progress_line.is_none(),
+            "progress line cleared once the report lands"
+        );
+        let all = state
+            .main_panel
+            .lines_text(0, state.main_panel.len())
+            .join("\n");
+        assert!(
+            all.contains("audit complete"),
+            "summary rendered; got: {all}"
+        );
+        assert!(all.contains("critical=1"), "counts rendered; got: {all}");
+        // The panel renders markdown, stripping the `#` heading markers, so the
+        // inline body appears as "Summary" / "Audit Report".
+        assert!(
+            all.contains("Summary") && all.contains("Audit Report"),
+            "inline report body rendered when no path; got: {all}"
+        );
+    }
 }
 
 #[cfg(test)]
