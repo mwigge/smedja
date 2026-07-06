@@ -6,6 +6,36 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.25.1] — 2026-07-06
+
+### Added
+- **Semantic memory by default** — a bundled local sentence embedder
+  (all-MiniLM-L6-v2, 384-dim, downloaded on first use) replaces the lexical FNV
+  hash as the default; FNV remains the offline fallback with degraded-status
+  surfacing. Recall separates a zero-shared-word paraphrase from noise (0.516
+  margin) where FNV cannot (0.000).
+- **ACP item 4** — per-session mcpServers wiring + the tool_call/tool_call_update
+  status stream (pending -> in_progress -> completed|failed) + a diff content type.
+- **Live shared block on handoff** — session takeover seeds a concurrently-editable
+  block the receiver reads and appends to (snapshot fallback intact).
+- **GPU-terminal hanging indent** — transcript body aligns under the author label
+  via render geometry (copy/selection stays clean; the ANSI-space hack avoided).
+
+### Fixed
+- **Transcript scroll** — the anchor was pinned to the last line in follow mode, so
+  scroll-up did nothing for a viewport; now scrolls one line per press and re-arms
+  follow at the bottom.
+- **External-runner output** — codex/claude output now gets markdown hierarchy
+  (headings, bullets, links) and dim chrome, and the redundant `↳ ok · [cmd]` echo
+  is dropped (one dim line per external tool call).
+
+### Changed
+- **Orchestrator `run()` refactor** — the ~1600-line god-method is a 56-line driver
+  over a TurnRun state struct + 16 phase methods; the too_many_lines suppression is
+  gone. Behavior-preserving.
+- **Enforcing file-size gate** — a ratcheting clean-as-you-code gate blocks new
+  oversized files + growth of baselined ones.
+
 ## [0.25.0] — 2026-07-06
 
 The universal-agent-runtime release: bring any backend (claude-cli, codex-cli,
