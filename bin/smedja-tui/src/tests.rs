@@ -1044,6 +1044,84 @@ fn usage_event_feeds_obs_throughput_live() {
     );
 }
 
+// Bug 2 regression: an external CLI runner (codex/claude) reports each shell
+// tool call as a structured `ToolCall` (which becomes the collapsed card) plus a
+// `↳ ok · [<cmd>]` result delta that merely echoes the command. Rendering both
+// doubled every tool call. The echo must be dropped so exactly one dim card line
+// survives per call.
+#[test]
+fn external_tool_call_renders_single_collapsed_line_not_two() {
+    let mut state = make_state("ext-tool");
+    // Prior assistant text so the tool result doesn't open a fresh author chip.
+    state.assistant_open = true;
+    let mut save = None;
+
+    apply_stream_event(
+        &mut state,
+        StreamEvent::ToolCall {
+            name: "shell".into(),
+            input: "git status".into(),
+            full: Some("git status".into()),
+        },
+        &mut save,
+    );
+    apply_stream_event(
+        &mut state,
+        StreamEvent::Delta {
+            text: "\n\u{21b3} ok \u{00b7} [git status]\n".into(),
+        },
+        &mut save,
+    );
+
+    let texts = state
+        .main_panel
+        .lines_text(0, state.main_panel.len().saturating_sub(1));
+    let echo_lines = texts.iter().filter(|t| t.contains("\u{21b3} ok")).count();
+    assert_eq!(
+        echo_lines, 0,
+        "redundant ok echo must be dropped; lines: {texts:?}"
+    );
+    let card_lines = texts.iter().filter(|t| t.contains("git status")).count();
+    assert_eq!(
+        card_lines, 1,
+        "exactly one collapsed tool card line (not two); lines: {texts:?}"
+    );
+}
+
+// Bug 2: a *failed* external tool call must keep its error detail — only the
+// redundant `↳ ok · …` echo is noise; `↳ error · …` carries information.
+#[test]
+fn external_tool_failure_keeps_detail_line() {
+    let mut state = make_state("ext-tool-fail");
+    state.assistant_open = true;
+    let mut save = None;
+
+    apply_stream_event(
+        &mut state,
+        StreamEvent::ToolCall {
+            name: "shell".into(),
+            input: "cat missing".into(),
+            full: Some("cat missing".into()),
+        },
+        &mut save,
+    );
+    apply_stream_event(
+        &mut state,
+        StreamEvent::Delta {
+            text: "\n\u{21b3} error \u{00b7} no such file or directory\n".into(),
+        },
+        &mut save,
+    );
+
+    let texts = state
+        .main_panel
+        .lines_text(0, state.main_panel.len().saturating_sub(1));
+    assert!(
+        texts.iter().any(|t| t.contains("\u{21b3} error")),
+        "failure detail must survive; lines: {texts:?}"
+    );
+}
+
 #[test]
 fn resume_list_formats_session_rows() {
     let list = serde_json::json!([
@@ -2191,6 +2269,74 @@ fn history_search_no_match_returns_none() {
 fn history_search_empty_history_returns_none() {
     let history: Vec<String> = vec![];
     assert!(history_search(&history, "git").is_none());
+}
+
+#[test]
+fn push_message_trim_shifts_display_start_idx() {
+    // `display_start_idx` is an absolute index into the bounded `messages` log.
+    // When the ring trims its oldest entries on push, the watermark must shift by
+    // the same amount so it keeps pointing at the same logical message rather than
+    // drifting forward into live content.
+    let mut state = make_state("sess-trim");
+    // Fill to the cap so the next pushes trim from the front.
+    for i in 0..MESSAGE_HISTORY_CAP {
+        state.messages.push(Message {
+            role: Role::System,
+            text: format!("m{i}"),
+        });
+    }
+    // Watermark sits in the middle of the buffer.
+    state.display_start_idx = 100;
+    let first_before = state.messages.first().map(|m| m.text.clone());
+
+    // Push three more: each trims exactly one oldest entry.
+    for j in 0..3 {
+        state.push_message(Message {
+            role: Role::System,
+            text: format!("new{j}"),
+        });
+    }
+
+    assert_eq!(
+        state.messages.len(),
+        MESSAGE_HISTORY_CAP,
+        "length stays capped"
+    );
+    assert_eq!(
+        state.display_start_idx, 97,
+        "watermark shifts back by the number trimmed (3)"
+    );
+    assert_ne!(
+        state.messages.first().map(|m| m.text.clone()),
+        first_before,
+        "oldest entries were actually trimmed"
+    );
+    assert_eq!(
+        state.messages.last().map(|m| m.text.as_str()),
+        Some("new2"),
+        "newest entry retained at the tail"
+    );
+}
+
+#[test]
+fn push_message_trim_watermark_saturates_at_zero() {
+    // A watermark already near the front must not underflow when more entries are
+    // trimmed than lie before it — it saturates at 0 (show everything).
+    let mut state = make_state("sess-trim-zero");
+    for i in 0..MESSAGE_HISTORY_CAP {
+        state.messages.push(Message {
+            role: Role::System,
+            text: format!("m{i}"),
+        });
+    }
+    state.display_start_idx = 1;
+    for j in 0..5 {
+        state.push_message(Message {
+            role: Role::System,
+            text: format!("n{j}"),
+        });
+    }
+    assert_eq!(state.display_start_idx, 0, "watermark saturates at zero");
 }
 
 #[test]

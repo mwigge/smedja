@@ -148,6 +148,22 @@ pub(crate) fn turn_event_to_ndjson(
             });
             (turn_id.clone(), line, false)
         }
+        TurnEvent::ToolCallUpdate {
+            tool_call_id,
+            tool_name,
+            status,
+            content,
+            turn_id,
+            ..
+        } => {
+            let line = ser(&StreamEvent::ToolCallUpdate {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                status: status.as_acp_str().to_owned(),
+                content: content.clone(),
+            });
+            (turn_id.clone(), line, false)
+        }
         TurnEvent::HistoryReplaced { turn_id, .. } => (Some(turn_id.clone()), String::new(), false),
     }
 }
@@ -264,5 +280,37 @@ mod tests {
             "thinking content must appear in NDJSON; got: {line}"
         );
         assert!(!terminal, "thinking delta must not be a terminal event");
+    }
+
+    #[test]
+    fn turn_event_to_ndjson_tool_call_update_maps_status_and_diff() {
+        use smedja_bellows::{ToolCallContent, ToolCallStatus};
+        let event = TurnEvent::ToolCallUpdate {
+            tool_call_id: "call-1".into(),
+            tool_name: "edit_file".into(),
+            status: ToolCallStatus::Completed,
+            content: vec![ToolCallContent::Diff {
+                path: "src/x.rs".into(),
+                old_text: "a".into(),
+                new_text: "b".into(),
+            }],
+            turn_id: Some("t-u".into()),
+            correlation: CorrelationCtx::default(),
+        };
+        let (tid, line, terminal) = turn_event_to_ndjson(&event, "t-u");
+        assert_eq!(tid.as_deref(), Some("t-u"));
+        assert!(
+            line.contains(r#""type":"tool_call_update""#),
+            "must map to tool_call_update; got: {line}"
+        );
+        assert!(
+            line.contains(r#""status":"completed""#),
+            "status string must be mapped; got: {line}"
+        );
+        assert!(
+            line.contains(r#""type":"diff""#) && line.contains("src/x.rs"),
+            "diff content must appear; got: {line}"
+        );
+        assert!(!terminal);
     }
 }

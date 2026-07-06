@@ -84,6 +84,19 @@ pub enum StreamEvent {
     /// for the terminal `ToolCall` event.
     ToolCallChunk { name: String, partial_input: String },
 
+    /// A tool call's lifecycle status transitioned (`pending | in_progress |
+    /// completed | failed`), correlated to its start by `tool_call_id`.
+    ///
+    /// `content` carries any attached items — e.g. a proposed diff for an edit
+    /// tool — so a client can render the change inline.
+    ToolCallUpdate {
+        tool_call_id: String,
+        tool_name: String,
+        status: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        content: Vec<crate::event::ToolCallContent>,
+    },
+
     /// Catchall for unknown future event types — never matched by the TUI.
     #[serde(other)]
     Unknown,
@@ -298,6 +311,39 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains(r#""type":"tool_call_chunk""#), "{json}");
         assert!(json.contains("bash"), "{json}");
+    }
+
+    #[test]
+    fn tool_call_update_roundtrips_with_diff() {
+        use crate::event::ToolCallContent;
+        let ev = StreamEvent::ToolCallUpdate {
+            tool_call_id: "c1".into(),
+            tool_name: "edit_file".into(),
+            status: "completed".into(),
+            content: vec![ToolCallContent::Diff {
+                path: "a.rs".into(),
+                old_text: "x".into(),
+                new_text: "y".into(),
+            }],
+        };
+        assert_eq!(roundtrip(&ev), ev);
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""type":"tool_call_update""#), "{json}");
+        assert!(json.contains("completed"), "{json}");
+        assert!(json.contains(r#""type":"diff""#), "{json}");
+    }
+
+    #[test]
+    fn tool_call_update_omits_empty_content() {
+        let ev = StreamEvent::ToolCallUpdate {
+            tool_call_id: "c1".into(),
+            tool_name: "bash".into(),
+            status: "in_progress".into(),
+            content: vec![],
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(!json.contains("content"), "{json}");
+        assert_eq!(roundtrip(&ev), ev);
     }
 
     #[test]

@@ -34,6 +34,56 @@ pub struct CorrelationCtx {
     pub status: Option<String>,
 }
 
+/// Lifecycle status of an ACP-shaped tool call.
+///
+/// Mirrors the orchestrator's tool lifecycle and the industry-ACP
+/// `tool_call` / `tool_call_update` status field: a call starts `Pending`, moves
+/// to `InProgress` once execution begins, and resolves to `Completed` or
+/// `Failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ToolCallStatus {
+    /// The call is queued (e.g. awaiting a permission decision).
+    Pending,
+    /// The tool is executing.
+    InProgress,
+    /// The tool finished successfully.
+    Completed,
+    /// The tool failed or was denied.
+    Failed,
+}
+
+impl ToolCallStatus {
+    /// The industry-ACP wire string (`pending | in_progress | completed |
+    /// failed`).
+    #[must_use]
+    pub fn as_acp_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// One content item attached to a tool-call status update.
+///
+/// Currently only a proposed file diff for edit tools, which an ACP client
+/// (Zed) renders inline so the human can modify-then-approve the change.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolCallContent {
+    /// A proposed file edit: `old_text` → `new_text` at `path`.
+    Diff {
+        /// Workspace-relative path of the file being edited.
+        path: String,
+        /// The file's current contents (empty for a new file).
+        old_text: String,
+        /// The proposed contents after the edit.
+        new_text: String,
+    },
+}
+
 /// Events emitted during the lifecycle of an agent turn.
 ///
 /// Each variant corresponds to a distinct point in the turn's progression —
@@ -252,6 +302,32 @@ pub enum TurnEvent {
         /// Agent's reasoning for invoking this tool.
         reasoning: String,
         /// Turn identifier; used to route the event into the correct stream buffer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        /// Correlation context (trace, conversation, agent, status).
+        #[serde(flatten)]
+        correlation: CorrelationCtx,
+    },
+
+    /// A tool call's status transitioned (`pending → in_progress → completed |
+    /// failed`), mirroring the orchestrator's tool lifecycle.
+    ///
+    /// Emitted after the initial [`TurnEvent::ToolCalled`] and correlated to it
+    /// by `tool_call_id`. An ACP session stream maps it to a `tool_call_update`
+    /// notification. Edit tools carry a [`ToolCallContent::Diff`] so an ACP
+    /// client (Zed) can render the proposed change inline for modify-then-approve.
+    ToolCallUpdate {
+        /// Correlates with the `tool_call_id` of the originating `ToolCalled`.
+        tool_call_id: String,
+        /// The tool whose status changed.
+        tool_name: String,
+        /// The new lifecycle status.
+        status: ToolCallStatus,
+        /// Content items (e.g. a proposed diff for an edit tool). Empty for a
+        /// plain status transition.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        content: Vec<ToolCallContent>,
+        /// Turn identifier; correlates this event with the enclosing turn.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
         /// Correlation context (trace, conversation, agent, status).
@@ -728,5 +804,81 @@ mod tests {
         } else {
             panic!("wrong variant");
         }
+    }
+
+    // --- ACP-shaped tool-call status stream ---
+
+    #[test]
+    fn tool_call_status_maps_to_acp_strings() {
+        assert_eq!(ToolCallStatus::Pending.as_acp_str(), "pending");
+        assert_eq!(ToolCallStatus::InProgress.as_acp_str(), "in_progress");
+        assert_eq!(ToolCallStatus::Completed.as_acp_str(), "completed");
+        assert_eq!(ToolCallStatus::Failed.as_acp_str(), "failed");
+    }
+
+    #[test]
+    fn tool_call_update_roundtrips_with_diff_content() {
+        let ev = TurnEvent::ToolCallUpdate {
+            tool_call_id: "call-7".into(),
+            tool_name: "edit_file".into(),
+            status: ToolCallStatus::Completed,
+            content: vec![ToolCallContent::Diff {
+                path: "src/lib.rs".into(),
+                old_text: "old".into(),
+                new_text: "new".into(),
+            }],
+            turn_id: Some("t-9".into()),
+            correlation: CorrelationCtx::default(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("ToolCallUpdate"), "variant tag; got: {json}");
+        let decoded: TurnEvent = serde_json::from_str(&json).unwrap();
+        if let TurnEvent::ToolCallUpdate {
+            tool_call_id,
+            status,
+            content,
+            turn_id,
+            ..
+        } = decoded
+        {
+            assert_eq!(tool_call_id, "call-7");
+            assert_eq!(status, ToolCallStatus::Completed);
+            assert_eq!(turn_id.as_deref(), Some("t-9"));
+            assert_eq!(content.len(), 1);
+            match &content[0] {
+                ToolCallContent::Diff {
+                    path,
+                    old_text,
+                    new_text,
+                } => {
+                    assert_eq!(path, "src/lib.rs");
+                    assert_eq!(old_text, "old");
+                    assert_eq!(new_text, "new");
+                }
+            }
+        } else {
+            panic!("wrong variant after roundtrip");
+        }
+    }
+
+    #[test]
+    fn tool_call_update_omits_empty_content() {
+        let ev = TurnEvent::ToolCallUpdate {
+            tool_call_id: "c".into(),
+            tool_name: "bash".into(),
+            status: ToolCallStatus::InProgress,
+            content: vec![],
+            turn_id: None,
+            correlation: CorrelationCtx::default(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(
+            !json.contains("content"),
+            "empty content must be omitted; got: {json}"
+        );
+        assert!(
+            !json.contains("turn_id"),
+            "None turn_id must be omitted; got: {json}"
+        );
     }
 }

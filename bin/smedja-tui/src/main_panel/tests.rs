@@ -1,5 +1,82 @@
 use super::*;
 
+/// Renders `panel` into a fresh 20×12 (inner 18×10) test terminal and returns
+/// the top logical line drawn — the anchor a user actually sees at the top.
+fn draw_and_top(panel: &mut MainPanel) -> usize {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let mut term = Terminal::new(TestBackend::new(20, 12)).unwrap();
+    term.draw(|f| panel.render(f.area(), f, None, None, false))
+        .unwrap();
+    panel.row_logical[0]
+}
+
+// Regression: a single scroll-up from the followed bottom must move the view up
+// by one logical line immediately. Previously `scroll` stayed anchored to the
+// last line, whose visual start is already past `max_off`, so the window clamped
+// to the bottom and the first ~viewport-height presses did nothing ("can't
+// scroll back").
+#[test]
+fn scroll_up_from_bottom_moves_view_immediately() {
+    let mut panel = MainPanel::new();
+    for i in 0..100u32 {
+        panel.push_line(format!("line {i}"));
+    }
+    let top_follow = draw_and_top(&mut panel);
+    panel.scroll_up();
+    let top_after = draw_and_top(&mut panel);
+    assert!(
+        top_after < top_follow,
+        "one scroll_up must move the top line up: {top_follow} -> {top_after}"
+    );
+    assert_eq!(top_after, top_follow - 1, "moves exactly one logical line");
+    assert!(!panel.follow, "scrolling up detaches follow");
+}
+
+// Scrolling back down to the bottom must clamp the window to the last line and
+// re-arm follow so new content tracks again.
+#[test]
+fn scrolling_back_to_bottom_rearms_follow() {
+    let mut panel = MainPanel::new();
+    for i in 0..100u32 {
+        panel.push_line(format!("line {i}"));
+    }
+    let bottom_top = draw_and_top(&mut panel);
+    // Scroll well up, then all the way back down.
+    for _ in 0..20 {
+        panel.scroll_up();
+        draw_and_top(&mut panel);
+    }
+    assert!(!panel.follow, "still detached mid-scroll");
+    for _ in 0..40 {
+        panel.scroll_down();
+        draw_and_top(&mut panel);
+    }
+    assert!(panel.follow, "reaching the bottom re-arms follow");
+    assert_eq!(
+        draw_and_top(&mut panel),
+        bottom_top,
+        "view clamps back to the same bottom window"
+    );
+}
+
+// The rendered top line never runs past the last line even if `scroll` is set
+// beyond the buffer (e.g. after an over-scroll or a resize) — the window
+// self-corrects to the last drawable anchor.
+#[test]
+fn overscrolled_anchor_clamps_to_last_window() {
+    let mut panel = MainPanel::new();
+    for i in 0..30u32 {
+        panel.push_line(format!("line {i}"));
+    }
+    panel.follow = false;
+    panel.scroll = 999; // absurd anchor past the end
+    let top = draw_and_top(&mut panel);
+    // 30 lines, inner height 10 → the bottom window starts at logical line 20.
+    assert_eq!(top, 20, "over-scrolled anchor clamps to the last window");
+    assert!(panel.follow, "clamping to the bottom re-arms follow");
+}
+
 // L121: +foo → LineStyle::Added
 #[test]
 fn plus_prefix_yields_added_style() {
@@ -721,4 +798,74 @@ fn push_line_applies_math_rendering() {
         "push_line must apply math rendering; got: {:?}",
         panel.lines[0].text
     );
+}
+
+// Helper: true when every non-empty span on `sl` carries the DIM modifier —
+// the "chrome recedes" invariant for a transcript line.
+fn line_is_dim(sl: &StyledLine) -> bool {
+    sl.spans.as_ref().is_some_and(|l| {
+        l.spans
+            .iter()
+            .all(|s| s.style.add_modifier.contains(Modifier::DIM))
+    })
+}
+
+// The reframed transcript fix: an EXTERNAL runner's (codex/claude) answer body
+// gains markdown hierarchy — headings bold, bullets aligned, links styled —
+// while every surrounding chrome line (execute banner, `↳ ok` echo, clipboard
+// notice, trace footer) recedes to dim so the content reads brighter.
+#[test]
+fn external_runner_body_gets_hierarchy_and_chrome_is_dim() {
+    // --- Content gains hierarchy ---------------------------------------
+    // codex prints its own bullet glyph "• …"; it must align + style, not
+    // read as flat prose.
+    let bullet = block_markdown_spans("\u{2022} High: something").expect("• is a list item");
+    let flat: String = bullet.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        flat.starts_with('\u{2022}'),
+        "• bullet stays a bullet: {flat}"
+    );
+    assert!(flat.contains("High: something"));
+
+    // A markdown heading in the answer body reads bold.
+    let heading = block_markdown_spans("## Findings").expect("heading");
+    assert!(heading
+        .spans
+        .iter()
+        .any(|s| s.style.add_modifier.contains(Modifier::BOLD)));
+
+    // A link reads as an accent-underlined anchor with the url dimmed.
+    let link = inline_markdown_spans("see [orchestrator/mod.rs](path/to#L1) now").expect("link");
+    assert!(
+        link.spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::UNDERLINED)),
+        "link label is underlined"
+    );
+
+    // --- Chrome recedes to dim -----------------------------------------
+    let mut panel = MainPanel::new();
+    panel.push_line(
+        "\u{23f5} execute \u{00b7} /usr/bin/bash -lc 'git status' \u{00b7} \u{2713} 0ms".into(),
+    );
+    panel.push_line("\u{21b3} ok \u{00b7} [git status]".into());
+    panel.push_line("\u{2713} 63 lines copied to clipboard".into());
+    panel.push_line(
+        "\u{21b3} 345635\u{2191} 3729\u{2193} \u{00b7} trace: 00-000 \u{00b7} traces not exported"
+            .into(),
+    );
+    for (i, sl) in panel.lines.iter().enumerate() {
+        assert!(
+            line_is_dim(sl),
+            "chrome line {i} must be dim: {:?}",
+            sl.text
+        );
+    }
+    // is_dim_chrome classifies each of those, and never plain content.
+    assert!(is_dim_chrome(
+        "\u{23f5} execute \u{00b7} cmd \u{00b7} \u{2713} 0ms"
+    ));
+    assert!(is_dim_chrome("\u{2717} 2 lines copied to clipboard"));
+    assert!(!is_dim_chrome("Findings"));
+    assert!(!is_dim_chrome("\u{2022} High: real content"));
 }

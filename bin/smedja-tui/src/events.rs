@@ -147,8 +147,14 @@ pub(crate) fn apply_stream_event(
                     state.tool_started_at = None;
                 }
             }
+            // The tool card resolved above (or, for a passthrough external CLI,
+            // the dim "⏵ execute · … · ✓" banner) already shows a successful
+            // tool call, so drop the redundant "↳ ok · …" result echo — one dim
+            // line per tool call, matching native cards. A failure
+            // ("↳ error · …") is kept so its detail survives.
+            let body = strip_ok_result_echo(&text);
             // Split on newlines so each line is a separate panel entry.
-            let mut remaining = text.as_str();
+            let mut remaining = body.as_ref();
             loop {
                 if let Some(pos) = remaining.find('\n') {
                     let chunk = &remaining[..pos];
@@ -505,7 +511,55 @@ pub(crate) fn apply_stream_event(
                 .session_tokens_out
                 .saturating_add(state.turn_tokens_out);
         }
-        StreamEvent::Unknown | StreamEvent::ToolCallChunk { .. } => {}
+        StreamEvent::Unknown
+        | StreamEvent::ToolCallChunk { .. }
+        | StreamEvent::ToolCallUpdate { .. } => {}
     }
     turn_done
+}
+
+/// Removes the redundant `↳ ok · …` tool-result echo from a streamed assistant
+/// chunk, keeping every other line (including the `↳ error · …` failure echo,
+/// whose detail must survive). The tool card already conveys a successful call,
+/// so echoing it doubles the line; collapsing it to the card alone gives one
+/// dim line per tool call. Borrows when there is nothing to strip.
+fn strip_ok_result_echo(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("\u{21b3} ok") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for seg in text.split_inclusive('\n') {
+        if seg.trim_start().starts_with("\u{21b3} ok") {
+            continue;
+        }
+        out.push_str(seg);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+#[cfg(test)]
+mod echo_tests {
+    use super::strip_ok_result_echo;
+
+    #[test]
+    fn ok_result_echo_is_dropped_but_failures_and_content_survive() {
+        // The "↳ ok · …" echo (as framed by the daemon) collapses away.
+        let s = strip_ok_result_echo("\n\u{21b3} ok \u{00b7} [git status]\n");
+        assert!(!s.contains("\u{21b3} ok"), "ok echo dropped: {s:?}");
+
+        // A failure echo keeps its detail.
+        let f = strip_ok_result_echo("\n\u{21b3} error \u{00b7} permission denied\n");
+        assert!(f.contains("\u{21b3} error"), "failure kept: {f:?}");
+
+        // Answer content interleaved with an ok echo keeps the content.
+        let mixed = strip_ok_result_echo("Findings\n\u{21b3} ok \u{00b7} done\nDetails\n");
+        assert!(mixed.contains("Findings") && mixed.contains("Details"));
+        assert!(!mixed.contains("\u{21b3} ok"));
+
+        // Nothing to strip → borrows without allocating.
+        assert!(matches!(
+            strip_ok_result_echo("plain text"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
 }

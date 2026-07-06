@@ -277,6 +277,26 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                             evict_and_push(buf, line);
                         }
                     }
+                    TurnEvent::ToolCallUpdate {
+                        ref tool_call_id,
+                        ref tool_name,
+                        status,
+                        ref content,
+                        ref turn_id,
+                        ..
+                    } => {
+                        let Some(tid) = turn_id else { continue };
+                        if let Some(buf) = store.get_mut(tid).map(TurnBuffer::touch) {
+                            let line = serde_json::to_string(&StreamEvent::ToolCallUpdate {
+                                tool_call_id: tool_call_id.clone(),
+                                tool_name: tool_name.clone(),
+                                status: status.as_acp_str().to_owned(),
+                                content: content.clone(),
+                            })
+                            .unwrap_or_default();
+                            evict_and_push(buf, line);
+                        }
+                    }
                     TurnEvent::HistoryReplaced {
                         ref session_id,
                         ref turn_id,
