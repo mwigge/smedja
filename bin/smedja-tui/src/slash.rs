@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde_json::{json, Value};
-use smedja_rpc::client::Client;
+use smedja_rpc::client::{Client, LONG_REQUEST_TIMEOUT};
 
 use crate::{
     fetch_latest_version, format_gov_list, format_resume_rows, format_token_count, gov_create,
@@ -743,7 +743,16 @@ pub(crate) async fn dispatch_slash(
                 )
                 .await;
 
-            match client.call("audit.run", params).await {
+            // The audit is a bounded read-only LLM exploration loop (~12
+            // iterations / 200k-token budget) that blocks until it finishes —
+            // minutes, not seconds. It must use the long RPC timeout, or the 30s
+            // default kills it mid-loop (JSON-RPC -32001). Show a progress line so
+            // the wait doesn't look hung.
+            push_system_message(state, "reviewing\u{2026} (this can take a few minutes)");
+            match client
+                .call_with_timeout("audit.run", params, LONG_REQUEST_TIMEOUT)
+                .await
+            {
                 Ok(resp) => {
                     let counts = resp.get("counts").cloned().unwrap_or_else(|| json!({}));
                     let report_path = resp.get("report_path").and_then(serde_json::Value::as_str);

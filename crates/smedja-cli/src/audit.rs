@@ -26,8 +26,15 @@ pub(crate) async fn dispatch_audit(action: AuditCmd, sock: &std::path::Path) -> 
             let mut client = Client::connect(sock)
                 .await
                 .with_context(|| format!("smdjad not running ({})", sock.display()))?;
+            // `audit.run` blocks for the full read-only LLM exploration loop
+            // (minutes), so it needs the long timeout — the 30s default would
+            // kill it mid-loop (JSON-RPC -32001).
             let resp = client
-                .call("audit.run", params)
+                .call_with_timeout(
+                    "audit.run",
+                    params,
+                    smedja_rpc::client::LONG_REQUEST_TIMEOUT,
+                )
                 .await
                 .context("audit.run failed")?;
             if format == "json" {
