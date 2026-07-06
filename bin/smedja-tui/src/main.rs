@@ -36,43 +36,20 @@ mod render;
 mod run_loop;
 mod state;
 
-// Re-export slash module items so that `use super::*` in the test module
-// continues to find them without change.  The `#[allow(unused_imports)]` is
-// needed because the compiler does not see the indirect usage via `use super::*`
-// in the test module.
-#[allow(unused_imports)]
-pub(crate) use slash::{
-    apply_agent, apply_tier, dispatch_slash, format_agents_table, format_approvals_list,
-    format_local_model_list, format_metrics, format_model_list,
-};
-
-// Re-export extracted module items so callers (slash.rs, tests) see them
-// at the crate root unchanged.
-#[allow(unused_imports)]
-pub(crate) use clipboard::{
-    emit_osc9, osc9_turn_complete_bytes, paste_from_clipboard, push_kill, yank_to_clipboard,
-};
-#[allow(unused_imports)]
-pub(crate) use editor::{open_in_editor, resolve_editor};
-#[allow(unused_imports)]
+// Crate-root convenience re-exports with real non-test consumers (crate root
+// body and sibling modules). Items that existed only to keep `use super::*`
+// working in the old monolithic test module now live where the tests import
+// them from (their defining module) and have been dropped.
+pub(crate) use clipboard::{emit_osc9, paste_from_clipboard, push_kill, yank_to_clipboard};
+pub(crate) use editor::open_in_editor;
 pub(crate) use events::{apply_stream_event, start_stream_reader};
-#[allow(unused_imports)]
-pub(crate) use governance::{
-    format_gov_list, gov_create, gov_transition, scan_gov_artifacts, GovArtifact,
-};
-#[allow(unused_imports)]
-pub(crate) use input::{
-    accept_slash_completion, apply_cowork_decision, clear_slash_popup, cowork_resolved, handle_key,
-};
-#[allow(unused_imports)]
+pub(crate) use governance::{format_gov_list, gov_create, gov_transition, scan_gov_artifacts};
+pub(crate) use input::handle_key;
 pub(crate) use render::render;
-#[allow(unused_imports)]
+pub(crate) use slash::dispatch_slash;
 pub(crate) use state::{AppState, Message, PanelVisibility, Role, SessionDetail};
-#[allow(unused_imports)]
 pub(crate) use terminal_guard::TerminalGuard;
-#[allow(unused_imports)]
 pub(crate) use tool_call::tool_call_card;
-#[allow(unused_imports)]
 pub(crate) use upgrade::{fetch_latest_version, is_newer, run_upgrade, VERSION};
 
 use std::collections::VecDeque;
@@ -1523,5 +1500,7 @@ fn toggle_metrics_view(state: &mut AppState) {
 // Tests (L128, L129)
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
