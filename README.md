@@ -182,7 +182,7 @@ tier   = "deep"
 tools  = ["read_file", "otel_query", "metric_query", "log_tail"]
 ```
 
-The assayer routes by **role + complexity**, not just complexity. A simple fix stays local; an architecture review goes to claude deep. No manual model selection per task.
+The assayer routes by **role plus complexity**, not just complexity. A simple fix stays local; an architecture review goes to claude deep. No manual model selection per task.
 
 **Role set.** Task-type roles (not per-language — language is detected context): `code`/`impl`, `plan`, `research`, `debug`, `ask`, `review`, `test`, `sre`, plus the domain roles `data` (SQL) and `iac` (infra), and `orchestrator`. Each has a default `(client, tier)` and a permission profile — read-only roles (plan/research/review/ask/orchestrator) can't mutate; `iac` always confirms. Set the active role with `/agent <role>`.
 
