@@ -75,8 +75,20 @@ jobs:
 
       - name: build
         run: |
-          cargo build --release --target ${{ matrix.target }} \
-            --bin smdjad --bin smj --bin smedja --bin smedja-tui
+          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
+            # ort (ONNX Runtime) ships no prebuilt binaries for Intel macOS
+            # (broke every release since 0.25.1 introduced the semantic
+            # embedder). Build the Intel-macOS daemon without the
+            # local-embedder feature — vault recall falls back to the lexical
+            # FNV embedder on that platform, surfaced as degraded.
+            cargo build --release --target ${{ matrix.target }} \
+              -p smdjad --no-default-features
+            cargo build --release --target ${{ matrix.target }} \
+              --bin smj --bin smedja --bin smedja-tui
+          else
+            cargo build --release --target ${{ matrix.target }} \
+              --bin smdjad --bin smj --bin smedja --bin smedja-tui
+          fi
 
       # cargo-deb and cargo-generate-rpm read asset paths from
       # bin/smdjad/Cargo.toml. Those paths are target/release/*, while this
