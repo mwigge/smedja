@@ -672,8 +672,10 @@ Fragments are expanded into your message before the turn runs:
 | `SMEDJA_SOCK` | `$XDG_RUNTIME_DIR/smdjad.sock` | Override daemon socket path |
 | `SMEDJA_WORKSPACE` | *(daemon cwd)* | Workspace root for the code-graph and LSP when not announced by a client |
 | `SMEDJA_TOOL_GATE` | `on` | Set to `off` to disable the claude PreToolUse approval hook |
-| `SMEDJA_MODEL_<RUNNER>_<TIER>` | *(built-in default)* | Pin a tier's model so new releases need no rebuild — e.g. `SMEDJA_MODEL_CLAUDE_DEEP=claude-opus-5`, `SMEDJA_MODEL_CODEX_FAST=gpt-6`. `<RUNNER>` ∈ `CLAUDE`/`CODEX`/`COPILOT`/`MINIMAX`/`LOCAL`; `<TIER>` ∈ `FAST`/`DEEP`/`LOCAL` |
-| `MINIMAX_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GITHUB_TOKEN` | *(unset)* | Provider keys (in `~/.config/smedja/secrets.env`) — enable the minimax/openai/anthropic-API/copilot runners when their CLI isn't installed |
+| `SMEDJA_MODEL_<RUNNER>_<TIER>` | *(built-in default)* | Pin a tier's model so new releases need no rebuild — e.g. `SMEDJA_MODEL_CLAUDE_DEEP=claude-opus-5`, `SMEDJA_MODEL_CODEX_FAST=gpt-6`, `SMEDJA_MODEL_MOONSHOT_DEEP=kimi-k3`. `<RUNNER>` ∈ `CLAUDE`/`CODEX`/`KIMI`/`MOONSHOT`/`GEMINI`/`GOOGLE`/`COPILOT`/`MINIMAX`/`LOCAL`; `<TIER>` ∈ `FAST`/`DEEP`/`LOCAL` |
+| `MINIMAX_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `MOONSHOT_API_KEY` / `GEMINI_API_KEY` / `GITHUB_TOKEN` | *(unset)* | Provider keys (in `~/.config/smedja/secrets.env`) — enable the minimax/openai/anthropic-API/moonshot(kimi)/google(gemini)/copilot runners when their CLI isn't installed |
+| `MOONSHOT_BASE_URL` | `https://api.moonshot.ai/v1` | Kimi API endpoint override — set `https://api.moonshot.cn/v1` for a mainland-China platform key |
+| `SMEDJA_KIMI_ACP` | `on` | Set to `off` to revert the kimi CLI path from gated ACP to one-shot `kimi -p` prompt mode (kimi then self-approves its own tool calls) |
 | `SMEDJA_DAILY_TOKEN_LIMIT` | *(unset — no limit)* | Daily token budget; shown in the `/quota` panel as a usage bar |
 | `SMEDJA_SANDBOX_MODE` | `auto` | Sandbox fallback: `auto \| required \| off` |
 | `SMEDJA_SANDBOX_NETWORK` | `none` | Subprocess network policy: `none \| allowlist \| open` |

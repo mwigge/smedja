@@ -940,6 +940,50 @@ impl TurnRun {
             }
         };
 
+        // Per-tool approval callback for ACP adapters: routes an external
+        // agent's `session/request_permission` through the same session gate
+        // as in-process tools, so the TUI shows the identical approve/deny
+        // prompt regardless of which side executes the tool.
+        let tool_gate = {
+            let gates = gates.clone();
+            let dispatcher = self.orch.dispatcher.clone();
+            let session_id = session_id.clone();
+            smedja_adapter::ToolGate::new(move |tool, input| {
+                let gates = gates.clone();
+                let dispatcher = dispatcher.clone();
+                let session_id = session_id.clone();
+                Box::pin(async move {
+                    let gate = gates
+                        .lock()
+                        .await
+                        .entry(session_id)
+                        .or_insert_with(
+                            || std::sync::Arc::new(crate::cowork::CoworkGate::default()),
+                        )
+                        .clone();
+                    match gate
+                        .gate_tool(0, &tool, input, "", Some((&dispatcher, None)))
+                        .await
+                    {
+                        crate::cowork::Decision::Approve => {
+                            smedja_adapter::ToolGateDecision::Allow
+                        }
+                        crate::cowork::Decision::Deny(reason) => {
+                            smedja_adapter::ToolGateDecision::Deny(reason)
+                        }
+                        // ACP's permission outcome is select-an-option; there is
+                        // no channel to hand modified arguments back to the
+                        // agent, so a Modify resolves fail-safe as a deny.
+                        crate::cowork::Decision::Modify(_) => {
+                            smedja_adapter::ToolGateDecision::Deny(
+                                "modified input is not supported over ACP; deny and re-prompt with adjusted arguments".to_owned(),
+                            )
+                        }
+                    }
+                })
+            })
+        };
+
         let opts = CallOptions {
             model: entry_model.clone(),
             max_tokens: Some(2048),
@@ -956,6 +1000,7 @@ impl TurnRun {
             stable_prefix_len,
             cache_strategy,
             workspace: Some(workspace_root.clone()),
+            tool_gate: Some(tool_gate),
         };
 
         self.runner = entry_runner_name.clone();
@@ -1730,6 +1775,7 @@ impl TurnRun {
             stable_prefix_len: None,
             cache_strategy: smedja_adapter::CacheStrategy::None,
             workspace: None,
+            tool_gate: None,
         };
         let stream = entry
             .provider

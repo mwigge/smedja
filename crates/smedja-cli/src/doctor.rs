@@ -1,7 +1,10 @@
 use super::*;
 
 pub(crate) fn is_subprocess_runner(runner_name: &str) -> bool {
-    matches!(runner_name, "claude-cli" | "codex-cli")
+    matches!(
+        runner_name,
+        "claude-cli" | "codex-cli" | "kimi-cli" | "gemini-cli"
+    )
 }
 
 pub(crate) async fn cmd_doctor(sock: &std::path::Path, json: bool) -> Result<()> {
@@ -16,6 +19,8 @@ pub(crate) async fn cmd_doctor(sock: &std::path::Path, json: bool) -> Result<()>
     let env_vars = [
         ("ANTHROPIC_API_KEY", "anthropic / claude-cli"),
         ("OPENAI_API_KEY", "openai / codex-cli"),
+        ("MOONSHOT_API_KEY", "moonshot / kimi-cli"),
+        ("GEMINI_API_KEY", "google / gemini-cli"),
         ("GITHUB_TOKEN", "copilot"),
         ("MINIMAX_API_KEY", "minimax"),
         ("BERGET_API_KEY", "berget"),

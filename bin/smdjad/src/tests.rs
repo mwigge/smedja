@@ -324,52 +324,67 @@ async fn provider_pool_builds_without_panic() {
     drop(pool);
 }
 
-/// Returns the provider name that `build_provider` would select given the
-/// detection results for each candidate, encoding the subscription-first
-/// priority order without touching the network or filesystem.
-///
-/// Priority (index 0 = highest):
-/// 0. claude CLI binary present
-/// 1. codex CLI binary present
-/// 2. copilot detected
-/// 3. poolside detected
-/// 4. `ANTHROPIC_API_KEY` set
-/// 5. `OPENAI_API_KEY` set
-/// 6. minimax detected
-/// 7. berget detected
-#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
-fn provider_priority(
+/// Detection results per candidate provider, for [`provider_priority`].
+/// `..Default::default()` keeps call sites readable as the ladder grows.
+#[derive(Default)]
+struct Detected {
     claude_cli: bool,
     codex_cli: bool,
+    kimi_cli: bool,
+    gemini_cli: bool,
     copilot: bool,
     poolside: bool,
     anthropic_key: bool,
     openai_key: bool,
+    moonshot_key: bool,
+    gemini_key: bool,
     minimax: bool,
     berget: bool,
-) -> &'static str {
-    if claude_cli {
+}
+
+/// Returns the provider name that `build_provider` would select given the
+/// detection results for each candidate, encoding the subscription-first
+/// priority order without touching the network or filesystem.
+///
+/// Priority (top = highest): claude CLI, codex CLI, kimi CLI, gemini CLI,
+/// copilot, poolside, then the API keys (`ANTHROPIC_API_KEY`,
+/// `OPENAI_API_KEY`, `MOONSHOT_API_KEY`, `GEMINI_API_KEY`), then minimax and
+/// berget.
+fn provider_priority(d: &Detected) -> &'static str {
+    if d.claude_cli {
         return "claude-cli";
     }
-    if codex_cli {
+    if d.codex_cli {
         return "codex-cli";
     }
-    if copilot {
+    if d.kimi_cli {
+        return "kimi-cli";
+    }
+    if d.gemini_cli {
+        return "gemini-cli";
+    }
+    if d.copilot {
         return "copilot";
     }
-    if poolside {
+    if d.poolside {
         return "poolside";
     }
-    if anthropic_key {
+    if d.anthropic_key {
         return "anthropic";
     }
-    if openai_key {
+    if d.openai_key {
         return "openai";
     }
-    if minimax {
+    if d.moonshot_key {
+        return "moonshot";
+    }
+    if d.gemini_key {
+        return "google";
+    }
+    if d.minimax {
         return "minimax";
     }
-    if berget {
+    if d.berget {
         return "berget";
     }
     "none"
@@ -379,24 +394,71 @@ fn provider_priority(
 fn cli_wins_over_api_key_when_both_present() {
     // CLI subscription beats API key — the fundamental invariant of L20.
     assert_eq!(
-        provider_priority(true, false, false, false, true, true, false, false),
+        provider_priority(&Detected {
+            claude_cli: true,
+            anthropic_key: true,
+            openai_key: true,
+            moonshot_key: true,
+            ..Detected::default()
+        }),
         "claude-cli"
     );
     assert_eq!(
-        provider_priority(false, true, false, false, false, true, false, false),
+        provider_priority(&Detected {
+            codex_cli: true,
+            openai_key: true,
+            moonshot_key: true,
+            ..Detected::default()
+        }),
         "codex-cli"
+    );
+    assert_eq!(
+        provider_priority(&Detected {
+            kimi_cli: true,
+            moonshot_key: true,
+            ..Detected::default()
+        }),
+        "kimi-cli"
+    );
+    assert_eq!(
+        provider_priority(&Detected {
+            gemini_cli: true,
+            gemini_key: true,
+            ..Detected::default()
+        }),
+        "gemini-cli"
     );
 }
 
 #[test]
 fn api_key_selected_when_no_cli_available() {
     assert_eq!(
-        provider_priority(false, false, false, false, true, false, false, false),
+        provider_priority(&Detected {
+            anthropic_key: true,
+            ..Detected::default()
+        }),
         "anthropic"
     );
     assert_eq!(
-        provider_priority(false, false, false, false, false, true, false, false),
+        provider_priority(&Detected {
+            openai_key: true,
+            ..Detected::default()
+        }),
         "openai"
+    );
+    assert_eq!(
+        provider_priority(&Detected {
+            moonshot_key: true,
+            ..Detected::default()
+        }),
+        "moonshot"
+    );
+    assert_eq!(
+        provider_priority(&Detected {
+            gemini_key: true,
+            ..Detected::default()
+        }),
+        "google"
     );
 }
 
@@ -404,15 +466,43 @@ fn api_key_selected_when_no_cli_available() {
 fn cli_providers_ordered_before_copilot_and_poolside() {
     // Even copilot (subscription-like) comes after the CLI runners.
     assert_eq!(
-        provider_priority(false, true, true, true, false, false, false, false),
+        provider_priority(&Detected {
+            codex_cli: true,
+            copilot: true,
+            poolside: true,
+            ..Detected::default()
+        }),
         "codex-cli"
+    );
+    assert_eq!(
+        provider_priority(&Detected {
+            kimi_cli: true,
+            copilot: true,
+            poolside: true,
+            ..Detected::default()
+        }),
+        "kimi-cli"
+    );
+    assert_eq!(
+        provider_priority(&Detected {
+            gemini_cli: true,
+            copilot: true,
+            poolside: true,
+            ..Detected::default()
+        }),
+        "gemini-cli"
     );
 }
 
 #[test]
 fn anthropic_key_before_openai_key() {
     assert_eq!(
-        provider_priority(false, false, false, false, true, true, false, false),
+        provider_priority(&Detected {
+            anthropic_key: true,
+            openai_key: true,
+            moonshot_key: true,
+            ..Detected::default()
+        }),
         "anthropic"
     );
 }
@@ -420,17 +510,20 @@ fn anthropic_key_before_openai_key() {
 #[test]
 fn minimax_and_berget_are_lowest_priority_before_local() {
     assert_eq!(
-        provider_priority(false, false, false, false, false, false, true, false),
+        provider_priority(&Detected {
+            minimax: true,
+            ..Detected::default()
+        }),
         "minimax"
     );
     assert_eq!(
-        provider_priority(false, false, false, false, false, false, false, true),
+        provider_priority(&Detected {
+            berget: true,
+            ..Detected::default()
+        }),
         "berget"
     );
-    assert_eq!(
-        provider_priority(false, false, false, false, false, false, false, false),
-        "none"
-    );
+    assert_eq!(provider_priority(&Detected::default()), "none");
 }
 
 // ── provider-display: session.create response fields ────────────────────

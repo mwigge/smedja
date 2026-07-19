@@ -56,6 +56,8 @@ pub(super) fn runner_label(runner: Runner) -> &'static str {
     match runner {
         Runner::Claude => "claude",
         Runner::Codex => "codex",
+        Runner::Kimi => "kimi",
+        Runner::Gemini => "gemini",
         Runner::Local => "local",
         Runner::Copilot => "copilot",
         Runner::Minimax => "minimax",

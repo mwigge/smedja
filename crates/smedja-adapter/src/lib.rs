@@ -17,9 +17,13 @@
 //! | [`LocalProvider`] | Local rs-llmctl instance (OpenAI-compatible) |
 //! | [`CopilotProvider`] | GitHub Copilot CLI or API |
 //! | [`PoolsideProvider`] | Poolside CLI |
+//! | [`KimiProvider`] | Kimi (Moonshot AI) HTTP API |
+//! | [`KimiCliProvider`] | Kimi CLI binary (ACP, gated) or Moonshot HTTP API |
+//! | [`AcpProvider`] | Any ACP-capable agent CLI over stdio (gated tool calls) |
 //! | [`MinimaxProvider`] | Minimax HTTP API |
 //! | [`BergetProvider`] | Berget AI HTTP API |
 
+pub mod acp_client;
 pub mod anthropic;
 pub mod claude_cli;
 pub mod codex_cli;
@@ -28,6 +32,7 @@ pub mod crush;
 pub mod error;
 pub mod gemini;
 pub mod gpu;
+pub mod kimi_cli;
 pub mod local;
 pub mod openai;
 pub mod openai_compat;
@@ -47,6 +52,7 @@ pub(crate) mod sse;
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+pub use acp_client::{AcpAgentSpec, AcpProvider, GEMINI_ACP, KIMI_ACP};
 pub use anthropic::AnthropicProvider;
 pub use claude_cli::ClaudeCliProvider;
 pub use codex_cli::CodexCliProvider;
@@ -60,16 +66,20 @@ pub use crush::{
 pub use error::{classify_http_error, AdapterError};
 pub use gemini::GeminiProvider;
 pub use gpu::{detect_gpu, fit_for, parse_gpu_snapshot, Fit, GpuSnapshot};
+pub use kimi_cli::KimiCliProvider;
 pub use local::{
     fetch_inventory, install_model, issue_swap_request, parse_model_inventory, record_local_swap,
     InstallOutcome, LocalCapability, LocalModel, LocalProvider, SwapOutcome,
 };
 pub use openai::OpenAiProvider;
 pub use openai_compat::{
-    BergetProvider, MinimaxProvider, OpenAiCompatProvider, OpenAiCompatSpec, OpenCodeProvider,
+    BergetProvider, KimiProvider, MinimaxProvider, OpenAiCompatProvider, OpenAiCompatSpec,
+    OpenCodeProvider,
 };
 pub use pool_cli::PoolCliProvider;
 pub use poolside::PoolsideProvider;
 pub use provider::{DeltaStream, Provider};
 pub use subprocess::SubprocessProvider;
-pub use types::{CacheStrategy, CallOptions, Delta, Message, Role};
+pub use types::{
+    CacheStrategy, CallOptions, Delta, Message, Role, ToolGate, ToolGateDecision, ToolGateFuture,
+};

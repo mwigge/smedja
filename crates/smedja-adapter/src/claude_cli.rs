@@ -703,6 +703,7 @@ mod tests {
             stable_prefix_len: None,
             cache_strategy: crate::types::CacheStrategy::None,
             workspace: None,
+            tool_gate: None,
         };
         let messages = vec![Message {
             role: crate::Role::User,
@@ -864,6 +865,7 @@ mod tests {
             stable_prefix_len: None,
             cache_strategy: crate::types::CacheStrategy::None,
             workspace: None,
+            tool_gate: None,
         };
         let messages = vec![Message {
             role: crate::Role::User,

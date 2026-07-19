@@ -406,3 +406,43 @@ fn native_api_preferred_over_subprocess_for_codex() {
     );
     assert_eq!(codex_preferred_runner(false, false), None);
 }
+
+#[test]
+fn native_api_preferred_over_subprocess_for_kimi() {
+    assert_eq!(
+        kimi_preferred_runner(true, true),
+        Some("moonshot"),
+        "API key wins over binary"
+    );
+    assert_eq!(
+        kimi_preferred_runner(false, true),
+        Some("kimi-cli"),
+        "binary used when no key"
+    );
+    assert_eq!(
+        kimi_preferred_runner(true, false),
+        Some("moonshot"),
+        "key works without binary"
+    );
+    assert_eq!(kimi_preferred_runner(false, false), None);
+}
+
+#[test]
+fn native_api_preferred_over_subprocess_for_gemini() {
+    assert_eq!(
+        gemini_preferred_runner(true, true),
+        Some("google"),
+        "API key wins over binary"
+    );
+    assert_eq!(
+        gemini_preferred_runner(false, true),
+        Some("gemini-cli"),
+        "binary used when no key"
+    );
+    assert_eq!(
+        gemini_preferred_runner(true, false),
+        Some("google"),
+        "key works without binary"
+    );
+    assert_eq!(gemini_preferred_runner(false, false), None);
+}

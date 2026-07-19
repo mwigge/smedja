@@ -131,6 +131,8 @@ pub(crate) fn runner_session_key(runner: Runner) -> &'static str {
     match runner {
         Runner::Claude => "claude-cli",
         Runner::Codex => "codex-cli",
+        Runner::Kimi => "kimi-cli",
+        Runner::Gemini => "gemini-cli",
         Runner::Local => "local",
         Runner::Copilot => "copilot",
         Runner::Minimax => "minimax",
@@ -147,6 +149,8 @@ pub(crate) fn parse_runner_str(s: &str) -> Option<Runner> {
     match s {
         "claude" | "claude-cli" => Some(Runner::Claude),
         "codex" | "codex-cli" => Some(Runner::Codex),
+        "kimi" | "kimi-cli" | "moonshot" => Some(Runner::Kimi),
+        "gemini" | "gemini-cli" | "google" => Some(Runner::Gemini),
         "local" => Some(Runner::Local),
         "copilot" => Some(Runner::Copilot),
         "minimax" => Some(Runner::Minimax),

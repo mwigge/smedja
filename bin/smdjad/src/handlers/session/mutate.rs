@@ -31,6 +31,8 @@ pub(crate) fn parse_runner_name(s: &str) -> Option<smedja_assayer::Runner> {
     match s.trim().to_ascii_lowercase().split('-').next()? {
         "claude" => Some(Runner::Claude),
         "codex" => Some(Runner::Codex),
+        "kimi" | "moonshot" => Some(Runner::Kimi),
+        "gemini" | "google" => Some(Runner::Gemini),
         "local" => Some(Runner::Local),
         "copilot" => Some(Runner::Copilot),
         "minimax" => Some(Runner::Minimax),
@@ -135,7 +137,7 @@ pub(crate) async fn set_runner(state: HandlerState, params: Value) -> Result<Val
         .ok_or_else(|| {
             RpcError::new(
                 codes::INVALID_PARAMS,
-                format!("unknown runner: {runner_str}; valid: claude, codex, local, copilot"),
+                format!("unknown runner: {runner_str}; valid: claude, codex, kimi, gemini, local, copilot, minimax, berget"),
             )
         })?;
     ig.update_session_runner_override(&session_id, canonical)

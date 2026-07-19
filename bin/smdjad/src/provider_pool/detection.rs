@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 
 use smedja_adapter::{
-    AnthropicProvider, BergetProvider, ClaudeCliProvider, CodexCliProvider, CopilotProvider,
-    LocalProvider, MinimaxProvider, OpenAiProvider, PoolCliProvider, PoolsideProvider,
-    SubprocessProvider,
+    AcpProvider, AnthropicProvider, BergetProvider, ClaudeCliProvider, CodexCliProvider,
+    CopilotProvider, GeminiProvider, KimiCliProvider, KimiProvider, LocalProvider, MinimaxProvider,
+    OpenAiProvider, PoolCliProvider, PoolsideProvider, SubprocessProvider, GEMINI_ACP,
 };
 use smedja_assayer::{Runner, Tier};
 use tracing::{error, info, warn};
@@ -36,6 +36,34 @@ pub(crate) fn codex_preferred_runner(has_api_key: bool, has_binary: bool) -> Opt
         Some("openai")
     } else if has_binary {
         Some("codex-cli")
+    } else {
+        None
+    }
+}
+
+/// Returns the preferred runner name for Kimi given availability.
+/// Native API wins over subprocess binary — `MOONSHOT_API_KEY` users get
+/// native HTTP without needing the `kimi` CLI binary installed.
+#[cfg(test)]
+pub(crate) fn kimi_preferred_runner(has_api_key: bool, has_binary: bool) -> Option<&'static str> {
+    if has_api_key {
+        Some("moonshot")
+    } else if has_binary {
+        Some("kimi-cli")
+    } else {
+        None
+    }
+}
+
+/// Returns the preferred runner name for Gemini given availability.
+/// Native API wins over subprocess binary — `GEMINI_API_KEY` users get
+/// native HTTP without needing the `gemini` CLI binary installed.
+#[cfg(test)]
+pub(crate) fn gemini_preferred_runner(has_api_key: bool, has_binary: bool) -> Option<&'static str> {
+    if has_api_key {
+        Some("google")
+    } else if has_binary {
+        Some("gemini-cli")
     } else {
         None
     }
@@ -162,32 +190,123 @@ pub async fn build_provider_pool() -> ProviderPool {
         );
     }
 
-    // 3. Copilot
+    // 3. Kimi (Moonshot) — native API preferred; the kimi CLI binary is the
+    //    fallback for Kimi Code subscription users (device-code OAuth) without
+    //    a MOONSHOT_API_KEY.
+    if let Some(p_fast) = KimiProvider::detect() {
+        add!(
+            Runner::Kimi,
+            Tier::Fast,
+            p_fast,
+            "moonshot",
+            "kimi-k2.7-code-highspeed"
+        );
+        if let Some(p_deep) = KimiProvider::detect() {
+            add!(Runner::Kimi, Tier::Deep, p_deep, "moonshot", "kimi-k3");
+        }
+        info!(runner = "moonshot", "provider ready");
+    } else if SubprocessProvider::available("kimi") {
+        // Same detect TOCTOU as the claude branch: skip on `None`, never panic.
+        if let Some(p_fast) = KimiCliProvider::detect() {
+            add!(
+                Runner::Kimi,
+                Tier::Fast,
+                p_fast,
+                "kimi-cli",
+                "kimi-code/kimi-for-coding-highspeed"
+            );
+            if let Some(p_deep) = KimiCliProvider::detect() {
+                add!(Runner::Kimi, Tier::Deep, p_deep, "kimi-cli", "kimi-code/k3");
+            }
+            info!(runner = "kimi-cli", "provider ready");
+        } else {
+            warn!(
+                runner = "kimi-cli",
+                "UNAVAILABLE — kimi binary detected then vanished before probe"
+            );
+        }
+    } else {
+        warn!(
+            runner = "kimi",
+            "UNAVAILABLE — no MOONSHOT_API_KEY and no kimi binary"
+        );
+    }
+
+    // 4. Gemini — native API preferred; the gemini CLI binary is the fallback,
+    //    driven over ACP so its tool calls are gated like kimi's.
+    if std::env::var("GEMINI_API_KEY").is_ok() {
+        match (GeminiProvider::from_env(), GeminiProvider::from_env()) {
+            (Ok(p_fast), Ok(p_deep)) => {
+                add!(
+                    Runner::Gemini,
+                    Tier::Fast,
+                    p_fast,
+                    "google",
+                    "gemini-2.5-flash"
+                );
+                add!(
+                    Runner::Gemini,
+                    Tier::Deep,
+                    p_deep,
+                    "google",
+                    "gemini-2.5-pro"
+                );
+                info!(runner = "google", "provider ready");
+            }
+            _ => warn!(
+                runner = "google",
+                "UNAVAILABLE — GEMINI_API_KEY vanished mid-probe"
+            ),
+        }
+    } else if SubprocessProvider::available("gemini") {
+        // Same detect TOCTOU as the claude branch: skip on `None`, never panic.
+        if let Some(p_fast) = AcpProvider::detect(GEMINI_ACP) {
+            // Empty model literals: gemini's ACP mode uses the agent's own
+            // configured default model; pins go via SMEDJA_MODEL_GEMINI_<TIER>.
+            add!(Runner::Gemini, Tier::Fast, p_fast, "gemini-cli", "");
+            if let Some(p_deep) = AcpProvider::detect(GEMINI_ACP) {
+                add!(Runner::Gemini, Tier::Deep, p_deep, "gemini-cli", "");
+            }
+            info!(runner = "gemini-cli", "provider ready");
+        } else {
+            warn!(
+                runner = "gemini-cli",
+                "UNAVAILABLE — gemini binary detected then vanished before probe"
+            );
+        }
+    } else {
+        warn!(
+            runner = "gemini",
+            "UNAVAILABLE — no GEMINI_API_KEY and no gemini binary"
+        );
+    }
+
+    // 5. Copilot
     if let Some(p) = CopilotProvider::detect() {
         add!(Runner::Copilot, Tier::Fast, p, "copilot", "gpt-5.5");
         info!(runner = "copilot", "provider ready");
     }
 
-    // 4. Poolside
+    // 6. Poolside
     if let Some(p) = PoolsideProvider::detect() {
         add!(Runner::Copilot, Tier::Deep, p, "poolside", "poolside-muse");
         info!(runner = "poolside", "provider ready");
     }
 
-    // 5. Pool (Poolside `pool` CLI)
+    // 7. Pool (Poolside `pool` CLI)
     if let Some(p) = PoolCliProvider::detect() {
         add!(Runner::Pool, Tier::Fast, p, "pool", "laguna-m1");
         info!(runner = "pool", "provider ready");
     }
 
-    // 6. Minimax — keyed under its own runner so it is routable by name and does
+    // 8. Minimax — keyed under its own runner so it is routable by name and does
     //    not shadow a local endpoint sharing the (Local, _) key space.
     if let Some(p) = MinimaxProvider::detect() {
         add!(Runner::Minimax, Tier::Fast, p, "minimax", "MiniMax-M2");
         info!(runner = "minimax", "provider ready");
     }
 
-    // 7. Berget — keyed under Runner::Berget. Registering it under Runner::Local
+    // 9. Berget — keyed under Runner::Berget. Registering it under Runner::Local
     //    collided with the local rs-llmctl endpoint at (Local, Local): whichever
     //    probed second overwrote the other, so a healthy local endpoint made
     //    Berget dead config. Its own runner key lets both coexist.
@@ -196,7 +315,7 @@ pub async fn build_provider_pool() -> ProviderPool {
         info!(runner = "berget", "provider ready");
     }
 
-    // 7. Local rs-llmctl
+    // 10. Local rs-llmctl
     let local = LocalProvider::connect().await;
     let mut local_control: Option<LocalControl> = None;
     if local.capability.healthy {

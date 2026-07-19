@@ -405,6 +405,7 @@ pub fn runner_color(runner: &str) -> Color {
     match runner_key(runner).as_str() {
         "claude" | "anthropic" => Color::Rgb(0xC9, 0x7A, 0x40), // copper
         "codex" | "openai" => Color::Rgb(0x10, 0xA3, 0x7F),     // openai green
+        "kimi" | "moonshot" => Color::Rgb(0xE0, 0x52, 0x9B),    // moon magenta
         "copilot" | "github" => Color::Rgb(0x3B, 0x8E, 0xEA),   // azure
         "minimax" => Color::Rgb(0xA0, 0x6C, 0xD5),              // violet
         "gemini" | "google" => Color::Rgb(0x53, 0x8B, 0xF0),    // blue
@@ -496,6 +497,7 @@ mod tests {
     fn runner_label_strips_cli_suffix_and_uppercases() {
         assert_eq!(runner_label("claude-cli"), "CLAUDE");
         assert_eq!(runner_label("codex-cli"), "CODEX");
+        assert_eq!(runner_label("kimi-cli"), "KIMI");
         assert_eq!(runner_label("copilot"), "COPILOT");
         assert_eq!(runner_label("  MiniMax  "), "MINIMAX");
     }
@@ -533,12 +535,18 @@ mod tests {
         let claude = runner_color("claude-cli");
         let codex = runner_color("codex");
         let copilot = runner_color("copilot");
+        let kimi = runner_color("kimi");
         assert!(matches!(claude, Color::Rgb(_, _, _)));
         assert_ne!(claude, codex);
         assert_ne!(codex, copilot);
         assert_ne!(claude, copilot);
-        // -cli suffix is irrelevant to the colour.
+        assert_ne!(kimi, claude);
+        assert_ne!(kimi, runner_color("minimax"));
+        // -cli suffix is irrelevant to the colour, and the moonshot API
+        // runner name shares the kimi brand colour.
         assert_eq!(runner_color("claude"), runner_color("claude-cli"));
+        assert_eq!(runner_color("kimi-cli"), kimi);
+        assert_eq!(runner_color("moonshot"), kimi);
     }
 
     #[test]

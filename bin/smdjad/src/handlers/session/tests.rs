@@ -10,6 +10,12 @@ fn parse_runner_name_tolerates_cli_suffix_and_rejects_unknown() {
     assert_eq!(parse_runner_name("claude"), Some(Runner::Claude));
     assert_eq!(parse_runner_name("claude-cli"), Some(Runner::Claude));
     assert_eq!(parse_runner_name("codex-cli"), Some(Runner::Codex));
+    assert_eq!(parse_runner_name("kimi"), Some(Runner::Kimi));
+    assert_eq!(parse_runner_name("kimi-cli"), Some(Runner::Kimi));
+    assert_eq!(parse_runner_name("moonshot"), Some(Runner::Kimi));
+    assert_eq!(parse_runner_name("gemini"), Some(Runner::Gemini));
+    assert_eq!(parse_runner_name("gemini-cli"), Some(Runner::Gemini));
+    assert_eq!(parse_runner_name("google"), Some(Runner::Gemini));
     assert_eq!(parse_runner_name("LOCAL"), Some(Runner::Local));
     assert_eq!(parse_runner_name("minimax"), Some(Runner::Minimax));
     assert_eq!(parse_runner_name("nope"), None);

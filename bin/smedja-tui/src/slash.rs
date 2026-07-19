@@ -978,6 +978,14 @@ pub(crate) async fn dispatch_slash(
                     .arg("codex")
                     .output()
                     .is_ok_and(|o| o.status.success());
+                let kimi_found = std::process::Command::new("which")
+                    .arg("kimi")
+                    .output()
+                    .is_ok_and(|o| o.status.success());
+                let gemini_found = std::process::Command::new("which")
+                    .arg("gemini")
+                    .output()
+                    .is_ok_and(|o| o.status.success());
                 let llmctl_found = std::process::Command::new("which")
                     .arg("llmctl")
                     .output()
@@ -996,6 +1004,18 @@ pub(crate) async fn dispatch_slash(
                     format!(
                         "  codex    [{}]  — OpenAI Codex CLI",
                         if codex_found {
+                            "installed"
+                        } else {
+                            "not found"
+                        }
+                    ),
+                    format!(
+                        "  kimi     [{}]  — Kimi Code subscription (OAuth) or MOONSHOT_API_KEY",
+                        if kimi_found { "installed" } else { "not found" }
+                    ),
+                    format!(
+                        "  gemini   [{}]  — Google Gemini CLI (OAuth) or GEMINI_API_KEY",
+                        if gemini_found {
                             "installed"
                         } else {
                             "not found"
@@ -1054,6 +1074,38 @@ pub(crate) async fn dispatch_slash(
                                 .to_owned()
                         }
                     }
+                    "kimi" => {
+                        let found = std::process::Command::new("which")
+                            .arg("kimi")
+                            .output()
+                            .is_ok_and(|o| o.status.success());
+                        if found {
+                            "kimi CLI is installed — uses your Kimi Code subscription (device-code OAuth).\n\
+                             if not authenticated yet, run: kimi login"
+                                .to_owned()
+                        } else {
+                            state.secret_var = Some("MOONSHOT_API_KEY".to_owned());
+                            "kimi CLI not found (install: https://moonshotai.github.io/kimi-code/).\n\
+                             paste your Moonshot API key then Enter — input is hidden · Esc to cancel"
+                                .to_owned()
+                        }
+                    }
+                    "gemini" => {
+                        let found = std::process::Command::new("which")
+                            .arg("gemini")
+                            .output()
+                            .is_ok_and(|o| o.status.success());
+                        if found {
+                            "gemini CLI is installed — driven over ACP; uses its own login state.\n\
+                             if not authenticated yet, run: gemini (interactive) and complete /auth"
+                                .to_owned()
+                        } else {
+                            state.secret_var = Some("GEMINI_API_KEY".to_owned());
+                            "gemini CLI not found (install: npm install -g @google/gemini-cli).\n\
+                             paste your Gemini API key then Enter — input is hidden · Esc to cancel"
+                                .to_owned()
+                        }
+                    }
                     "local" => "local runner uses rs-llmctl and a llama-swap proxy.\n\
                                 install rs-llmctl, then restart smdjad."
                         .to_owned(),
@@ -1071,7 +1123,7 @@ pub(crate) async fn dispatch_slash(
                             .to_owned()
                     }
                     other => format!(
-                        "unknown runner: {other}\nvalid: claude, codex, local, copilot, minimax, berget"
+                        "unknown runner: {other}\nvalid: claude, codex, kimi, gemini, local, copilot, minimax, berget"
                     ),
                 }
             };
@@ -1110,7 +1162,7 @@ pub(crate) async fn dispatch_slash(
                             state,
                             format!(
                                 "usage: /switch [runner]  — omit for interactive picker\n\
-                                 runners: claude, codex, local, copilot, minimax, berget\n\
+                                 runners: claude, codex, kimi, gemini, local, copilot, minimax, berget\n\
                                  (runner.list error: {e})"
                             ),
                         );

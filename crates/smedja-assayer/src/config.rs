@@ -91,6 +91,8 @@ fn parse_runner(s: &str) -> Option<Runner> {
         "claude" => Some(Runner::Claude),
         "local" => Some(Runner::Local),
         "codex" => Some(Runner::Codex),
+        "kimi" => Some(Runner::Kimi),
+        "gemini" => Some(Runner::Gemini),
         "copilot" => Some(Runner::Copilot),
         _ => None,
     }

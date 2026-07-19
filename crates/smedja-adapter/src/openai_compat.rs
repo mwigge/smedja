@@ -29,6 +29,15 @@ pub const MINIMAX: OpenAiCompatSpec = OpenAiCompatSpec {
     base_url: "https://api.minimax.io/v1",
 };
 
+/// Built-in spec for the Kimi (Moonshot AI) API — the international endpoint.
+///
+/// The mainland-China endpoint (`https://api.moonshot.cn/v1`) uses separate,
+/// non-interchangeable keys; select it via the `MOONSHOT_BASE_URL` override.
+pub const KIMI: OpenAiCompatSpec = OpenAiCompatSpec {
+    env_var: "MOONSHOT_API_KEY",
+    base_url: "https://api.moonshot.ai/v1",
+};
+
 /// Built-in spec for the Berget AI API.
 pub const BERGET: OpenAiCompatSpec = OpenAiCompatSpec {
     env_var: "BERGET_API_KEY",
@@ -107,6 +116,33 @@ impl MinimaxProvider {
     #[must_use]
     pub fn detect() -> Option<OpenAiCompatProvider> {
         OpenAiCompatProvider::detect(MINIMAX)
+    }
+}
+
+/// Entry point for the Kimi (Moonshot AI) API. Construct via
+/// [`KimiProvider::detect`].
+///
+/// Kimi honours a `MOONSHOT_BASE_URL` override (e.g. to select the
+/// mainland-China endpoint `https://api.moonshot.cn/v1`), and accepts the
+/// key from `MOONSHOT_API_KEY` (official convention) or `KIMI_API_KEY`
+/// (common third-party convention) — in that order.
+pub struct KimiProvider;
+
+impl KimiProvider {
+    /// Returns `Some` when `MOONSHOT_API_KEY` (or `KIMI_API_KEY`) is set in
+    /// the environment.
+    ///
+    /// The base URL defaults to `https://api.moonshot.ai/v1` but may be
+    /// overridden via the `MOONSHOT_BASE_URL` environment variable.
+    #[must_use]
+    pub fn detect() -> Option<OpenAiCompatProvider> {
+        let api_key = std::env::var(KIMI.env_var)
+            .or_else(|_| std::env::var("KIMI_API_KEY"))
+            .ok()?;
+        match std::env::var("MOONSHOT_BASE_URL") {
+            Ok(base_url) => Some(OpenAiCompatProvider::with_base_url(KIMI, base_url, api_key)),
+            Err(_) => Some(OpenAiCompatProvider::new(KIMI, api_key)),
+        }
     }
 }
 
@@ -212,6 +248,59 @@ mod tests {
         let provider = MinimaxProvider::detect();
         std::env::remove_var("MINIMAX_API_KEY");
         assert!(provider.is_some());
+    }
+
+    #[test]
+    fn kimi_marker_detect_returns_none_when_keys_absent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved_moonshot = std::env::var("MOONSHOT_API_KEY").ok();
+        let saved_kimi = std::env::var("KIMI_API_KEY").ok();
+        std::env::remove_var("MOONSHOT_API_KEY");
+        std::env::remove_var("KIMI_API_KEY");
+        let provider = KimiProvider::detect();
+        if let Some(v) = saved_moonshot {
+            std::env::set_var("MOONSHOT_API_KEY", v);
+        }
+        if let Some(v) = saved_kimi {
+            std::env::set_var("KIMI_API_KEY", v);
+        }
+        assert!(provider.is_none());
+    }
+
+    #[test]
+    fn kimi_marker_detect_returns_some_when_moonshot_key_present() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("MOONSHOT_API_KEY", "test-key");
+        std::env::remove_var("MOONSHOT_BASE_URL");
+        let provider = KimiProvider::detect();
+        std::env::remove_var("MOONSHOT_API_KEY");
+        assert!(provider.is_some());
+    }
+
+    #[test]
+    fn kimi_marker_detect_accepts_kimi_api_key_fallback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("MOONSHOT_API_KEY").ok();
+        std::env::remove_var("MOONSHOT_API_KEY");
+        std::env::set_var("KIMI_API_KEY", "test-key");
+        let provider = KimiProvider::detect();
+        std::env::remove_var("KIMI_API_KEY");
+        if let Some(v) = saved {
+            std::env::set_var("MOONSHOT_API_KEY", v);
+        }
+        assert!(provider.is_some());
+    }
+
+    #[test]
+    fn kimi_marker_detect_uses_custom_base_url_from_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("MOONSHOT_API_KEY", "test-key");
+        std::env::set_var("MOONSHOT_BASE_URL", "https://api.moonshot.cn/v1");
+        let provider = KimiProvider::detect();
+        std::env::remove_var("MOONSHOT_API_KEY");
+        std::env::remove_var("MOONSHOT_BASE_URL");
+        let provider = provider.expect("key set → provider");
+        assert_eq!(provider.env_var(), "MOONSHOT_API_KEY");
     }
 
     #[test]

@@ -288,6 +288,7 @@ impl ReviewTurn for ProviderReviewTurn {
                 stable_prefix_len: None,
                 cache_strategy: smedja_adapter::CacheStrategy::None,
                 workspace: None,
+                tool_gate: None,
             };
             let stream = entry.provider.stream_chat(&body, &opts);
             let drained = tokio::time::timeout(

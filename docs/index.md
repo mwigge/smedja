@@ -9,3 +9,4 @@
 | [govctl.md](govctl.md) | govctl TOML artifacts: work items, RFCs, ADRs |
 | [terminal.md](terminal.md) | smedja GPU terminal: block model, Glyph Protocol, config |
 | [maintenance.md](maintenance.md) | Module ownership, test placement, and verification commands |
+| [blog/](blog/) | Release announcements — latest: [Kimi joins the forge, with gated ACP](blog/2026-07-19-kimi-and-gated-acp.md) |

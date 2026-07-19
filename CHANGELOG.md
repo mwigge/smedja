@@ -6,6 +6,33 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Kimi (Moonshot AI) runner** — third CLI in the provider ladder, right after
+  Claude and Codex. Dual path like claude: `MOONSHOT_API_KEY` (or `KIMI_API_KEY`)
+  selects the native OpenAI-compatible Moonshot API (`moonshot` runner,
+  `kimi-k2.7-code-highspeed` fast / `kimi-k3` deep, `MOONSHOT_BASE_URL` override
+  for the mainland-China endpoint); otherwise a `kimi` binary on `$PATH` (Kimi
+  Code CLI, device-code OAuth subscription) is driven over ACP (below). Full
+  wiring: `/switch kimi`, `/login kimi`, `/takeover kimi`, `runner: "kimi"` in
+  loop/agents config, `SMEDJA_MODEL_MOONSHOT_*` / `SMEDJA_MODEL_KIMI_*` model
+  pins, doctor rows, and a kimi brand colour in the TUI.
+- **Generic ACP client with gated tool calls** — a new `AcpProvider` drives any
+  Agent Client Protocol agent CLI over stdio (JSON-RPC 2.0, protocol v1) and
+  routes the agent's `session/request_permission` through smedja's per-session
+  approval gate: the TUI shows the same approve/deny prompt as for in-process
+  tools, `auto` mode auto-approves, and a missing gate fails CLOSED. This closes
+  the hole where one-shot prompt modes (`kimi -p`) self-approve their tools. The
+  kimi CLI path uses ACP by default (`SMEDJA_KIMI_ACP=off` reverts to the
+  ungated one-shot mode). Model selection rides ACP `session/set_config_option`
+  when the agent advertises a model option.
+- **Gemini runner** — fourth CLI in the ladder, ACP consumer number two:
+  `GEMINI_API_KEY` selects the native Gemini streaming API (`google` runner);
+  otherwise a `gemini` binary on `$PATH` is driven via `gemini --acp` with the
+  same gated-permission flow (`gemini-cli` runner, agent-default model,
+  `SMEDJA_MODEL_GEMINI_*` pins).
+
 ## [0.25.3] — 2026-07-06
 
 ### Added

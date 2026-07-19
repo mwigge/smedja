@@ -19,6 +19,10 @@ pub enum Runner {
     Claude,
     /// `OpenAI` Codex (cloud).
     Codex,
+    /// Kimi / Moonshot AI (cloud).
+    Kimi,
+    /// Google Gemini (cloud).
+    Gemini,
     /// Local model running on device — no cloud egress.
     Local,
     /// GitHub Copilot (cloud).
@@ -303,6 +307,8 @@ mod tests {
         for runner in [
             Runner::Claude,
             Runner::Codex,
+            Runner::Kimi,
+            Runner::Gemini,
             Runner::Local,
             Runner::Copilot,
             Runner::Minimax,

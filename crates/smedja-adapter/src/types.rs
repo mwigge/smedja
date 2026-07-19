@@ -67,6 +67,55 @@ impl Message {
     }
 }
 
+/// Decision returned by a [`ToolGate`] callback for one tool invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolGateDecision {
+    /// Run the tool this once.
+    Allow,
+    /// Run the tool and pre-approve identical calls for the rest of the session.
+    AllowAlways,
+    /// Refuse the tool call; the reason is relayed to the agent.
+    Deny(String),
+}
+
+/// Boxed future returned by a [`ToolGate`] callback.
+pub type ToolGateFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ToolGateDecision> + Send>>;
+
+/// Async per-tool approval callback injected by the daemon.
+///
+/// ACP-speaking CLI adapters invoke this for every agent-side
+/// `session/request_permission`, so an external agent's tool calls flow
+/// through the same per-session approval gate as in-process tools. The daemon
+/// captures the session's gate in the closure; adapters never see daemon
+/// types. When absent, adapters fail closed (deny) unless the permission mode
+/// is `auto`.
+#[derive(Clone)]
+pub struct ToolGate(
+    std::sync::Arc<dyn Fn(String, serde_json::Value) -> ToolGateFuture + Send + Sync>,
+);
+
+impl ToolGate {
+    /// Wraps an async approval function.
+    pub fn new<F>(gate: F) -> Self
+    where
+        F: Fn(String, serde_json::Value) -> ToolGateFuture + Send + Sync + 'static,
+    {
+        Self(std::sync::Arc::new(gate))
+    }
+
+    /// Asks the gate to decide one tool invocation.
+    pub async fn decide(&self, tool_name: String, input: serde_json::Value) -> ToolGateDecision {
+        (self.0)(tool_name, input).await
+    }
+}
+
+impl std::fmt::Debug for ToolGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ToolGate(..)")
+    }
+}
+
 /// Options controlling a single chat-completion call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallOptions {
@@ -122,6 +171,10 @@ pub struct CallOptions {
     /// `current_dir` so the subprocess runs inside a trusted git repository.
     #[serde(default)]
     pub workspace: Option<std::path::PathBuf>,
+    /// Per-tool approval callback for ACP adapters (never serialized; the
+    /// daemon injects it per turn). See [`ToolGate`].
+    #[serde(skip)]
+    pub tool_gate: Option<ToolGate>,
 }
 
 /// Provider-neutral instruction for how an adapter should realise a cache hint.
@@ -212,6 +265,7 @@ mod tests {
             stable_prefix_len: None,
             cache_strategy: CacheStrategy::None,
             workspace: None,
+            tool_gate: None,
         }
     }
 

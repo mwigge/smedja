@@ -121,7 +121,7 @@ The loop engine policy contract. Required by `smj loop run`. Its SHA-256 is hash
 | `limits.max_attempts` | int | Max role attempts per slice before the loop fails |
 | `limits.agent_timeout_s` | int | Per-role wall-clock timeout in seconds |
 | `roles[].name` | string | Role name matching `agents.toml` |
-| `roles[].runner` | string | Runner to use for this role |
+| `roles[].runner` | string | Runner to use for this role: `claude`, `codex`, `kimi`, `gemini`, `local`, `copilot`, `minimax`, `berget` |
 | `roles[].tier` | string | Routing tier: `local`, `fast`, `deep` |
 | `roles[].read_only` | bool | Whether this role may write files |
 | `roles[].tools` | array | Allowed tool names (empty = use role defaults) |

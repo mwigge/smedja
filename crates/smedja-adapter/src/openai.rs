@@ -340,6 +340,7 @@ mod tests {
             stable_prefix_len: None,
             cache_strategy: CacheStrategy::None,
             workspace: None,
+            tool_gate: None,
         }
     }
 
