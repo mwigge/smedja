@@ -6,7 +6,7 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
-## [Unreleased]
+## [0.26.0] — 2026-07-19
 
 ### Added
 - **Kimi (Moonshot AI) runner** — third CLI in the provider ladder, right after
