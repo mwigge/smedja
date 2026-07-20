@@ -952,7 +952,10 @@ mod tests {
             reviewer.runner_differs_from(&implementer),
             "evaluator separation must survive model binding"
         );
-        assert_eq!(reviewer.model, None, "non-Claude runner keeps no built-in model");
+        assert_eq!(
+            reviewer.model, None,
+            "non-Claude runner keeps no built-in model"
+        );
         assert_eq!(
             implementer.model, None,
             "non-Claude runner keeps no built-in model"

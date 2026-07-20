@@ -75,8 +75,7 @@ pub(crate) async fn cmd_tool_gate(sock: &std::path::Path) {
             if fallback_open() {
                 (
                     "allow".to_owned(),
-                    "smedja gate unreachable; SMEDJA_TOOL_GATE_FALLBACK=open — allowing"
-                        .to_owned(),
+                    "smedja gate unreachable; SMEDJA_TOOL_GATE_FALLBACK=open — allowing".to_owned(),
                     None,
                 )
             } else {

@@ -452,9 +452,17 @@ fn native_api_preferred_over_subprocess_for_gemini() {
 fn missing_price_models_surface_unpriced_models() {
     let pt = PriceTable::embedded();
     let pool = pool_with(vec![
-        ((Runner::Kimi, Tier::Fast), "moonshot", "kimi-k2.7-code-highspeed"),
+        (
+            (Runner::Kimi, Tier::Fast),
+            "moonshot",
+            "kimi-k2.7-code-highspeed",
+        ),
         ((Runner::Kimi, Tier::Deep), "moonshot", "kimi-k3"),
-        ((Runner::Berget, Tier::Deep), "berget", "berget-unknown-model"),
+        (
+            (Runner::Berget, Tier::Deep),
+            "berget",
+            "berget-unknown-model",
+        ),
     ]);
     let missing = pool.missing_price_models(&pt);
     assert_eq!(
@@ -468,7 +476,11 @@ fn missing_price_models_surface_unpriced_models() {
 fn missing_price_models_is_empty_when_all_priced() {
     let pt = PriceTable::embedded();
     let pool = pool_with(vec![
-        ((Runner::Kimi, Tier::Fast), "moonshot", "kimi-k2.7-code-highspeed"),
+        (
+            (Runner::Kimi, Tier::Fast),
+            "moonshot",
+            "kimi-k2.7-code-highspeed",
+        ),
         ((Runner::Kimi, Tier::Deep), "moonshot", "kimi-k3"),
     ]);
     assert!(pool.missing_price_models(&pt).is_empty());
