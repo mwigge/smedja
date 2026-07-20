@@ -6,6 +6,32 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.26.1] — 2026-07-20
+
+### Added
+- Prices for new default models: `gpt-5.5`, `gemini-2.5-flash`, `gemini-2.5-pro`,
+  `MiniMax-M2`, and `laguna-m1`.
+- Codex `Tier::Deep` registration (latest `gpt-5.5` for both API and CLI paths).
+
+### Fixed
+- OpenAI-compat provider base URLs no longer carry a trailing `/v1`, so endpoint
+  resolution matches the documented API-root defaults.
+- `smj doctor` and `agents.toml` runner parsing now accept `pool`/`poolside` as
+  a subprocess runner.
+- The external tool gate now fails closed when the daemon socket is unreachable,
+  with `SMEDJA_TOOL_GATE_FALLBACK=open` as an explicit opt-in to fail-open.
+
+### Changed
+- Removed the `PoolsideProvider` adapter; pool routing now uses the generic
+  subprocess path.
+- `smedja-plugins` default skill directory is now `~/.config/smedja/skills`
+  (legacy `~/.claude/skills` fallback preserved) and skill-file descriptions are
+  client-neutral.
+- README clarifies `SMEDJA_MODEL_<RUNNER>_<TIER>` naming, documents
+  `BERGET_API_KEY`, and shows `MOONSHOT_BASE_URL` as the API root.
+
+---
+
 ## [0.26.0] — 2026-07-19
 
 ### Added
