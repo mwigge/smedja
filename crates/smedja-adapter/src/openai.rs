@@ -42,6 +42,12 @@ impl OpenAiProvider {
             api_key: api_key.into(),
         }
     }
+
+    /// Returns the configured base URL (without trailing `/v1/chat/completions`).
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
 }
 
 fn role_to_str(role: &Role) -> &'static str {

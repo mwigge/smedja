@@ -28,7 +28,8 @@ pub(crate) enum SkillCmd {
         /// Path to a directory of skills (e.g. agent-toolkit-bundle/skills)
         path: PathBuf,
     },
-    /// Create .codex/skills and .cursor/skills symlinks pointing to ~/.claude/skills
+    /// Create editor-specific skill directories (e.g. .codex/skills, .cursor/skills)
+    /// as symlinks pointing to the smedja skills directory
     LinkIdes {
         /// Project directory to link into (default: current directory)
         #[arg(long, default_value = ".")]

@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use smedja_assayer::{Runner, Tier};
 
 use super::types::{LocalControl, ProviderEntry};
+use crate::price_table::PriceTable;
+use tracing::warn;
 
 /// Map from `(Runner, Tier)` to a concrete provider instance.
 ///
@@ -168,6 +170,41 @@ impl ProviderPool {
             }
         }
         out
+    }
+
+    /// Returns the list of `(runner_name, model)` pairs in this pool that have
+    /// no price entry. De-duplicated and sorted for stable output.
+    #[must_use]
+    pub fn missing_price_models(&self, price_table: &PriceTable) -> Vec<(&str, &str)> {
+        let mut missing: Vec<(&str, &str)> = self
+            .entries
+            .values()
+            .filter_map(|entry| {
+                let model = entry.default_model.as_str();
+                if price_table.compute_cost(model, 1_000_000, 0).abs() < f64::EPSILON
+                    && price_table.compute_cost(model, 0, 1_000_000).abs() < f64::EPSILON
+                {
+                    Some((entry.runner_name, model))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        missing.sort();
+        missing.dedup();
+        missing
+    }
+
+    /// Logs a warning for every pool entry whose default model has no price
+    /// entry, so cost metrics silently reporting `$0.00` are surfaced at startup.
+    pub fn warn_missing_prices(&self, price_table: &PriceTable) {
+        for (runner, model) in self.missing_price_models(price_table) {
+            warn!(
+                runner = runner,
+                model = model,
+                "no price entry for model — session cost and metrics will report $0.00 until prices.toml is updated"
+            );
+        }
     }
 
     /// Returns all pool entries as `(runner_name, tier, default_model)` triples.

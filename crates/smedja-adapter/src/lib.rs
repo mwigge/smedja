@@ -16,7 +16,6 @@
 //! | [`OpenCodeProvider`] | OpenCode OpenAI-compatible API |
 //! | [`LocalProvider`] | Local rs-llmctl instance (OpenAI-compatible) |
 //! | [`CopilotProvider`] | GitHub Copilot CLI or API |
-//! | [`PoolsideProvider`] | Poolside CLI |
 //! | [`KimiProvider`] | Kimi (Moonshot AI) HTTP API |
 //! | [`KimiCliProvider`] | Kimi CLI binary (ACP, gated) or Moonshot HTTP API |
 //! | [`AcpProvider`] | Any ACP-capable agent CLI over stdio (gated tool calls) |
@@ -37,7 +36,6 @@ pub mod local;
 pub mod openai;
 pub mod openai_compat;
 pub mod pool_cli;
-pub mod poolside;
 pub mod provider;
 pub mod subprocess;
 pub mod types;
@@ -77,7 +75,6 @@ pub use openai_compat::{
     OpenCodeProvider,
 };
 pub use pool_cli::PoolCliProvider;
-pub use poolside::PoolsideProvider;
 pub use provider::{DeltaStream, Provider};
 pub use subprocess::SubprocessProvider;
 pub use types::{

@@ -469,11 +469,12 @@ fn is_subprocess_runner_distinguishes_native_from_cli() {
     assert!(is_subprocess_runner("codex-cli"));
     assert!(is_subprocess_runner("kimi-cli"));
     assert!(is_subprocess_runner("gemini-cli"));
+    assert!(is_subprocess_runner("copilot"));
+    assert!(is_subprocess_runner("pool"));
     assert!(!is_subprocess_runner("anthropic"));
     assert!(!is_subprocess_runner("openai"));
     assert!(!is_subprocess_runner("moonshot"));
     assert!(!is_subprocess_runner("google"));
-    assert!(!is_subprocess_runner("copilot"));
     assert!(!is_subprocess_runner("minimax"));
     assert!(!is_subprocess_runner("berget"));
     assert!(!is_subprocess_runner("local"));

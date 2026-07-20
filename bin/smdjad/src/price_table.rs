@@ -130,6 +130,38 @@ mod tests {
     }
 
     #[test]
+    fn kimi_k3_priced_and_windowed() {
+        let pt = PriceTable::embedded();
+        let input_cost = pt.compute_cost("kimi-k3", 1_000_000, 0);
+        let output_cost = pt.compute_cost("kimi-k3", 0, 1_000_000);
+        assert!(
+            (input_cost - 3.0).abs() < 1e-9,
+            "1M input tokens at $3/M should be $3.00; got {input_cost}"
+        );
+        assert!(
+            (output_cost - 15.0).abs() < 1e-9,
+            "1M output tokens at $15/M should be $15.00; got {output_cost}"
+        );
+        assert_eq!(pt.context_window("kimi-k3"), 1_050_000);
+    }
+
+    #[test]
+    fn kimi_k27_code_highspeed_priced_and_windowed() {
+        let pt = PriceTable::embedded();
+        let input_cost = pt.compute_cost("kimi-k2.7-code-highspeed", 1_000_000, 0);
+        let output_cost = pt.compute_cost("kimi-k2.7-code-highspeed", 0, 1_000_000);
+        assert!(
+            (input_cost - 0.95).abs() < 1e-9,
+            "1M input tokens at $0.95/M should be $0.95; got {input_cost}"
+        );
+        assert!(
+            (output_cost - 4.0).abs() < 1e-9,
+            "1M output tokens at $4/M should be $4.00; got {output_cost}"
+        );
+        assert_eq!(pt.context_window("kimi-k2.7-code-highspeed"), 256_000);
+    }
+
+    #[test]
     fn context_window_unknown_model_defaults_to_200k() {
         let pt = PriceTable::embedded();
         assert_eq!(

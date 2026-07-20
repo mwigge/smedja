@@ -83,7 +83,7 @@ pub(crate) enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Manage Claude Code skill files
+    /// Manage skill files
     Skill {
         #[command(subcommand)]
         action: SkillCmd,
@@ -155,8 +155,9 @@ pub(crate) enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Internal: Claude Code `PreToolUse` approval hook. Reads the hook payload on
-    /// stdin and emits a permission decision; installed via `--settings`.
+    /// Internal: `PreToolUse` approval hook for the claude CLI runner. Reads the
+    /// hook payload on stdin and emits a permission decision; installed via
+    /// `--settings`.
     #[command(hide = true)]
     ToolGate,
 }

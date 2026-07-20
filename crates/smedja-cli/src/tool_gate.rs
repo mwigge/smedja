@@ -28,6 +28,17 @@ pub(crate) async fn cmd_tool_gate(sock: &std::path::Path) {
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
+    /// True when `SMEDJA_TOOL_GATE_FALLBACK=open` — reverts the *expected-but-
+    /// unavailable* gate case to fail-open behaviour. Default is fail-closed.
+    fn fallback_open() -> bool {
+        std::env::var("SMEDJA_TOOL_GATE_FALLBACK").is_ok_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "open" | "1" | "true" | "allow"
+            )
+        })
+    }
+
     // `updated_input` is only present when the user chose *modify* with a JSON
     // object of replacement arguments; it maps to the PreToolUse hook's
     // `updatedInput` field so claude re-runs the call with the rewritten args.
@@ -60,11 +71,23 @@ pub(crate) async fn cmd_tool_gate(sock: &std::path::Path) {
                 None,
             ),
         },
-        Err(_) => (
-            "allow".to_owned(),
-            "smedja gate unreachable; allowing".to_owned(),
-            None,
-        ),
+        Err(_) => {
+            if fallback_open() {
+                (
+                    "allow".to_owned(),
+                    "smedja gate unreachable; SMEDJA_TOOL_GATE_FALLBACK=open — allowing"
+                        .to_owned(),
+                    None,
+                )
+            } else {
+                (
+                    "deny".to_owned(),
+                    "smedja gate unreachable; denied fail-closed. Set SMEDJA_TOOL_GATE_FALLBACK=open to override."
+                        .to_owned(),
+                    None,
+                )
+            }
+        }
     };
 
     let mut hook_output = json!({

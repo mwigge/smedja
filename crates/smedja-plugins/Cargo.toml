@@ -1,6 +1,6 @@
 [package]
 name        = "smedja-plugins"
-description = "Claude Code skill file manager — reads, installs, updates and removes ~/.claude/skills entries"
+description = "Skill file manager — reads, installs, updates and removes skill entries"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true

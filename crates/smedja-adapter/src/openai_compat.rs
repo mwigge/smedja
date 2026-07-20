@@ -24,30 +24,41 @@ pub struct OpenAiCompatSpec {
 }
 
 /// Built-in spec for the Minimax API.
+///
+/// The base URL is the API root (without `/v1`); `OpenAiProvider` appends
+/// `/v1/chat/completions` to it.
 pub const MINIMAX: OpenAiCompatSpec = OpenAiCompatSpec {
     env_var: "MINIMAX_API_KEY",
-    base_url: "https://api.minimax.io/v1",
+    base_url: "https://api.minimax.io",
 };
 
 /// Built-in spec for the Kimi (Moonshot AI) API — the international endpoint.
 ///
-/// The mainland-China endpoint (`https://api.moonshot.cn/v1`) uses separate,
-/// non-interchangeable keys; select it via the `MOONSHOT_BASE_URL` override.
+/// The base URL is the API root (without `/v1`); `OpenAiProvider` appends
+/// `/v1/chat/completions` to it. The mainland-China endpoint
+/// (`https://api.moonshot.cn`) uses separate, non-interchangeable keys; select
+/// it via the `MOONSHOT_BASE_URL` override.
 pub const KIMI: OpenAiCompatSpec = OpenAiCompatSpec {
     env_var: "MOONSHOT_API_KEY",
-    base_url: "https://api.moonshot.ai/v1",
+    base_url: "https://api.moonshot.ai",
 };
 
 /// Built-in spec for the Berget AI API.
+///
+/// The base URL is the API root (without `/v1`); `OpenAiProvider` appends
+/// `/v1/chat/completions` to it.
 pub const BERGET: OpenAiCompatSpec = OpenAiCompatSpec {
     env_var: "BERGET_API_KEY",
-    base_url: "https://api.berget.ai/v1",
+    base_url: "https://api.berget.ai",
 };
 
 /// Built-in spec for the `OpenCode` API.
+///
+/// The base URL is the API root (without `/v1`); `OpenAiProvider` appends
+/// `/v1/chat/completions` to it.
 pub const OPENCODE: OpenAiCompatSpec = OpenAiCompatSpec {
     env_var: "OPENCODE_API_KEY",
-    base_url: "https://api.opencode.ai/v1",
+    base_url: "https://api.opencode.ai",
 };
 
 /// A provider for any service that speaks the `OpenAI` chat-completions
@@ -94,6 +105,13 @@ impl OpenAiCompatProvider {
     #[must_use]
     pub fn env_var(&self) -> &'static str {
         self.spec.env_var
+    }
+
+    /// Returns the configured base URL (which may be the spec default or an
+    /// explicit override).
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        self.inner.base_url()
     }
 }
 
@@ -295,12 +313,15 @@ mod tests {
     fn kimi_marker_detect_uses_custom_base_url_from_env() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("MOONSHOT_API_KEY", "test-key");
-        std::env::set_var("MOONSHOT_BASE_URL", "https://api.moonshot.cn/v1");
+        // The override should be the API root (without trailing `/v1`); the
+        // provider appends `/v1/chat/completions` internally.
+        std::env::set_var("MOONSHOT_BASE_URL", "https://api.moonshot.cn");
         let provider = KimiProvider::detect();
         std::env::remove_var("MOONSHOT_API_KEY");
         std::env::remove_var("MOONSHOT_BASE_URL");
         let provider = provider.expect("key set → provider");
         assert_eq!(provider.env_var(), "MOONSHOT_API_KEY");
+        assert_eq!(provider.base_url(), "https://api.moonshot.cn");
     }
 
     #[test]
@@ -350,18 +371,19 @@ mod tests {
     fn opencode_marker_detect_uses_custom_base_url_from_env() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("OPENCODE_API_KEY", "test-key");
-        std::env::set_var("OPENCODE_BASE_URL", "https://custom.opencode.example/v1");
+        // Override must be the API root (without trailing `/v1`).
+        std::env::set_var("OPENCODE_BASE_URL", "https://custom.opencode.example");
         let provider = OpenCodeProvider::detect();
         std::env::remove_var("OPENCODE_API_KEY");
         std::env::remove_var("OPENCODE_BASE_URL");
-        assert!(provider.is_some());
+        let provider = provider.expect("key set → provider");
+        assert_eq!(provider.base_url(), "https://custom.opencode.example");
     }
 
     #[test]
     fn opencode_marker_with_base_url_constructs_with_explicit_url() {
-        let provider =
-            OpenCodeProvider::with_base_url("https://staging.opencode.ai/v1", "test-key");
-        drop(provider);
+        let provider = OpenCodeProvider::with_base_url("https://staging.opencode.ai", "test-key");
+        assert_eq!(provider.base_url(), "https://staging.opencode.ai");
     }
 
     // OpenAI-compatible providers delegate streaming (and therefore non-success

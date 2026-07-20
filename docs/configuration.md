@@ -180,7 +180,7 @@ Both default to `true`. A missing or unparseable config resolves to the all-on d
 
 ## `.smedja/skills/`
 
-Skill files loaded as Claude Code skills and injected into the system prompt. Each file is a `SKILL.md` following the Claude Code skill format.
+Skill files injected into the system prompt. Each file is a `SKILL.md` following the standard skill-file format.
 
 Manage via:
 

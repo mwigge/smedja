@@ -185,7 +185,7 @@ Registered MCP servers are available to agent tool calls. The `/mcp` HTTP endpoi
 
 ## skill
 
-Claude Code skill file management.
+Skill file management.
 
 ```sh
 smj skill list

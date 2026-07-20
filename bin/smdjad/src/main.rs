@@ -368,6 +368,10 @@ async fn main() -> anyhow::Result<()> {
 
     let price_table = Arc::new(PriceTable::embedded());
 
+    // Surface models that will report $0.00 cost at startup so missing pricing
+    // data is never a silent surprise.
+    pool.warn_missing_prices(&price_table);
+
     let vault = Arc::new(Mutex::new(open_vault()));
 
     // Resolve the embedding backend from `[embedder]` config + runtime

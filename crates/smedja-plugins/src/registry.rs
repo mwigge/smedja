@@ -8,7 +8,7 @@ use crate::error::PluginsError;
 use crate::parse::parse_skill;
 use crate::types::Skill;
 
-/// Manages Claude Code skill files stored under a skills directory.
+/// Manages skill files stored under a skills directory.
 ///
 /// Skills are stored as either:
 /// - `<skills_dir>/<name>/SKILL.md` (directory-based), or
@@ -26,19 +26,39 @@ impl SkillRegistry {
         }
     }
 
-    /// Returns `~/.claude/skills` as the default registry path.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the home directory cannot be determined (i.e. `$HOME` is
-    /// unset). This is intentional: a tool that cannot locate its own config
-    /// directory has no safe fallback.
-    #[must_use]
-    pub fn default_path() -> PathBuf {
+    /// Returns the home directory, preferring `$HOME` and falling back to
+    /// `$USERPROFILE` on Windows.
+    fn home_dir() -> PathBuf {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .expect("HOME environment variable must be set");
-        PathBuf::from(home).join(".claude").join("skills")
+        PathBuf::from(home)
+    }
+
+    /// Returns `~/.config/smedja/skills` as the default registry path.
+    ///
+    /// If that directory does not exist but the legacy `~/.claude/skills`
+    /// directory does, the legacy path is returned so existing skill libraries
+    /// keep working.
+    #[must_use]
+    pub fn default_path() -> PathBuf {
+        Self::default_path_in(Self::home_dir())
+    }
+
+    /// Returns the default registry path under `home`.
+    ///
+    /// Exposed for tests so they do not depend on the developer's actual
+    /// home-directory layout.
+    #[must_use]
+    pub(crate) fn default_path_in(home: impl AsRef<Path>) -> PathBuf {
+        let home = home.as_ref();
+        let modern = home.join(".config").join("smedja").join("skills");
+        let legacy = home.join(".claude").join("skills");
+        if modern.exists() || !legacy.exists() {
+            modern
+        } else {
+            legacy
+        }
     }
 
     /// Scans `skills_dir` for skill files and returns all successfully parsed
@@ -754,22 +774,25 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // default_path smoke test
+    // default_path smoke tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn default_path_ends_with_claude_skills() {
-        let path = SkillRegistry::default_path();
-        let components: Vec<_> = path
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            components
-                .windows(2)
-                .any(|w| w[0] == ".claude" && w[1] == "skills"),
-            "default path must end with .claude/skills, got: {}",
-            path.display()
+    fn default_path_prefers_smedja_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = SkillRegistry::default_path_in(tmp.path());
+        assert_eq!(
+            path,
+            tmp.path().join(".config").join("smedja").join("skills")
         );
+    }
+
+    #[test]
+    fn default_path_falls_back_to_legacy_claude_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join(".claude").join("skills");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let path = SkillRegistry::default_path_in(tmp.path());
+        assert_eq!(path, legacy);
     }
 }

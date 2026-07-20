@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use smedja_adapter::{
     AcpProvider, AnthropicProvider, BergetProvider, ClaudeCliProvider, CodexCliProvider,
     CopilotProvider, GeminiProvider, KimiCliProvider, KimiProvider, LocalProvider, MinimaxProvider,
-    OpenAiProvider, PoolCliProvider, PoolsideProvider, SubprocessProvider, GEMINI_ACP,
+    OpenAiProvider, PoolCliProvider, SubprocessProvider, GEMINI_ACP,
 };
 use smedja_assayer::{Runner, Tier};
 use tracing::{error, info, warn};
@@ -169,13 +169,22 @@ pub async fn build_provider_pool() -> ProviderPool {
 
     // 2. Codex/OpenAI — native API preferred; CLI binary is the fallback.
     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        let p = OpenAiProvider::new("https://api.openai.com", key);
+        let p = OpenAiProvider::new("https://api.openai.com", key.clone());
         add!(Runner::Codex, Tier::Fast, p, "openai", "gpt-5.5");
+        // Deep tier uses the same latest model by default; override with
+        // SMEDJA_MODEL_OPENAI_DEEP if a stronger model is available.
+        let p_deep = OpenAiProvider::new("https://api.openai.com", key);
+        add!(Runner::Codex, Tier::Deep, p_deep, "openai", "gpt-5.5");
         info!(runner = "openai", "provider ready");
     } else if SubprocessProvider::available("codex") {
         // Same detect TOCTOU as the claude branch: skip on `None`, never panic.
         if let Some(p_fast) = CodexCliProvider::detect(None) {
             add!(Runner::Codex, Tier::Fast, p_fast, "codex-cli", "gpt-5.5");
+            // Deep tier uses the same latest model by default; override with
+            // SMEDJA_MODEL_CODEX_DEEP if a stronger model is available.
+            if let Some(p_deep) = CodexCliProvider::detect(None) {
+                add!(Runner::Codex, Tier::Deep, p_deep, "codex-cli", "gpt-5.5");
+            }
             info!(runner = "codex-cli", "provider ready");
         } else {
             warn!(
@@ -287,13 +296,7 @@ pub async fn build_provider_pool() -> ProviderPool {
         info!(runner = "copilot", "provider ready");
     }
 
-    // 6. Poolside
-    if let Some(p) = PoolsideProvider::detect() {
-        add!(Runner::Copilot, Tier::Deep, p, "poolside", "poolside-muse");
-        info!(runner = "poolside", "provider ready");
-    }
-
-    // 7. Pool (Poolside `pool` CLI)
+    // 6. Pool (Poolside `pool` CLI)
     if let Some(p) = PoolCliProvider::detect() {
         add!(Runner::Pool, Tier::Fast, p, "pool", "laguna-m1");
         info!(runner = "pool", "provider ready");

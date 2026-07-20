@@ -3,7 +3,7 @@ use super::*;
 pub(crate) fn is_subprocess_runner(runner_name: &str) -> bool {
     matches!(
         runner_name,
-        "claude-cli" | "codex-cli" | "kimi-cli" | "gemini-cli"
+        "claude-cli" | "codex-cli" | "kimi-cli" | "gemini-cli" | "copilot" | "pool"
     )
 }
 

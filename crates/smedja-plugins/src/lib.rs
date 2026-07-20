@@ -1,8 +1,9 @@
-//! `smedja-plugins` — Claude Code skill file manager.
+//! `smedja-plugins` — skill file manager.
 //!
-//! Manages `.md` skill files stored under `~/.claude/skills/`. Skills live
-//! either as directory-based entries (`<name>/SKILL.md`) or as flat files
-//! (`<name>.md`) directly inside the skills directory.
+//! Manages `.md` skill files stored under `~/.config/smedja/skills/` (with a
+//! legacy fallback to `~/.claude/skills/`). Skills live either as directory-
+//! based entries (`<name>/SKILL.md`) or as flat files (`<name>.md`) directly
+//! inside the skills directory.
 
 mod bundle;
 mod error;

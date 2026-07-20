@@ -13,7 +13,7 @@ use std::sync::Arc;
 use smedja_assayer::Assayer;
 use smedja_bellows::Dispatcher;
 use smedja_ingot::{IngotHandle, Session, Task};
-use smedja_loop::{LoopConfig, LoopRole, LoopState, RoleRunner, StatusSink, Tier};
+use smedja_loop::{LoopConfig, LoopRole, LoopState, RoleRunner, Runner, StatusSink, Tier};
 use smedja_types::Timestamp;
 use smedja_vault::Vault;
 use tokio::sync::Mutex;
@@ -38,14 +38,24 @@ const PLAN_DIRECTIVE: &str =
     "Decompose the umbrella intent into a coarse slice list and write it to \
      tasks.md, one `- [ ] ` line per slice.";
 
-/// Built-in model for a loop phase, keyed by role name and routed tier.
+/// Built-in model for a loop phase, keyed by role name, runner family, and
+/// routed tier.
 ///
 /// This is the 4-slot tier→model binding of the owner's loop×tier vision:
 /// planner→Fable, implementer/fix→Sonnet (Deep/complex) or Haiku (cheaper/simple)
-/// keyed by the role's routed tier, reviewer→Opus. Roles outside the pipeline
-/// (orchestrator, proposer, tester) return `None` and keep the pool default.
+/// keyed by the role's routed tier, reviewer→Opus. It only applies to
+/// Claude-family runners; for other runners the built-in defaults would be
+/// nonsensical model ids, so `None` is returned and the pool's runner-specific
+/// default (or an explicit `model` in `loop.json`) is used instead. Roles
+/// outside the pipeline (orchestrator, proposer, tester) also return `None`.
 #[must_use]
-fn builtin_model_for(role_name: &str, tier: Tier) -> Option<&'static str> {
+fn builtin_model_for(role_name: &str, runner: Runner, tier: Tier) -> Option<&'static str> {
+    // The built-in ids are Claude-family models; never pin them on a Kimi,
+    // Gemini, local, etc. role. Non-Claude runners keep their pool default
+    // unless `loop.json` supplies an explicit model.
+    if !matches!(runner, Runner::Claude) {
+        return None;
+    }
     match role_name {
         "plan" => Some(MODEL_PLAN),
         "reviewer" => Some(MODEL_REVIEW),
@@ -63,18 +73,21 @@ fn builtin_model_for(role_name: &str, tier: Tier) -> Option<&'static str> {
 /// Binds a phase role to the owner's model, returning a role whose `model` field
 /// carries the resolved id.
 ///
-/// An explicit `model` in `loop.json` always wins. Otherwise the built-in
-/// mapping is resolved through the existing `SMEDJA_MODEL_<RUNNER>_<TIER>` env
-/// override ([`crate::provider_pool::model_default`]) so a newly released model
-/// can be swapped in without a recompile. The binding is via `LoopRole::model`
-/// and leaves `runner`/`tier` untouched, so evaluator separation (a runner-level
-/// check) is unaffected.
+/// An explicit `model` in `loop.json` always wins. For Claude-family runners the
+/// built-in mapping is resolved through the existing
+/// `SMEDJA_MODEL_<RUNNER>_<TIER>` env override
+/// ([`crate::provider_pool::model_default`]) so a newly released model can be
+/// swapped in without a recompile. For other runners the built-in mapping is
+/// skipped and the pool's own default model id is used, unless overridden via
+/// `SMEDJA_MODEL_<RUNNER>_<TIER>` or an explicit `loop.json` model. The binding
+/// is via `LoopRole::model` and leaves `runner`/`tier` untouched, so evaluator
+/// separation (a runner-level check) is unaffected.
 #[must_use]
 fn bind_role_model(role: &LoopRole) -> LoopRole {
     if role.model.is_some() {
         return role.clone();
     }
-    let Some(builtin) = builtin_model_for(&role.name, role.tier) else {
+    let Some(builtin) = builtin_model_for(&role.name, role.runner, role.tier) else {
         return role.clone();
     };
     let runner_name = crate::common::runner_session_key(role.runner);
@@ -855,27 +868,39 @@ mod tests {
     fn builtin_model_maps_the_four_phase_slots() {
         // planner=Fable, implementer=Sonnet(complex)/Haiku(simple), reviewer=Opus.
         assert_eq!(
-            super::builtin_model_for("plan", Tier::Deep),
+            super::builtin_model_for("plan", Runner::Claude, Tier::Deep),
             Some("claude-fable-5")
         );
         assert_eq!(
-            super::builtin_model_for("reviewer", Tier::Fast),
+            super::builtin_model_for("reviewer", Runner::Claude, Tier::Fast),
             Some("claude-opus-4-8")
         );
         assert_eq!(
-            super::builtin_model_for("implementer", Tier::Deep),
+            super::builtin_model_for("implementer", Runner::Claude, Tier::Deep),
             Some("claude-sonnet-5")
         );
         assert_eq!(
-            super::builtin_model_for("implementer", Tier::Local),
+            super::builtin_model_for("implementer", Runner::Claude, Tier::Local),
             Some("claude-haiku-4-5")
         );
         assert_eq!(
-            super::builtin_model_for("fix", Tier::Deep),
+            super::builtin_model_for("fix", Runner::Claude, Tier::Deep),
             Some("claude-sonnet-5")
         );
         // Non-pipeline roles keep the pool default.
-        assert_eq!(super::builtin_model_for("orchestrator", Tier::Deep), None);
+        assert_eq!(
+            super::builtin_model_for("orchestrator", Runner::Claude, Tier::Deep),
+            None
+        );
+        // Built-in Claude models must never be pinned on a non-Claude runner.
+        assert_eq!(
+            super::builtin_model_for("implementer", Runner::Kimi, Tier::Deep),
+            None
+        );
+        assert_eq!(
+            super::builtin_model_for("reviewer", Runner::Gemini, Tier::Deep),
+            None
+        );
     }
 
     #[test]
@@ -887,11 +912,15 @@ mod tests {
             Some("claude-fable-5"),
             "the plan phase binds to fable"
         );
-        let reviewer = roles.iter().find(|r| r.name == "reviewer").unwrap();
+        // The default reviewer is routed to Minimax, so the Claude built-in
+        // mapping must not apply. A reviewer explicitly routed to Claude still
+        // binds to opus.
+        let mut reviewer = roles.iter().find(|r| r.name == "reviewer").unwrap().clone();
+        reviewer.runner = Runner::Claude;
         assert_eq!(
-            super::bind_role_model(reviewer).model.as_deref(),
+            super::bind_role_model(&reviewer).model.as_deref(),
             Some("claude-opus-4-8"),
-            "the review phase binds to opus"
+            "a Claude-routed review phase binds to opus"
         );
     }
 
@@ -911,8 +940,10 @@ mod tests {
 
     #[test]
     fn model_binding_preserves_evaluator_separation() {
-        // opus-review over haiku/sonnet-implement: the binding only touches
-        // `model`, so the runner-level reviewer≠implementer separation still holds.
+        // Model binding only touches `model`, so the runner-level
+        // reviewer≠implementer separation still holds. The default roles route
+        // implementer to Local and reviewer to Minimax; neither is a Claude
+        // runner, so the built-in mapping is skipped and both models stay None.
         let roles = LoopRole::defaults();
         let implementer =
             super::bind_role_model(roles.iter().find(|r| r.name == "implementer").unwrap());
@@ -921,8 +952,11 @@ mod tests {
             reviewer.runner_differs_from(&implementer),
             "evaluator separation must survive model binding"
         );
-        assert_eq!(reviewer.model.as_deref(), Some("claude-opus-4-8"));
-        assert_eq!(implementer.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(reviewer.model, None, "non-Claude runner keeps no built-in model");
+        assert_eq!(
+            implementer.model, None,
+            "non-Claude runner keeps no built-in model"
+        );
     }
 
     async fn deps() -> (

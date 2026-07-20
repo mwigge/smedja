@@ -139,9 +139,8 @@ struct RawSkillMeta {
     supporting_files: Vec<String>,
 }
 
-/// Agent frontmatter (Claude-CLI `.claude/agents/<name>.md` convention): flat
-/// top-level keys. `tools` accepts either a YAML list or a comma-separated
-/// string.
+/// Agent frontmatter (`.claude/agents/<name>.md` convention): flat top-level
+/// keys. `tools` accepts either a YAML list or a comma-separated string.
 #[derive(Default, Deserialize)]
 struct RawAgentFront {
     name: Option<String>,

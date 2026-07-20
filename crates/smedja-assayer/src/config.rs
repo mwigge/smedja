@@ -94,6 +94,7 @@ fn parse_runner(s: &str) -> Option<Runner> {
         "kimi" => Some(Runner::Kimi),
         "gemini" => Some(Runner::Gemini),
         "copilot" => Some(Runner::Copilot),
+        "pool" | "poolside" => Some(Runner::Pool),
         _ => None,
     }
 }

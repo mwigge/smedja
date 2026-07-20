@@ -8,7 +8,14 @@
 "claude-opus-4-8"           = 15.00
 "gpt-4o-mini"               = 0.15
 "gpt-4o"                    = 2.50
+"gpt-5.5"                   = 5.00
 "o3-mini"                   = 1.10
+"kimi-k3"                   = 3.00
+"kimi-k2.7-code-highspeed"  = 0.95
+"gemini-2.5-flash"          = 0.30
+"gemini-2.5-pro"            = 1.25
+"MiniMax-M2"                = 0.30
+"laguna-m1"                 = 0.20
 
 [output]
 "claude-haiku-4-5-20251001" = 4.00
@@ -16,7 +23,14 @@
 "claude-opus-4-8"           = 75.00
 "gpt-4o-mini"               = 0.60
 "gpt-4o"                    = 10.00
+"gpt-5.5"                   = 30.00
 "o3-mini"                   = 4.40
+"kimi-k3"                   = 15.00
+"kimi-k2.7-code-highspeed"  = 4.00
+"gemini-2.5-flash"          = 2.50
+"gemini-2.5-pro"            = 10.00
+"MiniMax-M2"                = 1.20
+"laguna-m1"                 = 0.40
 
 # Context window sizes in tokens. Used by the TUI context rail.
 [windows]
@@ -25,4 +39,11 @@
 "claude-opus-4-8"           = 200000
 "gpt-4o-mini"               = 128000
 "gpt-4o"                    = 128000
+"gpt-5.5"                   = 1000000
 "o3-mini"                   = 200000
+"kimi-k3"                   = 1050000
+"kimi-k2.7-code-highspeed"  = 256000
+"gemini-2.5-flash"          = 1048576
+"gemini-2.5-pro"            = 1048576
+"MiniMax-M2"                = 196608
+"laguna-m1"                 = 262144
