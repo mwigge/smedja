@@ -6,6 +6,25 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.26.2] — 2026-07-24
+
+### Fixed
+- Runner switches no longer send a foreign model id to the new runner's CLI.
+  A session's pinned `model_override` (e.g. codex's `gpt-5.5`) previously
+  leaked onto the new runner, which rejected it (kimi: "issue with the
+  selected model", exit 1):
+  - `/switch` (`session.set_runner`) now clears the stale model pin so the
+    new runner's per-tier default model applies.
+  - Failover rotation ignores route/env/session model pins on entries of a
+    different runner family, using each entry's own default model instead.
+  - `/takeover` inherits the model pin only when staying on the parent's
+    effective runner.
+- The TUI status line now shows the new runner's tier-matched default model
+  after `/switch` and `/takeover` (previously the deep-tier model was always
+  shown, and `/takeover` refreshed nothing).
+
+---
+
 ## [0.26.1] — 2026-07-20
 
 ### Added
