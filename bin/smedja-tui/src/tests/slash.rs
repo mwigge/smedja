@@ -10,7 +10,7 @@ use crate::governance::{
 use crate::input::{accept_slash_completion, clear_slash_popup, handle_key};
 use crate::slash::{
     apply_agent, apply_tier, dispatch_slash, format_agents_table, format_approvals_list,
-    format_local_model_list, format_metrics, format_model_list,
+    format_local_model_list, format_metrics, format_model_list, runner_default_model,
 };
 use crate::test_support::{make_state, render_frame};
 use crate::{
@@ -1157,4 +1157,29 @@ fn command_palette_filters_by_substring() {
 fn command_palette_no_match_returns_empty() {
     let completions = command_palette_filtered("zzznomatch");
     assert!(completions.is_empty());
+}
+
+#[test]
+fn runner_default_model_prefers_current_tier() {
+    let list = json!({
+        "runners": [
+            { "runner": "kimi-cli", "tier": "deep", "model": "kimi-code/k3" },
+            { "runner": "kimi-cli", "tier": "fast", "model": "kimi-code/kimi-for-coding-highspeed" },
+            { "runner": "codex-cli", "tier": "fast", "model": "gpt-5.5" }
+        ]
+    });
+    assert_eq!(
+        runner_default_model(&list, "kimi-cli", Some("fast")).as_deref(),
+        Some("kimi-code/kimi-for-coding-highspeed"),
+    );
+    assert_eq!(
+        runner_default_model(&list, "kimi-cli", Some("deep")).as_deref(),
+        Some("kimi-code/k3"),
+    );
+    // No tier set → first entry for the runner; unknown runner → None.
+    assert_eq!(
+        runner_default_model(&list, "kimi-cli", None).as_deref(),
+        Some("kimi-code/k3"),
+    );
+    assert_eq!(runner_default_model(&list, "nope", None), None);
 }

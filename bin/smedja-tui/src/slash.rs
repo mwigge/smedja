@@ -43,6 +43,31 @@ pub(crate) fn apply_tier(args: &str, state: &mut AppState) -> String {
     }
 }
 
+/// Picks the model to display for `runner` from a `runner.list` response,
+/// preferring the entry whose tier matches the session's current tier and
+/// falling back to the runner's first entry. Used after `/switch` and
+/// `/takeover` so the status line shows the model the next turn will
+/// actually run on.
+pub(crate) fn runner_default_model(
+    list: &Value,
+    runner: &str,
+    tier: Option<&str>,
+) -> Option<String> {
+    let entries: Vec<&Value> = list
+        .get("runners")?
+        .as_array()?
+        .iter()
+        .filter(|r| r.get("runner").and_then(|n| n.as_str()) == Some(runner))
+        .collect();
+    entries
+        .iter()
+        .find(|r| r.get("tier").and_then(|t| t.as_str()) == tier)
+        .or_else(|| entries.first())
+        .and_then(|r| r.get("model"))
+        .and_then(|m| m.as_str())
+        .map(str::to_owned)
+}
+
 /// Agent-mode usage string, listing every role the daemon can route
 /// (`parse_session_mode_to_role`), grouped for readability.
 pub(crate) const AGENT_MODE_USAGE: &str =
@@ -1185,18 +1210,14 @@ pub(crate) async fn dispatch_slash(
                         .unwrap_or(args)
                         .to_owned();
                     state.runner.clone_from(&canonical);
-                    // Update the displayed model to the new runner's default.
+                    // Update the displayed model to the new runner's default
+                    // for the current tier (the daemon cleared the old
+                    // runner's model pin, so the next turn runs on this).
                     if let Ok(list) = client.call("runner.list", json!({})).await {
-                        if let Some(runners) = list.get("runners").and_then(|r| r.as_array()) {
-                            if let Some(m) = runners
-                                .iter()
-                                .find(|r| {
-                                    r.get("runner").and_then(|n| n.as_str()) == Some(&canonical)
-                                })
-                                .and_then(|r| r.get("model").and_then(|m| m.as_str()))
-                            {
-                                state.model = Some(m.to_owned());
-                            }
+                        if let Some(m) =
+                            runner_default_model(&list, &canonical, state.tier.as_deref())
+                        {
+                            state.model = Some(m);
                         }
                     }
                     push_system_message(state, format!("runner switched to {canonical}"));
@@ -1241,6 +1262,14 @@ pub(crate) async fn dispatch_slash(
                         .to_owned();
                     state.session_id.clone_from(&new_session_id);
                     state.runner.clone_from(&runner);
+                    // Display the new runner's default model for the current
+                    // tier (a cross-runner takeover drops the old model pin).
+                    if let Ok(list) = client.call("runner.list", json!({})).await {
+                        if let Some(m) = runner_default_model(&list, &runner, state.tier.as_deref())
+                        {
+                            state.model = Some(m);
+                        }
+                    }
                     push_system_message(
                         state,
                         format!(
