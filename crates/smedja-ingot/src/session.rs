@@ -308,6 +308,27 @@ pub(crate) fn update_model_override(
     Ok(())
 }
 
+/// Clears the `model_override` field (sets it to NULL) and updates `updated_at`
+/// for the session identified by `id`.
+///
+/// Used when the session's runner changes: a model pinned for the old runner
+/// (e.g. `gpt-5.5` from codex) is not a valid model id on the new runner, so
+/// the pin must be dropped and the new runner's own default model applies.
+///
+/// # Errors
+///
+/// Returns [`rusqlite::Error`] if the UPDATE fails.
+pub(crate) fn clear_model_override(
+    conn: &rusqlite::Connection,
+    id: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE sessions SET model_override = NULL, updated_at = ?1 WHERE id = ?2",
+        rusqlite::params![Timestamp::now().as_micros(), id],
+    )?;
+    Ok(())
+}
+
 /// Sets the `runner_override` field and updates `updated_at` for the session identified by `id`.
 ///
 /// When set, `run_turn` bypasses the assayer and routes directly to this runner.
@@ -431,6 +452,17 @@ impl Ingot {
         model: &str,
     ) -> Result<(), IngotError> {
         update_model_override(&self.conn, session_id, model).map_err(IngotError::Db)
+    }
+
+    /// Clears the `model_override` field (sets it to NULL) for the session
+    /// identified by `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngotError::Db`] if the UPDATE fails.
+    #[must_use = "check the Result to confirm the model override was cleared"]
+    pub fn clear_session_model_override(&self, session_id: &str) -> Result<(), IngotError> {
+        clear_model_override(&self.conn, session_id).map_err(IngotError::Db)
     }
 
     /// Sets the `runner_override` field for the session identified by `session_id`.
@@ -606,6 +638,18 @@ impl IngotHandle {
         let session_id = session_id.to_owned();
         let model = model.to_owned();
         self.run_blocking(move |ig| ig.update_session_model_override(&session_id, &model))
+            .await
+    }
+
+    /// Clears the `model_override` for a session (sets it to NULL).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IngotError::Db`] from the underlying UPDATE, or
+    /// [`IngotError::TaskPanic`] if the blocking task panics.
+    pub async fn clear_session_model_override(&self, session_id: &str) -> Result<(), IngotError> {
+        let session_id = session_id.to_owned();
+        self.run_blocking(move |ig| ig.clear_session_model_override(&session_id))
             .await
     }
 

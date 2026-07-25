@@ -277,3 +277,77 @@ async fn fork_at_turn_n_before_all_checkpoints_returns_error() {
         "must error when no checkpoint <= requested turn"
     );
 }
+
+// ── session.set_runner ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn set_runner_clears_stale_model_override() {
+    let ig = handle();
+    let id = Uuid::new_v4();
+    ig.create_session(sample_session(id, "s")).await.unwrap();
+    // Pin a codex model (as /tier or /model would on a codex session).
+    ig.update_session_model_override(&id.to_string(), "gpt-5.5")
+        .await
+        .unwrap();
+
+    let resp = set_runner_with(&ig, &id.to_string(), "kimi").await.unwrap();
+    assert_eq!(resp["runner"].as_str().unwrap(), "kimi-cli");
+
+    let sess = ig.get_session(&id.to_string()).await.unwrap().unwrap();
+    assert_eq!(sess.runner_override.as_deref(), Some("kimi-cli"));
+    assert_eq!(
+        sess.model_override, None,
+        "a model pinned for the old runner must not leak onto the new one"
+    );
+}
+
+#[tokio::test]
+async fn set_runner_rejects_unknown_runner() {
+    let ig = handle();
+    let id = Uuid::new_v4();
+    ig.create_session(sample_session(id, "s")).await.unwrap();
+    let err = set_runner_with(&ig, &id.to_string(), "nope")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, smedja_rpc::codes::INVALID_PARAMS);
+}
+
+// ── session.takeover model inheritance ────────────────────────────────────
+
+#[test]
+fn takeover_drops_model_pin_when_switching_runner_family() {
+    let mut parent = sample_session(Uuid::new_v4(), "s");
+    parent.runner_override = Some("codex-cli".into());
+    parent.model_override = Some("gpt-5.5".into());
+    assert_eq!(
+        inherited_takeover_model(&parent, "kimi-cli", "claude-cli"),
+        None,
+        "a codex model pin must not leak onto a kimi takeover"
+    );
+}
+
+#[test]
+fn takeover_keeps_model_pin_when_staying_on_runner() {
+    let mut parent = sample_session(Uuid::new_v4(), "s");
+    parent.runner_override = Some("codex-cli".into());
+    parent.model_override = Some("gpt-5.5".into());
+    assert_eq!(
+        inherited_takeover_model(&parent, "codex-cli", "claude-cli"),
+        Some("gpt-5.5".to_owned()),
+    );
+}
+
+#[test]
+fn takeover_compares_against_startup_runner_when_parent_has_no_override() {
+    let mut parent = sample_session(Uuid::new_v4(), "s");
+    parent.model_override = Some("claude-opus-4-8".into());
+    // No runner_override: the pin belongs to the startup runner's family.
+    assert_eq!(
+        inherited_takeover_model(&parent, "claude-cli", "claude-cli"),
+        Some("claude-opus-4-8".to_owned()),
+    );
+    assert_eq!(
+        inherited_takeover_model(&parent, "kimi-cli", "claude-cli"),
+        None,
+    );
+}

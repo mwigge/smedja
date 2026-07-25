@@ -393,6 +393,31 @@ pub(crate) async fn fork_with(
     }))
 }
 
+/// Decides which model pin a takeover child inherits: the parent's
+/// `model_override` when the takeover stays on the parent's effective runner
+/// (its `runner_override`, else the startup default), otherwise `None`. A
+/// model pinned for another runner family is not a valid id on the new
+/// runner, and `run_turn` gives `model_override` precedence over the new
+/// runner's own default — so a cross-runner hand-off must drop the pin and
+/// let the new runner's per-tier default apply.
+pub(crate) fn inherited_takeover_model(
+    parent: &Session,
+    canonical_runner: &str,
+    startup_runner: &str,
+) -> Option<String> {
+    let parent_runner = parent
+        .runner_override
+        .clone()
+        .unwrap_or_else(|| startup_runner.to_owned());
+    let stays_on_runner = crate::common::parse_runner_str(&parent_runner)
+        == crate::common::parse_runner_str(canonical_runner);
+    if stays_on_runner {
+        parent.model_override.clone()
+    } else {
+        None
+    }
+}
+
 /// Handles `session.takeover`: forks a session onto a new runner atomically.
 ///
 /// # Errors
@@ -443,6 +468,11 @@ pub(crate) async fn takeover(state: HandlerState, params: Value) -> Result<Value
     let now = Timestamp::now();
     let new_id = Uuid::new_v4().to_string();
 
+    // Inherit the pinned model only when the takeover stays on the parent's
+    // runner (see inherited_takeover_model).
+    let inherited_model =
+        inherited_takeover_model(&parent, canonical, state.startup_runner.as_ref());
+
     {
         ig.create_session(Session {
             id: Uuid::parse_str(&new_id)
@@ -455,7 +485,7 @@ pub(crate) async fn takeover(state: HandlerState, params: Value) -> Result<Value
             title: parent.title.clone(),
             cowork_mode: parent.cowork_mode,
             workspace_root: parent.workspace_root.clone(),
-            model_override: parent.model_override.clone(),
+            model_override: inherited_model,
             runner_override: Some(canonical.to_owned()),
         })
         .await

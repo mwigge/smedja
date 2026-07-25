@@ -58,6 +58,31 @@ use super::{
 
 /// A turn rotates to at most this many alternative providers before failing.
 const MAX_PROVIDER_ROTATIONS: u32 = 3;
+
+/// Resolves the model id for one rotation-ring entry.
+///
+/// Explicit pins — the session's `model_override`, the route's model, and
+/// `SMEDJA_MODEL` — only apply to the runner they were pinned for
+/// (`same_runner`). A failover-rotated entry of a different runner family
+/// must fall back to its own default model: a foreign model id (e.g.
+/// codex's `gpt-5.5`) is rejected by another runner's CLI (kimi exits 1
+/// with "issue with the selected model").
+fn resolve_entry_model(
+    same_runner: bool,
+    route_model: Option<&str>,
+    env_model: Option<String>,
+    session_override: Option<&str>,
+    entry_default: &str,
+) -> String {
+    if !same_runner {
+        return entry_default.to_owned();
+    }
+    session_override
+        .or(route_model)
+        .map(str::to_owned)
+        .or(env_model)
+        .unwrap_or_else(|| entry_default.to_owned())
+}
 /// Provider back-off budget for a single rate-limited call before rotating.
 const MAX_RATE_LIMIT_RETRIES: u32 = 4;
 /// Base back-off (seconds) for the rate-limit retry loop.
@@ -869,16 +894,15 @@ impl TurnRun {
         );
 
         // Re-derive the model for this entry: explicit route/env/session
-        // override take precedence over the entry's default model.
-        let entry_model = route
-            .model
-            .clone()
-            .or_else(|| std::env::var("SMEDJA_MODEL").ok())
-            .unwrap_or_else(|| entry.default_model.clone());
-        let entry_model = session
-            .as_ref()
-            .and_then(|s| s.model_override.clone())
-            .unwrap_or(entry_model);
+        // override take precedence over the entry's default model — but only
+        // on the runner they were pinned for (see resolve_entry_model).
+        let entry_model = resolve_entry_model(
+            runner_enum == route.runner,
+            route.model.as_deref(),
+            std::env::var("SMEDJA_MODEL").ok(),
+            session.as_ref().and_then(|s| s.model_override.as_deref()),
+            &entry.default_model,
+        );
         let context_window = model_context_window(&entry_model);
         self.turn_context_window = context_window;
 
@@ -2021,5 +2045,51 @@ fn materialize_bundle_subagents(workspace_root: &std::path::Path) {
         Err(e) => {
             tracing::warn!(error = %e, "failed to materialize bundle agents; continuing")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_entry_model;
+
+    #[test]
+    fn rotated_foreign_runner_ignores_all_model_pins() {
+        // Failover codex → kimi: the codex model must not be sent to kimi.
+        let model = resolve_entry_model(
+            false,
+            Some("gpt-5.5"),
+            Some("gpt-5.5".to_owned()),
+            Some("gpt-5.5"),
+            "kimi-code/k3",
+        );
+        assert_eq!(model, "kimi-code/k3");
+    }
+
+    #[test]
+    fn session_override_wins_on_the_pinned_runner() {
+        let model = resolve_entry_model(
+            true,
+            Some("route-model"),
+            Some("env-model".to_owned()),
+            Some("session-model"),
+            "default-model",
+        );
+        assert_eq!(model, "session-model");
+    }
+
+    #[test]
+    fn route_model_beats_env_and_default_on_the_pinned_runner() {
+        let model = resolve_entry_model(
+            true,
+            Some("route-model"),
+            Some("env-model".to_owned()),
+            None,
+            "default-model",
+        );
+        assert_eq!(model, "route-model");
+        let model = resolve_entry_model(true, None, Some("env-model".to_owned()), None, "default");
+        assert_eq!(model, "env-model");
+        let model = resolve_entry_model(true, None, None, None, "default-model");
+        assert_eq!(model, "default-model");
     }
 }

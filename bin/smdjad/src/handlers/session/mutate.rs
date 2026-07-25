@@ -117,12 +117,18 @@ pub(crate) async fn set_tier(state: HandlerState, params: Value) -> Result<Value
 
 /// Handles `session.set_runner`.
 ///
+/// Switching runners also clears any pinned `model_override`: a model pinned
+/// for the old runner (e.g. `gpt-5.5` from codex) is not a valid model id on
+/// the new runner, and `run_turn` gives `model_override` precedence over the
+/// new runner's own default — so a stale pin would send a foreign model id to
+/// a CLI that rejects it (kimi: "issue with the selected model"). With the pin
+/// cleared, turns fall back to the new runner's per-tier default model.
+///
 /// # Errors
 ///
 /// Returns an error when `session_id`/`runner` is missing, the runner is unknown,
 /// or the ingot write fails.
 pub(crate) async fn set_runner(state: HandlerState, params: Value) -> Result<Value, RpcError> {
-    let ig = state.ingot;
     let session_id = params["session_id"]
         .as_str()
         .ok_or_else(|| missing_param("session_id"))?
@@ -131,8 +137,18 @@ pub(crate) async fn set_runner(state: HandlerState, params: Value) -> Result<Val
         .as_str()
         .ok_or_else(|| missing_param("runner"))?
         .to_owned();
+    set_runner_with(&state.ingot, &session_id, &runner_str).await
+}
+
+/// Core of `session.set_runner`, factored out so tests can exercise it
+/// without constructing a full [`HandlerState`].
+pub(crate) async fn set_runner_with(
+    ig: &smedja_ingot::IngotHandle,
+    session_id: &str,
+    runner_str: &str,
+) -> Result<Value, RpcError> {
     // Validate and normalise to the canonical key stored in the DB.
-    let canonical = crate::common::parse_runner_str(&runner_str)
+    let canonical = crate::common::parse_runner_str(runner_str)
         .map(crate::common::runner_session_key)
         .ok_or_else(|| {
             RpcError::new(
@@ -140,7 +156,10 @@ pub(crate) async fn set_runner(state: HandlerState, params: Value) -> Result<Val
                 format!("unknown runner: {runner_str}; valid: claude, codex, kimi, gemini, local, copilot, minimax, berget"),
             )
         })?;
-    ig.update_session_runner_override(&session_id, canonical)
+    ig.update_session_runner_override(session_id, canonical)
+        .await
+        .map_err(|e| ingot_err(&e))?;
+    ig.clear_session_model_override(session_id)
         .await
         .map_err(|e| ingot_err(&e))?;
     Ok(json!({ "session_id": session_id, "runner": canonical }))
