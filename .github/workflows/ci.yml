@@ -44,8 +44,35 @@ jobs:
       - name: version consistency
         run: cargo run -q -p xtask -- check-versions
 
+      # Keep this flag set in sync with scripts/pre-commit.sh — it is the
+      # single curated allow list (each entry justified there). Notably:
+      # duration_suboptimal_units suggests APIs newer than the MSRV (1.82),
+      # and wildcard_imports conflicts with the repo's `use super::*;`
+      # module-split idiom.
       - name: clippy (pedantic, warnings as errors)
-        run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic
+        run: >
+          cargo clippy --workspace --all-targets --
+          -D warnings -W clippy::pedantic
+          -A clippy::module_name_repetitions
+          -A clippy::must_use_candidate
+          -A clippy::cast_precision_loss
+          -A clippy::cast_possible_truncation
+          -A clippy::cast_sign_loss
+          -A clippy::cast_possible_wrap
+          -A clippy::missing_panics_doc
+          -A clippy::many_single_char_names
+          -A clippy::similar_names
+          -A clippy::items_after_statements
+          -A clippy::doc_markdown
+          -A clippy::implicit_clone
+          -A clippy::map_unwrap_or
+          -A clippy::needless_pass_by_value
+          -A clippy::type_complexity
+          -A clippy::struct_excessive_bools
+          -A clippy::fn_params_excessive_bools
+          -A clippy::trivially_copy_pass_by_ref
+          -A clippy::duration_suboptimal_units
+          -A clippy::wildcard_imports
 
       - name: test (whole workspace, incl. term/)
         run: cargo test --workspace --all-targets

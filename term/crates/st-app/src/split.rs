@@ -64,8 +64,8 @@ impl SplitLayout {
             display: Display::Flex,
             flex_direction: FlexDirection::Row,
             size: Size {
-                width: length(100.0),
-                height: length(100.0),
+                width: length(100.0_f32),
+                height: length(100.0_f32),
             },
             ..Default::default()
         };
@@ -141,8 +141,8 @@ impl SplitLayout {
                 flex_direction: flex_dir,
                 flex_grow: 1.0,
                 size: Size {
-                    width: length(100.0),
-                    height: length(100.0),
+                    width: length(100.0_f32),
+                    height: length(100.0_f32),
                 },
                 ..Default::default()
             };

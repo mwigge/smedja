@@ -148,7 +148,7 @@ mod tests {
             outcome: "ok".into(),
         });
         // "first" should have been evicted.
-        assert!(log.events.front().map(|e| e.action.as_str()) != Some("first"));
+        assert_ne!(log.events.front().map(|e| e.action.as_str()), Some("first"));
         assert_eq!(log.events.back().map(|e| e.action.as_str()), Some("third"));
     }
 

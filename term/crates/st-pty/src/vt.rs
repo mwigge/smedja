@@ -204,7 +204,7 @@ impl vte::Perform for VtHandler {
                 apply_sgr(&mut grid, &p);
             }
             // ── Private mode (DEC) ───────────────────────────────────────────
-            'h' if intermediates == [b'?'] => match p.first().copied().unwrap_or(0) {
+            'h' if intermediates == *b"?" => match p.first().copied().unwrap_or(0) {
                 1049 => grid.enter_alt_screen(),
                 25 => grid.cursor_visible = true,
                 1000 => grid.mouse_mode = MouseMode::X10,
@@ -216,7 +216,7 @@ impl vte::Perform for VtHandler {
                 2026 => grid.synchronized_output = true,
                 _ => {}
             },
-            'l' if intermediates == [b'?'] => match p.first().copied().unwrap_or(0) {
+            'l' if intermediates == *b"?" => match p.first().copied().unwrap_or(0) {
                 1049 => grid.leave_alt_screen(),
                 25 => grid.cursor_visible = false,
                 1000 | 1002 | 1003 => grid.mouse_mode = MouseMode::None,
@@ -228,19 +228,19 @@ impl vte::Perform for VtHandler {
             },
             // ── Kitty keyboard protocol ──────────────────────────────────────
             // Query current flags: respond with `CSI ? <flags> u`.
-            'u' if intermediates == [b'?'] => {
+            'u' if intermediates == *b"?" => {
                 let flags = grid.kbd_flags();
                 let resp = format!("\x1b[?{flags}u");
                 grid.pending_responses.extend_from_slice(resp.as_bytes());
             }
             // Push flags onto the stack (`CSI > flags u`, default 1).
-            'u' if intermediates == [b'>'] => {
+            'u' if intermediates == *b">" => {
                 #[allow(clippy::cast_possible_truncation)]
                 let flags = p.first().copied().unwrap_or(1) as u8;
                 grid.kbd_flags_stack.push(flags);
             }
             // Pop N entries (`CSI < N u`, default 1).
-            'u' if intermediates == [b'<'] => {
+            'u' if intermediates == *b"<" => {
                 let n = p.first().copied().unwrap_or(1).max(1) as usize;
                 for _ in 0..n {
                     grid.kbd_flags_stack.pop();
@@ -248,7 +248,7 @@ impl vte::Perform for VtHandler {
             }
             // Set current flags (`CSI = flags ; mode u`): mode 1=all, 2=set
             // bits, 3=clear bits (default 1).
-            'u' if intermediates == [b'='] => {
+            'u' if intermediates == *b"=" => {
                 #[allow(clippy::cast_possible_truncation)]
                 let flags = p.first().copied().unwrap_or(0) as u8;
                 let mode = p.get(1).copied().unwrap_or(1);

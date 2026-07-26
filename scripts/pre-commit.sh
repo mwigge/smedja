@@ -27,6 +27,7 @@ fi
 # clippy::too_many_lines is intentionally NOT blanket-disabled here: long
 # functions are scoped with a per-function #[allow(clippy::too_many_lines)]
 # (the repo convention), so any NEW over-long function is caught.
+# Keep this flag set in sync with the clippy step in .github/workflows/ci.yml.
 run_check "cargo clippy" cargo clippy \
   --workspace --all-targets --all-features \
   -- -D warnings -W clippy::pedantic \
