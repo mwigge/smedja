@@ -66,6 +66,7 @@ pub(crate) fn is_dim_chrome(text: &str) -> bool {
 /// `* item` are left alone. The returned line's flattened text drops the markers,
 /// matching what is displayed (and what gets copied).
 #[allow(clippy::many_single_char_names)]
+#[allow(clippy::too_many_lines)] // inline-markdown scanner; the states form one pass
 pub(crate) fn inline_markdown_spans(text: &str) -> Option<Line<'static>> {
     let p = palette();
     let chars: Vec<char> = text.chars().collect();

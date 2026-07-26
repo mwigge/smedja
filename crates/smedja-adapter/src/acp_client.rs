@@ -911,6 +911,7 @@ mod tests {
     /// a permission request answered allow, message chunks, prompt response.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the stream to serialize $PATH mutation
+    #[allow(clippy::too_many_lines)] // scripted mock-agent stream test; the length is the script
     async fn streams_mock_acp_agent_with_gated_permission() {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp_dir = std::env::temp_dir().join(format!(

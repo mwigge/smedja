@@ -25,6 +25,8 @@ pub(crate) async fn exec_bash(cmd: &str, workspace: &std::path::Path) -> String 
 /// On timeout the child is killed and any partial stdout already read is
 /// returned with a timeout suffix. Stderr is appended as a `[stderr]` block
 /// when the exit status is non-zero.
+#[allow(clippy::too_many_lines)]
+// spawn/pipe/timeout plumbing is inherently linear; the length is the orchestration, not complexity
 #[allow(clippy::items_after_statements)]
 pub(crate) async fn exec_bash_ext(
     cmd: &str,

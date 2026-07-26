@@ -44,16 +44,19 @@ impl client::Handler for KnownHostsHandler {
                 Ok(true)
             }
             // Host already recorded → the presented key MUST match a stored one.
-            Ok(_) => match keys::known_hosts::check_known_hosts(host, port, server_public_key) {
-                Ok(true) => Ok(true),
-                Ok(false) | Err(_) => {
+            Ok(_) => {
+                if let Ok(true) =
+                    keys::known_hosts::check_known_hosts(host, port, server_public_key)
+                {
+                    Ok(true)
+                } else {
                     error!(
                         host,
                         port, "SSH host key does not match known_hosts — refusing connection (possible MITM)"
                     );
                     Ok(false)
                 }
-            },
+            }
             // Cannot read known_hosts → fail closed rather than trust blindly.
             Err(e) => {
                 error!(host, port, error = %e, "cannot read known_hosts — refusing connection");

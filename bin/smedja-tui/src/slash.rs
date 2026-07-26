@@ -8,6 +8,7 @@
 //! The pure-formatting helpers in this module are only called from within
 //! `dispatch_slash`; they live here to keep `main.rs` focused on wiring.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -954,16 +955,16 @@ pub(crate) async fn dispatch_slash(
 
             let mut text = format!("test: {}", report.summary());
             for s in &report.suites {
-                text.push('\n');
-                text.push_str(&format!(
-                    "  [{}] {} passed, {} failed, {} skipped ({} ms)",
+                let _ = write!(
+                    text,
+                    "\n  [{}] {} passed, {} failed, {} skipped ({} ms)",
                     s.runner, s.passed, s.failed, s.skipped, s.duration_ms
-                ));
+                );
                 if let Some(note) = &s.note {
-                    text.push_str(&format!(" — {note}"));
+                    let _ = write!(text, " — {note}");
                 }
                 for f in s.failures.iter().take(10) {
-                    text.push_str(&format!("\n      FAIL {} — {}", f.name, f.message));
+                    let _ = write!(text, "\n      FAIL {} — {}", f.name, f.message);
                 }
             }
             push_system_message(state, text);

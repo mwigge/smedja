@@ -103,6 +103,7 @@ pub(crate) fn missing_param(name: &str) -> RpcError {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)] // startup is one linear wiring sequence; the length is the subsystem fan-out, not complexity
 async fn main() -> anyhow::Result<()> {
     // smdjad has no clap parser; honour `--version`/`-V` so it can report its
     // own build like the other binaries (CARGO_PKG_VERSION = workspace version).

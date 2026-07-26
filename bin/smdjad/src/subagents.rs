@@ -7,6 +7,7 @@
 //! policy; a name with no matching role is carried as a materialisable
 //! definition but never invents a new internal route.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use smedja_assayer::AgentRole;
@@ -50,19 +51,19 @@ pub fn agent_tools(item: &BundleItem) -> &[String] {
 #[must_use]
 fn render_agent_md(item: &BundleItem) -> String {
     let mut front = String::from("---\n");
-    front.push_str(&format!("name: {}\n", item.name));
+    let _ = writeln!(front, "name: {}", item.name);
     if !item.description.is_empty() {
-        front.push_str(&format!("description: {}\n", item.description));
+        let _ = writeln!(front, "description: {}", item.description);
     }
     if let Some(agent) = &item.agent {
         if !agent.tools.is_empty() {
-            front.push_str(&format!("tools: {}\n", agent.tools.join(", ")));
+            let _ = writeln!(front, "tools: {}", agent.tools.join(", "));
         }
         if let Some(model) = &agent.model {
-            front.push_str(&format!("model: {model}\n"));
+            let _ = writeln!(front, "model: {model}");
         }
         if let Some(mode) = &agent.permission_mode {
-            front.push_str(&format!("permissionMode: {mode}\n"));
+            let _ = writeln!(front, "permissionMode: {mode}");
         }
     }
     front.push_str("---\n");

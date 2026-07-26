@@ -57,6 +57,7 @@ pub(crate) use scope::*;
 ///
 /// Returns an [`RpcError`] when scope seeding fails (e.g. a `git` error or an
 /// unresolvable pull-request reference) or persistence fails.
+#[allow(clippy::too_many_lines)] // one handler covering both the streaming and blocking paths; the length is the two branches, not complexity
 pub(crate) async fn run(state: HandlerState, params: Value) -> Result<Value, RpcError> {
     let workspace = resolve_workspace(&params);
     let scope = resolve_scope(&params);
@@ -153,7 +154,7 @@ pub(crate) async fn run(state: HandlerState, params: Value) -> Result<Value, Rpc
                 &ingot,
                 &spawn_task_id,
                 &workspace,
-                &report_path,
+                report_path.as_ref(),
                 outcome,
             )
             .await;
@@ -189,7 +190,7 @@ async fn publish_audit_report(
     ingot: &IngotHandle,
     task_id: &str,
     workspace: &Path,
-    report_path: &Option<String>,
+    report_path: Option<&String>,
     outcome: Result<Vec<AuditFinding>, RpcError>,
 ) {
     use smedja_bellows::TurnEvent;

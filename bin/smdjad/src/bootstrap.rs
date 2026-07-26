@@ -28,9 +28,14 @@ where
 {
     use futures_util::future::FutureExt as _;
     tokio::spawn(async move {
-        match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
-            Ok(()) => tracing::error!(task = name, "supervised subsystem exited unexpectedly"),
-            Err(_) => tracing::error!(task = name, "supervised subsystem panicked"),
+        if std::panic::AssertUnwindSafe(fut)
+            .catch_unwind()
+            .await
+            .is_ok()
+        {
+            tracing::error!(task = name, "supervised subsystem exited unexpectedly");
+        } else {
+            tracing::error!(task = name, "supervised subsystem panicked");
         }
     })
 }

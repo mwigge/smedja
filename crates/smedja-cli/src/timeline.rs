@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::too_many_lines)] // one match arm per timeline subcommand; the length is the dispatch table
 pub(crate) fn dispatch_timeline(action: TimelineCmd) -> Result<()> {
     let db_path = default_ingot_path();
     let ingot = Ingot::open(&db_path)

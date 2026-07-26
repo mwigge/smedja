@@ -115,6 +115,7 @@ struct ToolSpec {
 }
 
 /// The tool specs to run for `lang`.
+#[allow(clippy::too_many_lines)] // static tool-spec table; the length is the data, not complexity
 fn specs_for(lang: Language) -> Vec<ToolSpec> {
     match lang {
         Language::Rust => vec![

@@ -1,6 +1,7 @@
 use super::*;
 use serde_json::json;
 
+#[allow(clippy::too_many_lines)] // one match arm per audit subcommand; the length is the dispatch table
 pub(crate) async fn dispatch_audit(action: AuditCmd, sock: &std::path::Path) -> Result<()> {
     match action {
         AuditCmd::Run {

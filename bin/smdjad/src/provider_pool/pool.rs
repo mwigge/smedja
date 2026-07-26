@@ -190,7 +190,7 @@ impl ProviderPool {
                 }
             })
             .collect();
-        missing.sort();
+        missing.sort_unstable();
         missing.dedup();
         missing
     }

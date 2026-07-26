@@ -13,6 +13,8 @@
 //! - [`parse_pending_slices`] / [`task_counts`] read `tasks.md` — the single code
 //!   path the loop's slice reader also routes through.
 
+use std::fmt::Write as _;
+
 use crate::model::{Delta, DeltaOp, Requirement, Scenario, Spec};
 
 /// Prefix that opens a requirement block.
@@ -172,7 +174,7 @@ pub fn render_requirement(req: &Requirement) -> String {
         out.push('\n');
     }
     for scn in &req.scenarios {
-        out.push_str(&format!("\n{SCN_PREFIX} {}\n", scn.name));
+        let _ = writeln!(out, "\n{SCN_PREFIX} {}", scn.name);
         if !scn.body.trim().is_empty() {
             out.push_str(scn.body.trim());
             out.push('\n');

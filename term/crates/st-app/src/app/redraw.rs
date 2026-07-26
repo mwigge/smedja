@@ -1,6 +1,7 @@
 use super::*;
 
 impl App {
+    #[allow(clippy::too_many_lines)] // linear redraw pipeline; splitting hurts readability
     pub(super) fn handle_redraw_requested(&mut self) {
         // Flush any bytes the VT parser queued to write back to the
         // application (e.g. the kitty keyboard protocol query response).

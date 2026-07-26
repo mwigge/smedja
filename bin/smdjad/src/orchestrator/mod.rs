@@ -283,7 +283,9 @@ mod tests {
             super::ProviderSessionEntry::new("resume-live".to_owned()),
         );
         // Fill past the cap so the GC engages, all stale (touched an hour ago).
-        let stale = Instant::now() - Duration::from_secs(60 * 60);
+        let stale = Instant::now()
+            .checked_sub(Duration::from_secs(60 * 60))
+            .unwrap_or_else(Instant::now);
         for i in 0..11_000 {
             map.insert(
                 format!("stale-{i}"),

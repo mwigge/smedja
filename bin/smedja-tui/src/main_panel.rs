@@ -374,6 +374,7 @@ impl MainPanel {
     /// `selection` highlights lines from `lo` to `hi` (inclusive) in reverse video.
     /// `search_query` highlights lines containing the query text (yellow background).
     /// `no_color` strips all colours when the `NO_COLOR` env var is set.
+    #[allow(clippy::too_many_lines)] // linear render pipeline; splitting hurts readability
     pub fn render(
         &mut self,
         area: Rect,

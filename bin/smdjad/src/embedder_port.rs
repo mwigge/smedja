@@ -249,13 +249,13 @@ impl LearnedEmbedder {
     /// [`note_success`]: LearnedEmbedder::note_success
     fn note_fallback(&self) {
         self.fallback_count.fetch_add(1, Ordering::Relaxed);
-        if !self.degraded.swap(true, Ordering::Relaxed) {
+        if self.degraded.swap(true, Ordering::Relaxed) {
+            tracing::debug!(model = %self.model_id, "learned endpoint still degraded; FNV fallback");
+        } else {
             tracing::warn!(
                 model = %self.model_id,
                 "embedder DEGRADED: learned endpoint unreachable, vault recall has fallen back to lexical FNV keyword overlap until it recovers"
             );
-        } else {
-            tracing::debug!(model = %self.model_id, "learned endpoint still degraded; FNV fallback");
         }
     }
 

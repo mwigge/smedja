@@ -677,7 +677,7 @@ async fn publish_audit_report_emits_terminal_report_with_counts() {
         &ig,
         "audit-2",
         ws.path(),
-        &None,
+        None,
         Ok(sample_findings()),
     )
     .await;
@@ -719,7 +719,7 @@ async fn publish_audit_report_surfaces_loop_error_as_failed() {
         &ig,
         "audit-3",
         ws.path(),
-        &None,
+        None,
         Err(RpcError::new(codes::INTERNAL_ERROR, "no provider")),
     )
     .await;

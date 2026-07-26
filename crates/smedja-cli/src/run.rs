@@ -17,6 +17,12 @@ use crate::timeline::dispatch_timeline;
 use crate::usage::{dispatch_cost, dispatch_metrics, dispatch_savings};
 use crate::workspace::dispatch_workspace;
 
+/// Parses the CLI arguments and dispatches the requested command.
+///
+/// # Errors
+///
+/// Returns an error if the selected subcommand's dispatch fails, e.g. when the
+/// daemon socket is unreachable or the daemon returns an error response.
 pub async fn run() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();

@@ -1,6 +1,7 @@
 use super::*;
 
 impl App {
+    #[allow(clippy::too_many_lines)] // flat keybinding dispatch table; splitting is out of scope
     pub(super) fn handle_keyboard_input(&mut self, event_loop: &ActiveEventLoop, logical_key: Key) {
         // ── Phase 6 multiplexer bindings ──────────────────────────────
         //

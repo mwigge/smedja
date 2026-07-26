@@ -8,6 +8,7 @@
 //! - `openspec/changes/<name>/specs/<capability>/spec.md` — a change's delta.
 //! - `openspec/changes/archive/<name>/` — where completed changes land.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -439,19 +440,20 @@ impl SpecEngine {
         if caps.is_empty() {
             out.push_str("Deltas: (none)\n");
         } else {
-            out.push_str(&format!("Deltas: {}\n", caps.join(", ")));
+            let _ = writeln!(out, "Deltas: {}", caps.join(", "));
         }
 
         let report = self.validate(change, false);
-        out.push_str(&format!(
-            "\nValidation: {}\n",
+        let _ = writeln!(
+            out,
+            "\nValidation: {}",
             if report.valid { "pass" } else { "fail" }
-        ));
+        );
         for e in &report.errors {
-            out.push_str(&format!("  error: {e}\n"));
+            let _ = writeln!(out, "  error: {e}");
         }
         for w in &report.warnings {
-            out.push_str(&format!("  warn: {w}\n"));
+            let _ = writeln!(out, "  warn: {w}");
         }
         out
     }
@@ -462,7 +464,7 @@ impl SpecEngine {
     pub fn diff(&self, change: &str) -> String {
         let mut out = String::new();
         for delta in self.read_deltas(change) {
-            out.push_str(&format!("## spec: {}\n\n", delta.capability));
+            let _ = writeln!(out, "## spec: {}\n", delta.capability);
             out.push_str(&render_delta(&delta));
             out.push('\n');
         }

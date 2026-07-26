@@ -1,6 +1,7 @@
 use st_agent::{AgentChunk, SharedAgentManager, SharedPaneState};
 use tracing::debug;
 
+#[allow(clippy::too_many_lines)] // linear bridge-setup pipeline; splitting hurts readability
 pub(crate) fn spawn_agent_bridge(
     state: SharedPaneState,
     agent_manager: SharedAgentManager,

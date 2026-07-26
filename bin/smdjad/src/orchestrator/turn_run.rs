@@ -331,6 +331,7 @@ impl TurnRun {
     /// working-memory strata/graph/LSP/vault-recall/cold/history and the sealed
     /// prefix. Marks the task in-progress and primes the per-turn accumulators.
     #[allow(clippy::items_after_statements)] // inline `use` keeps the block self-documenting
+    #[allow(clippy::too_many_lines)] // sequential context-assembly pipeline; splitting would obscure the stages
     async fn build_context(&mut self, route: &Route) {
         let ingot = &self.orch.ingot;
         let vault = &self.orch.vault;
@@ -403,7 +404,7 @@ impl TurnRun {
         };
 
         let (base_system, all_tools) = self
-            .assemble_tools(&session, &workspace_root, &task_prefix, role)
+            .assemble_tools(session.as_ref(), &workspace_root, &task_prefix, role)
             .await;
 
         // Per-runner-tier strata + token budget. `fast` keeps a shallow warm
@@ -560,6 +561,7 @@ impl TurnRun {
     /// Drive one eligible ring entry: derive its `CallOptions`, run the inner
     /// tool loop, and classify the outcome into a [`Flow`] signal.
     #[allow(clippy::items_after_statements)] // inline `use` keeps moved blocks self-documenting
+    #[allow(clippy::too_many_lines)] // one ring entry's call + outcome classification, kept linear
     async fn attempt_entry(
         &mut self,
         entry: &ProviderEntry,
@@ -783,7 +785,7 @@ impl TurnRun {
     /// any MCP server tools. Also probes local-provider health as a side effect.
     async fn assemble_tools(
         &self,
-        session: &Option<Session>,
+        session: Option<&Session>,
         workspace_root: &std::path::Path,
         task_prefix: &str,
         role: AgentRole,
@@ -842,7 +844,6 @@ impl TurnRun {
         }
 
         let is_sre_mode = session
-            .as_ref()
             .and_then(|s| s.mode.as_deref())
             .is_some_and(|m| m == "sre");
         let builtin_tools = tools_catalog::builtin_tools(is_sre_mode);
@@ -858,6 +859,7 @@ impl TurnRun {
     /// cross-turn cache aligner hint, and fold in the session permission mode.
     /// Records the routed runner/model/context-window and span attributes on
     /// `self`, and returns `(opts, runner, session_store_key, context_window)`.
+    #[allow(clippy::too_many_lines)] // sequential CallOptions derivation; each stage feeds the next
     async fn prepare_call_options(
         &mut self,
         entry: &ProviderEntry,
@@ -1027,8 +1029,8 @@ impl TurnRun {
             tool_gate: Some(tool_gate),
         };
 
-        self.runner = entry_runner_name.clone();
-        self.model = entry_model.clone();
+        self.runner.clone_from(&entry_runner_name);
+        self.model.clone_from(&entry_model);
         (opts, runner_enum, session_store_key, context_window)
     }
 
@@ -1616,6 +1618,7 @@ impl TurnRun {
     /// savings (cache reads + cold-context omission, zero-valued rows skipped),
     /// the message checkpoint, and the cumulative per-turn token snapshot. All
     /// errors are logged and swallowed — a ledger write must never break a turn.
+    #[allow(clippy::too_many_lines)] // sequential ledger writes, each with its own failure handling
     async fn persist_turn_records(&self, turn_n: i64) {
         let ingot = &self.orch.ingot;
         let price_table = &self.orch.price_table;
@@ -1745,6 +1748,7 @@ impl TurnRun {
     /// configured threshold: run a fast summariser, upsert the summary into the
     /// vault `compact` namespace, and publish a `HistoryReplaced` event. A no-op
     /// below threshold or when no summariser provider is available.
+    #[allow(clippy::too_many_lines)] // summariser call + vault upsert + event publish kept linear
     async fn maybe_compact(&self, turn_n: i64) {
         let dispatcher = &self.orch.dispatcher;
         let session_id = &self.session_id;
@@ -1863,6 +1867,7 @@ impl TurnRun {
     /// record cost/savings/checkpoint/token-snapshot, auto-summarise on context
     /// pressure, close the span, and publish the terminal audit + completion.
     #[allow(clippy::items_after_statements)] // inline `use` keeps moved blocks self-documenting
+    #[allow(clippy::too_many_lines)] // sequential turn-finalisation steps, each failure-isolated
     async fn finalize(&mut self) {
         let ingot = &self.orch.ingot;
         let dispatcher = &self.orch.dispatcher;
@@ -2025,17 +2030,18 @@ fn materialize_bundle_subagents(workspace_root: &std::path::Path) {
     // materialised only for the native runner. This is the AgentRole mapping
     // surface for subagents.
     for agent in bundle.agents() {
-        match crate::subagents::role_for_agent(&agent.name) {
-            Some(role) => tracing::debug!(
+        if let Some(role) = crate::subagents::role_for_agent(&agent.name) {
+            tracing::debug!(
                 agent = %agent.name,
                 role = role.label(),
                 tools = crate::subagents::agent_tools(agent).len(),
                 "bundle agent bound to role"
-            ),
-            None => tracing::debug!(
+            );
+        } else {
+            tracing::debug!(
                 agent = %agent.name,
                 "bundle agent is native-only (no matching role)"
-            ),
+            );
         }
     }
     let dest = workspace_root.join(".claude").join("agents");
@@ -2043,7 +2049,7 @@ fn materialize_bundle_subagents(workspace_root: &std::path::Path) {
         Ok(0) => {}
         Ok(n) => tracing::debug!(count = n, "materialized bundle agents for claude-cli"),
         Err(e) => {
-            tracing::warn!(error = %e, "failed to materialize bundle agents; continuing")
+            tracing::warn!(error = %e, "failed to materialize bundle agents; continuing");
         }
     }
 }

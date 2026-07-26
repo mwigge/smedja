@@ -1,6 +1,7 @@
 use super::*;
 use crate::daemon::connect_or_exit;
 
+#[allow(clippy::too_many_lines)] // one match arm per session subcommand; the length is the dispatch table
 pub(crate) async fn dispatch_session(action: SessionCmd, sock: &std::path::Path) -> Result<()> {
     {
         let mut client = connect_or_exit(sock).await;

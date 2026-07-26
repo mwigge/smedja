@@ -175,7 +175,7 @@ mod tests {
 
     /// Binds a one-shot server that accepts a connection, reads one request, waits
     /// `reply_after`, then replies with a result echoing the request id.
-    async fn spawn_slow_reply_server(sock: std::path::PathBuf, reply_after: Duration) {
+    fn spawn_slow_reply_server(sock: std::path::PathBuf, reply_after: Duration) {
         let listener = UnixListener::bind(&sock).unwrap();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -197,7 +197,7 @@ mod tests {
         let sock =
             std::env::temp_dir().join(format!("smedja-rpc-long-ok-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
-        spawn_slow_reply_server(sock.clone(), Duration::from_millis(300)).await;
+        spawn_slow_reply_server(sock.clone(), Duration::from_millis(300));
 
         let mut client = Client::connect(&sock).await.unwrap();
         // Generous window (well past the 300ms reply) — models `LONG_REQUEST_TIMEOUT`.
@@ -216,7 +216,7 @@ mod tests {
         let sock =
             std::env::temp_dir().join(format!("smedja-rpc-short-kill-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
-        spawn_slow_reply_server(sock.clone(), Duration::from_millis(300)).await;
+        spawn_slow_reply_server(sock.clone(), Duration::from_millis(300));
 
         let mut client = Client::connect(&sock).await.unwrap();
         let err = client
@@ -235,7 +235,7 @@ mod tests {
             std::env::temp_dir().join(format!("smedja-rpc-long-hang-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
         // Reply is scheduled far past the client's window, i.e. effectively hung.
-        spawn_slow_reply_server(sock.clone(), Duration::from_secs(60)).await;
+        spawn_slow_reply_server(sock.clone(), Duration::from_secs(60));
 
         let mut client = Client::connect(&sock).await.unwrap();
         let err = client

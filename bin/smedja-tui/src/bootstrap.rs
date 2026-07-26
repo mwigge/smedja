@@ -233,7 +233,7 @@ pub(crate) async fn bootstrap() -> Result<Session> {
         resume_into_view(&mut state, &mut client, resume_plan(cli.turn)).await;
     }
 
-    let _guard = TerminalGuard; // instantiate immediately so Drop restores terminal on any panic
+    let guard = TerminalGuard; // instantiate immediately so Drop restores terminal on any panic
     enable_raw_mode().context("enable raw mode")?;
     execute!(
         stdout(),
@@ -276,6 +276,6 @@ pub(crate) async fn bootstrap() -> Result<Session> {
         sock,
         terminal,
         sigterm_rx,
-        guard: _guard,
+        guard,
     })
 }

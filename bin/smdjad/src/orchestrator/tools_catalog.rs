@@ -6,6 +6,7 @@
 /// Assembles the built-in tool schemas. When `is_sre_mode` is true the SRE
 /// observability tools (`alert_list`, `otel_query`, `metric_query`, `log_tail`)
 /// are appended.
+#[allow(clippy::too_many_lines)] // static tool-spec table; the length is the data, not complexity
 pub(crate) fn builtin_tools(is_sre_mode: bool) -> Vec<serde_json::Value> {
     let mut builtin_tools: Vec<serde_json::Value> = vec![
         serde_json::json!({

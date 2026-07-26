@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::too_many_lines)] // one match arm per loop subcommand; the length is the dispatch table
 pub(crate) async fn dispatch_loop(action: LoopCmd, sock: &std::path::Path) -> Result<()> {
     let mut client = Client::connect(sock)
         .await

@@ -14,6 +14,7 @@ use std::io::{Read, Write};
 
 use serde_json::{json, Value};
 
+#[allow(clippy::too_many_lines)] // scripted mock server; the length is the script
 fn main() {
     let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
@@ -27,11 +28,11 @@ fn main() {
             "initialize" => {
                 respond(
                     &mut stdout,
-                    &id,
+                    id.as_ref(),
                     json!({ "capabilities": { "renameProvider": true } }),
                 );
             }
-            "shutdown" => respond(&mut stdout, &id, Value::Null),
+            "shutdown" => respond(&mut stdout, id.as_ref(), Value::Null),
             "exit" => break,
             "textDocument/didOpen" => {
                 let uri = msg["params"]["textDocument"]["uri"]
@@ -57,7 +58,7 @@ fn main() {
                     .unwrap_or_default();
                 respond(
                     &mut stdout,
-                    &id,
+                    id.as_ref(),
                     json!({
                         "uri": uri,
                         "range": {
@@ -70,14 +71,14 @@ fn main() {
             "textDocument/hover" => {
                 respond(
                     &mut stdout,
-                    &id,
+                    id.as_ref(),
                     json!({ "contents": { "kind": "markdown", "value": "mock hover" } }),
                 );
             }
             "textDocument/documentSymbol" => {
                 respond(
                     &mut stdout,
-                    &id,
+                    id.as_ref(),
                     json!([{
                         "name": "mock_symbol",
                         "kind": 12,
@@ -99,7 +100,7 @@ fn main() {
                 let new_name = msg["params"]["newName"].as_str().unwrap_or("renamed");
                 respond(
                     &mut stdout,
-                    &id,
+                    id.as_ref(),
                     json!({
                         "changes": {
                             uri: [{
@@ -116,14 +117,14 @@ fn main() {
             _ => {
                 // Any other server-addressed request gets a null result.
                 if id.is_some() {
-                    respond(&mut stdout, &id, Value::Null);
+                    respond(&mut stdout, id.as_ref(), Value::Null);
                 }
             }
         }
     }
 }
 
-fn respond(out: &mut impl Write, id: &Option<Value>, result: Value) {
+fn respond(out: &mut impl Write, id: Option<&Value>, result: Value) {
     let Some(id) = id else { return };
     send(
         out,

@@ -156,23 +156,21 @@ pub async fn drive<R: RoleRunner, S: StatusSink>(
     // plan → implement → verify → review.
     if start_slice == 0 && config.roles.iter().any(|r| r.name == "plan") {
         let plan = resolve_role(config, "plan");
-        match run_plan_traced(runner, &plan, &slices).await {
-            Ok(planned) => slices = planned,
-            Err(_) => {
-                let _ = crate::mining::write_failure_guide(
-                    "plan",
-                    &["plan phase failed to produce a slice list".to_owned()],
-                    None,
-                    workspace,
-                );
-                sink.set_status(&LoopState::Failed).await;
-                finish(change_name, &LoopState::Failed, 0, started);
-                return LoopOutcome {
-                    final_state: LoopState::Failed,
-                    slices_completed: 0,
-                };
-            }
-        }
+        let Ok(planned) = run_plan_traced(runner, &plan, &slices).await else {
+            let _ = crate::mining::write_failure_guide(
+                "plan",
+                &["plan phase failed to produce a slice list".to_owned()],
+                None,
+                workspace,
+            );
+            sink.set_status(&LoopState::Failed).await;
+            finish(change_name, &LoopState::Failed, 0, started);
+            return LoopOutcome {
+                final_state: LoopState::Failed,
+                slices_completed: 0,
+            };
+        };
+        slices = planned;
     }
 
     let implementer = resolve_role(config, "implementer");

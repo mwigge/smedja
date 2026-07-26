@@ -86,6 +86,12 @@ enum BlockAction {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// Runs the terminal application's event loop until exit.
+///
+/// # Errors
+///
+/// Returns an error if tracing initialisation, the window/event-loop setup,
+/// or the PTY spawn fails, or if the event loop itself exits with an error.
 pub fn run() -> anyhow::Result<()> {
     // Honour RUST_LOG, but default the GPU stack (wgpu/naga) to `warn` so a
     // `RUST_LOG=debug` capture isn't drowned by thousands of per-frame wgpu

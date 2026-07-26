@@ -5,6 +5,7 @@
 //! These files are read by agents on subsequent attempts to avoid repeating
 //! the same mistakes.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use anyhow::Result;
@@ -92,23 +93,24 @@ fn render_verification(result: &VerifyResult) -> String {
     }
 
     let mut section = String::from("## Verification output\n\n");
-    section.push_str(&format!(
+    let _ = writeln!(
+        section,
         "The verification command exited with code {}. Address the failures below; \
-         do not guess.\n",
+         do not guess.",
         result.exit_code
-    ));
+    );
 
     // Reuse the shared testkit parser to normalise the verification output into
     // a structured pass/fail tally when it recognises a known test format.
     if let Some(summary) = normalized_test_summary(stdout, stderr) {
-        section.push_str(&format!("\nNormalised test report: {summary}\n"));
+        let _ = writeln!(section, "\nNormalised test report: {summary}");
     }
 
     let failing = failing_test_names(stdout, stderr);
     if !failing.is_empty() {
         section.push_str("\n### Failing tests\n\n");
         for name in &failing {
-            section.push_str(&format!("- `{name}`\n"));
+            let _ = writeln!(section, "- `{name}`");
         }
     }
 
@@ -143,7 +145,7 @@ fn tail_truncate(text: &str) -> String {
         while start < kept.len() && !kept.is_char_boundary(start) {
             start += 1;
         }
-        kept = kept[start..].to_owned();
+        kept.replace_range(..start, "");
         truncated = true;
     }
 
@@ -376,7 +378,7 @@ mod tests {
         // Distinctive first and last lines around a huge body.
         let mut body = String::from("FIRST_LINE_MARKER\n");
         for i in 0..10_000 {
-            body.push_str(&format!("noise line {i} padding padding padding padding\n"));
+            let _ = writeln!(body, "noise line {i} padding padding padding padding");
         }
         body.push_str("LAST_LINE_MARKER\n");
         let result = failing(&body, "");

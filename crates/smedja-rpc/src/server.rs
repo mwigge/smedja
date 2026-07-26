@@ -86,25 +86,22 @@ async fn handle_connection(stream: UnixStream, router: Arc<Router>) {
         let Ok(Some(frame)) = read_frame(&mut reader).await else {
             break;
         };
-        let req = match serde_json::from_str::<Request>(frame.trim_end()) {
-            Ok(req) => req,
-            Err(_) => {
-                // Not a valid `Request`. If the payload is JSON carrying a
-                // non-null `id`, the sender is awaiting a reply, so answer with
-                // an Invalid Request error rather than dropping it silently and
-                // leaving the caller blocked forever. A payload with no id (or a
-                // null id) is treated as a notification and skipped.
-                if let Ok(value) = serde_json::from_str::<Value>(frame.trim_end()) {
-                    if let Some(id) = value.get("id").filter(|v| !v.is_null()) {
-                        let resp = Response::err(
-                            Some(id.clone()),
-                            RpcError::new(codes::INVALID_REQUEST, "invalid request"),
-                        );
-                        let _ = tx.send(resp).await;
-                    }
+        // Not a valid `Request`. If the payload is JSON carrying a
+        // non-null `id`, the sender is awaiting a reply, so answer with
+        // an Invalid Request error rather than dropping it silently and
+        // leaving the caller blocked forever. A payload with no id (or a
+        // null id) is treated as a notification and skipped.
+        let Ok(req) = serde_json::from_str::<Request>(frame.trim_end()) else {
+            if let Ok(value) = serde_json::from_str::<Value>(frame.trim_end()) {
+                if let Some(id) = value.get("id").filter(|v| !v.is_null()) {
+                    let resp = Response::err(
+                        Some(id.clone()),
+                        RpcError::new(codes::INVALID_REQUEST, "invalid request"),
+                    );
+                    let _ = tx.send(resp).await;
                 }
-                continue;
             }
+            continue;
         };
         let is_notification = req.is_notification();
         let id = req.id.clone();

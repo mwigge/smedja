@@ -87,6 +87,7 @@ pub(crate) async fn start_stream_reader(
 /// Applies a single streamed [`StreamEvent`] to `state`, mirroring the inline
 /// dispatch that previously lived in the event loop. Returns `true` when the
 /// event terminates the turn (`Done`/`Error`), so the caller finalises it.
+#[allow(clippy::too_many_lines)] // flat StreamEvent dispatch table; splitting is out of scope
 pub(crate) fn apply_stream_event(
     state: &mut AppState,
     event: StreamEvent,
@@ -532,12 +533,11 @@ pub(crate) fn apply_stream_event(
             );
             let color = if state.no_color { p.text_dim } else { p.molten };
             let line = Line::from(Span::styled(text, Style::default().fg(color)));
-            match state.audit_progress_line {
-                Some(idx) => state.main_panel.replace_styled_line(idx, line),
-                None => {
-                    state.main_panel.push_styled_line(line);
-                    state.audit_progress_line = Some(state.main_panel.len().saturating_sub(1));
-                }
+            if let Some(idx) = state.audit_progress_line {
+                state.main_panel.replace_styled_line(idx, line);
+            } else {
+                state.main_panel.push_styled_line(line);
+                state.audit_progress_line = Some(state.main_panel.len().saturating_sub(1));
             }
         }
         StreamEvent::AuditReport {

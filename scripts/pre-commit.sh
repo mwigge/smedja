@@ -47,7 +47,13 @@ run_check "cargo clippy" cargo clippy \
      -A clippy::type_complexity \
      -A clippy::struct_excessive_bools \
      -A clippy::fn_params_excessive_bools \
-     -A clippy::trivially_copy_pass_by_ref
+     -A clippy::trivially_copy_pass_by_ref \
+     -A clippy::duration_suboptimal_units \
+     -A clippy::wildcard_imports
+# wildcard_imports: `use super::*;` is the repo's deliberate module-split
+# idiom (files carved out of a former single module).
+# duration_suboptimal_units: the suggested `Duration::from_mins`/`from_hours`
+# constructors require Rust 1.96+, but the workspace MSRV is 1.82.
 
 run_check "cargo test" cargo test --workspace --quiet
 

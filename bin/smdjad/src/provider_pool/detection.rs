@@ -244,28 +244,27 @@ pub async fn build_provider_pool() -> ProviderPool {
     // 4. Gemini — native API preferred; the gemini CLI binary is the fallback,
     //    driven over ACP so its tool calls are gated like kimi's.
     if std::env::var("GEMINI_API_KEY").is_ok() {
-        match (GeminiProvider::from_env(), GeminiProvider::from_env()) {
-            (Ok(p_fast), Ok(p_deep)) => {
-                add!(
-                    Runner::Gemini,
-                    Tier::Fast,
-                    p_fast,
-                    "google",
-                    "gemini-2.5-flash"
-                );
-                add!(
-                    Runner::Gemini,
-                    Tier::Deep,
-                    p_deep,
-                    "google",
-                    "gemini-2.5-pro"
-                );
-                info!(runner = "google", "provider ready");
-            }
-            _ => warn!(
+        if let (Ok(p_fast), Ok(p_deep)) = (GeminiProvider::from_env(), GeminiProvider::from_env()) {
+            add!(
+                Runner::Gemini,
+                Tier::Fast,
+                p_fast,
+                "google",
+                "gemini-2.5-flash"
+            );
+            add!(
+                Runner::Gemini,
+                Tier::Deep,
+                p_deep,
+                "google",
+                "gemini-2.5-pro"
+            );
+            info!(runner = "google", "provider ready");
+        } else {
+            warn!(
                 runner = "google",
                 "UNAVAILABLE — GEMINI_API_KEY vanished mid-probe"
-            ),
+            );
         }
     } else if SubprocessProvider::available("gemini") {
         // Same detect TOCTOU as the claude branch: skip on `None`, never panic.
