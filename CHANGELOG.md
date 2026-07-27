@@ -6,6 +6,35 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.27.0] — 2026-07-27
+
+### Added
+- Terminal mouse text selection: drag to select when the foreground app does
+  not capture the mouse, or Shift+drag to override its capture (e.g. inside
+  smedja-tui). The dragged range is highlighted (inverted colours) and copied
+  to the clipboard on release — select-to-copy, kitty/foot style.
+  Ctrl+Shift+C copies the selection explicitly and clears the highlight;
+  clipboard writes use `wl-copy` on Wayland with `xclip`/`xsel`/`arboard`
+  fallbacks.
+
+### Fixed
+- Long input no longer blanks the TUI prompt. The echo is pre-wrapped with
+  the same char-level algorithm as the height calculation, so an unbroken
+  token (a URL, a pasted blob) can no longer be pushed onto a hidden visual
+  row — pasting with Ctrl+V / Ctrl+Shift+V appeared to wipe the prompt, and
+  typing past the wrap point blanked the line until the next row. The
+  char/token counter now only renders when it cannot overlap the text, and
+  CR bytes are stripped from pastes.
+- The right-rail panels (runner/metrics, context, cockpit, obs, quality,
+  value, LSP) render again: the auto-loaded sessions rail consumed enough
+  columns to suppress the entire rail, and the layout solver starved
+  mid-rail panels to zero height. The sessions rail now defaults to hidden
+  (Ctrl-W toggles), rail visibility is decided once for both input wrap and
+  body layout, and panels are stacked deterministically with LSP taking the
+  remaining rows.
+
+---
+
 ## [0.26.2] — 2026-07-24
 
 ### Fixed
