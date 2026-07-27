@@ -10,7 +10,11 @@
 //! - `Ctrl+W` → close active tab
 //! - `Ctrl+Tab` / `Ctrl+Shift+Tab` → next / prev tab
 //! - `Ctrl+Shift+H` → split horizontal
-//! - `Ctrl+Shift+V` → split vertical
+//! - `Ctrl+Shift+B` → split vertical
+//! - `Ctrl+Shift+V` (or `Ctrl+V`) → paste from clipboard
+//! - `Ctrl+Shift+C` → copy the mouse selection to the clipboard
+//! - Mouse drag (or Shift+drag when the app captures the mouse) → select text;
+//!   the selection is copied on release
 //! - `Ctrl+Shift+Z` → toggle zoom on active pane
 //! - `Ctrl+Shift+L` → open launch menu overlay
 //! - `Ctrl+N` → open a new window
@@ -23,6 +27,7 @@ mod input;
 mod launch;
 mod mouse;
 mod render;
+mod selection;
 mod split;
 mod ssh_mux;
 mod status;

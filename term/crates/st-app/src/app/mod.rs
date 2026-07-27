@@ -99,6 +99,12 @@ pub(crate) struct App {
     cursor_pos: (f64, f64),
     /// Which mouse buttons are currently held down.
     mouse_buttons: u8,
+    /// Local selection anchor `(col, row)` in visible-grid coordinates. Set on
+    /// left-press when the child app isn't capturing the mouse (or Shift
+    /// overrides its capture); `None` when there is no selection.
+    selection_anchor: Option<(u16, u16)>,
+    /// Moving endpoint of the local selection.
+    selection_end: Option<(u16, u16)>,
     /// True while the window is fully occluded by another window on Wayland.
     /// Used to suppress redraws that would burn GPU for invisible frames.
     occluded: bool,
@@ -150,6 +156,8 @@ impl App {
             pane_id: String::new(),
             cursor_pos: (0.0, 0.0),
             mouse_buttons: 0,
+            selection_anchor: None,
+            selection_end: None,
             occluded: false,
             suppress_clear_until: None,
             forced_redraws: FORCED_REDRAWS,
@@ -322,6 +330,57 @@ impl App {
         };
         if let Err(e) = pty.write_input(&data) {
             debug!("PTY paste write error: {}", e);
+        }
+    }
+
+    // ── Local selection helpers ───────────────────────────────────────────────
+
+    /// The current selection as a normalised reading-order range; `None` when
+    /// there is no selection or the endpoints coincide (a plain click).
+    fn selection_range(&self) -> Option<((u16, u16), (u16, u16))> {
+        let a = self.selection_anchor?;
+        let b = self.selection_end?;
+        if a == b {
+            return None;
+        }
+        Some(crate::selection::normalize(a, b))
+    }
+
+    /// Extracts the selected text from the visible grid. Mirrors the redraw
+    /// path's view choice: the live cells normally, the scrolled window when
+    /// the user has scrolled back (the alt screen has no scrollback view).
+    fn selection_text(&self) -> Option<String> {
+        let range = self.selection_range()?;
+        let pty = self.pty.as_ref()?;
+        let grid = pty.grid.lock();
+        let rows: Vec<&Vec<st_pty::Cell>> = if grid.scroll_offset <= 0 || grid.alt_screen {
+            grid.cells.iter().collect()
+        } else {
+            grid.visible_rows(grid.scroll_offset)
+        };
+        let text = crate::selection::extract_text(&rows, &range);
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    /// Copies the current selection to the system clipboard. Returns false
+    /// when there is no usable selection (callers treat that as a no-op).
+    fn copy_selection_to_clipboard(&mut self) -> bool {
+        let Some(text) = self.selection_text() else {
+            return false;
+        };
+        crate::clipboard::write_clipboard_text(&text)
+    }
+
+    /// Clears the local selection and flags a repaint when one was showing.
+    fn clear_selection(&mut self) {
+        if self.selection_anchor.take().is_some() | self.selection_end.take().is_some() {
+            if let Some(pty) = &self.pty {
+                pty.dirty.store(true, Ordering::Release);
+            }
         }
     }
 

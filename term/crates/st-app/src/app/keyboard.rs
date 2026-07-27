@@ -98,6 +98,16 @@ impl App {
                         self.paste_from_clipboard();
                         return;
                     }
+                    // Ctrl+Shift+C → copy the local mouse selection to the
+                    // clipboard, then clear the highlight (kitty/foot
+                    // convention). With no selection this is a no-op — Ctrl+C
+                    // (no shift) still delivers SIGINT as usual.
+                    "c" => {
+                        if self.copy_selection_to_clipboard() {
+                            self.clear_selection();
+                        }
+                        return;
+                    }
                     // Ctrl+Shift+B → vertical split (was Ctrl+Shift+V before paste)
                     "b" => {
                         self.split_active_pane(SplitDirection::Vertical);

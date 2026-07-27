@@ -3,6 +3,9 @@ use super::*;
 impl App {
     #[allow(clippy::too_many_lines)] // linear redraw pipeline; splitting hurts readability
     pub(super) fn handle_redraw_requested(&mut self) {
+        // Snapshot the local selection before the renderer's mutable borrow
+        // below begins (field-level borrows can't overlap a &self call).
+        let sel_range = self.selection_range();
         // Flush any bytes the VT parser queued to write back to the
         // application (e.g. the kitty keyboard protocol query response).
         if let Some(pty) = &mut self.pty {
@@ -68,6 +71,17 @@ impl App {
                     cells.len(),
                     non_blank
                 );
+
+                // Invert fg/bg on cells covered by the terminal-local mouse
+                // selection so the dragged range reads as highlighted.
+                let mut cells = cells;
+                if let Some(range) = sel_range {
+                    for cell in &mut cells {
+                        if crate::selection::contains(&range, cell.col, cell.row) {
+                            std::mem::swap(&mut cell.fg, &mut cell.bg);
+                        }
+                    }
+                }
 
                 // If all cells just went blank and we're inside the
                 // post-resize suppress window, skip this frame.  The

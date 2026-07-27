@@ -274,6 +274,22 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x, position.y);
+                // Extend a terminal-local selection while the left button is
+                // held (the anchor is only set when the app isn't capturing
+                // the mouse, so this never fights a mouse-aware child).
+                if self.selection_anchor.is_some() && self.mouse_buttons & 1 != 0 {
+                    if let Some((col, row, _, _)) = self.pointer_cell(position.x, position.y) {
+                        if self.selection_end != Some((col, row)) {
+                            self.selection_end = Some((col, row));
+                            if let Some(pty) = &self.pty {
+                                pty.dirty.store(true, Ordering::Release);
+                            }
+                            if let Some(w) = self.windows.get(&window_id) {
+                                w.request_redraw();
+                            }
+                        }
+                    }
+                }
                 // Send mouse motion events when a button is held (ButtonEvent mode)
                 // or unconditionally (AnyEvent mode).
                 if self.pty.is_some() {
@@ -342,6 +358,38 @@ impl ApplicationHandler<UserEvent> for App {
                     "MouseInput mode={:?} sgr={} col={} row={}",
                     mode, sgr, col, row
                 );
+                // Terminal-local selection: when the child app isn't capturing
+                // the mouse (MouseMode::None) — or Shift overrides its
+                // capture — the left button drives a local text selection
+                // instead of being reported to the app. Press starts a range;
+                // release with a real range copies it to the clipboard
+                // (select-to-copy, kitty/foot style); a click with no drag
+                // just clears any previous selection.
+                let local_select = button == MouseButton::Left
+                    && (mode == st_pty::MouseMode::None || self.shift());
+                if local_select {
+                    if pressed {
+                        self.selection_anchor = Some((col, row));
+                        self.selection_end = Some((col, row));
+                    } else if self.selection_range().is_some() {
+                        self.copy_selection_to_clipboard();
+                    } else {
+                        self.selection_anchor = None;
+                        self.selection_end = None;
+                    }
+                    if let Some(pty) = &self.pty {
+                        pty.dirty.store(true, Ordering::Release);
+                    }
+                    if let Some(w) = self.windows.get(&window_id) {
+                        w.request_redraw();
+                    }
+                    return;
+                }
+                // A left press the app does capture still clears the local
+                // selection highlight.
+                if pressed && button == MouseButton::Left {
+                    self.clear_selection();
+                }
                 if mode == st_pty::MouseMode::None {
                     debug!("MouseInput: mode=None, not forwarding to PTY");
                     return;
