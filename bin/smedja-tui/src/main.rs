@@ -41,6 +41,7 @@ mod thoughts_panel;
 mod tool_call;
 mod upgrade;
 mod value_panel;
+mod viz;
 
 // Re-export extracted-module items at the crate root so `main` and the retained
 // test module (`use super::*`) continue to resolve the moved names unchanged.
@@ -74,8 +75,9 @@ pub(crate) use messages::{
 };
 #[allow(unused_imports)]
 pub(crate) use metrics_poll::{
-    format_token_count, lsp_snapshot_from_rpc, metrics_poll_due, metrics_rows_from_summary,
-    toggle_metrics_view, METRICS_POLL_INTERVAL, METRICS_SINCE_WINDOW_MICROS,
+    format_token_count, hourly_from_summary, lsp_snapshot_from_rpc, metrics_poll_due,
+    metrics_rows_from_summary, toggle_metrics_view, METRICS_POLL_INTERVAL,
+    METRICS_SINCE_WINDOW_MICROS,
 };
 #[allow(unused_imports)]
 pub(crate) use render::{
@@ -407,6 +409,7 @@ async fn main() -> Result<()> {
         },
         metrics_snapshot: Vec::new(),
         savings_snapshot: metrics_view::SavingsSnapshot::default(),
+        metrics_hourly: Vec::new(),
         last_metrics_poll: None,
         last_obs_poll: None,
         context_used: 0,
@@ -1344,6 +1347,7 @@ async fn main() -> Result<()> {
                 .await
             {
                 state.metrics_snapshot = metrics_rows_from_summary(&resp);
+                state.metrics_hourly = hourly_from_summary(&resp);
                 // Fallback: if no persisted buckets yet, show current-session totals.
                 if state.metrics_snapshot.is_empty()
                     && (state.session_tokens_in > 0 || state.session_tokens_out > 0)
@@ -1418,7 +1422,14 @@ async fn main() -> Result<()> {
                 .await
             {
                 state.value_snapshot.change_name = vc["change_name"].as_str().map(str::to_owned);
-                state.value_snapshot.token_cost = vc["token_cost"].as_u64().unwrap_or(0);
+                let token_cost = vc["token_cost"].as_u64().unwrap_or(0);
+                state.value_snapshot.token_cost = token_cost;
+                // Rolling history for the spend-velocity sparkline.
+                let trend = &mut state.value_snapshot.tok_trend;
+                trend.push(token_cost);
+                if trend.len() > 64 {
+                    trend.drain(0..trend.len() - 64);
+                }
                 state.value_snapshot.cost_usd_micros = vc["cost_usd_micros"].as_u64().unwrap_or(0);
                 state.value_snapshot.quality_avg = state.quality_snapshot.score;
             }

@@ -338,6 +338,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
                 state.metrics_snapshot.clone(),
                 state.savings_snapshot.clone(),
             )
+            .with_hourly(state.metrics_hourly.clone())
             .lines()
             .len();
             // +2 for Block top and bottom border.
@@ -349,7 +350,8 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
                     metrics_view::MetricsView::with_savings(
                         state.metrics_snapshot.clone(),
                         state.savings_snapshot.clone(),
-                    ),
+                    )
+                    .with_hourly(state.metrics_hourly.clone()),
                     chunk,
                 );
             }
@@ -397,7 +399,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
 
         // ── Value / ROI panel ─────────────────────────────────────────────
         if show_value {
-            if let Some(chunk) = take(4) {
+            if let Some(chunk) = take(8) {
                 value_panel::ValuePanel::new(&state.value_snapshot).render(chunk, frame);
             }
         }

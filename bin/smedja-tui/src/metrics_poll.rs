@@ -119,6 +119,34 @@ pub(crate) fn metrics_rows_from_summary(resp: &serde_json::Value) -> Vec<metrics
     rows
 }
 
+/// Folds a `metrics.summary` response into per-hour token totals for the runner
+/// panel's 24 h usage chart: one value per `bucket_start` hour (input + output
+/// summed across runners and models), ordered oldest → newest and capped to the
+/// most recent 21 hours (the rail's chart width after the `"24h "` prefix).
+/// Missing or malformed buckets are tolerated as empty / zero.
+#[must_use]
+pub(crate) fn hourly_from_summary(resp: &serde_json::Value) -> Vec<u64> {
+    const HOURLY_CAP: usize = 21;
+    let Some(buckets) = resp["buckets"].as_array() else {
+        return Vec::new();
+    };
+    // BTreeMap keys sort ascending by hour, so values come out chronological.
+    let mut per_hour: std::collections::BTreeMap<i64, u64> = std::collections::BTreeMap::new();
+    for bucket in buckets {
+        let start = bucket["bucket_start"].as_i64().unwrap_or(0);
+        let tokens =
+            bucket["input_tok"].as_u64().unwrap_or(0) + bucket["output_tok"].as_u64().unwrap_or(0);
+        *per_hour.entry(start).or_insert(0) += tokens;
+    }
+    // Keep only the most recent HOURLY_CAP hours, back in oldest → newest order.
+    per_hour
+        .into_values()
+        .rev()
+        .take(HOURLY_CAP)
+        .rev()
+        .collect()
+}
+
 /// Returns whether the metrics panel poll is due: true only when the panel is
 /// `visible` and `last` is unset or [`METRICS_POLL_INTERVAL`] has elapsed by
 /// `now`. The panel is never polled while hidden.
@@ -175,6 +203,48 @@ mod tests {
         assert_eq!(rows[0].errors, 3, "errors accumulated");
         assert_eq!(rows[1].runner, "local");
         assert_eq!(rows[1].tokens, 480);
+    }
+
+    #[test]
+    fn hourly_from_summary_folds_runners_into_hours_chronologically() {
+        let resp = json!({
+            "tier": "hourly",
+            "buckets": [
+                { "bucket_start": 3_600_000_000_i64, "runner": "claude",
+                  "input_tok": 200, "output_tok": 80 },
+                { "bucket_start": 0, "runner": "claude",
+                  "input_tok": 100, "output_tok": 50 },
+                { "bucket_start": 0, "runner": "local",
+                  "input_tok": 480, "output_tok": 0 },
+            ],
+        });
+        let hourly = hourly_from_summary(&resp);
+        // Oldest → newest; same-hour buckets summed across runners.
+        assert_eq!(hourly, vec![100 + 50 + 480, 200 + 80]);
+    }
+
+    #[test]
+    fn hourly_from_summary_keeps_only_most_recent_21_hours() {
+        let buckets: Vec<serde_json::Value> = (0i64..25)
+            .map(|h| {
+                json!({ "bucket_start": h * 3_600_000_000_i64,
+                        "runner": "claude", "input_tok": h, "output_tok": 0 })
+            })
+            .collect();
+        let resp = json!({ "tier": "hourly", "buckets": buckets });
+        let hourly = hourly_from_summary(&resp);
+        assert_eq!(hourly.len(), 21, "capped to the rail's chart width");
+        assert_eq!(hourly.first(), Some(&4), "oldest kept hour is #4");
+        assert_eq!(hourly.last(), Some(&24), "newest hour kept");
+    }
+
+    #[test]
+    fn hourly_from_summary_tolerates_missing_or_malformed_buckets() {
+        let missing = json!({ "tier": "hourly" });
+        assert!(hourly_from_summary(&missing).is_empty());
+        // No bucket_start / token fields → one zero-valued hour, no panic.
+        let malformed = json!({ "buckets": [ { "runner": "claude" } ] });
+        assert_eq!(hourly_from_summary(&malformed), vec![0]);
     }
 
     #[test]

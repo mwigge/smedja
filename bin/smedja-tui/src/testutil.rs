@@ -53,6 +53,7 @@ pub(crate) fn make_state(session_id: &str) -> AppState {
         },
         metrics_snapshot: Vec::new(),
         savings_snapshot: metrics_view::SavingsSnapshot::default(),
+        metrics_hourly: Vec::new(),
         last_metrics_poll: None,
         last_obs_poll: None,
         context_used: 0,

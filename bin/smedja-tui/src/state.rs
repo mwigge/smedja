@@ -121,6 +121,9 @@ pub(crate) struct AppState {
     pub(crate) metrics_snapshot: Vec<metrics_view::MetricsRow>,
     /// Cached token-economy savings snapshot for the latest rollup window.
     pub(crate) savings_snapshot: metrics_view::SavingsSnapshot,
+    /// Hourly token totals (input + output) over the last 24h, chronological,
+    /// feeding the runner panel's 24h usage chart.
+    pub(crate) metrics_hourly: Vec<u64>,
     /// Timestamp of the last metrics panel poll (drives both the `metrics.summary`
     /// per-runner fetch and the `savings.summary` token-economy fetch on one
     /// cadence). `None` forces an immediate fetch on the next tick.
