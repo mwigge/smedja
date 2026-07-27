@@ -1,0 +1,394 @@
+{
+  "description": "Daemon health: RPC throughput, turn pipeline, log volume.",
+  "layout": [
+    {
+      "h": 3,
+      "i": "39dca42c-a135-4217-a68f-752beb120cd3",
+      "w": 6,
+      "x": 0,
+      "y": 0
+    },
+    {
+      "h": 3,
+      "i": "41b57caa-3314-4a5e-a259-e48b2a020a0a",
+      "w": 6,
+      "x": 6,
+      "y": 0
+    },
+    {
+      "h": 3,
+      "i": "4691420a-a0bd-4359-b4b7-830b258ac14d",
+      "w": 6,
+      "x": 0,
+      "y": 3
+    },
+    {
+      "h": 3,
+      "i": "f94b5c83-cf5c-4543-a7b5-8a2aa7196390",
+      "w": 6,
+      "x": 6,
+      "y": 3
+    },
+    {
+      "h": 3,
+      "i": "d3d78f00-2831-41dd-b42d-fe41441e2ed8",
+      "w": 6,
+      "x": 0,
+      "y": 6
+    },
+    {
+      "h": 3,
+      "i": "05ac9407-7bcb-4b25-b977-9c492553bed1",
+      "w": 6,
+      "x": 6,
+      "y": 6
+    }
+  ],
+  "tags": [
+    "smedja"
+  ],
+  "title": "Smedja — Overview",
+  "variables": {},
+  "version": "v5",
+  "widgets": [
+    {
+      "description": "JSON-RPC calls served by smdjad, rate per method.",
+      "id": "39dca42c-a135-4217-a68f-752beb120cd3",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "aggregations": [
+                {
+                  "metricName": "smedja_rpc_requests_total",
+                  "reduceTo": "avg",
+                  "spaceAggregation": "sum",
+                  "temporality": "Cumulative",
+                  "timeAggregation": "rate"
+                }
+              ],
+              "dataSource": "metrics",
+              "disabled": false,
+              "expression": "A",
+              "function": [],
+              "groupBy": [
+                {
+                  "dataType": "string",
+                  "isColumn": false,
+                  "key": "rpc.method",
+                  "type": "tag"
+                }
+              ],
+              "having": {
+                "expression": ""
+              },
+              "legend": "{{rpc.method}}",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "RPC requests /s by method",
+      "yAxisUnit": "none"
+    },
+    {
+      "description": "Provider/runner health probes — a flat line means the daemon is alive.",
+      "id": "41b57caa-3314-4a5e-a259-e48b2a020a0a",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "aggregations": [
+                {
+                  "metricName": "smedja_local_health_checks_total",
+                  "reduceTo": "avg",
+                  "spaceAggregation": "sum",
+                  "temporality": "Cumulative",
+                  "timeAggregation": "rate"
+                }
+              ],
+              "dataSource": "metrics",
+              "disabled": false,
+              "expression": "A",
+              "function": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Local health checks /s",
+      "yAxisUnit": "none"
+    },
+    {
+      "description": "smedja.agent.invoke spans, grouped by routing tier.",
+      "id": "4691420a-a0bd-4359-b4b7-830b258ac14d",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "aggregations": [
+                {
+                  "expression": "count()"
+                }
+              ],
+              "dataSource": "traces",
+              "disabled": false,
+              "expression": "A",
+              "filter": {
+                "expression": "name = 'smedja.agent.invoke' smedja.tier EXISTS"
+              },
+              "function": [],
+              "groupBy": [
+                {
+                  "dataType": "string",
+                  "isColumn": false,
+                  "key": "smedja.tier",
+                  "type": "tag"
+                }
+              ],
+              "having": {
+                "expression": ""
+              },
+              "legend": "{{smedja.tier}}",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Turns started",
+      "yAxisUnit": "none"
+    },
+    {
+      "description": "End-to-end turn duration percentiles.",
+      "id": "f94b5c83-cf5c-4543-a7b5-8a2aa7196390",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "aggregations": [
+                {
+                  "expression": "p50(durationNano)"
+                }
+              ],
+              "dataSource": "traces",
+              "disabled": false,
+              "expression": "A",
+              "filter": {
+                "expression": "name = 'smedja.agent.invoke'"
+              },
+              "function": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "p50",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60
+            },
+            {
+              "aggregations": [
+                {
+                  "expression": "p95(durationNano)"
+                }
+              ],
+              "dataSource": "traces",
+              "disabled": false,
+              "expression": "B",
+              "filter": {
+                "expression": "name = 'smedja.agent.invoke'"
+              },
+              "function": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "p95",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "B",
+              "stepInterval": 60
+            },
+            {
+              "aggregations": [
+                {
+                  "expression": "p99(durationNano)"
+                }
+              ],
+              "dataSource": "traces",
+              "disabled": false,
+              "expression": "C",
+              "filter": {
+                "expression": "name = 'smedja.agent.invoke'"
+              },
+              "function": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "p99",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "C",
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Turn latency",
+      "yAxisUnit": "ns"
+    },
+    {
+      "description": "All smdjad log records per second, by severity.",
+      "id": "d3d78f00-2831-41dd-b42d-fe41441e2ed8",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "aggregations": [
+                {
+                  "expression": "count()"
+                }
+              ],
+              "dataSource": "logs",
+              "disabled": false,
+              "expression": "A",
+              "filter": {
+                "expression": "service.name = 'smdjad' severity_text EXISTS"
+              },
+              "function": [],
+              "groupBy": [
+                {
+                  "dataType": "string",
+                  "isColumn": false,
+                  "key": "severity_text",
+                  "type": "tag"
+                }
+              ],
+              "having": {
+                "expression": ""
+              },
+              "legend": "{{severity_text}}",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Logs by severity",
+      "yAxisUnit": "none"
+    },
+    {
+      "description": "WARN and ERROR log records per second.",
+      "id": "05ac9407-7bcb-4b25-b977-9c492553bed1",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "aggregations": [
+                {
+                  "expression": "count()"
+                }
+              ],
+              "dataSource": "logs",
+              "disabled": false,
+              "expression": "A",
+              "filter": {
+                "expression": "(service.name = 'smdjad' AND severity_text IN ['WARN', 'ERROR'])"
+              },
+              "function": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "warn+err",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Warnings & errors",
+      "yAxisUnit": "none"
+    }
+  ]
+}

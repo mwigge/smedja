@@ -1,0 +1,436 @@
+{
+  "description": "Autonomous loop metrics plus raw error logs and recent turns.",
+  "layout": [
+    {
+      "h": 3,
+      "i": "6d4814ec-34a6-436c-9b2c-794ca857f2f4",
+      "w": 6,
+      "x": 0,
+      "y": 0
+    },
+    {
+      "h": 3,
+      "i": "84a9e479-387d-4a4a-9581-1957afa31c0f",
+      "w": 6,
+      "x": 6,
+      "y": 0
+    },
+    {
+      "h": 3,
+      "i": "cf689af5-a898-4380-a27d-b02a6ea815e0",
+      "w": 6,
+      "x": 0,
+      "y": 3
+    },
+    {
+      "h": 3,
+      "i": "36bf32e9-1a30-429d-8b47-f2b097d4de99",
+      "w": 6,
+      "x": 6,
+      "y": 3
+    },
+    {
+      "h": 3,
+      "i": "413ca801-c993-44c2-b024-4e705f2291f8",
+      "w": 6,
+      "x": 0,
+      "y": 6
+    },
+    {
+      "h": 3,
+      "i": "21d0fe78-f40d-4412-995b-9897cfc61291",
+      "w": 6,
+      "x": 6,
+      "y": 6
+    }
+  ],
+  "tags": [
+    "smedja"
+  ],
+  "title": "Smedja — Loops, Logs & Traces",
+  "variables": {},
+  "version": "v5",
+  "widgets": [
+    {
+      "description": "",
+      "id": "6d4814ec-34a6-436c-9b2c-794ca857f2f4",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "aggregations": [
+                {
+                  "metricName": "smedja_loop_input_tokens_total",
+                  "reduceTo": "avg",
+                  "spaceAggregation": "sum",
+                  "temporality": "Cumulative",
+                  "timeAggregation": "rate"
+                }
+              ],
+              "dataSource": "metrics",
+              "disabled": false,
+              "expression": "A",
+              "function": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "input",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60
+            },
+            {
+              "aggregations": [
+                {
+                  "metricName": "smedja_loop_output_tokens_total",
+                  "reduceTo": "avg",
+                  "spaceAggregation": "sum",
+                  "temporality": "Cumulative",
+                  "timeAggregation": "rate"
+                }
+              ],
+              "dataSource": "metrics",
+              "disabled": false,
+              "expression": "B",
+              "function": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "output",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "B",
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Loop tokens /s",
+      "yAxisUnit": "none"
+    },
+    {
+      "description": "Compaction slices executed and tier escalations triggered by loops.",
+      "id": "84a9e479-387d-4a4a-9581-1957afa31c0f",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "aggregations": [
+                {
+                  "metricName": "smedja_loop_slices_total",
+                  "reduceTo": "avg",
+                  "spaceAggregation": "sum",
+                  "temporality": "Cumulative",
+                  "timeAggregation": "rate"
+                }
+              ],
+              "dataSource": "metrics",
+              "disabled": false,
+              "expression": "A",
+              "function": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "slices",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60
+            },
+            {
+              "aggregations": [
+                {
+                  "metricName": "smedja_loop_tier_escalations_total",
+                  "reduceTo": "avg",
+                  "spaceAggregation": "sum",
+                  "temporality": "Cumulative",
+                  "timeAggregation": "rate"
+                }
+              ],
+              "dataSource": "metrics",
+              "disabled": false,
+              "expression": "B",
+              "function": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "tier escalations",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "B",
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Loop slices & escalations",
+      "yAxisUnit": "none"
+    },
+    {
+      "description": "Savings from context compression.",
+      "id": "cf689af5-a898-4380-a27d-b02a6ea815e0",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "aggregations": [
+                {
+                  "metricName": "smedja_loop_tokens_compressed_total",
+                  "reduceTo": "avg",
+                  "spaceAggregation": "sum",
+                  "temporality": "Cumulative",
+                  "timeAggregation": "rate"
+                }
+              ],
+              "dataSource": "metrics",
+              "disabled": false,
+              "expression": "A",
+              "function": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Tokens compressed /s",
+      "yAxisUnit": "none"
+    },
+    {
+      "description": "Newest WARN/ERROR log lines; trace_id links to the full trace.",
+      "id": "36bf32e9-1a30-429d-8b47-f2b097d4de99",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "list",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "dataSource": "logs",
+              "disabled": false,
+              "expression": "A",
+              "filter": {
+                "expression": "(service.name = 'smdjad' AND severity_text IN ['WARN', 'ERROR'])"
+              },
+              "function": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "",
+              "limit": 100,
+              "orderBy": [],
+              "queryName": "A",
+              "selectFields": [
+                {
+                  "dataType": "string",
+                  "isColumn": true,
+                  "key": "timestamp",
+                  "type": "tag"
+                },
+                {
+                  "dataType": "string",
+                  "isColumn": true,
+                  "key": "severity_text",
+                  "type": "tag"
+                },
+                {
+                  "dataType": "string",
+                  "isColumn": false,
+                  "key": "body",
+                  "type": "tag"
+                },
+                {
+                  "dataType": "string",
+                  "isColumn": true,
+                  "key": "trace_id",
+                  "type": "tag"
+                }
+              ],
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Recent errors & warnings",
+      "yAxisUnit": "none"
+    },
+    {
+      "description": "Newest smedja.agent.invoke spans with model, tier and duration.",
+      "id": "413ca801-c993-44c2-b024-4e705f2291f8",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "list",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "dataSource": "traces",
+              "disabled": false,
+              "expression": "A",
+              "filter": {
+                "expression": "name = 'smedja.agent.invoke'"
+              },
+              "function": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "",
+              "limit": 100,
+              "orderBy": [],
+              "queryName": "A",
+              "selectFields": [
+                {
+                  "dataType": "string",
+                  "isColumn": true,
+                  "key": "timestamp",
+                  "type": "tag"
+                },
+                {
+                  "dataType": "string",
+                  "isColumn": true,
+                  "key": "name",
+                  "type": "tag"
+                },
+                {
+                  "dataType": "float64",
+                  "isColumn": true,
+                  "key": "durationNano",
+                  "type": ""
+                },
+                {
+                  "dataType": "string",
+                  "isColumn": false,
+                  "key": "gen_ai.request.model",
+                  "type": "tag"
+                },
+                {
+                  "dataType": "string",
+                  "isColumn": false,
+                  "key": "smedja.tier",
+                  "type": "tag"
+                },
+                {
+                  "dataType": "string",
+                  "isColumn": false,
+                  "key": "smedja.session.id",
+                  "type": "tag"
+                },
+                {
+                  "dataType": "string",
+                  "isColumn": true,
+                  "key": "traceID",
+                  "type": "tag"
+                }
+              ],
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Recent turns",
+      "yAxisUnit": "none"
+    },
+    {
+      "description": "Turn spans with error status.",
+      "id": "21d0fe78-f40d-4412-995b-9897cfc61291",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "aggregations": [
+                {
+                  "expression": "count()"
+                }
+              ],
+              "dataSource": "traces",
+              "disabled": false,
+              "expression": "A",
+              "filter": {
+                "expression": "(name = 'smedja.agent.invoke' AND hasError = 'true')"
+              },
+              "function": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "error turns",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Turn errors",
+      "yAxisUnit": "none"
+    }
+  ]
+}

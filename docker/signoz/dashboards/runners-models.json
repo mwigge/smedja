@@ -1,0 +1,449 @@
+{
+  "description": "Which runner/model serves turns, token consumption, tool and LLM activity.",
+  "layout": [
+    {
+      "h": 3,
+      "i": "11e1f0c8-9130-4d9a-9289-326e906d0279",
+      "w": 6,
+      "x": 0,
+      "y": 0
+    },
+    {
+      "h": 3,
+      "i": "f7ba28d6-06c7-4e2a-a5cd-970e7f4daa2f",
+      "w": 6,
+      "x": 6,
+      "y": 0
+    },
+    {
+      "h": 3,
+      "i": "5b8e9c3f-0026-48f4-9e71-61cb928a0059",
+      "w": 6,
+      "x": 0,
+      "y": 3
+    },
+    {
+      "h": 3,
+      "i": "68be7ad8-7c3c-4c26-a656-55c320cdd92c",
+      "w": 6,
+      "x": 6,
+      "y": 3
+    },
+    {
+      "h": 3,
+      "i": "da613e43-a80c-4928-84bd-53319ef47040",
+      "w": 6,
+      "x": 0,
+      "y": 6
+    },
+    {
+      "h": 3,
+      "i": "db50ab72-ae16-494f-86c5-44833cb24506",
+      "w": 6,
+      "x": 6,
+      "y": 6
+    },
+    {
+      "h": 3,
+      "i": "bfe54ecf-fe97-4ed8-b370-6bdd37c4fd33",
+      "w": 6,
+      "x": 0,
+      "y": 9
+    }
+  ],
+  "tags": [
+    "smedja"
+  ],
+  "title": "Smedja — Runners & Models",
+  "variables": {},
+  "version": "v5",
+  "widgets": [
+    {
+      "description": "",
+      "id": "11e1f0c8-9130-4d9a-9289-326e906d0279",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "aggregations": [
+                {
+                  "expression": "count()"
+                }
+              ],
+              "dataSource": "traces",
+              "disabled": false,
+              "expression": "A",
+              "filter": {
+                "expression": "name = 'smedja.agent.invoke' gen_ai.request.model EXISTS"
+              },
+              "function": [],
+              "groupBy": [
+                {
+                  "dataType": "string",
+                  "isColumn": false,
+                  "key": "gen_ai.request.model",
+                  "type": "tag"
+                }
+              ],
+              "having": {
+                "expression": ""
+              },
+              "legend": "{{gen_ai.request.model}}",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Turns by model",
+      "yAxisUnit": "none"
+    },
+    {
+      "description": "gen_ai.system on turn spans (claude-cli, codex-cli, anthropic, openai, ...).",
+      "id": "f7ba28d6-06c7-4e2a-a5cd-970e7f4daa2f",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "aggregations": [
+                {
+                  "expression": "count()"
+                }
+              ],
+              "dataSource": "traces",
+              "disabled": false,
+              "expression": "A",
+              "filter": {
+                "expression": "name = 'smedja.agent.invoke' gen_ai.system EXISTS"
+              },
+              "function": [],
+              "groupBy": [
+                {
+                  "dataType": "string",
+                  "isColumn": false,
+                  "key": "gen_ai.system",
+                  "type": "tag"
+                }
+              ],
+              "having": {
+                "expression": ""
+              },
+              "legend": "{{gen_ai.system}}",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Turns by runner system",
+      "yAxisUnit": "none"
+    },
+    {
+      "description": "Input/output tokens reported on turn spans.",
+      "id": "5b8e9c3f-0026-48f4-9e71-61cb928a0059",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "aggregations": [
+                {
+                  "expression": "sum(gen_ai.usage.input_tokens)"
+                }
+              ],
+              "dataSource": "traces",
+              "disabled": false,
+              "expression": "A",
+              "filter": {
+                "expression": "name = 'smedja.agent.invoke'"
+              },
+              "function": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "input",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60
+            },
+            {
+              "aggregations": [
+                {
+                  "expression": "sum(gen_ai.usage.output_tokens)"
+                }
+              ],
+              "dataSource": "traces",
+              "disabled": false,
+              "expression": "B",
+              "filter": {
+                "expression": "name = 'smedja.agent.invoke'"
+              },
+              "function": [],
+              "groupBy": [],
+              "having": {
+                "expression": ""
+              },
+              "legend": "output",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "B",
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Tokens per turn (span attrs)",
+      "yAxisUnit": "none"
+    },
+    {
+      "description": "GenAI semconv histogram — populated by anthropic/openai HTTP adapters only.",
+      "id": "68be7ad8-7c3c-4c26-a656-55c320cdd92c",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "aggregations": [
+                {
+                  "metricName": "gen_ai.client.token.usage",
+                  "reduceTo": "avg",
+                  "spaceAggregation": "sum",
+                  "temporality": "Cumulative",
+                  "timeAggregation": "rate"
+                }
+              ],
+              "dataSource": "metrics",
+              "disabled": false,
+              "expression": "A",
+              "function": [],
+              "groupBy": [
+                {
+                  "dataType": "string",
+                  "isColumn": false,
+                  "key": "gen_ai.request.model",
+                  "type": "tag"
+                },
+                {
+                  "dataType": "string",
+                  "isColumn": false,
+                  "key": "gen_ai.token.type",
+                  "type": "tag"
+                }
+              ],
+              "having": {
+                "expression": ""
+              },
+              "legend": "{{gen_ai.request.model}} / {{gen_ai.token.type}}",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "gen_ai.client.token.usage",
+      "yAxisUnit": "none"
+    },
+    {
+      "description": "smedja.tool.execute spans by tool.",
+      "id": "da613e43-a80c-4928-84bd-53319ef47040",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "aggregations": [
+                {
+                  "expression": "count()"
+                }
+              ],
+              "dataSource": "traces",
+              "disabled": false,
+              "expression": "A",
+              "filter": {
+                "expression": "name = 'smedja.tool.execute' gen_ai.tool.name EXISTS"
+              },
+              "function": [],
+              "groupBy": [
+                {
+                  "dataType": "string",
+                  "isColumn": false,
+                  "key": "gen_ai.tool.name",
+                  "type": "tag"
+                }
+              ],
+              "having": {
+                "expression": ""
+              },
+              "legend": "{{gen_ai.tool.name}}",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Tool executions",
+      "yAxisUnit": "none"
+    },
+    {
+      "description": "smedja.llm.chat spans — HTTP adapters only (CLI runners emit turn spans).",
+      "id": "db50ab72-ae16-494f-86c5-44833cb24506",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "aggregations": [
+                {
+                  "expression": "count()"
+                }
+              ],
+              "dataSource": "traces",
+              "disabled": false,
+              "expression": "A",
+              "filter": {
+                "expression": "name = 'smedja.llm.chat' gen_ai.request.model EXISTS"
+              },
+              "function": [],
+              "groupBy": [
+                {
+                  "dataType": "string",
+                  "isColumn": false,
+                  "key": "gen_ai.request.model",
+                  "type": "tag"
+                }
+              ],
+              "having": {
+                "expression": ""
+              },
+              "legend": "{{gen_ai.request.model}}",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "LLM calls by model",
+      "yAxisUnit": "none"
+    },
+    {
+      "description": "TTFT in ms, from smedja.llm.ttft_ms span attribute.",
+      "id": "bfe54ecf-fe97-4ed8-b370-6bdd37c4fd33",
+      "isStacked": false,
+      "nullZeroValues": "",
+      "opacity": "",
+      "panelTypes": "graph",
+      "query": {
+        "builder": {
+          "queryData": [
+            {
+              "aggregations": [
+                {
+                  "expression": "p95(smedja.llm.ttft_ms)"
+                }
+              ],
+              "dataSource": "traces",
+              "disabled": false,
+              "expression": "A",
+              "filter": {
+                "expression": "name = 'smedja.llm.chat' gen_ai.request.model EXISTS"
+              },
+              "function": [],
+              "groupBy": [
+                {
+                  "dataType": "string",
+                  "isColumn": false,
+                  "key": "gen_ai.request.model",
+                  "type": "tag"
+                }
+              ],
+              "having": {
+                "expression": ""
+              },
+              "legend": "{{gen_ai.request.model}}",
+              "limit": null,
+              "orderBy": [],
+              "queryName": "A",
+              "stepInterval": 60
+            }
+          ],
+          "queryFormulas": []
+        },
+        "queryType": "builder"
+      },
+      "softMax": null,
+      "softMin": null,
+      "thresholds": [],
+      "timePreferance": "GLOBAL_TIME",
+      "title": "LLM time-to-first-token p95",
+      "yAxisUnit": "none"
+    }
+  ]
+}
