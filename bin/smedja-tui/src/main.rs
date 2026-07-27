@@ -1438,6 +1438,34 @@ fn metrics_rows_from_summary(resp: &serde_json::Value) -> Vec<metrics_view::Metr
     rows
 }
 
+/// Folds a `metrics.summary` response into per-hour token totals for the runner
+/// panel's 24 h usage chart: one value per `bucket_start` hour (input + output
+/// summed across runners and models), ordered oldest → newest and capped to the
+/// most recent 21 hours (the rail's chart width after the `"24h "` prefix).
+/// Missing or malformed buckets are tolerated as empty / zero.
+#[must_use]
+fn hourly_from_summary(resp: &serde_json::Value) -> Vec<u64> {
+    const HOURLY_CAP: usize = 21;
+    let Some(buckets) = resp["buckets"].as_array() else {
+        return Vec::new();
+    };
+    // BTreeMap keys sort ascending by hour, so values come out chronological.
+    let mut per_hour: std::collections::BTreeMap<i64, u64> = std::collections::BTreeMap::new();
+    for bucket in buckets {
+        let start = bucket["bucket_start"].as_i64().unwrap_or(0);
+        let tokens =
+            bucket["input_tok"].as_u64().unwrap_or(0) + bucket["output_tok"].as_u64().unwrap_or(0);
+        *per_hour.entry(start).or_insert(0) += tokens;
+    }
+    // Keep only the most recent HOURLY_CAP hours, back in oldest → newest order.
+    per_hour
+        .into_values()
+        .rev()
+        .take(HOURLY_CAP)
+        .rev()
+        .collect()
+}
+
 /// Folds a `metrics.summary` response into one [`metrics_view::TierRow`] per
 /// model, in first-seen order.
 ///

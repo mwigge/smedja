@@ -23,6 +23,9 @@ pub struct ValueSnapshot {
     pub quality_avg: u8,
     /// Human-readable ROI estimate: "high", "medium", or "low".
     pub estimated_value: &'static str,
+    /// Rolling history of `token_cost` samples (most recent last, capped at 64)
+    /// feeding the spend-velocity sparkline.
+    pub tok_trend: Vec<u64>,
 }
 
 /// Computes the change's USD cost in microdollars using the session's blended
@@ -189,6 +192,29 @@ impl<'a> ValuePanel<'a> {
             ),
         ]));
 
+        // ── Spend velocity: deltas of the rolling token-cost history ─────────
+        // Needs at least two samples to form a delta; the cumulative counter
+        // resets when a new change starts, so saturate rather than underflow.
+        if snap.tok_trend.len() >= 2 {
+            let deltas: Vec<u64> = snap
+                .tok_trend
+                .windows(2)
+                .map(|w| w[1].saturating_sub(w[0]))
+                .collect();
+            let max = deltas.iter().copied().max().unwrap_or(0).max(1);
+            let pct: Vec<u8> = deltas
+                .iter()
+                .map(|&d| u8::try_from(d.saturating_mul(100) / max).unwrap_or(100))
+                .collect();
+            lines.push(Line::from(vec![
+                Span::styled("spd ", Style::default().fg(p.text_dim)),
+                Span::styled(
+                    crate::viz::sparkline(&pct, 100),
+                    Style::default().fg(p.molten),
+                ),
+            ]));
+        }
+
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 }
@@ -221,6 +247,7 @@ mod tests {
             cost_usd_micros: 42_000,
             quality_avg: 78,
             estimated_value: "high",
+            tok_trend: Vec::new(),
         };
         let rendered = render_snapshot(&snap, 30, 10);
         assert!(rendered.contains("value"), "title present: {rendered}");
@@ -254,6 +281,7 @@ mod tests {
             cost_usd_micros: 1_000,
             quality_avg: 80,
             estimated_value: "high",
+            tok_trend: Vec::new(),
         };
         let rendered = render_snapshot(&snap, 40, 10);
         assert!(rendered.contains("value"), "title present: {rendered}");
@@ -267,12 +295,41 @@ mod tests {
             cost_usd_micros: 99_999,
             quality_avg: 55,
             estimated_value: "low",
+            tok_trend: Vec::new(),
         };
         let rendered = render_snapshot(&snap, 20, 10);
         assert!(
             rendered.contains("value"),
             "title at narrow width: {rendered}"
         );
+    }
+
+    #[test]
+    fn spend_velocity_shown_with_two_or_more_samples() {
+        let snap = ValueSnapshot {
+            change_name: Some("test-change".into()),
+            token_cost: 300,
+            cost_usd_micros: 300,
+            quality_avg: 80,
+            estimated_value: "high",
+            tok_trend: vec![100, 300],
+        };
+        let rendered = render_snapshot(&snap, 30, 10);
+        assert!(rendered.contains("spd"), "spd line present: {rendered}");
+    }
+
+    #[test]
+    fn spend_velocity_hidden_below_two_samples() {
+        let snap = ValueSnapshot {
+            change_name: Some("test-change".into()),
+            token_cost: 100,
+            cost_usd_micros: 100,
+            quality_avg: 80,
+            estimated_value: "high",
+            tok_trend: vec![100],
+        };
+        let rendered = render_snapshot(&snap, 30, 10);
+        assert!(!rendered.contains("spd"), "no spd line: {rendered}");
     }
 
     #[test]

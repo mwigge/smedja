@@ -426,6 +426,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
                 state.savings_snapshot.clone(),
                 state.tier_snapshot.clone(),
             )
+            .with_hourly(state.metrics_hourly.clone())
             .lines()
             .len();
             // +2 for Block top and bottom border.
@@ -438,7 +439,8 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
                         state.metrics_snapshot.clone(),
                         state.savings_snapshot.clone(),
                         state.tier_snapshot.clone(),
-                    ),
+                    )
+                    .with_hourly(state.metrics_hourly.clone()),
                     chunk,
                 );
             }

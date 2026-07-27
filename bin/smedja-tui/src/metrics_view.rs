@@ -102,6 +102,8 @@ pub struct MetricsView {
     pub savings: SavingsSnapshot,
     /// Per-tier (per-model) usage rows for the latest window, in display order.
     pub tiers: Vec<TierRow>,
+    /// Hourly token totals (input + output) over the last 24h, chronological.
+    pub hourly: Vec<u64>,
 }
 
 impl MetricsView {
@@ -112,6 +114,7 @@ impl MetricsView {
             rows,
             savings,
             tiers: Vec::new(),
+            hourly: Vec::new(),
         }
     }
 
@@ -125,6 +128,13 @@ impl MetricsView {
         let mut view = Self::with_savings(rows, savings);
         view.tiers = tiers;
         view
+    }
+
+    /// Attaches the 24h hourly token series for the usage chart line.
+    #[must_use]
+    pub fn with_hourly(mut self, hourly: Vec<u64>) -> Self {
+        self.hourly = hourly;
+        self
     }
 
     /// Renders the panel content as text lines (header + one row per runner, or
@@ -151,6 +161,17 @@ impl MetricsView {
                     row.errors,
                 ));
             }
+        }
+        // 24h usage chart: hourly token totals scaled to a sparkline. Omitted
+        // when the daemon has no bucket data yet (fresh window).
+        if !self.hourly.is_empty() {
+            let max = self.hourly.iter().copied().max().unwrap_or(0).max(1);
+            let pct: Vec<u8> = self
+                .hourly
+                .iter()
+                .map(|&v| u8::try_from(v.saturating_mul(100) / max).unwrap_or(100))
+                .collect();
+            out.push(format!("24h {}", crate::viz::sparkline(&pct, 100)));
         }
         out.extend(self.tier_lines());
         out.extend(self.savings_lines());
@@ -232,6 +253,8 @@ impl Widget for MetricsView {
                         text,
                         Style::default().add_modifier(Modifier::BOLD),
                     ))
+                } else if text.starts_with("24h ") {
+                    Line::from(Span::styled(text, Style::default().fg(p.local)))
                 } else {
                     // Highlight any runner with errors in red.
                     let has_error = rows.get(idx - 1).is_some_and(|row| row.errors > 0);
@@ -430,6 +453,25 @@ mod tests {
         );
         // Must not panic on a mid-codepoint 12-byte cut.
         assert!(!view.lines().is_empty());
+    }
+
+    #[test]
+    fn hourly_chart_shown_when_series_present() {
+        let view = MetricsView::with_savings(vec![], SavingsSnapshot::default())
+            .with_hourly(vec![10, 40, 100]);
+        let joined = view.lines().join("\n");
+        assert!(joined.contains("24h "), "chart line present: {joined}");
+        // The series maximum scales to the top block.
+        assert!(joined.contains('█'), "max hour is full-height: {joined}");
+    }
+
+    #[test]
+    fn hourly_chart_absent_without_series() {
+        let view = MetricsView::with_savings(vec![], SavingsSnapshot::default());
+        assert!(
+            !view.lines().join("\n").contains("24h "),
+            "no chart line without hourly data"
+        );
     }
 
     #[test]

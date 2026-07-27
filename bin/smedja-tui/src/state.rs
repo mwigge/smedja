@@ -143,6 +143,10 @@ pub(crate) struct AppState {
     /// Cached per-tier (per-model) usage snapshot for the latest rollup window —
     /// the fable-plan / sonnet-haiku-implement / opus-review split.
     pub(crate) tier_snapshot: Vec<metrics_view::TierRow>,
+    /// Per-hour token totals (oldest → newest, capped to the chart width) for
+    /// the runner panel's 24 h usage chart, folded from the same
+    /// `metrics.summary` response as `metrics_snapshot`.
+    pub(crate) metrics_hourly: Vec<u64>,
     /// Cached token-economy savings snapshot for the latest rollup window.
     pub(crate) savings_snapshot: metrics_view::SavingsSnapshot,
     /// Timestamp of the last metrics panel poll (drives both the `metrics.summary`

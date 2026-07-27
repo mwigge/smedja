@@ -122,6 +122,7 @@ pub(crate) async fn bootstrap() -> Result<Session> {
         },
         metrics_snapshot: Vec::new(),
         tier_snapshot: Vec::new(),
+        metrics_hourly: Vec::new(),
         savings_snapshot: metrics_view::SavingsSnapshot::default(),
         last_metrics_poll: None,
         last_obs_poll: None,

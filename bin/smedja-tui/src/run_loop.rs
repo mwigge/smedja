@@ -498,6 +498,7 @@ pub(crate) async fn run(session: bootstrap::Session) -> Result<()> {
             {
                 state.metrics_snapshot = metrics_rows_from_summary(&resp);
                 state.tier_snapshot = tier_rows_from_summary(&resp);
+                state.metrics_hourly = hourly_from_summary(&resp);
                 // Extract 24h token total for the daily quota bar (buckets array).
                 if let Some(buckets) = resp["buckets"].as_array() {
                     let total_24h: u64 = buckets
@@ -560,6 +561,12 @@ pub(crate) async fn run(session: bootstrap::Session) -> Result<()> {
                 state.value_snapshot.change_name = vc["change_name"].as_str().map(str::to_owned);
                 let token_cost = vc["token_cost"].as_u64().unwrap_or(0);
                 state.value_snapshot.token_cost = token_cost;
+                // Rolling history for the spend-velocity sparkline.
+                let trend = &mut state.value_snapshot.tok_trend;
+                trend.push(token_cost);
+                if trend.len() > 64 {
+                    trend.drain(0..trend.len() - 64);
+                }
                 // Session blended $/token rate applied to this change's tokens.
                 let total_tok = state
                     .session_tokens_in
