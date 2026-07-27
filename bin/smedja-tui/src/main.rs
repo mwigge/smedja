@@ -398,7 +398,7 @@ async fn main() -> Result<()> {
         panels: PanelVisibility {
             context_rail: true,
             metrics: true,
-            session_rail: true,
+            session_rail: false,
             lsp: true,
             obs: true,
             role_cockpit: true,
@@ -668,6 +668,9 @@ async fn main() -> Result<()> {
                         _ => {}
                     },
                     Event::Paste(text) => {
+                        // CR bytes are stripped, mirroring the Ctrl-V path, so
+                        // CRLF clipboard content can't smuggle phantom chars in.
+                        let text = text.replace('\r', "");
                         // Large pastes are saved to a temp file to avoid
                         // flooding the input bar; a short token is substituted.
                         let insert_text = if let Some((token, msg)) = large_paste_token(&text) {
