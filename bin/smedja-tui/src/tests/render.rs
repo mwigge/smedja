@@ -623,7 +623,11 @@ fn long_unbroken_input_stays_visible_with_context_rail() {
     let buf = terminal.backend().buffer().clone();
     // bottom row (row 29) must contain the input text
     let row: String = (0..100)
-        .map(|x| buf.cell((x, 29)).map(ratatui::buffer::Cell::symbol).unwrap_or(" "))
+        .map(|x| {
+            buf.cell((x, 29))
+                .map(ratatui::buffer::Cell::symbol)
+                .unwrap_or(" ")
+        })
         .collect();
     eprintln!("row29 = {row:?}");
     assert!(
