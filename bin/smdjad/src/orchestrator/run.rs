@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use opentelemetry::{
     global,
-    trace::{Span as _, Status as SpanStatus, Tracer as _},
+    trace::{FutureExt as _, Span as _, Status as SpanStatus, TraceContextExt as _, Tracer as _},
     KeyValue,
 };
 use smedja_adapter::types::Message as AdapterMessage;
@@ -34,8 +34,30 @@ use super::context::{
 use super::{AlignerKey, TurnOrchestrator};
 
 impl TurnOrchestrator {
-    #[allow(clippy::too_many_lines, clippy::items_after_statements)] // sequential turn pipeline kept inline to preserve a single tracing span scope
     pub(crate) async fn run(self, session_id: String, turn_id: String) {
+        let tracer = global::tracer("smedja");
+        let turn_span = tracer.start(tel::SPAN_AGENT_INVOKE);
+        // Attach the turn's span context for the whole execution: spans created
+        // downstream (tool executes, llm.chat) parent on `Context::current()`
+        // and so become children of this turn, and the OTLP log bridge stamps
+        // every log line emitted inside the turn with its trace/span ids. A
+        // remote-span wrapper shares the ids while the span itself stays owned
+        // here for attribute/status updates.
+        let turn_cx = opentelemetry::Context::current()
+            .with_remote_span_context(turn_span.span_context().clone());
+        self.run_inner(session_id, turn_id, turn_span)
+            .with_context(turn_cx)
+            .await;
+    }
+
+    /// Body of [`Self::run`], executed inside the turn's attached span context.
+    #[allow(clippy::too_many_lines, clippy::items_after_statements)] // sequential turn pipeline kept inline to preserve a single tracing span scope
+    async fn run_inner(
+        self,
+        session_id: String,
+        turn_id: String,
+        mut turn_span: global::BoxedSpan,
+    ) {
         const MAX_RATE_LIMIT_RETRIES: u32 = 4;
         const RATE_LIMIT_BACKOFF_BASE_SECS: u64 = 1;
         // A turn rotates to at most this many alternative providers (4 providers
@@ -55,9 +77,6 @@ impl TurnOrchestrator {
         let embedder = &self.embedder;
         let provider_sessions = &self.provider_sessions;
         let cache_aligners = &self.cache_aligners;
-
-        let tracer = global::tracer("smedja");
-        let mut turn_span = tracer.start(tel::SPAN_AGENT_INVOKE);
 
         // 1. Load the task to retrieve user content.
         let task = {
@@ -921,7 +940,7 @@ impl TurnOrchestrator {
                         } else {
                             "extension"
                         };
-                    let mut tool_span = tracer.start(tel::SPAN_TOOL_EXECUTE);
+                    let mut tool_span = global::tracer("smedja").start(tel::SPAN_TOOL_EXECUTE);
                     tool_span.set_attribute(KeyValue::new(
                         tel::OPERATION_NAME,
                         tel::OPERATION_EXECUTE_TOOL,

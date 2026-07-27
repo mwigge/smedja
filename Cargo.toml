@@ -69,7 +69,8 @@ etagere      = "0.2"
 futures-core = "0.3"
 futures-util = "0.3"
 opentelemetry          = "0.27"
-opentelemetry-otlp     = { version = "0.27", features = ["grpc-tonic", "http-proto"] }
+opentelemetry-appender-tracing = "0.27"
+opentelemetry-otlp     = { version = "0.27", features = ["grpc-tonic", "http-proto", "reqwest-blocking-client"] }
 opentelemetry-semantic-conventions = "0.27"
 opentelemetry_sdk      = { version = "0.27", features = ["rt-tokio"] }
 parking_lot  = "0.12"

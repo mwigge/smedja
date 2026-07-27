@@ -8,15 +8,16 @@ use std::sync::Arc;
 use smedja_assayer::Assayer;
 use smedja_bellows::{Dispatcher, TurnEvent};
 use smedja_ingot::IngotHandle;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::orchestrator;
 use crate::paths::dirs_home;
 use crate::quality_hook;
 
 /// Installs the W3C trace-context propagator process-wide and, when
-/// `SMEDJA_OTLP_ENDPOINT` is set, an OTLP span exporter. Falls back to recording
-/// spans through the structured-log layer, logging the destination either way.
+/// `SMEDJA_OTLP_ENDPOINT` is set, the OTLP traces and metrics exporters. Falls
+/// back to recording spans through the structured-log layer, logging the
+/// destination either way.
 pub(crate) fn install_telemetry() {
     // Install the W3C trace-context propagator process-wide so outbound HTTP
     // calls inject `traceparent`/`tracestate` and inbound contexts are
@@ -26,30 +27,15 @@ pub(crate) fn install_telemetry() {
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
 
-    // Install an OTLP exporter when SMEDJA_OTLP_ENDPOINT is set; otherwise fall
-    // back to recording spans through the structured-log layer. The trace
-    // destination is logged in both branches so operators always know where
-    // span data goes (no silent discard).
-    if let Ok(endpoint) = std::env::var("SMEDJA_OTLP_ENDPOINT") {
-        use opentelemetry_otlp::WithExportConfig as _;
-        let build_result = opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_endpoint(&endpoint)
-            .build();
-        match build_result {
-            Ok(exporter) => {
-                let provider = opentelemetry_sdk::trace::TracerProvider::builder()
-                    .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-                    .build();
-                opentelemetry::global::set_tracer_provider(provider);
-                info!(endpoint = %endpoint, "trace destination: OTLP exporter");
-            }
-            Err(e) => {
-                error!(error = %e, endpoint = %endpoint, "failed to install OTLP exporter; trace destination: structured logs only");
-            }
-        }
+    // Install the OTLP traces and metrics pipelines when SMEDJA_OTLP_ENDPOINT
+    // is set (logs are wired earlier — the bridge is a subscriber layer). The
+    // destination is logged either way so operators always know where
+    // telemetry goes (no silent discard).
+    if let Some(endpoint) = crate::otel::otlp_endpoint() {
+        crate::otel::install_traces(&endpoint);
+        crate::otel::install_metrics(&endpoint);
     } else {
-        info!("SMEDJA_OTLP_ENDPOINT not set; trace destination: structured logs only (set the endpoint to export OTLP spans)");
+        info!("SMEDJA_OTLP_ENDPOINT not set; OTel exporters disabled — telemetry stays in structured logs");
     }
 }
 

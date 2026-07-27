@@ -27,7 +27,10 @@ macro_rules! route {
         let s = $state.clone();
         $router.register($method, move |params: Value| {
             let state = s.clone();
-            async move { $handler(state, params).await }
+            async move {
+                crate::otel::record_rpc_call($method);
+                $handler(state, params).await
+            }
         });
     }};
 }

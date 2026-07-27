@@ -33,6 +33,7 @@ mod compaction;
 mod exec;
 mod mcp_refresh;
 mod net_guard;
+mod otel;
 mod paths;
 mod router;
 mod servers;
@@ -76,12 +77,20 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    paths::init_tracing();
+    // OTel pipelines: resolve the endpoint first — the log bridge's provider
+    // must exist before the subscriber is initialised.
+    let otlp_endpoint = otel::otlp_endpoint();
+    let logger_provider = otlp_endpoint
+        .as_deref()
+        .and_then(otel::build_logger_provider);
+    paths::init_tracing(logger_provider);
 
     // Validate SMEDJA_COMPACT_THRESHOLD at startup — reject invalid values early.
     bootstrap::validate_compact_threshold()?;
 
-    // Install the W3C trace-context propagator and (optionally) the OTLP exporter.
+    // Install the W3C trace-context propagator and (optionally) the OTLP
+    // traces/metrics exporters (logs are wired earlier — the bridge is a
+    // subscriber layer).
     bootstrap::install_telemetry();
 
     let path = paths::socket_path();
