@@ -161,13 +161,31 @@ pub(crate) fn sd_notify_ready() {}
 ///
 /// `text` (default) uses the human-readable formatter; `json` emits structured
 /// JSON for log-ingestion pipelines (Loki, `OpenSearch`); an unrecognised value
-/// falls back to text with a warning.
-pub(crate) fn init_tracing() {
+/// falls back to text with a warning. When `otel_logger` is present, an
+/// additional bridge layer forwards every event to the OTLP logs pipeline —
+/// events emitted inside a turn carry that turn's trace/span ids (the turn
+/// attaches its span context, see `orchestrator::turn_run`).
+pub(crate) fn init_tracing(otel_logger: Option<opentelemetry_sdk::logs::LoggerProvider>) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    let bridge = otel_logger
+        .as_ref()
+        .map(opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new);
     match std::env::var("SMEDJA_LOG_FORMAT").as_deref() {
-        Ok("json") => tracing_subscriber::fmt().json().init(),
-        Ok("text" | "") | Err(_) => tracing_subscriber::fmt().init(),
+        Ok("json") => tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().json())
+            .with(bridge)
+            .init(),
+        Ok("text" | "") | Err(_) => tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(bridge)
+            .init(),
         Ok(other) => {
-            tracing_subscriber::fmt().init();
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::fmt::layer())
+                .with(bridge)
+                .init();
             tracing::warn!(format = other, "unrecognised SMEDJA_LOG_FORMAT; using text");
         }
     }

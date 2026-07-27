@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use opentelemetry::{
     global,
-    trace::{Span as _, Status as SpanStatus, Tracer as _},
+    trace::{FutureExt as _, Span as _, Status as SpanStatus, TraceContextExt as _, Tracer as _},
     KeyValue,
 };
 use smedja_adapter::types::{Message as AdapterMessage, Role as AdapterRole};
@@ -151,8 +151,27 @@ impl TurnOrchestrator {
     /// existing `tokio::spawn` call sites.
     pub(crate) async fn run(self, session_id: String, turn_id: String) {
         let tracer = global::tracer("smedja");
-        let mut turn_span = tracer.start(tel::SPAN_AGENT_INVOKE);
+        let turn_span = tracer.start(tel::SPAN_AGENT_INVOKE);
+        // Attach the turn's span context for the whole execution: spans created
+        // downstream (tool executes, llm.chat) parent on `Context::current()`
+        // and so become children of this turn, and the OTLP log bridge stamps
+        // every log line emitted inside the turn with its trace/span ids. A
+        // remote-span wrapper shares the ids while the span itself stays owned
+        // here for attribute/status updates.
+        let turn_cx = opentelemetry::Context::current()
+            .with_remote_span_context(turn_span.span_context().clone());
+        self.run_inner(session_id, turn_id, turn_span)
+            .with_context(turn_cx)
+            .await;
+    }
 
+    /// Body of [`Self::run`], executed inside the turn's attached span context.
+    async fn run_inner(
+        self,
+        session_id: String,
+        turn_id: String,
+        mut turn_span: global::BoxedSpan,
+    ) {
         // 1. Load the task to retrieve user content.
         let task = match self.ingot.get_task(&turn_id).await {
             Ok(Some(t)) => t,

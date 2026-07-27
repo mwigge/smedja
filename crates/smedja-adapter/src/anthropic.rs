@@ -415,6 +415,12 @@ impl Provider for AnthropicProvider {
             if let Some(v) = ttft {
                 llm_span.set_attribute(opentelemetry::KeyValue::new(tel::TTFT_MS, v));
             }
+            crate::otel::record_token_usage(
+                "anthropic",
+                &model_name_for_span,
+                in_tok.map_or(0, u64::from),
+                out_tok.map_or(0, u64::from),
+            );
             // Record the response capture policy so backends know what to expect.
             llm_span.set_attribute(opentelemetry::KeyValue::new(
                 "smedja.capture.responses",

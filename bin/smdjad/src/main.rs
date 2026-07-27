@@ -46,6 +46,8 @@ mod router;
 mod net_guard;
 pub(crate) use net_guard::{is_blocked_ip, is_safe_mcp_url};
 
+mod otel;
+
 mod store;
 use store::{dirs_home, open_ingot, open_vault};
 
@@ -115,7 +117,13 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    init_tracing();
+    // OTel pipelines: resolve the endpoint first — the log bridge's provider
+    // must exist before the subscriber is initialised.
+    let otlp_endpoint = otel::otlp_endpoint();
+    let logger_provider = otlp_endpoint
+        .as_deref()
+        .and_then(otel::build_logger_provider);
+    init_tracing(logger_provider);
 
     // Validate SMEDJA_COMPACT_THRESHOLD at startup — reject invalid values early.
     if let Ok(val) = std::env::var("SMEDJA_COMPACT_THRESHOLD") {
@@ -144,30 +152,15 @@ async fn main() -> anyhow::Result<()> {
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
 
-    // Install an OTLP exporter when SMEDJA_OTLP_ENDPOINT is set; otherwise fall
-    // back to recording spans through the structured-log layer. The trace
-    // destination is logged in both branches so operators always know where
-    // span data goes (no silent discard).
-    if let Ok(endpoint) = std::env::var("SMEDJA_OTLP_ENDPOINT") {
-        use opentelemetry_otlp::WithExportConfig as _;
-        let build_result = opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_endpoint(&endpoint)
-            .build();
-        match build_result {
-            Ok(exporter) => {
-                let provider = opentelemetry_sdk::trace::TracerProvider::builder()
-                    .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-                    .build();
-                opentelemetry::global::set_tracer_provider(provider);
-                info!(endpoint = %endpoint, "trace destination: OTLP exporter");
-            }
-            Err(e) => {
-                error!(error = %e, endpoint = %endpoint, "failed to install OTLP exporter; trace destination: structured logs only");
-            }
-        }
+    // Install the OTLP traces and metrics pipelines when SMEDJA_OTLP_ENDPOINT
+    // is set (logs are wired earlier — the bridge is a subscriber layer). The
+    // destination is logged either way so operators always know where
+    // telemetry goes (no silent discard).
+    if let Some(endpoint) = otlp_endpoint.as_deref() {
+        otel::install_traces(endpoint);
+        otel::install_metrics(endpoint);
     } else {
-        info!("SMEDJA_OTLP_ENDPOINT not set; trace destination: structured logs only (set the endpoint to export OTLP spans)");
+        info!("SMEDJA_OTLP_ENDPOINT not set; OTel exporters disabled — telemetry stays in structured logs and the local rollups");
     }
 
     let path = socket::socket_path();

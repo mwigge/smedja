@@ -319,6 +319,12 @@ impl Provider for OpenAiProvider {
             if let Some(v) = ttft_ms {
                 llm_span.set_attribute(opentelemetry::KeyValue::new(tel::TTFT_MS, v));
             }
+            crate::otel::record_token_usage(
+                "openai",
+                &model_name_for_span,
+                input_tok.map_or(0, u64::from),
+                output_tok.map_or(0, u64::from),
+            );
             llm_span.set_status(opentelemetry::trace::Status::Ok);
             llm_span.end();
         });
