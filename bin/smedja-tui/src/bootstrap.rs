@@ -109,7 +109,10 @@ pub(crate) async fn bootstrap() -> Result<Session> {
         panels: PanelVisibility {
             context_rail: true,
             metrics: true,
-            session_rail: true,
+            // Sessions rail is opt-in (Ctrl-W): autoloading it pushed the
+            // body under the context rail's width floor at typical terminal
+            // sizes, which hid every right-rail panel.
+            session_rail: false,
             lsp: true,
             obs: true,
             role_cockpit: true,

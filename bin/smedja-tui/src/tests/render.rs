@@ -605,3 +605,29 @@ fn session_rail_down_arrow_clamps_at_bottom_in_input_mode() {
 // --- Slice 7: command palette ---
 
 // --- Slice 8: file picker ---
+
+#[test]
+fn long_unbroken_input_stays_visible_with_context_rail() {
+    // Regression: a long single-token input (URL, pasted blob) was pushed to
+    // the next visual row by ratatui's WordWrapper while the height
+    // calculation (char-level `wrap_input_rows`) said 1 row — the prompt then
+    // rendered as "> " plus blanks, looking like the paste wiped the input.
+    use ratatui::backend::TestBackend;
+    let mut state = make_state("sess-repro");
+    state.input = "helloPASTED-VIA-CLIPBOARDXBRACKETED-PASTEPASTED-VIA-CLIPBOARD".to_owned();
+    state.input_cursor = state.input.len();
+    assert_eq!(state.input.chars().count(), 61);
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &mut state)).unwrap();
+    let buf = terminal.backend().buffer().clone();
+    // bottom row (row 29) must contain the input text
+    let row: String = (0..100)
+        .map(|x| buf.cell((x, 29)).map(ratatui::buffer::Cell::symbol).unwrap_or(" "))
+        .collect();
+    eprintln!("row29 = {row:?}");
+    assert!(
+        row.contains("helloPASTED"),
+        "input text missing from prompt row: {row:?}"
+    );
+}

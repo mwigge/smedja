@@ -132,6 +132,9 @@ pub(crate) async fn run(session: bootstrap::Session) -> Result<()> {
                         // Because we don't process it key-by-key, embedded
                         // newlines stay literal (no accidental submit) — pasting
                         // a multi-line URL/snippet just lands in the input.
+                        // CR bytes are stripped, mirroring the Ctrl-V path, so
+                        // CRLF clipboard content can't smuggle phantom chars in.
+                        let text = text.replace('\r', "");
                         let cur = state.input_cursor.min(state.input.len());
                         state.input.insert_str(cur, &text);
                         state.input_cursor = cur + text.len();

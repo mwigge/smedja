@@ -41,7 +41,20 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     // subtracting their widths here keeps the height calculation and the visual
     // rendering in sync, so the input grows a row at the same point the text
     // visually wraps instead of running under the rail.
-    let right_rail_w = if state.panels.context_rail && area.width >= 100 {
+    // Decide rail visibility ONCE, up front: the session rail carves
+    // SESSION_RAIL_W columns off the left of the body, and the context rail
+    // needs 100 columns of what remains. The input-width calculation below
+    // and the body split further down must agree on these, or the input
+    // wraps at a width that has no relation to what is actually on screen
+    // (previously the input reserved rail width even when the rail was not
+    // drawn, because the two checks used different widths).
+    const SESSION_RAIL_W: u16 = 28;
+    let session_rail_on = state.panels.session_rail && area.width >= SESSION_RAIL_W + 40;
+    let content_w = area
+        .width
+        .saturating_sub(if session_rail_on { SESSION_RAIL_W } else { 0 });
+    let context_rail_on = state.panels.context_rail && content_w >= 100;
+    let right_rail_w = if context_rail_on {
         context_rail::ContextRail::WIDTH
     } else {
         0
@@ -57,12 +70,18 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         let cursor_row = wrap_input_rows(&head, input_w).len().saturating_sub(1);
         (format!("{head}_{}", &state.input[cur..]), cursor_row)
     };
+    // Pre-wrap the echo with the same char-level algorithm the render pass
+    // uses below, so the height calculation and the drawn rows can never
+    // disagree. (ratatui's WordWrapper wraps at whitespace and would push a
+    // long unbroken token — a URL, a pasted blob — onto a visual row the
+    // field never grew, rendering the prompt as "> " plus blanks.)
+    let wrapped_input_rows = wrap_input_rows(&input_display, input_w);
     let input_rows: u16 = if state.history_search_mode {
         2
     } else if state.secret_var.is_some() {
         1
     } else {
-        u16::try_from(wrap_input_rows(&input_display, input_w).len())
+        u16::try_from(wrapped_input_rows.len())
             .unwrap_or(INPUT_MAX_ROWS)
             .clamp(1, INPUT_MAX_ROWS)
     };
@@ -127,13 +146,9 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     );
 
     // -- Body: optional session rail | main panel | optional context rail ------
-    #[allow(clippy::items_after_statements)]
-    const SESSION_RAIL_W: u16 = 28;
-
-    // First carve out the optional left session rail.
-    let (session_rail_area_opt, content_area) = if state.panels.session_rail
-        && body_area.width >= SESSION_RAIL_W + 40
-    {
+    // Rail visibility was decided at the top of render() next to the input
+    // width calculation — reuse those decisions here so the two never drift.
+    let (session_rail_area_opt, content_area) = if session_rail_on {
         let cols = Layout::horizontal([Constraint::Length(SESSION_RAIL_W), Constraint::Fill(1)])
             .split(body_area);
         (Some(cols[0]), cols[1])
@@ -142,7 +157,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     };
 
     // Then carve out the optional right context rail.
-    let (main_area, rail_area) = if state.panels.context_rail && content_area.width >= 100 {
+    let (main_area, rail_area) = if context_rail_on {
         let cols = Layout::horizontal([
             Constraint::Fill(1),
             Constraint::Length(context_rail::ContextRail::WIDTH),
@@ -297,28 +312,28 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
     };
     // Colour the leading "> " prompt indicator with the signature molten
     // lava-orange (primary accent); the typed text keeps the default fg.
-    let input_content: ratatui::text::Text<'static> =
-        if !state.no_color && state.secret_var.is_none() {
-            if let Some(rest) = input_display.strip_prefix("> ") {
-                Line::from(vec![
+    // The echo is pre-wrapped above (char-level, identical to the height
+    // calculation), so the Paragraph renders it verbatim WITHOUT ratatui's
+    // word wrapper — the two can never disagree about the row count.
+    let mut input_lines: Vec<Line<'static>> = Vec::with_capacity(wrapped_input_rows.len());
+    for (row_idx, row) in wrapped_input_rows.iter().enumerate() {
+        if row_idx == 0 && !state.no_color && state.secret_var.is_none() {
+            if let Some(rest) = row.strip_prefix("> ") {
+                input_lines.push(Line::from(vec![
                     Span::styled(
                         "> ",
                         Style::default().fg(p.molten).add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(rest.to_owned()),
-                ])
-                .into()
-            } else {
-                input_display.clone().into()
+                ]));
+                continue;
             }
-        } else {
-            input_display.clone().into()
-        };
-    let input_para = Paragraph::new(input_content)
-        .wrap(ratatui::widgets::Wrap { trim: false })
-        .scroll((input_scroll, 0));
-    // Narrow the render rect to match input_w so the Paragraph wrap point
-    // agrees with the height calculation above.
+        }
+        input_lines.push(Line::from(row.clone()));
+    }
+    let input_para = Paragraph::new(input_lines).scroll((input_scroll, 0));
+    // Narrow the render rect to match input_w so the pre-wrapped rows agree
+    // with the height calculation above.
     let effective_input_w = u16::try_from(input_w).unwrap_or(input_area.width);
     let effective_input_area = ratatui::layout::Rect::new(
         input_area.x,
@@ -326,7 +341,15 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         effective_input_w.min(input_area.width),
         input_area.height,
     );
-    if input_rows == 1 && counter_len > 0 && counter_len + 4 < effective_input_w {
+    // The counter shares the row with the prompt; only show it when the
+    // single visible row is short enough that the counter can't overlap it
+    // (previously the gate ignored the content width, so a nearly-full row
+    // wrapped under the counter and the tail scrolled out of view).
+    let row0_w = u16::try_from(unicode_width::UnicodeWidthStr::width(
+        wrapped_input_rows.first().map_or("", String::as_str),
+    ))
+    .unwrap_or(u16::MAX);
+    if input_rows == 1 && counter_len > 0 && row0_w + 2 + counter_len < effective_input_w {
         let input_sub_w = effective_input_w - counter_len;
         let input_sub = ratatui::layout::Rect::new(
             effective_input_area.x,
@@ -361,18 +384,15 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         frame.render_widget(search_widget, search_area);
     }
 
-    // -- Right rail: context | role cockpit | LSP panel | obs panel | quality panel | value panel
-    // The rail is split vertically into 1–6 sections. Context (1 row) is always
-    // present; role cockpit, LSP, obs, quality, and value panels are individually toggled.
+    // -- Right rail: context | role cockpit | obs | trace | fleet | plan | quality | value | LSP
+    // Context (1 row) is always present; the other panels are individually
+    // toggled. Panels are STACKED MANUALLY top-to-bottom in priority order:
+    // ratatui's cassowary Layout solver does not treat `Length` as exact —
+    // it repeatedly starved the mid-rail obs panel to zero height while
+    // inflating its neighbours. Manual stacking is deterministic: every
+    // enabled panel gets its fixed height while room remains, and LSP (the
+    // flexible panel) takes whatever is left at the bottom.
     if let Some(rail_rect) = rail_area {
-        use Constraint::{Length, Min};
-
-        // Minimum rows the LSP panel keeps even when the trace waterfall, obs,
-        // and other fixed-height panels are all enabled below it. Using `Min`
-        // rather than `Fill` gives LSP a floor so turning on the trace can never
-        // starve it to zero height (it still grows to absorb any rail slack).
-        const LSP_MIN_H: u16 = 6;
-
         let show_cockpit = state.panels.role_cockpit;
         let show_lsp = state.panels.lsp;
         let show_obs = state.panels.obs;
@@ -384,9 +404,21 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         // the current turn has recorded any spans.
         let show_trace = show_obs && !state.current_trace.is_empty();
 
-        // Build constraint list dynamically so Layout never gets zero-length.
-        let mut constraints: Vec<Constraint> = vec![];
-        // Metrics panel sits at the very top of the rail when visible.
+        let rail_bottom = rail_rect.y + rail_rect.height;
+        let mut rail_y = rail_rect.y;
+        // Carve `h` rows off the top of the remaining rail; `None` when full.
+        let mut take = |h: u16| -> Option<ratatui::layout::Rect> {
+            let avail = rail_bottom.saturating_sub(rail_y);
+            if avail == 0 {
+                return None;
+            }
+            let hh = h.min(avail);
+            let chunk = ratatui::layout::Rect::new(rail_rect.x, rail_y, rail_rect.width, hh);
+            rail_y += hh;
+            Some(chunk)
+        };
+
+        // ── Metrics / runner panel (top of rail) ─────────────────────────
         let show_metrics = state.panels.metrics;
         if show_metrics {
             let metrics_lines = metrics_view::MetricsView::with_savings_and_tiers(
@@ -400,155 +432,135 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
             let h = u16::try_from(metrics_lines + 2)
                 .unwrap_or(11)
                 .min(rail_rect.height / 2);
-            constraints.push(Length(h));
+            if let Some(chunk) = take(h) {
+                frame.render_widget(
+                    metrics_view::MetricsView::with_savings_and_tiers(
+                        state.metrics_snapshot.clone(),
+                        state.savings_snapshot.clone(),
+                        state.tier_snapshot.clone(),
+                    ),
+                    chunk,
+                );
+            }
         }
-        constraints.push(Length(1)); // context row
+
+        // ── Context slot (always, 1 row) ──────────────────────────────────
+        // Clamp to usize::MAX — well within range on 64-bit targets.
+        if let Some(chunk) = take(1) {
+            let slots = vec![context_rail::ContextSlot {
+                name: "context".into(),
+                used: usize::try_from(state.context_used).unwrap_or(usize::MAX),
+                total: usize::try_from(state.context_window).unwrap_or(usize::MAX),
+            }];
+            frame.render_widget(context_rail::ContextRail::new(slots), chunk);
+        }
+
+        // ── Role cockpit panel ────────────────────────────────────────────
         if show_cockpit {
-            constraints.push(Length(7));
+            if let Some(chunk) = take(7) {
+                render_role_cockpit(frame, chunk, state);
+            }
         }
-        // LSP gets flexible space with a guaranteed floor; fixed-height panels
-        // (obs, trace, fleet, …) slot directly below it without starving it.
-        if show_lsp {
-            constraints.push(Min(LSP_MIN_H));
-        }
+
+        // ── Observability panel ───────────────────────────────────────────
         if show_obs {
-            constraints.push(Length(6));
+            if let Some(chunk) = take(6) {
+                obs_panel::ObsPanel::new(&state.obs_snapshot).render(chunk, frame);
+            }
         }
+
+        // ── Turn trace waterfall (the in-terminal OTel viewer) ────────────
         if show_trace {
             // Border (2) + one row per span + up to 3 detail rows when expanded.
             #[allow(clippy::cast_possible_truncation)]
             let span_rows = state.current_trace.spans.len() as u16;
-            let detail = if state.trace_expanded { 3 } else { 0 };
-            let h = (span_rows + 2 + detail).min(rail_rect.height / 3).max(3);
-            constraints.push(Length(h));
-        }
-        if show_fleet {
-            #[allow(clippy::cast_possible_truncation)]
-            let rows = state.fleet.len() as u16;
-            constraints.push(Length((rows + 3).min(rail_rect.height / 3).max(4)));
-        }
-        if show_plan {
-            constraints.push(Length(plan_panel::panel_height(state.plan_steps.len())));
-        }
-        if show_quality {
-            constraints.push(Length(8));
-        }
-        if show_value {
-            constraints.push(Length(7));
-        }
-
-        let rail_chunks = Layout::vertical(constraints).split(rail_rect);
-        let mut ci = 0usize;
-
-        // ── Metrics / runner panel ────────────────────────────────────────
-        if show_metrics && ci < rail_chunks.len() {
-            frame.render_widget(
-                metrics_view::MetricsView::with_savings_and_tiers(
-                    state.metrics_snapshot.clone(),
-                    state.savings_snapshot.clone(),
-                    state.tier_snapshot.clone(),
-                ),
-                rail_chunks[ci],
-            );
-            ci += 1;
-        }
-
-        // ── Context slot ──────────────────────────────────────────────────
-        // Clamp to usize::MAX — well within range on 64-bit targets.
-        let slots = vec![context_rail::ContextSlot {
-            name: "context".into(),
-            used: usize::try_from(state.context_used).unwrap_or(usize::MAX),
-            total: usize::try_from(state.context_window).unwrap_or(usize::MAX),
-        }];
-        frame.render_widget(context_rail::ContextRail::new(slots), rail_chunks[ci]);
-        ci += 1;
-
-        // ── Role cockpit panel ────────────────────────────────────────────
-        if show_cockpit && ci < rail_chunks.len() {
-            render_role_cockpit(frame, rail_chunks[ci], state);
-            ci += 1;
-        }
-
-        // ── LSP panel ─────────────────────────────────────────────────────
-        if show_lsp && ci < rail_chunks.len() {
-            lsp_panel::LspPanel::new(&state.lsp_snapshot)
-                .with_graph(state.graph_symbols)
-                .render(rail_chunks[ci], frame);
-            ci += 1;
-        }
-
-        // ── Observability panel ───────────────────────────────────────────
-        if show_obs && ci < rail_chunks.len() {
-            obs_panel::ObsPanel::new(&state.obs_snapshot).render(rail_chunks[ci], frame);
-            ci += 1;
-        }
-
-        // ── Turn trace waterfall (the in-terminal OTel viewer) ────────────
-        if show_trace && ci < rail_chunks.len() {
-            let sel = Some(
-                state
-                    .trace_selected
-                    .min(state.current_trace.spans.len().saturating_sub(1)),
-            );
-            trace_waterfall::render(
-                rail_chunks[ci],
-                frame,
-                &state.current_trace,
-                sel,
-                state.trace_expanded,
-                state.no_color,
-            );
-            if state.trace_expanded {
-                // Overlay the selected span's detail on the panel's lower rows.
-                let detail_lines = trace_waterfall::span_detail_lines(
+            let detail_h = if state.trace_expanded { 3 } else { 0 };
+            let trace_h = (span_rows + 2 + detail_h).min(rail_rect.height / 3).max(3);
+            if let Some(chunk) = take(trace_h) {
+                let sel = Some(
+                    state
+                        .trace_selected
+                        .min(state.current_trace.spans.len().saturating_sub(1)),
+                );
+                trace_waterfall::render(
+                    chunk,
+                    frame,
                     &state.current_trace,
-                    state.trace_selected,
+                    sel,
+                    state.trace_expanded,
                     state.no_color,
                 );
-                let chunk = rail_chunks[ci];
-                if chunk.height > 4 {
-                    let dh = u16::try_from(detail_lines.len()).unwrap_or(3).min(3);
-                    let drect = ratatui::layout::Rect::new(
-                        chunk.x + 1,
-                        chunk.y + chunk.height.saturating_sub(dh + 1),
-                        chunk.width.saturating_sub(2),
-                        dh,
+                if state.trace_expanded {
+                    // Overlay the selected span's detail on the panel's lower rows.
+                    let detail_lines = trace_waterfall::span_detail_lines(
+                        &state.current_trace,
+                        state.trace_selected,
+                        state.no_color,
                     );
-                    frame.render_widget(Paragraph::new(detail_lines), drect);
+                    if chunk.height > 4 {
+                        let dh = u16::try_from(detail_lines.len()).unwrap_or(3).min(3);
+                        let drect = ratatui::layout::Rect::new(
+                            chunk.x + 1,
+                            chunk.y + chunk.height.saturating_sub(dh + 1),
+                            chunk.width.saturating_sub(2),
+                            dh,
+                        );
+                        frame.render_widget(Paragraph::new(detail_lines), drect);
+                    }
                 }
             }
-            ci += 1;
         }
 
         // ── Multi-agent fleet roster ──────────────────────────────────────
-        if show_fleet && ci < rail_chunks.len() {
-            fleet_panel::FleetPanel {
-                fleet: &state.fleet,
-                mode: state.render_mode,
-                no_color: state.no_color,
+        if show_fleet {
+            #[allow(clippy::cast_possible_truncation)]
+            let rows = state.fleet.len() as u16;
+            let fleet_h = (rows + 3).min(rail_rect.height / 3).max(4);
+            if let Some(chunk) = take(fleet_h) {
+                fleet_panel::FleetPanel {
+                    fleet: &state.fleet,
+                    mode: state.render_mode,
+                    no_color: state.no_color,
+                }
+                .render(chunk, frame);
             }
-            .render(rail_chunks[ci], frame);
-            ci += 1;
         }
 
         // ── Plan step tracker ─────────────────────────────────────────────
-        if show_plan && ci < rail_chunks.len() {
-            let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'][state.spinner_tick as usize % 8];
-            plan_panel::PlanPanel::new(&state.plan_steps, state.plan_current, spinner)
-                .render(rail_chunks[ci], frame);
-            ci += 1;
+        if show_plan {
+            let plan_h = plan_panel::panel_height(state.plan_steps.len());
+            if let Some(chunk) = take(plan_h) {
+                let spinner =
+                    ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'][state.spinner_tick as usize % 8];
+                plan_panel::PlanPanel::new(&state.plan_steps, state.plan_current, spinner)
+                    .render(chunk, frame);
+            }
         }
 
         // ── Quality gate panel ────────────────────────────────────────────
-        if show_quality && ci < rail_chunks.len() {
-            quality_panel::QualityPanel::new(&state.quality_snapshot)
-                .render(rail_chunks[ci], frame);
-            ci += 1;
+        if show_quality {
+            if let Some(chunk) = take(8) {
+                quality_panel::QualityPanel::new(&state.quality_snapshot).render(chunk, frame);
+            }
         }
 
         // ── Value / ROI panel ─────────────────────────────────────────────
-        if show_value && ci < rail_chunks.len() {
-            value_panel::ValuePanel::new(&state.value_snapshot).render(rail_chunks[ci], frame);
+        if show_value {
+            if let Some(chunk) = take(7) {
+                value_panel::ValuePanel::new(&state.value_snapshot).render(chunk, frame);
+            }
+        }
+
+        // ── LSP panel (last — takes all rows the other panels leave) ──────
+        if show_lsp {
+            let remaining = rail_bottom.saturating_sub(rail_y);
+            if remaining > 0 {
+                let chunk =
+                    ratatui::layout::Rect::new(rail_rect.x, rail_y, rail_rect.width, remaining);
+                lsp_panel::LspPanel::new(&state.lsp_snapshot)
+                    .with_graph(state.graph_symbols)
+                    .render(chunk, frame);
+            }
         }
     }
 
