@@ -6,6 +6,28 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.27.2] — 2026-07-28
+
+### Fixed
+- ACP runner turns (kimi-cli, gemini-cli) hung indefinitely at the first
+  gated tool call: the ACP tool-gate passed `turn_id: None`, and both
+  stream delivery paths drop turn-less events, so the approval prompt
+  never reached the TUI while the agent subprocess blocked on its
+  permission response. The turn id is now threaded through, matching the
+  in-process path.
+- Tool cards rendered as `execute null` for ACP runners: kimi's ACP
+  `tool_call` announce omits `rawInput`, and the null payload was
+  stringified into the card. Null inputs now produce an empty summary and
+  no detail payload.
+- The runner rail panel never showed the session's current runner — it
+  was purely a 24h metrics rollup. It now heads the panel with
+  `now <runner> · <model>`.
+
+### Chore
+- Regenerated the stale file-size gate baseline (several files had grown
+  past their recorded ceilings without a refresh) and restored cargo-sort
+  ordering in the workspace manifests.
+
 ## [0.27.1] — 2026-07-28
 
 ### Fixed
