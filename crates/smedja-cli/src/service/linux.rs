@@ -45,6 +45,13 @@ fn write_unit_inner(smdjad_bin: &Path, unit: &Path, otlp_endpoint: Option<&str>)
     // time, so /run/user/%U stays correct even if the UID differs from the one
     // that installed the unit. This mirrors assets/smdjad.service.
     let mut env_lines = String::from("Environment=XDG_RUNTIME_DIR=/run/user/%U\n");
+    // Runner CLIs (kimi, claude, codex, gemini) install under the user's home
+    // bins, which a systemd user service does NOT inherit. Put them on PATH so
+    // the provider pool can detect them at startup — mirrors
+    // assets/smdjad.service.
+    env_lines.push_str(
+        "Environment=PATH=%h/.kimi-code/bin:%h/.local/bin:%h/.npm-global/bin:%h/bin:/usr/local/bin:/usr/bin:/bin\n",
+    );
     if let Some(ep) = otlp_endpoint {
         let _ = writeln!(env_lines, "Environment=\"SMEDJA_OTLP_ENDPOINT={ep}\"");
     }
@@ -142,6 +149,27 @@ mod tests {
         assert!(content.contains(fake_bin.to_str().unwrap()));
         assert!(content.contains("smedja agent daemon"));
         assert!(content.contains("Restart=on-failure"));
+    }
+
+    #[test]
+    fn write_unit_inner_includes_home_bin_paths_for_cli_detection() {
+        // Runner CLIs (kimi at ~/.kimi-code/bin, claude/codex at ~/.local/bin,
+        // gemini at ~/.npm-global/bin) must be on the daemon's PATH or the
+        // provider pool never detects them.
+        let dir = tempfile::tempdir().unwrap();
+        let fake_bin = dir.path().join("smdjad");
+        std::fs::write(&fake_bin, b"").unwrap();
+        let unit_dest = dir.path().join("smdjad.service");
+
+        write_unit_inner(&fake_bin, &unit_dest, None).unwrap();
+
+        let content = std::fs::read_to_string(&unit_dest).unwrap();
+        for home_bin in [".kimi-code/bin", ".local/bin", ".npm-global/bin"] {
+            assert!(
+                content.contains(home_bin),
+                "unit PATH must include {home_bin}, got:\n{content}"
+            );
+        }
     }
 
     #[test]

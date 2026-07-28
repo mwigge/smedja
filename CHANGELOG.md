@@ -6,6 +6,18 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.27.1] — 2026-07-28
+
+### Fixed
+- `/models` list missed the kimi runner: the systemd unit PATH lacked
+  `~/.kimi-code/bin` (where the kimi CLI installs), so `which(kimi)` failed
+  in the daemon and kimi-cli never entered the provider pool. Fixed in
+  `assets/smdjad.service` and in the `smj service install` unit template,
+  which previously wrote no PATH line at all.
+- `/models` list rendered a dangling blank for gemini-cli: ACP-driven CLI
+  runners intentionally carry an empty model literal (the agent's configured
+  default is used); the list now shows `(agent default)` instead.
+
 ## [0.27.0] — 2026-07-27
 
 ### Added

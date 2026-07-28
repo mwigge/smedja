@@ -14,6 +14,14 @@ pub(crate) fn format_model_list(v: &serde_json::Value) -> String {
         let runner = r.get("runner").and_then(|v| v.as_str()).unwrap_or("?");
         let tier = r.get("tier").and_then(|v| v.as_str()).unwrap_or("?");
         let model = r.get("model").and_then(|v| v.as_str()).unwrap_or("?");
+        // ACP-driven CLI runners (gemini-cli) carry an empty model literal:
+        // the agent's own configured default model is used. Show that instead
+        // of a dangling blank, which reads as a broken entry.
+        let model = if model.is_empty() {
+            "(agent default)"
+        } else {
+            model
+        };
         lines.push(format!("  {runner} ({tier}): {model}"));
     }
     lines.join("\n")
