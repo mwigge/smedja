@@ -82,14 +82,14 @@ local-embedder = ["dep:fastembed"]
 
 [dependencies]
 anyhow             = { workspace = true }
-# Local semantic embedder: bundles ONNX Runtime + tokenizers and handles
-# download-on-first-use of bge-small / all-MiniLM weights into a cache dir.
-# rustls (not native-tls) so no system OpenSSL is required to build.
-fastembed          = { version = "5", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
 async-trait        = { workspace = true }
 axum               = { workspace = true }
 base64             = { workspace = true }
 chrono             = { workspace = true }
+# Local semantic embedder: bundles ONNX Runtime + tokenizers and handles
+# download-on-first-use of bge-small / all-MiniLM weights into a cache dir.
+# rustls (not native-tls) so no system OpenSSL is required to build.
+fastembed          = { version = "5", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
 futures-util       = { workspace = true }
 opentelemetry          = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }
@@ -115,9 +115,9 @@ smedja-review      = { path = "../../crates/smedja-review" }
 smedja-rpc         = { path = "../../crates/smedja-rpc" }
 smedja-security    = { path = "../../crates/smedja-security" }
 smedja-spec        = { path = "../../crates/smedja-spec" }
-smedja-testkit     = { path = "../../crates/smedja-testkit" }
 smedja-sre         = { path = "../../crates/smedja-sre" }
 smedja-telemetry   = { path = "../../crates/smedja-telemetry" }
+smedja-testkit     = { path = "../../crates/smedja-testkit" }
 smedja-types       = { path = "../../crates/smedja-types" }
 smedja-vault       = { path = "../../crates/smedja-vault" }
 tokio              = { workspace = true }
@@ -131,15 +131,15 @@ uuid               = { workspace = true }
 walkdir            = { workspace = true }
 which              = { workspace = true }
 
-# Unix-only libc bindings: used to set a restrictive `umask` around the socket
-# bind so the Unix socket is created 0600 with no world-accessible window.
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 # Linux-only Landlock LSM bindings for the native sandbox backend. Target-gated
 # so the macOS build never pulls it in.
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
+
+# Unix-only libc bindings: used to set a restrictive `umask` around the socket
+# bind so the Unix socket is created 0600 with no world-accessible window.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "testing"] }

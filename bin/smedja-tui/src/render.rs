@@ -421,12 +421,21 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
         // ── Metrics / runner panel (top of rail) ─────────────────────────
         let show_metrics = state.panels.metrics;
         if show_metrics {
+            // The session's selected runner+model heads the panel; the rows
+            // below it are a 24h usage rollup and would otherwise never
+            // reflect a runner switch.
+            let current = format!(
+                "{} · {}",
+                crate::theme::runner_label(&state.runner).to_lowercase(),
+                state.model.as_deref().unwrap_or("?")
+            );
             let metrics_lines = metrics_view::MetricsView::with_savings_and_tiers(
                 state.metrics_snapshot.clone(),
                 state.savings_snapshot.clone(),
                 state.tier_snapshot.clone(),
             )
             .with_hourly(state.metrics_hourly.clone())
+            .with_current(current.clone())
             .lines()
             .len();
             // +2 for Block top and bottom border.
@@ -440,7 +449,8 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
                         state.savings_snapshot.clone(),
                         state.tier_snapshot.clone(),
                     )
-                    .with_hourly(state.metrics_hourly.clone()),
+                    .with_hourly(state.metrics_hourly.clone())
+                    .with_current(current),
                     chunk,
                 );
             }

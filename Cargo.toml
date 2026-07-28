@@ -21,14 +21,14 @@ members = [
     "crates/smedja-rpc",
     "crates/smedja-security",
     "crates/smedja-spec",
-    "crates/smedja-testkit",
     "crates/smedja-sre",
     "crates/smedja-telemetry",
+    "crates/smedja-testkit",
     "crates/smedja-types",
     "crates/smedja-vault",
     "term/bin/smedja",
-    "term/crates/st-app",
     "term/crates/st-agent",
+    "term/crates/st-app",
     "term/crates/st-blocks",
     "term/crates/st-config",
     "term/crates/st-glyph",
@@ -40,7 +40,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.27.1"
+version = "0.27.2"
 edition    = "2021"
 license    = "Apache-2.0"
 repository = "https://github.com/mwigge/smedja"
