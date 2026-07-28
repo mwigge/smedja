@@ -993,10 +993,12 @@ impl TurnRun {
             let gates = gates.clone();
             let dispatcher = self.orch.dispatcher.clone();
             let session_id = session_id.clone();
+            let turn_id = self.turn_id.clone();
             smedja_adapter::ToolGate::new(move |tool, input| {
                 let gates = gates.clone();
                 let dispatcher = dispatcher.clone();
                 let session_id = session_id.clone();
+                let turn_id = turn_id.clone();
                 Box::pin(async move {
                     let gate = gates
                         .lock()
@@ -1006,8 +1008,12 @@ impl TurnRun {
                             || std::sync::Arc::new(crate::cowork::CoworkGate::default()),
                         )
                         .clone();
+                    // Thread the turn id so the approval push reaches the TUI;
+                    // `None` was dropped by both stream delivery paths, which
+                    // left the approval invisible and the ACP turn parked on
+                    // the gate (the in-process path fixed the same bug).
                     match gate
-                        .gate_tool(0, &tool, input, "", Some((&dispatcher, None)))
+                        .gate_tool(0, &tool, input, "", Some((&dispatcher, Some(turn_id.as_str()))))
                         .await
                     {
                         crate::cowork::Decision::Approve => {

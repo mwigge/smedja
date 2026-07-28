@@ -104,6 +104,10 @@ pub struct MetricsView {
     pub tiers: Vec<TierRow>,
     /// Hourly token totals (input + output) over the last 24h, chronological.
     pub hourly: Vec<u64>,
+    /// The session's currently selected runner and model, shown as the first
+    /// content line — the rollup rows below are a 24h window, so without this
+    /// the panel never reflects a runner switch.
+    pub current: Option<String>,
 }
 
 impl MetricsView {
@@ -115,6 +119,7 @@ impl MetricsView {
             savings,
             tiers: Vec::new(),
             hourly: Vec::new(),
+            current: None,
         }
     }
 
@@ -137,16 +142,28 @@ impl MetricsView {
         self
     }
 
+    /// Attaches the session's current runner+model label, rendered as the
+    /// first content line (`now  kimi · kimi-code/k3`).
+    #[must_use]
+    pub fn with_current(mut self, current: impl Into<String>) -> Self {
+        self.current = Some(current.into());
+        self
+    }
+
     /// Renders the panel content as text lines (header + one row per runner, or
     /// a placeholder when there is no data, followed by the savings section).
     /// Column widths are sized for 25 chars (rail width 27 minus 2 for Block borders).
     /// Exposed for unit testing the layout without a `Buffer`.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
-        let mut out = vec![format!(
+        let mut out: Vec<String> = Vec::new();
+        if let Some(current) = &self.current {
+            out.push(format!("now  {current}"));
+        }
+        out.push(format!(
             "{:<7} {:>4} {:>8} {:>3}",
             "RUNNER", "TOK", "COST", "ERR"
-        )];
+        ));
         if self.rows.is_empty() {
             out.push("(no metrics)".to_owned());
         } else {
@@ -243,21 +260,26 @@ impl Widget for MetricsView {
         block.render(area, buf);
 
         let rows = &self.rows;
+        // The optional leading "now" line shifts the header and data rows down
+        // by one; account for it in every index below.
+        let off = usize::from(self.current.is_some());
         let lines: Vec<Line<'_>> = self
             .lines()
             .into_iter()
             .enumerate()
             .map(|(idx, text)| {
-                if idx == 0 {
+                if idx == off {
                     Line::from(Span::styled(
                         text,
                         Style::default().add_modifier(Modifier::BOLD),
                     ))
+                } else if idx < off {
+                    Line::from(Span::styled(text, Style::default().fg(p.accent)))
                 } else if text.starts_with("24h ") {
                     Line::from(Span::styled(text, Style::default().fg(p.local)))
                 } else {
                     // Highlight any runner with errors in red.
-                    let has_error = rows.get(idx - 1).is_some_and(|row| row.errors > 0);
+                    let has_error = rows.get(idx - off - 1).is_some_and(|row| row.errors > 0);
                     let style = if has_error {
                         Style::default().fg(p.error)
                     } else {

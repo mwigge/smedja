@@ -299,14 +299,17 @@ pub(crate) async fn drain_stream(
                 let input_summary = summarize_tool_input(&input);
                 let _ = writeln!(full_response, "▶ {name}: {input_summary}");
                 // The full input (capped) backs the on-demand detail view.
-                let full_input: String = input.to_string().chars().take(4096).collect();
+                // ACP announces carry a null input (args stream later) — keep
+                // it None rather than the literal "null".
+                let full_input =
+                    (!input.is_null()).then(|| input.to_string().chars().take(4096).collect());
                 // Publish ONLY the structured tool_call event; the UI renders the
                 // card from it. Previously we ALSO published the same line as an
                 // AssistantDelta, so every tool call rendered twice.
                 dispatcher.publish(TurnEvent::ToolCalled {
                     tool_name: name,
                     input_summary,
-                    full_input: Some(full_input),
+                    full_input,
                     turn_id: turn_id.map(str::to_owned),
                     correlation: CorrelationCtx {
                         operation_name: Some(tel::OPERATION_EXECUTE_TOOL.to_owned()),
@@ -409,6 +412,12 @@ fn summarize_tool_input(input: &serde_json::Value) -> String {
         if !parts.is_empty() {
             return truncate_summary(&parts.join(" "), 100);
         }
+    }
+    // ACP agents announce a tool call before its arguments stream in; the
+    // announce carries a null input, and rendering the literal "null" reads
+    // as a broken card. No meaningful field → empty summary.
+    if input.is_null() {
+        return String::new();
     }
     truncate_summary(&input.to_string(), 100)
 }
