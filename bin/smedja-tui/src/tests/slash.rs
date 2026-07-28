@@ -363,6 +363,22 @@ fn format_model_list_renders_all_entries() {
 }
 
 #[test]
+fn format_model_list_shows_agent_default_for_empty_model() {
+    // ACP-driven CLI runners (gemini-cli) report an empty model literal; the
+    // list must say "(agent default)" instead of rendering a dangling blank.
+    let v = serde_json::json!({
+        "runners": [
+            { "runner": "gemini-cli", "tier": "deep", "model": "" }
+        ]
+    });
+    let out = format_model_list(&v);
+    assert!(
+        out.contains("gemini-cli (deep): (agent default)"),
+        "empty model must render as (agent default), got: {out}"
+    );
+}
+
+#[test]
 fn format_local_model_list_renders_fit_and_active() {
     let v = serde_json::json!({
         "active_model_id": "qwen3-14b",
