@@ -70,6 +70,14 @@ pub const GEMINI_ACP: AcpAgentSpec = AcpAgentSpec {
     model_config_id: "model",
 };
 
+/// GitHub Copilot CLI (`copilot --acp`), replacing the retired gh extension.
+pub const COPILOT_ACP: AcpAgentSpec = AcpAgentSpec {
+    name: "copilot",
+    binary: "copilot",
+    args: &["--acp"],
+    model_config_id: "",
+};
+
 /// A [`Provider`] that drives an ACP agent subprocess for each turn.
 pub struct AcpProvider {
     spec: AcpAgentSpec,

@@ -80,6 +80,9 @@ pub(crate) struct PanelVisibility {
 #[derive(Debug)]
 pub(crate) struct AppState {
     pub(crate) session_id: String,
+    pub(crate) daemon_sock: PathBuf,
+    /// Force ratatui to repaint after an external CLI login used the terminal.
+    pub(crate) needs_clear: bool,
     pub(crate) mode: Option<String>,
     pub(crate) tier: Option<String>,
     pub(crate) runner: String,
@@ -172,6 +175,11 @@ pub(crate) struct AppState {
     pub(crate) slash_cursor: usize,
     /// True when the popup is showing a runner picker (Enter confirms runner switch).
     pub(crate) runner_picker_mode: bool,
+    /// Provider selection opened by `/connect`.
+    pub(crate) connect_picker_mode: bool,
+    pub(crate) model_picker_mode: bool,
+    pub(crate) model_picker_all: Vec<String>,
+    pub(crate) model_search: String,
     /// True when the popup is showing a session picker (Enter resumes the highlighted session).
     pub(crate) session_picker_mode: bool,
     /// True when the popup is the Ctrl+K command palette (fuzzy filter, wider, shows descriptions).

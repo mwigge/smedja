@@ -15,7 +15,7 @@ pub(super) fn render_slash_popup(
     // Session-picker rows (`<short-id>  <title>  <mode>  <updated_at>`) are wider
     // than the 20-col command popup, so widen to fit when the picker is open.
     // Command palette also widens to accommodate the description column.
-    let desired_w = if state.session_picker_mode {
+    let desired_w = if state.session_picker_mode || state.model_picker_mode {
         60
     } else if state.command_palette_mode {
         50
@@ -28,9 +28,13 @@ pub(super) fn render_slash_popup(
     let popup_x = area.x;
     let popup_rect = ratatui::layout::Rect::new(popup_x, popup_y, popup_w, popup_h);
 
+    let visible = usize::from(popup_h.saturating_sub(2));
+    let start = state.slash_cursor.saturating_sub(visible.saturating_sub(1));
     let lines: Vec<Line<'_>> = completions
         .iter()
         .enumerate()
+        .skip(start)
+        .take(visible)
         .map(|(i, c)| {
             let label = if state.command_palette_mode {
                 let desc = SLASH_COMMAND_DESCRIPTIONS
@@ -56,13 +60,17 @@ pub(super) fn render_slash_popup(
         .collect();
 
     let title = if state.session_picker_mode {
-        "sessions"
+        "sessions".to_owned()
     } else if state.runner_picker_mode {
-        "runners"
+        "runners".to_owned()
+    } else if state.connect_picker_mode {
+        "connect provider".to_owned()
+    } else if state.model_picker_mode {
+        format!("models: {}", state.model_search)
     } else if state.command_palette_mode {
-        "palette"
+        "palette".to_owned()
     } else {
-        "commands"
+        "commands".to_owned()
     };
     frame.render_widget(Clear, popup_rect);
     let popup = Paragraph::new(lines)

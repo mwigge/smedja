@@ -107,6 +107,7 @@ pub(crate) fn missing_param(name: &str) -> RpcError {
 #[tokio::main]
 #[allow(clippy::too_many_lines)] // startup is one linear wiring sequence; the length is the subsystem fan-out, not complexity
 async fn main() -> anyhow::Result<()> {
+    load_saved_provider_keys();
     // smdjad has no clap parser; honour `--version`/`-V` so it can report its
     // own build like the other binaries (CARGO_PKG_VERSION = workspace version).
     if std::env::args()
@@ -737,6 +738,40 @@ async fn main() -> anyhow::Result<()> {
     // Socket is removed by _socket_guard's Drop impl on function exit.
 
     Ok(())
+}
+
+/// Load keys saved by the TUI when the daemon is started directly rather than
+/// through the systemd unit's `EnvironmentFile`. Explicit environment values win.
+fn load_saved_provider_keys() {
+    const KEYS: &[&str] = &[
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "MOONSHOT_API_KEY",
+        "GEMINI_API_KEY",
+        "MINIMAX_API_KEY",
+        "BERGET_API_KEY",
+        "MISTRAL_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "OLLAMA_API_KEY",
+        "OPENROUTER_API_KEY",
+        "XAI_API_KEY",
+        "GROQ_API_KEY",
+        "CEREBRAS_API_KEY",
+    ];
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(home).join(".config/smedja/secrets.env");
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in contents.lines() {
+        if let Some((name, value)) = line.split_once('=') {
+            if KEYS.contains(&name) && !value.is_empty() && std::env::var_os(name).is_none() {
+                std::env::set_var(name, value);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -22,6 +22,8 @@ use crate::{
 pub(crate) fn make_state(session_id: &str) -> AppState {
     AppState {
         session_id: session_id.to_owned(),
+        daemon_sock: PathBuf::from("/tmp/smdjad-test.sock"),
+        needs_clear: false,
         mode: None,
         tier: None,
         runner: String::from("unknown"),
@@ -74,6 +76,10 @@ pub(crate) fn make_state(session_id: &str) -> AppState {
         slash_popup_visible: false,
         slash_cursor: 0,
         runner_picker_mode: false,
+        connect_picker_mode: false,
+        model_picker_mode: false,
+        model_picker_all: Vec::new(),
+        model_search: String::new(),
         session_picker_mode: false,
         command_palette_mode: false,
         session_picker_ids: Vec::new(),

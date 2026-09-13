@@ -27,9 +27,24 @@ pub(crate) fn clear_slash_popup(state: &mut AppState) {
     state.input.clear();
     state.input_cursor = 0;
     state.runner_picker_mode = false;
+    state.connect_picker_mode = false;
+    state.model_picker_mode = false;
+    state.model_picker_all.clear();
+    state.model_search.clear();
     state.session_picker_mode = false;
     state.command_palette_mode = false;
     state.session_picker_ids.clear();
+}
+
+fn filter_model_picker(state: &mut AppState) {
+    let query = state.model_search.to_ascii_lowercase();
+    state.slash_completions = state
+        .model_picker_all
+        .iter()
+        .filter(|name| name.to_ascii_lowercase().contains(&query))
+        .cloned()
+        .collect();
+    state.slash_cursor = 0;
 }
 
 // dispatch_slash, apply_tier, apply_agent, and their exclusive format helpers
@@ -333,8 +348,20 @@ pub(crate) async fn handle_key(
             KeyCode::Esc => {
                 clear_slash_popup(state);
             }
+            KeyCode::Char(c) if state.model_picker_mode => {
+                state.model_search.push(c);
+                filter_model_picker(state);
+            }
+            KeyCode::Backspace if state.model_picker_mode => {
+                state.model_search.pop();
+                filter_model_picker(state);
+            }
             KeyCode::Char(' ') | KeyCode::Tab => {
-                if !state.runner_picker_mode && !state.session_picker_mode {
+                if !state.runner_picker_mode
+                    && !state.session_picker_mode
+                    && !state.connect_picker_mode
+                    && !state.model_picker_mode
+                {
                     accept_slash_completion(state, true);
                 }
             }
@@ -348,7 +375,39 @@ pub(crate) async fn handle_key(
                 state.slash_cursor = state.slash_cursor.saturating_sub(1);
             }
             KeyCode::Enter => {
-                if state.session_picker_mode {
+                if state.model_picker_mode {
+                    let chosen = state.slash_completions.get(state.slash_cursor).cloned();
+                    clear_slash_popup(state);
+                    if let Some(model) = chosen {
+                        match client
+                            .call(
+                                "session.set_model",
+                                json!({"session_id": state.session_id, "model": model}),
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                state.model = Some(model.clone());
+                                push_system_message(state, format!("model set to {model}"));
+                            }
+                            Err(e) => {
+                                push_system_message(state, format!("model selection failed: {e}"))
+                            }
+                        }
+                    }
+                } else if state.connect_picker_mode {
+                    let chosen = state.slash_completions.get(state.slash_cursor).cloned();
+                    clear_slash_popup(state);
+                    if let Some(provider) = chosen {
+                        let provider = provider.split_whitespace().next().unwrap_or_default();
+                        let _ = crate::slash::dispatch_slash(
+                            &format!("/connect {provider}"),
+                            state,
+                            client,
+                        )
+                        .await;
+                    }
+                } else if state.session_picker_mode {
                     let chosen = state.session_picker_ids.get(state.slash_cursor).cloned();
                     state.session_picker_mode = false;
                     state.slash_popup_visible = false;
@@ -1021,12 +1080,113 @@ pub(crate) async fn handle_key(
             if let Some(var) = state.secret_var.take() {
                 let key = std::mem::take(&mut state.input);
                 state.input_cursor = 0;
-                let msg = if key.trim().is_empty() {
-                    "login: empty key — cancelled".to_owned()
-                } else {
-                    secrets::save_secret(&var, key.trim())
+                if key.trim().is_empty() {
+                    push_system_message(state, "connect: empty key — cancelled");
+                    return Ok(());
+                }
+                let checked = client
+                    .call(
+                        "provider.check_key",
+                        json!({"provider": var, "key": key.trim()}),
+                    )
+                    .await;
+                let check = match checked {
+                    Ok(value) => value,
+                    Err(e) => {
+                        state.secret_var = Some(var);
+                        push_system_message(
+                            state,
+                            format!("connect: {e}. Re-enter the key or press Esc."),
+                        );
+                        return Ok(());
+                    }
                 };
+                let verified = check["verified"].as_bool() == Some(true);
+                let msg = secrets::save_secret(&var, key.trim());
+                let saved = msg.starts_with('✓');
                 push_system_message(state, msg);
+                if saved {
+                    if var == "MOONSHOT_API_KEY"
+                        && verified
+                        && check["models"].as_array().is_some_and(|models| {
+                            !models.iter().any(|model| model.as_str() == Some("kimi-k3"))
+                        })
+                    {
+                        push_system_message(state,
+                            "Moonshot key works, but K3 is absent from this account's model catalog. Select another model with /model.");
+                    }
+                    push_system_message(
+                        state,
+                        if verified {
+                            "Credential verified with provider."
+                        } else {
+                            "Credential saved; this provider has no read-only key check, so it is not yet verified."
+                        },
+                    );
+                    if cfg!(target_os = "linux")
+                        && std::process::Command::new("systemctl")
+                            .args(["--user", "is-active", "--quiet", "smdjad"])
+                            .status()
+                            .is_ok_and(|status| status.success())
+                    {
+                        let restarted = std::process::Command::new("systemctl")
+                            .args(["--user", "restart", "smdjad"])
+                            .status()
+                            .is_ok_and(|status| status.success());
+                        if restarted {
+                            if let Some(reconnected) = try_reconnect(&state.daemon_sock).await {
+                                *client = reconnected;
+                                let runner = match var.as_str() {
+                                    "ANTHROPIC_API_KEY" => "claude",
+                                    "OPENAI_API_KEY" => "codex",
+                                    "MOONSHOT_API_KEY" => "kimi",
+                                    "MISTRAL_API_KEY" => "mistral",
+                                    "DEEPSEEK_API_KEY" => "deepseek",
+                                    "OLLAMA_API_KEY" => "ollama-cloud",
+                                    "MINIMAX_API_KEY" => "minimax",
+                                    "BERGET_API_KEY" => "berget",
+                                    "GEMINI_API_KEY" => "gemini",
+                                    "OPENROUTER_API_KEY" => "openrouter",
+                                    "XAI_API_KEY" => "xai",
+                                    "GROQ_API_KEY" => "groq",
+                                    "CEREBRAS_API_KEY" => "cerebras",
+                                    _ => "",
+                                };
+                                if verified && !runner.is_empty() {
+                                    if let Ok(value) = client.call("session.set_runner",
+                                        json!({"session_id": state.session_id, "runner": runner})).await {
+                                        let canonical = value["runner"].as_str().unwrap_or(runner);
+                                        state.runner = canonical.to_owned();
+                                        if let Ok(list) = client.call("runner.list", json!({})).await {
+                                            state.model = crate::slash::runner_default_model(
+                                                &list, canonical, state.tier.as_deref());
+                                        }
+                                        push_system_message(state, format!("Connected to {canonical}. Ready for a prompt."));
+                                    } else {
+                                        push_system_message(state, "Daemon reloaded. Use /switch to select the provider.");
+                                    }
+                                } else {
+                                    push_system_message(
+                                        state,
+                                        "Daemon reloaded. Use /switch to select the provider.",
+                                    );
+                                }
+                            } else {
+                                push_system_message(state, "Daemon restarted; reconnect is pending. Restart the TUI if it does not reconnect.");
+                            }
+                        } else {
+                            push_system_message(
+                                state,
+                                "Could not restart smdjad. Restart it to activate the saved key.",
+                            );
+                        }
+                    } else {
+                        push_system_message(
+                            state,
+                            "Restart smdjad to activate the saved key, then use /switch.",
+                        );
+                    }
+                }
                 return Ok(());
             }
 

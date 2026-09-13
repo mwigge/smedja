@@ -55,9 +55,7 @@ pub(crate) async fn bootstrap() -> Result<Session> {
         eprintln!("  systemctl --user start smdjad");
         eprintln!("  # or run directly: smdjad &");
         eprintln!();
-        eprintln!("If you haven't set up a provider yet:");
-        eprintln!("  export ANTHROPIC_API_KEY=<your-key>");
-        eprintln!("  smdjad &");
+        eprintln!("Start smdjad even without a key, then use /connect in the TUI.");
         std::process::exit(1);
     });
 
@@ -79,6 +77,8 @@ pub(crate) async fn bootstrap() -> Result<Session> {
     let stream_sock_path = stream_socket_path(&sock);
     let mut state = AppState {
         session_id,
+        daemon_sock: sock.clone(),
+        needs_clear: false,
         mode: cli.mode.or(resumed_mode),
         tier: cli.tier.or(startup_tier),
         runner: startup_runner,
@@ -134,6 +134,10 @@ pub(crate) async fn bootstrap() -> Result<Session> {
         slash_popup_visible: false,
         slash_cursor: 0,
         runner_picker_mode: false,
+        connect_picker_mode: false,
+        model_picker_mode: false,
+        model_picker_all: Vec::new(),
+        model_search: String::new(),
         session_picker_mode: false,
         command_palette_mode: false,
         file_picker_open: false,
@@ -229,6 +233,20 @@ pub(crate) async fn bootstrap() -> Result<Session> {
         &mut state.main_panel,
         "type a message or /help for commands",
     );
+
+    if client
+        .call("runner.list", serde_json::json!({}))
+        .await
+        .ok()
+        .and_then(|v| v["runners"].as_array().map(Vec::is_empty))
+        == Some(true)
+    {
+        crate::push_system_message(
+            &mut state,
+            "No provider is ready. Run /connect to set one up.",
+        );
+        let _ = crate::slash::dispatch_slash("/connect", &mut state, &mut client).await;
+    }
 
     // On resume, optionally rewind to --turn and replay history into the view
     // before the event loop starts. Done before terminal setup so a transport

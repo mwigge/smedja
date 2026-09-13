@@ -9,17 +9,55 @@
 //! `dispatch_slash`; they live here to keep `main.rs` focused on wiring.
 
 use std::fmt::Write as _;
+use std::io::stdout;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde_json::{json, Value};
 use smedja_rpc::client::Client;
 
+/// Temporarily hand the terminal to a provider's interactive OAuth login.
+/// The caller marks the ratatui frame dirty so its next draw repaints fully.
+fn run_cli_login(binary: &str) -> Result<std::process::ExitStatus> {
+    use crossterm::event::{
+        DisableBracketedPaste, DisableMouseCapture, PopKeyboardEnhancementFlags,
+    };
+    use crossterm::event::{
+        EnableBracketedPaste, EnableMouseCapture, KeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+    };
+    use crossterm::terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    };
+    crossterm::execute!(
+        stdout(),
+        PopKeyboardEnhancementFlags,
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
+    disable_raw_mode()?;
+    let result = std::process::Command::new(binary).arg("login").status();
+    enable_raw_mode()?;
+    crossterm::execute!(
+        stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        )
+    )?;
+    result.map_err(Into::into)
+}
+
 use crate::{
     fetch_latest_version, format_gov_list, format_resume_rows, format_token_count, gov_create,
     gov_transition, is_newer, parse_resume_args, parse_review_scope, push_system_message,
     render_findings_summary, resume_blocked_by_pending_turn, resume_into_view, resume_plan,
-    run_upgrade, scan_gov_artifacts, slugify, submit, AppState, OutputType, HELP_TEXT, VERSION,
+    run_upgrade, scan_gov_artifacts, slugify, submit, try_reconnect, AppState, OutputType,
+    HELP_TEXT, VERSION,
 };
 
 mod format;
@@ -58,7 +96,17 @@ pub(crate) fn runner_default_model(
         .get("runners")?
         .as_array()?
         .iter()
-        .filter(|r| r.get("runner").and_then(|n| n.as_str()) == Some(runner))
+        .filter(|r| {
+            let name = r.get("runner").and_then(|n| n.as_str()).unwrap_or("");
+            match runner {
+                "claude" | "claude-cli" => matches!(name, "claude-cli" | "anthropic"),
+                "codex" | "codex-cli" => matches!(name, "codex-cli" | "openai"),
+                "kimi" | "kimi-cli" => matches!(name, "kimi-cli" | "moonshot"),
+                "kimi-code" => matches!(name, "kimi-code" | "kimi-cli"),
+                "gemini" | "gemini-cli" => matches!(name, "gemini-cli" | "google"),
+                _ => name == runner,
+            }
+        })
         .collect();
     entries
         .iter()
@@ -130,6 +178,156 @@ pub(crate) async fn dispatch_slash(
     let args = parts.next().unwrap_or_default().trim();
 
     match cmd {
+        "connect" => {
+            const CHOICES: &[&str] = &[
+                "claude",
+                "anthropic",
+                "codex",
+                "openai",
+                "copilot",
+                "mistral",
+                "deepseek",
+                "kimi-code",
+                "moonshot",
+                "ollama-cloud",
+                "minimax",
+                "berget",
+                "gemini",
+                "openrouter",
+                "xai",
+                "groq",
+                "cerebras",
+            ];
+            if args.is_empty() {
+                let ready = client.call("runner.list", json!({})).await.ok();
+                state.slash_completions = CHOICES
+                    .iter()
+                    .map(|name| {
+                        let is_ready = ready
+                            .as_ref()
+                            .and_then(|v| v["runners"].as_array())
+                            .is_some_and(|rows| {
+                                rows.iter().any(|row| {
+                                    let value = row["runner"].as_str().unwrap_or("");
+                                    match *name {
+                                        "claude" => value == "claude-cli",
+                                        "anthropic" => value == "anthropic",
+                                        "codex" => value == "codex-cli",
+                                        "openai" => value == "openai",
+                                        "kimi-code" => matches!(value, "kimi-cli" | "kimi-code"),
+                                        "moonshot" => value == "moonshot",
+                                        "gemini" => matches!(value, "gemini-cli" | "google"),
+                                        _ => value == *name,
+                                    }
+                                })
+                            });
+                        format!("{name}  [{}]", if is_ready { "detected" } else { "set up" })
+                    })
+                    .collect();
+                state.slash_cursor = 0;
+                state.slash_popup_visible = true;
+                state.connect_picker_mode = true;
+                state.input.clear();
+                state.input_cursor = 0;
+                push_system_message(state, "select a provider, then press Enter");
+                return Ok(true);
+            }
+            let provider = args.to_ascii_lowercase();
+            let key_var = match provider.as_str() {
+                "anthropic" => Some("ANTHROPIC_API_KEY"),
+                "openai" => Some("OPENAI_API_KEY"),
+                "mistral" => Some("MISTRAL_API_KEY"),
+                "deepseek" => Some("DEEPSEEK_API_KEY"),
+                "moonshot" => Some("MOONSHOT_API_KEY"),
+                "ollama-cloud" => Some("OLLAMA_API_KEY"),
+                "minimax" => Some("MINIMAX_API_KEY"),
+                "berget" => Some("BERGET_API_KEY"),
+                "gemini" => Some("GEMINI_API_KEY"),
+                "openrouter" => Some("OPENROUTER_API_KEY"),
+                "xai" => Some("XAI_API_KEY"),
+                "groq" => Some("GROQ_API_KEY"),
+                "cerebras" => Some("CEREBRAS_API_KEY"),
+                _ => None,
+            };
+            if let Some(var) = key_var {
+                state.secret_var = Some(var.to_owned());
+                push_system_message(state, format!(
+                    "{provider}: paste your API key, then press Enter. Input is hidden; Esc cancels."
+                ));
+            } else {
+                let cli = match provider.as_str() {
+                    "claude" => Some(("claude", "claude")),
+                    "codex" => Some(("codex", "codex")),
+                    "kimi-code" => Some(("kimi", "kimi-code")),
+                    "copilot" => Some(("copilot", "copilot")),
+                    _ => None,
+                };
+                if let Some((binary, runner)) = cli {
+                    let present = std::process::Command::new("which")
+                        .arg(binary)
+                        .output()
+                        .is_ok_and(|output| output.status.success());
+                    if present {
+                        let login = run_cli_login(binary);
+                        state.needs_clear = true;
+                        match login {
+                            Ok(status) if status.success() => {
+                                if cfg!(target_os = "linux")
+                                    && std::process::Command::new("systemctl")
+                                        .args(["--user", "is-active", "--quiet", "smdjad"])
+                                        .status()
+                                        .is_ok_and(|status| status.success())
+                                {
+                                    let restarted = std::process::Command::new("systemctl")
+                                        .args(["--user", "restart", "smdjad"])
+                                        .status()
+                                        .is_ok_and(|status| status.success());
+                                    if restarted {
+                                        if let Some(reconnected) =
+                                            try_reconnect(&state.daemon_sock).await
+                                        {
+                                            *client = reconnected;
+                                        }
+                                    }
+                                }
+                                match client.call("session.set_runner",
+                                    json!({"session_id": state.session_id, "runner": runner})).await {
+                                    Ok(value) => {
+                                        let canonical = value["runner"].as_str().unwrap_or(runner);
+                                        state.runner = canonical.to_owned();
+                                        if let Ok(list) = client.call("runner.list", json!({})).await {
+                                            state.model = runner_default_model(&list, canonical,
+                                                state.tier.as_deref());
+                                        }
+                                        push_system_message(state, format!("{binary} authenticated. Ready for a prompt."));
+                                    }
+                                    Err(_) => push_system_message(state,
+                                        format!("{binary} authenticated. Restart smdjad, then /switch {runner}.")),
+                                }
+                            }
+                            Ok(_) => push_system_message(
+                                state,
+                                format!("{binary} login was cancelled or failed."),
+                            ),
+                            Err(e) => push_system_message(
+                                state,
+                                format!("could not run {binary} login: {e}"),
+                            ),
+                        }
+                        return Ok(true);
+                    }
+                }
+                let guidance = match provider.as_str() {
+                    "claude" => "Claude subscription: install Claude Code, run `claude login`, then restart smdjad and /switch claude. Use /connect anthropic for an API key.",
+                    "codex" => "Codex subscription: install Codex CLI, run `codex login`, then restart smdjad and /switch codex. Use /connect openai for an API key.",
+                    "kimi-code" => "Kimi Code subscription: install Kimi CLI, run `kimi login`, then restart smdjad and /switch kimi-code. Use /connect moonshot for a Platform API key.",
+                    "copilot" => "GitHub Copilot: install the `copilot` CLI, run `copilot login`, then restart smdjad and /switch copilot. The old `gh copilot suggest` extension is retired.",
+                    _ => "unknown provider; run /connect to choose one",
+                };
+                push_system_message(state, guidance);
+            }
+            Ok(true)
+        }
         "tier" => {
             let text = apply_tier(args, state);
             push_system_message(state, text);
@@ -632,17 +830,53 @@ pub(crate) async fn dispatch_slash(
             let session_id = state.session_id.clone();
             let is_local = state.runner == "local";
             if args.is_empty() || args == "reset" {
-                // For the local runner, list the GPU-annotated inventory via
-                // local.models; for hosted runners keep the runner.list view.
+                // Local models keep the GPU inventory; hosted models open a
+                // searchable picker backed by the provider's catalog.
                 let text = if is_local {
                     match client.call("local.models", json!({})).await {
                         Ok(v) => format_local_model_list(&v),
                         Err(e) => format!("local.models error: {e}"),
                     }
                 } else {
-                    match client.call("runner.list", json!({})).await {
-                        Ok(v) => format_model_list(&v),
-                        Err(e) => format!("runner.list error: {e}"),
+                    match client
+                        .call("runner.models", json!({"runner": state.runner}))
+                        .await
+                    {
+                        Ok(v) => {
+                            let models: Vec<String> = v["models"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(Value::as_str)
+                                .filter(|m| !m.is_empty())
+                                .map(str::to_owned)
+                                .collect();
+                            if models.is_empty() {
+                                "no models available for this provider".to_owned()
+                            } else {
+                                state.model_picker_all = models.clone();
+                                state.model_search.clear();
+                                state.slash_completions = models;
+                                state.slash_cursor = state
+                                    .model
+                                    .as_ref()
+                                    .and_then(|current| {
+                                        state.slash_completions.iter().position(|m| m == current)
+                                    })
+                                    .unwrap_or(0);
+                                state.model_picker_mode = true;
+                                state.slash_popup_visible = true;
+                                state.input.clear();
+                                state.input_cursor = 0;
+                                return Ok(true);
+                            }
+                        }
+                        Err(e) => match client.call("runner.list", json!({})).await {
+                            Ok(v) => {
+                                format!("model catalog unavailable: {e}\n{}", format_model_list(&v))
+                            }
+                            Err(_) => format!("runner.models error: {e}"),
+                        },
                     }
                 };
                 push_system_message(state, text);

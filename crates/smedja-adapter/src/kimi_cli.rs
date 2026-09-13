@@ -60,8 +60,7 @@ fn acp_disabled() -> bool {
 
 impl KimiCliProvider {
     /// Selects the CLI (ACP by default) if the `kimi` binary is on `$PATH`,
-    /// otherwise uses the environment API key (`MOONSHOT_API_KEY` /
-    /// `KIMI_API_KEY`).
+    /// otherwise uses the Moonshot Platform API key (`MOONSHOT_API_KEY`).
     ///
     /// Returns `None` if neither is available.
     #[must_use]

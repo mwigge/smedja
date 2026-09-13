@@ -186,6 +186,7 @@ const SLASH_COMMAND_DESCRIPTIONS: &[(&str, &str)] = &[
         "list provider capabilities (thinking, subprocess, model)",
     ),
     ("/clear", "clear message display"),
+    ("/connect", "set up a provider"),
     ("/cowork", "toggle cowork approval mode"),
     ("/drawio", "generate draw.io diagram"),
     ("/gov", "govctl artifacts"),
@@ -221,6 +222,7 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/briefing",
     "/capabilities",
     "/clear",
+    "/connect",
     "/cowork",
     "/drawio",
     "/gov",
@@ -262,6 +264,7 @@ slash commands:
   /health            — check daemon connectivity
   /help              — show this message
   /login             — authenticate with runner
+  /connect [provider] — choose a provider and enter its API key
   /loop [status|list|create <goal>|cancel] — manage loop runs
   /index [path]      — build the code graph for the workspace (auto-injected into context)
   /lsp               — show LSP server status and diagnostic summary

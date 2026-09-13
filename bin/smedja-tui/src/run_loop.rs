@@ -43,6 +43,10 @@ pub(crate) async fn run(session: bootstrap::Session) -> Result<()> {
                 match ev {
                     Event::Key(key) => {
                         handle_key(key, &mut state, &mut client, &mut editor).await?;
+                        if state.needs_clear {
+                            terminal.clear()?;
+                            state.needs_clear = false;
+                        }
                     }
                     Event::Mouse(mouse_ev) => match mouse_ev.kind {
                         MouseEventKind::ScrollDown => {

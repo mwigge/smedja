@@ -597,9 +597,17 @@ fn parse_runner_str_accepts_canonical_keys() {
 #[test]
 fn parse_runner_str_rejects_unknown_values() {
     use crate::common::parse_runner_str;
-    assert!(parse_runner_str("openai").is_none());
     assert!(parse_runner_str("").is_none());
-    assert!(parse_runner_str("anthropic").is_none());
+    assert!(parse_runner_str("not-a-provider").is_none());
+}
+
+#[test]
+fn parse_runner_str_accepts_native_api_names() {
+    use crate::common::parse_runner_str;
+    use smedja_assayer::Runner;
+    assert_eq!(parse_runner_str("openai"), Some(Runner::Codex));
+    assert_eq!(parse_runner_str("anthropic"), Some(Runner::Claude));
+    assert_eq!(parse_runner_str("moonshot"), Some(Runner::Kimi));
 }
 
 // ── session.set_runner / session.takeover ─────────────────────────────

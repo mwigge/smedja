@@ -61,6 +61,48 @@ pub const OPENCODE: OpenAiCompatSpec = OpenAiCompatSpec {
     base_url: "https://api.opencode.ai",
 };
 
+/// Mistral's OpenAI-compatible chat endpoint.
+pub const MISTRAL: OpenAiCompatSpec = OpenAiCompatSpec {
+    env_var: "MISTRAL_API_KEY",
+    base_url: "https://api.mistral.ai",
+};
+
+/// DeepSeek's OpenAI-compatible chat endpoint.
+pub const DEEPSEEK: OpenAiCompatSpec = OpenAiCompatSpec {
+    env_var: "DEEPSEEK_API_KEY",
+    base_url: "https://api.deepseek.com",
+};
+
+/// Ollama Cloud's OpenAI-compatible endpoint.
+pub const OLLAMA_CLOUD: OpenAiCompatSpec = OpenAiCompatSpec {
+    env_var: "OLLAMA_API_KEY",
+    base_url: "https://ollama.com",
+};
+
+/// OpenRouter's OpenAI-compatible chat endpoint.
+pub const OPENROUTER: OpenAiCompatSpec = OpenAiCompatSpec {
+    env_var: "OPENROUTER_API_KEY",
+    base_url: "https://openrouter.ai/api",
+};
+
+/// xAI's OpenAI-compatible chat endpoint.
+pub const XAI: OpenAiCompatSpec = OpenAiCompatSpec {
+    env_var: "XAI_API_KEY",
+    base_url: "https://api.x.ai",
+};
+
+/// GroqCloud's OpenAI-compatible endpoint.
+pub const GROQ: OpenAiCompatSpec = OpenAiCompatSpec {
+    env_var: "GROQ_API_KEY",
+    base_url: "https://api.groq.com/openai",
+};
+
+/// Cerebras Inference's OpenAI-compatible endpoint.
+pub const CEREBRAS: OpenAiCompatSpec = OpenAiCompatSpec {
+    env_var: "CEREBRAS_API_KEY",
+    base_url: "https://api.cerebras.ai",
+};
+
 /// A provider for any service that speaks the `OpenAI` chat-completions
 /// protocol, parameterised by an [`OpenAiCompatSpec`].
 pub struct OpenAiCompatProvider {
@@ -142,23 +184,24 @@ impl MinimaxProvider {
 ///
 /// Kimi honours a `MOONSHOT_BASE_URL` override (e.g. to select the
 /// mainland-China endpoint `https://api.moonshot.cn/v1`), and accepts the
-/// key from `MOONSHOT_API_KEY` (official convention) or `KIMI_API_KEY`
-/// (common third-party convention) — in that order.
+/// key from `MOONSHOT_API_KEY`. `KIMI_API_KEY` may represent a Kimi For
+/// Coding credential for a different endpoint and must not be routed here.
 pub struct KimiProvider;
 
 impl KimiProvider {
-    /// Returns `Some` when `MOONSHOT_API_KEY` (or `KIMI_API_KEY`) is set in
+    /// Returns `Some` when `MOONSHOT_API_KEY` is set in
     /// the environment.
     ///
-    /// The base URL defaults to `https://api.moonshot.ai/v1` but may be
+    /// The base URL defaults to `https://api.moonshot.ai` but may be
     /// overridden via the `MOONSHOT_BASE_URL` environment variable.
     #[must_use]
     pub fn detect() -> Option<OpenAiCompatProvider> {
-        let api_key = std::env::var(KIMI.env_var)
-            .or_else(|_| std::env::var("KIMI_API_KEY"))
-            .ok()?;
+        let api_key = std::env::var(KIMI.env_var).ok()?;
         match std::env::var("MOONSHOT_BASE_URL") {
-            Ok(base_url) => Some(OpenAiCompatProvider::with_base_url(KIMI, base_url, api_key)),
+            Ok(base_url) => {
+                let root = base_url.trim_end_matches('/').trim_end_matches("/v1");
+                Some(OpenAiCompatProvider::with_base_url(KIMI, root, api_key))
+            }
             Err(_) => Some(OpenAiCompatProvider::new(KIMI, api_key)),
         }
     }
@@ -240,6 +283,26 @@ mod tests {
     }
 
     #[test]
+    fn additional_suppliers_have_distinct_keys_and_https_endpoints() {
+        let specs = [
+            MISTRAL,
+            DEEPSEEK,
+            OLLAMA_CLOUD,
+            OPENROUTER,
+            XAI,
+            GROQ,
+            CEREBRAS,
+        ];
+        let mut keys = std::collections::HashSet::new();
+        for spec in specs {
+            assert!(spec.base_url.starts_with("https://"));
+            assert!(keys.insert(spec.env_var), "duplicate credential variable");
+            let provider = OpenAiCompatProvider::new(spec, "test-key");
+            assert_eq!(provider.base_url(), spec.base_url);
+        }
+    }
+
+    #[test]
     fn with_base_url_accepts_override() {
         let provider =
             OpenAiCompatProvider::with_base_url(OPENCODE, "https://staging.opencode.ai/v1", "k");
@@ -296,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn kimi_marker_detect_accepts_kimi_api_key_fallback() {
+    fn kimi_marker_does_not_confuse_coding_key_with_platform_key() {
         let _guard = ENV_LOCK.lock().unwrap();
         let saved = std::env::var("MOONSHOT_API_KEY").ok();
         std::env::remove_var("MOONSHOT_API_KEY");
@@ -306,7 +369,7 @@ mod tests {
         if let Some(v) = saved {
             std::env::set_var("MOONSHOT_API_KEY", v);
         }
-        assert!(provider.is_some());
+        assert!(provider.is_none());
     }
 
     #[test]
@@ -321,6 +384,17 @@ mod tests {
         std::env::remove_var("MOONSHOT_BASE_URL");
         let provider = provider.expect("key set → provider");
         assert_eq!(provider.env_var(), "MOONSHOT_API_KEY");
+        assert_eq!(provider.base_url(), "https://api.moonshot.cn");
+    }
+
+    #[test]
+    fn kimi_base_url_accepts_versioned_endpoint_without_doubling_v1() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("MOONSHOT_API_KEY", "test-key");
+        std::env::set_var("MOONSHOT_BASE_URL", "https://api.moonshot.cn/v1/");
+        let provider = KimiProvider::detect().expect("key set");
+        std::env::remove_var("MOONSHOT_API_KEY");
+        std::env::remove_var("MOONSHOT_BASE_URL");
         assert_eq!(provider.base_url(), "https://api.moonshot.cn");
     }
 

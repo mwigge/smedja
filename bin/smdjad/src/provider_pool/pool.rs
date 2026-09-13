@@ -30,6 +30,20 @@ pub struct ProviderPool {
 }
 
 impl ProviderPool {
+    /// Configured tier models for one runner, in stable pool order.
+    #[must_use]
+    pub fn models_for_runner(&self, runner: Runner) -> Vec<&str> {
+        self.order
+            .iter()
+            .filter(|(name, _)| *name == runner)
+            .filter_map(|key| {
+                self.entries
+                    .get(key)
+                    .map(|entry| entry.default_model.as_str())
+            })
+            .collect()
+    }
+
     /// Returns the `local` runner control plane, or `None` when no healthy local
     /// endpoint was detected at startup.
     #[must_use]

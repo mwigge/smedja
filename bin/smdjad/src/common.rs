@@ -132,12 +132,20 @@ pub(crate) fn runner_session_key(runner: Runner) -> &'static str {
         Runner::Claude => "claude-cli",
         Runner::Codex => "codex-cli",
         Runner::Kimi => "kimi-cli",
+        Runner::KimiCode => "kimi-code",
         Runner::Gemini => "gemini-cli",
         Runner::Local => "local",
         Runner::Copilot => "copilot",
         Runner::Minimax => "minimax",
         Runner::Berget => "berget",
         Runner::Pool => "pool",
+        Runner::Mistral => "mistral",
+        Runner::Deepseek => "deepseek",
+        Runner::OllamaCloud => "ollama-cloud",
+        Runner::Openrouter => "openrouter",
+        Runner::Xai => "xai",
+        Runner::Groq => "groq",
+        Runner::Cerebras => "cerebras",
     }
 }
 
@@ -147,15 +155,23 @@ pub(crate) fn runner_session_key(runner: Runner) -> &'static str {
 #[must_use]
 pub(crate) fn parse_runner_str(s: &str) -> Option<Runner> {
     match s {
-        "claude" | "claude-cli" => Some(Runner::Claude),
-        "codex" | "codex-cli" => Some(Runner::Codex),
+        "claude" | "claude-cli" | "anthropic" => Some(Runner::Claude),
+        "codex" | "codex-cli" | "openai" => Some(Runner::Codex),
         "kimi" | "kimi-cli" | "moonshot" => Some(Runner::Kimi),
+        "kimi-code" => Some(Runner::KimiCode),
         "gemini" | "gemini-cli" | "google" => Some(Runner::Gemini),
         "local" => Some(Runner::Local),
         "copilot" => Some(Runner::Copilot),
         "minimax" => Some(Runner::Minimax),
         "berget" => Some(Runner::Berget),
         "pool" | "poolside" => Some(Runner::Pool),
+        "mistral" => Some(Runner::Mistral),
+        "deepseek" => Some(Runner::Deepseek),
+        "ollama-cloud" | "ollama" => Some(Runner::OllamaCloud),
+        "openrouter" => Some(Runner::Openrouter),
+        "xai" | "grok" => Some(Runner::Xai),
+        "groq" => Some(Runner::Groq),
+        "cerebras" => Some(Runner::Cerebras),
         _ => None,
     }
 }

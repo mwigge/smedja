@@ -57,12 +57,20 @@ pub(super) fn runner_label(runner: Runner) -> &'static str {
         Runner::Claude => "claude",
         Runner::Codex => "codex",
         Runner::Kimi => "kimi",
+        Runner::KimiCode => "kimi-code",
         Runner::Gemini => "gemini",
         Runner::Local => "local",
         Runner::Copilot => "copilot",
         Runner::Minimax => "minimax",
         Runner::Berget => "berget",
         Runner::Pool => "pool",
+        Runner::Mistral => "mistral",
+        Runner::Deepseek => "deepseek",
+        Runner::OllamaCloud => "ollama-cloud",
+        Runner::Openrouter => "openrouter",
+        Runner::Xai => "xai",
+        Runner::Groq => "groq",
+        Runner::Cerebras => "cerebras",
     }
 }
 

@@ -491,12 +491,29 @@ async fn model_command_local_runner_lists_via_local_models() {
     );
 }
 
+#[tokio::test]
+async fn model_command_hosted_opens_catalog_picker() {
+    let (_dir, sock_path, rx) = spawn_method_capture(serde_json::json!({
+        "runner": "kimi", "verified": true, "models": ["kimi-k3", "kimi-k2.7-code-highspeed"]
+    }));
+    let mut client = Client::connect(&sock_path).await.unwrap();
+    let mut state = make_state("sess-kimi");
+    state.runner = "moonshot".to_owned();
+    dispatch_slash("/model", &mut state, &mut client)
+        .await
+        .unwrap();
+    assert_eq!(rx.await.unwrap(), "runner.models");
+    assert!(state.model_picker_mode);
+    assert_eq!(state.slash_completions[0], "kimi-k3");
+}
+
 #[test]
 fn slash_completions_include_new_commands() {
     let required = [
         "/agent",
         "/approve",
         "/briefing",
+        "/connect",
         "/login",
         "/metrics",
         "/model",
@@ -511,6 +528,38 @@ fn slash_completions_include_new_commands() {
             "{cmd} must be in SLASH_COMPLETIONS"
         );
     }
+}
+
+#[tokio::test]
+async fn connect_opens_picker_with_requested_suppliers() {
+    let (_dir, sock_path, rx) = spawn_method_capture(serde_json::json!({
+        "runners": [{"runner": "moonshot", "tier": "deep", "model": "kimi-k3"}]
+    }));
+    let mut client = Client::connect(&sock_path).await.unwrap();
+    let mut state = make_state("sess-connect");
+    dispatch_slash("/connect", &mut state, &mut client)
+        .await
+        .unwrap();
+    assert_eq!(rx.await.unwrap(), "runner.list");
+    assert!(state.connect_picker_mode);
+    assert!(state.slash_popup_visible);
+    for provider in [
+        "mistral",
+        "deepseek",
+        "kimi-code",
+        "ollama-cloud",
+        "groq",
+        "cerebras",
+    ] {
+        assert!(state
+            .slash_completions
+            .iter()
+            .any(|choice| choice.starts_with(provider)));
+    }
+    assert!(state
+        .slash_completions
+        .iter()
+        .any(|choice| choice == "moonshot  [detected]"));
 }
 
 #[test]
@@ -919,6 +968,7 @@ fn runner_picker_confirm_sets_runner_and_clears_mode() {
 fn clear_slash_popup_resets_runner_picker_mode() {
     let mut state = make_state("sess-popup");
     state.runner_picker_mode = true;
+    state.connect_picker_mode = true;
     state.slash_popup_visible = true;
     state.slash_completions = vec!["claude".to_owned()];
 
@@ -928,6 +978,7 @@ fn clear_slash_popup_resets_runner_picker_mode() {
         !state.runner_picker_mode,
         "runner_picker_mode must be false after clear"
     );
+    assert!(!state.connect_picker_mode);
     assert!(!state.slash_popup_visible);
     assert!(state.slash_completions.is_empty());
 }

@@ -50,7 +50,7 @@ pub(crate) mod sse;
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-pub use acp_client::{AcpAgentSpec, AcpProvider, GEMINI_ACP, KIMI_ACP};
+pub use acp_client::{AcpAgentSpec, AcpProvider, COPILOT_ACP, GEMINI_ACP, KIMI_ACP};
 pub use anthropic::AnthropicProvider;
 pub use claude_cli::ClaudeCliProvider;
 pub use codex_cli::CodexCliProvider;
@@ -72,7 +72,7 @@ pub use local::{
 pub use openai::OpenAiProvider;
 pub use openai_compat::{
     BergetProvider, KimiProvider, MinimaxProvider, OpenAiCompatProvider, OpenAiCompatSpec,
-    OpenCodeProvider,
+    OpenCodeProvider, CEREBRAS, DEEPSEEK, GROQ, MISTRAL, OLLAMA_CLOUD, OPENROUTER, XAI,
 };
 pub use pool_cli::PoolCliProvider;
 pub use provider::{DeltaStream, Provider};

@@ -92,9 +92,17 @@ fn parse_runner(s: &str) -> Option<Runner> {
         "local" => Some(Runner::Local),
         "codex" => Some(Runner::Codex),
         "kimi" => Some(Runner::Kimi),
+        "kimi-code" => Some(Runner::KimiCode),
         "gemini" => Some(Runner::Gemini),
         "copilot" => Some(Runner::Copilot),
         "pool" | "poolside" => Some(Runner::Pool),
+        "mistral" => Some(Runner::Mistral),
+        "deepseek" => Some(Runner::Deepseek),
+        "ollama-cloud" | "ollama" => Some(Runner::OllamaCloud),
+        "openrouter" => Some(Runner::Openrouter),
+        "xai" | "grok" => Some(Runner::Xai),
+        "groq" => Some(Runner::Groq),
+        "cerebras" => Some(Runner::Cerebras),
         _ => None,
     }
 }

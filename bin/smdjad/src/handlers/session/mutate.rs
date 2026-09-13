@@ -9,7 +9,7 @@ use super::*;
 ///
 /// Returns an error when `session_id`/`model` is missing or the ingot write fails.
 pub(crate) async fn set_model(state: HandlerState, params: Value) -> Result<Value, RpcError> {
-    let ig = state.ingot;
+    let ig = state.ingot.clone();
     let session_id = params["session_id"]
         .as_str()
         .ok_or_else(|| missing_param("session_id"))?
@@ -18,6 +18,25 @@ pub(crate) async fn set_model(state: HandlerState, params: Value) -> Result<Valu
         .as_str()
         .ok_or_else(|| missing_param("model"))?
         .to_owned();
+    let runner = ig
+        .get_session(&session_id)
+        .await
+        .map_err(|e| ingot_err(&e))?
+        .and_then(|s| s.runner_override)
+        .unwrap_or_else(|| state.startup_runner.to_string());
+    let catalog = query::runner_models(state, json!({"runner": runner})).await?;
+    if catalog["verified"].as_bool() == Some(true)
+        && !catalog["models"]
+            .as_array()
+            .is_some_and(|models| models.iter().any(|item| item.as_str() == Some(&model)))
+    {
+        return Err(RpcError::new(
+            codes::INVALID_PARAMS,
+            format!(
+                "model {model} is unavailable for {runner}; use /model to list available models"
+            ),
+        ));
+    }
     ig.update_session_model_override(&session_id, &model)
         .await
         .map_err(|e| ingot_err(&e))?;
@@ -28,15 +47,26 @@ pub(crate) async fn set_model(state: HandlerState, params: Value) -> Result<Valu
 /// a [`Runner`]. Returns `None` for unknown runners.
 pub(crate) fn parse_runner_name(s: &str) -> Option<smedja_assayer::Runner> {
     use smedja_assayer::Runner;
-    match s.trim().to_ascii_lowercase().split('-').next()? {
-        "claude" => Some(Runner::Claude),
-        "codex" => Some(Runner::Codex),
+    let lower = s.trim().to_ascii_lowercase();
+    if lower == "kimi-code" {
+        return Some(Runner::KimiCode);
+    }
+    match lower.split('-').next()? {
+        "claude" | "anthropic" => Some(Runner::Claude),
+        "codex" | "openai" => Some(Runner::Codex),
         "kimi" | "moonshot" => Some(Runner::Kimi),
         "gemini" | "google" => Some(Runner::Gemini),
         "local" => Some(Runner::Local),
         "copilot" => Some(Runner::Copilot),
         "minimax" => Some(Runner::Minimax),
         "berget" => Some(Runner::Berget),
+        "mistral" => Some(Runner::Mistral),
+        "deepseek" => Some(Runner::Deepseek),
+        "ollama" | "ollama-cloud" => Some(Runner::OllamaCloud),
+        "openrouter" => Some(Runner::Openrouter),
+        "xai" | "grok" => Some(Runner::Xai),
+        "groq" => Some(Runner::Groq),
+        "cerebras" => Some(Runner::Cerebras),
         _ => None,
     }
 }
@@ -63,6 +93,7 @@ pub(crate) fn parse_tier_name(s: &str) -> Option<smedja_assayer::Tier> {
 /// Returns an error when `session_id`/`tier` is missing, the tier is unknown,
 /// or no model is configured for the (runner, tier) pair.
 pub(crate) async fn set_tier(state: HandlerState, params: Value) -> Result<Value, RpcError> {
+    let catalog_state = state.clone();
     let ig = state.ingot;
     let pool = state.provider_pool;
     let session_id = params["session_id"]
@@ -103,6 +134,18 @@ pub(crate) async fn set_tier(state: HandlerState, params: Value) -> Result<Value
             )
         })?;
 
+    if pool.get(runner, tier).is_some() {
+        let catalog = query::runner_models(catalog_state, json!({"runner": runner_str})).await?;
+        if catalog["verified"].as_bool() == Some(true)
+            && !catalog["models"]
+                .as_array()
+                .is_some_and(|models| models.iter().any(|item| item.as_str() == Some(&model)))
+        {
+            return Err(RpcError::new(codes::INVALID_PARAMS,
+                format!("{model} is unavailable for {runner_str}; choose an available model with /model")));
+        }
+    }
+
     ig.update_session_model_override(&session_id, &model)
         .await
         .map_err(|e| ingot_err(&e))?;
@@ -137,7 +180,33 @@ pub(crate) async fn set_runner(state: HandlerState, params: Value) -> Result<Val
         .as_str()
         .ok_or_else(|| missing_param("runner"))?
         .to_owned();
-    set_runner_with(&state.ingot, &session_id, &runner_str).await
+    let mut runner = crate::common::parse_runner_str(&runner_str).ok_or_else(|| {
+        RpcError::new(
+            codes::INVALID_PARAMS,
+            format!("unknown runner: {runner_str}"),
+        )
+    })?;
+    if runner == smedja_assayer::Runner::KimiCode
+        && state.provider_pool.models_for_runner(runner).is_empty()
+        && state
+            .provider_pool
+            .get(smedja_assayer::Runner::Kimi, smedja_assayer::Tier::Fast)
+            .is_some_and(|entry| entry.runner_name == "kimi-cli")
+    {
+        runner = smedja_assayer::Runner::Kimi;
+    }
+    if state.provider_pool.models_for_runner(runner).is_empty() {
+        return Err(RpcError::new(
+            codes::INVALID_PARAMS,
+            format!("{runner_str} is not ready; use /connect to set it up"),
+        ));
+    }
+    set_runner_with(
+        &state.ingot,
+        &session_id,
+        crate::common::runner_session_key(runner),
+    )
+    .await
 }
 
 /// Core of `session.set_runner`, factored out so tests can exercise it
@@ -153,7 +222,7 @@ pub(crate) async fn set_runner_with(
         .ok_or_else(|| {
             RpcError::new(
                 codes::INVALID_PARAMS,
-                format!("unknown runner: {runner_str}; valid: claude, codex, kimi, gemini, local, copilot, minimax, berget"),
+                format!("unknown runner: {runner_str}; valid: claude, codex, kimi, gemini, local, copilot, minimax, berget, mistral, deepseek, ollama-cloud, openrouter, xai, groq, cerebras"),
             )
         })?;
     ig.update_session_runner_override(session_id, canonical)

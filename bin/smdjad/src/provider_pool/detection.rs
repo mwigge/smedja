@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use smedja_adapter::{
     AcpProvider, AnthropicProvider, BergetProvider, ClaudeCliProvider, CodexCliProvider,
     CopilotProvider, GeminiProvider, KimiCliProvider, KimiProvider, LocalProvider, MinimaxProvider,
-    OpenAiProvider, PoolCliProvider, SubprocessProvider, GEMINI_ACP,
+    OpenAiCompatProvider, OpenAiProvider, PoolCliProvider, SubprocessProvider, CEREBRAS, DEEPSEEK,
+    GEMINI_ACP, GROQ, MISTRAL, OLLAMA_CLOUD, OPENROUTER, XAI,
 };
 use smedja_assayer::{Runner, Tier};
 use tracing::{error, info, warn};
@@ -241,6 +242,30 @@ pub async fn build_provider_pool() -> ProviderPool {
         );
     }
 
+    // When a Moonshot Platform key and a Kimi Code subscription coexist,
+    // retain a separately selectable gated CLI path instead of hiding it
+    // behind the API-preferred `kimi` runner.
+    if KimiProvider::detect().is_some() && SubprocessProvider::available("kimi") {
+        if let Some(p_fast) = KimiCliProvider::detect() {
+            add!(
+                Runner::KimiCode,
+                Tier::Fast,
+                p_fast,
+                "kimi-code",
+                "kimi-code/kimi-for-coding-highspeed"
+            );
+            if let Some(p_deep) = KimiCliProvider::detect() {
+                add!(
+                    Runner::KimiCode,
+                    Tier::Deep,
+                    p_deep,
+                    "kimi-code",
+                    "kimi-code/k3"
+                );
+            }
+        }
+    }
+
     // 4. Gemini — native API preferred; the gemini CLI binary is the fallback,
     //    driven over ACP so its tool calls are gated like kimi's.
     if std::env::var("GEMINI_API_KEY").is_ok() {
@@ -291,7 +316,7 @@ pub async fn build_provider_pool() -> ProviderPool {
 
     // 5. Copilot
     if let Some(p) = CopilotProvider::detect() {
-        add!(Runner::Copilot, Tier::Fast, p, "copilot", "gpt-5.5");
+        add!(Runner::Copilot, Tier::Fast, p, "copilot", "");
         info!(runner = "copilot", "provider ready");
     }
 
@@ -315,6 +340,84 @@ pub async fn build_provider_pool() -> ProviderPool {
     if let Some(p) = BergetProvider::detect() {
         add!(Runner::Berget, Tier::Local, p, "berget", "gpt-4o-mini");
         info!(runner = "berget", "provider ready");
+    }
+
+    // Additional OpenAI-compatible suppliers. Each has its own runner identity
+    // so selection and fallback never silently substitute another account.
+    for (runner, spec, name, fast, deep) in [
+        (
+            Runner::Mistral,
+            MISTRAL,
+            "mistral",
+            "mistral-small-latest",
+            "mistral-large-latest",
+        ),
+        (
+            Runner::Deepseek,
+            DEEPSEEK,
+            "deepseek",
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+        ),
+        (
+            Runner::OllamaCloud,
+            OLLAMA_CLOUD,
+            "ollama-cloud",
+            "gpt-oss:20b",
+            "gpt-oss:120b",
+        ),
+        (
+            Runner::Openrouter,
+            OPENROUTER,
+            "openrouter",
+            "~openai/gpt-latest",
+            "~openai/gpt-latest",
+        ),
+        (Runner::Xai, XAI, "xai", "grok-4.3", "grok-4.6"),
+        (
+            Runner::Groq,
+            GROQ,
+            "groq",
+            "openai/gpt-oss-20b",
+            "openai/gpt-oss-120b",
+        ),
+        (
+            Runner::Cerebras,
+            CEREBRAS,
+            "cerebras",
+            "gpt-oss-120b",
+            "gpt-oss-120b",
+        ),
+    ] {
+        if let Some(p_fast) = OpenAiCompatProvider::detect(spec) {
+            // `add!` requires static model literals to feed model_default.
+            // Build these entries directly for data-driven suppliers.
+            for (tier, model, provider) in [
+                (Tier::Fast, fast, p_fast),
+                (
+                    Tier::Deep,
+                    deep,
+                    OpenAiCompatProvider::detect(spec).expect("key present"),
+                ),
+            ] {
+                let key = (runner, tier);
+                entries.insert(
+                    key,
+                    ProviderEntry {
+                        provider: Box::new(provider),
+                        runner,
+                        tier,
+                        runner_name: name,
+                        default_model: model_default(name, tier, model),
+                    },
+                );
+                order.push(key);
+                if default.is_none() {
+                    default = Some(key);
+                }
+            }
+            info!(runner = name, "provider ready");
+        }
     }
 
     // 10. Local rs-llmctl

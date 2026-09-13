@@ -1,5 +1,7 @@
 //! Secrets storage — write API keys to `~/.config/smedja/secrets.env`.
 
+use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
@@ -37,25 +39,21 @@ fn save_to_path(var: &str, value: &str, path: &Path) -> String {
         .collect();
     lines.push(format!("{var}={value}"));
     let body = format!("{}\n", lines.join("\n"));
-    if std::fs::write(path, body).is_err() {
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()
+    })();
+    if write_result.is_err() {
         return format!("login: failed to write {}", path.display());
     }
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    format!(
-        "\u{2713} saved {var} to {} (0600). Activate: {}",
-        path.display(),
-        activation_hint()
-    )
-}
-
-fn activation_hint() -> &'static str {
-    if cfg!(target_os = "linux") {
-        "add\n  EnvironmentFile=%h/.config/smedja/secrets.env\nto the smdjad unit, then: systemctl --user restart smdjad"
-    } else if cfg!(target_os = "macos") {
-        "restart smdjad with `launchctl kickstart -k gui/$(id -u)/nu.wigge.smedja.smdjad`"
-    } else {
-        "restart smdjad so it inherits the updated environment"
-    }
+    format!("\u{2713} saved {var} to {} (0600)", path.display())
 }
 
 fn valid_env_name(var: &str) -> bool {

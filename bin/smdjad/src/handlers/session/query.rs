@@ -145,6 +145,209 @@ pub(crate) async fn runner_list(state: HandlerState, _params: Value) -> Result<V
     Ok(json!({ "runners": runners }))
 }
 
+/// Lists models from the authenticated provider when it exposes a standard
+/// catalog. CLI-backed runners fall back to their configured tier models.
+pub(crate) async fn runner_models(state: HandlerState, params: Value) -> Result<Value, RpcError> {
+    let runner = params["runner"]
+        .as_str()
+        .ok_or_else(|| missing_param("runner"))?;
+    let canonical = mutate::parse_runner_name(runner)
+        .ok_or_else(|| RpcError::new(codes::INVALID_PARAMS, format!("unknown runner: {runner}")))?;
+    let configured: Vec<String> = state
+        .provider_pool
+        .models_for_runner(canonical)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    if configured.is_empty() {
+        return Err(RpcError::new(
+            codes::INVALID_PARAMS,
+            format!("runner {runner} is not ready"),
+        ));
+    }
+    let remote = match canonical {
+        smedja_assayer::Runner::Claude => Some((
+            "https://api.anthropic.com/v1/models".to_owned(),
+            "ANTHROPIC_API_KEY",
+            true,
+        )),
+        smedja_assayer::Runner::Codex => Some((
+            "https://api.openai.com/v1/models".to_owned(),
+            "OPENAI_API_KEY",
+            false,
+        )),
+        smedja_assayer::Runner::Kimi => Some((
+            format!(
+                "{}/v1/models",
+                std::env::var("MOONSHOT_BASE_URL")
+                    .unwrap_or_else(|_| "https://api.moonshot.ai".to_owned())
+                    .trim_end_matches('/')
+                    .trim_end_matches("/v1")
+            ),
+            "MOONSHOT_API_KEY",
+            false,
+        )),
+        smedja_assayer::Runner::Mistral => Some((
+            "https://api.mistral.ai/v1/models".to_owned(),
+            "MISTRAL_API_KEY",
+            false,
+        )),
+        smedja_assayer::Runner::Deepseek => Some((
+            "https://api.deepseek.com/models".to_owned(),
+            "DEEPSEEK_API_KEY",
+            false,
+        )),
+        smedja_assayer::Runner::OllamaCloud => Some((
+            "https://ollama.com/v1/models".to_owned(),
+            "OLLAMA_API_KEY",
+            false,
+        )),
+        smedja_assayer::Runner::Openrouter => Some((
+            "https://openrouter.ai/api/v1/models".to_owned(),
+            "OPENROUTER_API_KEY",
+            false,
+        )),
+        smedja_assayer::Runner::Xai => Some((
+            "https://api.x.ai/v1/models".to_owned(),
+            "XAI_API_KEY",
+            false,
+        )),
+        smedja_assayer::Runner::Groq => Some((
+            "https://api.groq.com/openai/v1/models".to_owned(),
+            "GROQ_API_KEY",
+            false,
+        )),
+        smedja_assayer::Runner::Cerebras => Some((
+            "https://api.cerebras.ai/v1/models".to_owned(),
+            "CEREBRAS_API_KEY",
+            false,
+        )),
+        _ => None,
+    };
+    if let Some((url, env_var, anthropic)) = remote {
+        if let Ok(key) = std::env::var(env_var) {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(8))
+                .build()
+                .map_err(|e| RpcError::new(codes::INTERNAL_ERROR, e.to_string()))?;
+            let request = if anthropic {
+                client
+                    .get(url)
+                    .header("x-api-key", key)
+                    .header("anthropic-version", "2023-06-01")
+            } else {
+                client.get(url).bearer_auth(key)
+            };
+            let response = request.send().await.map_err(|e| {
+                RpcError::new(
+                    codes::INTERNAL_ERROR,
+                    format!("model catalog unavailable: {e}"),
+                )
+            })?;
+            if !response.status().is_success() {
+                return Err(RpcError::new(
+                    codes::INVALID_PARAMS,
+                    format!("provider model catalog returned HTTP {}", response.status()),
+                ));
+            }
+            let value: Value = response.json().await.map_err(|e| {
+                RpcError::new(codes::INTERNAL_ERROR, format!("invalid model catalog: {e}"))
+            })?;
+            let models: Vec<String> = value["data"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|m| m["id"].as_str().map(str::to_owned))
+                .collect();
+            let authenticated_catalog = !matches!(
+                canonical,
+                smedja_assayer::Runner::OllamaCloud | smedja_assayer::Runner::Openrouter
+            );
+            return Ok(
+                json!({"runner": runner, "models": models, "verified": authenticated_catalog}),
+            );
+        }
+    }
+    Ok(json!({"runner": runner, "models": configured, "verified": false}))
+}
+
+/// Checks a newly entered API key before it is saved. The key is used only for
+/// this outbound request and is never included in a response or error string.
+pub(crate) async fn check_provider_key(
+    _state: HandlerState,
+    params: Value,
+) -> Result<Value, RpcError> {
+    let provider = params["provider"]
+        .as_str()
+        .ok_or_else(|| missing_param("provider"))?;
+    let key = params["key"].as_str().ok_or_else(|| missing_param("key"))?;
+    if key.trim().is_empty() {
+        return Err(RpcError::new(codes::INVALID_PARAMS, "empty API key"));
+    }
+    let moonshot_url = format!(
+        "{}/v1/models",
+        std::env::var("MOONSHOT_BASE_URL")
+            .unwrap_or_else(|_| "https://api.moonshot.ai".to_owned())
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+    );
+    let (url, header) = match provider {
+        "ANTHROPIC_API_KEY" => ("https://api.anthropic.com/v1/models", true),
+        "OPENAI_API_KEY" => ("https://api.openai.com/v1/models", false),
+        "MOONSHOT_API_KEY" => (moonshot_url.as_str(), false),
+        "MISTRAL_API_KEY" => ("https://api.mistral.ai/v1/models", false),
+        "DEEPSEEK_API_KEY" => ("https://api.deepseek.com/models", false),
+        "OPENROUTER_API_KEY" => ("https://openrouter.ai/api/v1/key", false),
+        "XAI_API_KEY" => ("https://api.x.ai/v1/models", false),
+        "GROQ_API_KEY" => ("https://api.groq.com/openai/v1/models", false),
+        "CEREBRAS_API_KEY" => ("https://api.cerebras.ai/v1/models", false),
+        // These providers do not offer a documented authenticated read-only
+        // key check. Do not claim their keys have been verified.
+        "OLLAMA_API_KEY" | "MINIMAX_API_KEY" | "BERGET_API_KEY" | "GEMINI_API_KEY" => {
+            return Ok(json!({"verified": false}))
+        }
+        _ => {
+            return Err(RpcError::new(
+                codes::INVALID_PARAMS,
+                "unsupported provider key",
+            ))
+        }
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|_| RpcError::new(codes::INTERNAL_ERROR, "cannot create HTTP client"))?;
+    let request = if header {
+        client
+            .get(url)
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01")
+    } else {
+        client.get(url).bearer_auth(key)
+    };
+    let response = request
+        .send()
+        .await
+        .map_err(|_| RpcError::new(codes::INTERNAL_ERROR, "provider unreachable; key not saved"))?;
+    if !response.status().is_success() {
+        return Err(RpcError::new(
+            codes::INVALID_PARAMS,
+            format!(
+                "provider rejected key or catalog request (HTTP {})",
+                response.status()
+            ),
+        ));
+    }
+    let body: Value = response.json().await.unwrap_or(Value::Null);
+    let models: Vec<&str> = body["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["id"].as_str())
+        .collect();
+    Ok(json!({"verified": true, "models": models}))
+}
+
 /// Handles `session.context`: token-window usage plus vault warm/cold counts.
 ///
 /// # Errors

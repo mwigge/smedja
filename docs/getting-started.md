@@ -52,19 +52,25 @@ cp target/release/{smdjad,smj,smedja-tui,smedja} ~/.local/bin/
 
 ## 2. Configure a provider
 
-smedja needs an LLM provider to generate responses. The easiest way to get started is with Anthropic's API:
+Start `smdjad` and `smedja-tui`, then run `/connect`. A new installation with
+no ready provider opens the provider picker automatically. Choose a provider,
+paste its API key in the hidden input, and Smedja checks the key where the
+provider offers a read-only check. On a managed Linux installation, the active
+daemon restarts and the TUI reconnects. If you run the daemon manually, restart
+it after saving a key. Smedja also reads saved keys from
+`~/.config/smedja/secrets.env` when started directly.
 
-```sh
-export ANTHROPIC_API_KEY=sk-ant-...   # add to ~/.bashrc or ~/.zshrc to persist
-```
+`/connect` offers Claude (subscription or Anthropic API), Codex (subscription
+or OpenAI API), GitHub Copilot, Mistral, DeepSeek, Kimi Code, Moonshot Platform,
+Ollama Cloud, MiniMax, Berget, Gemini, OpenRouter, xAI, Groq, and Cerebras. CLI subscriptions
+use the provider's own login command, then a daemon restart. Kimi Code uses
+the gated `kimi acp` path; Moonshot Platform uses its separate API key and
+endpoint. Use `/switch` to select a ready runner and `/model` to inspect its
+model catalog. The `MOONSHOT_BASE_URL` override selects a regional Platform
+endpoint and must match the region that issued the key.
 
-Or, to use a local model via an OpenAI-compatible server (Ollama, llama-swap, etc.):
-
-```sh
-export SMEDJA_LOCAL_ENDPOINT=http://127.0.0.1:11434/v1
-```
-
-smdjad will automatically detect and use a configured provider. If no provider is configured, turns will fail with a DEGRADED status — check `smj status` or the TUI status bar for provider health.
+For a local model via an OpenAI-compatible server (Ollama, llama-swap, etc.),
+set `SMEDJA_LOCAL_ENDPOINT=http://127.0.0.1:11434/v1` before starting the daemon.
 
 ---
 

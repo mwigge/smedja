@@ -21,6 +21,9 @@ pub enum Runner {
     Codex,
     /// Kimi / Moonshot AI (cloud).
     Kimi,
+    /// Kimi Code CLI subscription path, independently selectable from Moonshot API.
+    #[serde(rename = "kimi-code")]
+    KimiCode,
     /// Google Gemini (cloud).
     Gemini,
     /// Local model running on device — no cloud egress.
@@ -33,6 +36,21 @@ pub enum Runner {
     Berget,
     /// Poolside (cloud, `pool` CLI).
     Pool,
+    /// Mistral AI API.
+    Mistral,
+    /// DeepSeek API.
+    Deepseek,
+    /// Ollama Cloud API.
+    #[serde(rename = "ollama-cloud")]
+    OllamaCloud,
+    /// OpenRouter gateway.
+    Openrouter,
+    /// xAI Grok API.
+    Xai,
+    /// GroqCloud API.
+    Groq,
+    /// Cerebras Inference API.
+    Cerebras,
 }
 
 /// The execution tier that controls latency vs. capability trade-offs.
@@ -308,12 +326,20 @@ mod tests {
             Runner::Claude,
             Runner::Codex,
             Runner::Kimi,
+            Runner::KimiCode,
             Runner::Gemini,
             Runner::Local,
             Runner::Copilot,
             Runner::Minimax,
             Runner::Berget,
             Runner::Pool,
+            Runner::Mistral,
+            Runner::Deepseek,
+            Runner::OllamaCloud,
+            Runner::Openrouter,
+            Runner::Xai,
+            Runner::Groq,
+            Runner::Cerebras,
         ] {
             let json = serde_json::to_string(&runner).expect("serialise runner");
             let back: Runner = serde_json::from_str(&json).expect("deserialise runner");

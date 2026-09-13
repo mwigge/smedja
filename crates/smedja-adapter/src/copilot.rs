@@ -1,43 +1,16 @@
-//! GitHub Copilot provider — CLI-first with `GITHUB_TOKEN` fallback.
+//! GitHub Copilot CLI provider, driven over gated ACP.
 
-use crate::{CallOptions, DeltaStream, Message, OpenAiProvider, Provider, SubprocessProvider};
+use crate::{AcpProvider, COPILOT_ACP};
 
-/// Runs the `gh copilot suggest` CLI if available; falls back to the Copilot HTTP API.
-pub enum CopilotProvider {
-    /// Delegates to the locally installed `gh` CLI with the copilot extension.
-    Cli(SubprocessProvider),
-    /// Delegates to the GitHub Copilot HTTP API using a `GITHUB_TOKEN` bearer key.
-    Api(OpenAiProvider),
-}
+/// Entry point for the installed `copilot` CLI. Authentication is managed by
+/// the CLI (`copilot login` or a supported token environment variable).
+pub struct CopilotProvider;
 
 impl CopilotProvider {
-    /// Returns `Some(Self)` if either `gh` binary is on `$PATH` or `GITHUB_TOKEN` is set.
+    /// Returns a provider only when the current Copilot CLI is installed.
     #[must_use]
-    pub fn detect() -> Option<Self> {
-        if which::which("gh").is_ok() {
-            return Some(Self::Cli(SubprocessProvider::new(
-                "gh",
-                vec![
-                    "copilot".into(),
-                    "suggest".into(),
-                    "-t".into(),
-                    "code".into(),
-                    "-m".into(),
-                ],
-            )));
-        }
-        std::env::var("GITHUB_TOKEN")
-            .ok()
-            .map(|key| Self::Api(OpenAiProvider::new("https://api.githubcopilot.com", key)))
-    }
-}
-
-impl Provider for CopilotProvider {
-    fn stream_chat(&self, messages: &[Message], opts: &CallOptions) -> DeltaStream {
-        match self {
-            Self::Cli(p) => p.stream_chat(messages, opts),
-            Self::Api(p) => p.stream_chat(messages, opts),
-        }
+    pub fn detect() -> Option<AcpProvider> {
+        AcpProvider::detect(COPILOT_ACP)
     }
 }
 
@@ -46,41 +19,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detect_returns_cli_when_gh_on_path() {
-        // This test is conditional: if `gh` is on PATH, Cli is selected.
-        if which::which("gh").is_ok() {
-            let provider = CopilotProvider::detect();
-            assert!(matches!(provider, Some(CopilotProvider::Cli(_))));
-        }
-    }
-
-    #[test]
-    fn detect_returns_api_when_no_gh_but_token_set() {
-        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
-        if which::which("gh").is_ok() {
-            // CLI wins; skip this case.
-            return;
-        }
-        // Temporarily set the env var to verify the fallback.
-        std::env::set_var("GITHUB_TOKEN", "test-token");
-        let provider = CopilotProvider::detect();
-        std::env::remove_var("GITHUB_TOKEN");
-        assert!(matches!(provider, Some(CopilotProvider::Api(_))));
-    }
-
-    #[test]
-    fn detect_returns_none_when_no_gh_and_no_token() {
-        let _env_guard = crate::TEST_ENV_LOCK.lock().unwrap();
-        if which::which("gh").is_ok() {
-            // CLI wins; can't test the None path.
-            return;
-        }
-        let saved = std::env::var("GITHUB_TOKEN").ok();
-        std::env::remove_var("GITHUB_TOKEN");
-        let provider = CopilotProvider::detect();
-        if let Some(v) = saved {
-            std::env::set_var("GITHUB_TOKEN", v);
-        }
-        assert!(provider.is_none());
+    fn detection_matches_current_cli_availability() {
+        assert_eq!(
+            CopilotProvider::detect().is_some(),
+            crate::SubprocessProvider::available("copilot")
+        );
     }
 }

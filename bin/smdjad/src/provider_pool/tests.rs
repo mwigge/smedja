@@ -74,6 +74,35 @@ fn pool_with(entries: Vec<((Runner, Tier), &'static str, &'static str)>) -> Prov
 }
 
 #[test]
+fn models_for_runner_keeps_supplier_models_separate() {
+    let pool = pool_with(vec![
+        (
+            (Runner::Mistral, Tier::Fast),
+            "mistral",
+            "mistral-small-latest",
+        ),
+        (
+            (Runner::Deepseek, Tier::Fast),
+            "deepseek",
+            "deepseek-v4-flash",
+        ),
+        (
+            (Runner::Mistral, Tier::Deep),
+            "mistral",
+            "mistral-large-latest",
+        ),
+    ]);
+    assert_eq!(
+        pool.models_for_runner(Runner::Mistral),
+        vec!["mistral-small-latest", "mistral-large-latest"]
+    );
+    assert_eq!(
+        pool.models_for_runner(Runner::Deepseek),
+        vec!["deepseek-v4-flash"]
+    );
+}
+
+#[test]
 fn local_control_exposes_inventory_and_mutable_active_model() {
     let control = LocalControl::new(
         "http://127.0.0.1:9090".to_owned(),

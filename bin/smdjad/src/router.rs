@@ -164,6 +164,18 @@ pub(crate) fn build_router(
         handlers::cost::active_change
     );
     route!(router, "runner.list", state, handlers::session::runner_list);
+    route!(
+        router,
+        "runner.models",
+        state,
+        handlers::session::runner_models
+    );
+    route!(
+        router,
+        "provider.check_key",
+        state,
+        handlers::session::check_provider_key
+    );
     route!(router, "turn.submit", state, handlers::turn::submit);
     route!(router, "turn.cancel", state, handlers::turn::cancel);
     // Blocks until terminal status or 60 s deadline; event-driven, no poll.
