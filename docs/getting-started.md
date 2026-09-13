@@ -55,19 +55,32 @@ cp target/release/{smdjad,smj,smedja-tui,smedja} ~/.local/bin/
 Start `smdjad` and `smedja-tui`, then run `/connect`. A new installation with
 no ready provider opens the provider picker automatically. Choose a provider,
 paste its API key in the hidden input, and Smedja checks the key where the
-provider offers a read-only check. On a managed Linux installation, the active
-daemon restarts and the TUI reconnects. If you run the daemon manually, restart
-it after saving a key. Smedja also reads saved keys from
+provider offers a read-only check. The daemon reloads its provider pool after
+the key is saved, so a restart is not needed for API-key setup. Smedja also reads saved keys from
 `~/.config/smedja/secrets.env` when started directly.
 
 `/connect` offers Claude (subscription or Anthropic API), Codex (subscription
 or OpenAI API), GitHub Copilot, Mistral, DeepSeek, Kimi Code, Moonshot Platform,
 Ollama Cloud, MiniMax, Berget, Gemini, OpenRouter, xAI, Groq, and Cerebras. CLI subscriptions
-use the provider's own login command, then a daemon restart. Kimi Code uses
+use the provider's own login command, then a provider reload. Kimi Code uses
 the gated `kimi acp` path; Moonshot Platform uses its separate API key and
 endpoint. Use `/switch` to select a ready runner and `/model` to inspect its
 model catalog. The `MOONSHOT_BASE_URL` override selects a regional Platform
 endpoint and must match the region that issued the key.
+
+With a Moonshot Platform account that exposes K3, an opt-in live smoke test
+checks the authenticated catalog, streamed K3 text, and a follow-up turn:
+`MOONSHOT_API_KEY=... cargo test -p smedja-adapter live_moonshot_k3_stream_and_follow_up -- --ignored`.
+It makes two short paid requests. Kimi Code subscription approval and usage
+behavior still require a separate manual account test.
+
+For another OpenAI-compatible API, put `SMEDJA_COMPAT_BASE_URL=https://example.com`
+(the API root, without `/v1`) and `SMEDJA_COMPAT_MODEL=model-id` in
+`~/.config/smedja/secrets.env` (mode 0600). Restart a daemon that was already
+running so it reads those two settings, then run `/connect custom` and enter
+its API key. Smedja checks the
+key against `/v1/models`, saves it privately, and reloads the provider pool
+without restarting. The endpoint must use HTTPS, or HTTP on localhost.
 
 For a local model via an OpenAI-compatible server (Ollama, llama-swap, etc.),
 set `SMEDJA_LOCAL_ENDPOINT=http://127.0.0.1:11434/v1` before starting the daemon.

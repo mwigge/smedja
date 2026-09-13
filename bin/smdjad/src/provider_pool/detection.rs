@@ -3,10 +3,10 @@
 use std::collections::HashMap;
 
 use smedja_adapter::{
-    AcpProvider, AnthropicProvider, BergetProvider, ClaudeCliProvider, CodexCliProvider,
-    CopilotProvider, GeminiProvider, KimiCliProvider, KimiProvider, LocalProvider, MinimaxProvider,
-    OpenAiCompatProvider, OpenAiProvider, PoolCliProvider, SubprocessProvider, CEREBRAS, DEEPSEEK,
-    GEMINI_ACP, GROQ, MISTRAL, OLLAMA_CLOUD, OPENROUTER, XAI,
+    AcpProvider, AnthropicProvider, ClaudeCliProvider, CodexCliProvider, CopilotProvider,
+    GeminiProvider, KimiCliProvider, LocalProvider, OpenAiCompatProvider, OpenAiProvider,
+    PoolCliProvider, SubprocessProvider, BERGET, CEREBRAS, DEEPSEEK, GEMINI_ACP, GROQ, KIMI,
+    MINIMAX, MISTRAL, OLLAMA_CLOUD, OPENROUTER, XAI,
 };
 use smedja_assayer::{Runner, Tier};
 use tracing::{error, info, warn};
@@ -81,6 +81,13 @@ pub(crate) fn gemini_preferred_runner(has_api_key: bool, has_binary: bool) -> Op
 /// logged and skipped rather than aborting pool construction.
 #[allow(clippy::too_many_lines)] // sequential provider probes kept inline; each branch logs a distinct readiness signal
 pub async fn build_provider_pool() -> ProviderPool {
+    build_provider_pool_with_keys(&HashMap::new()).await
+}
+
+/// Build a replacement pool using saved credentials without changing process
+/// environment while other daemon threads are running.
+pub async fn build_provider_pool_with_keys(keys: &HashMap<String, String>) -> ProviderPool {
+    let credential = |name: &str| keys.get(name).cloned().or_else(|| std::env::var(name).ok());
     let mut entries: HashMap<(Runner, Tier), ProviderEntry> = HashMap::new();
     let mut order: Vec<(Runner, Tier)> = Vec::new();
     let mut default: Option<(Runner, Tier)> = None;
@@ -114,7 +121,7 @@ pub async fn build_provider_pool() -> ProviderPool {
 
     // 1. Claude — native API preferred; CLI binary is the fallback for
     //    subscription users without an ANTHROPIC_API_KEY.
-    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").ok();
+    let anthropic_key = credential("ANTHROPIC_API_KEY");
     if let Some(key) = anthropic_key {
         let p_fast = AnthropicProvider::new(key.clone());
         let p_deep = AnthropicProvider::new(key);
@@ -169,7 +176,7 @@ pub async fn build_provider_pool() -> ProviderPool {
     }
 
     // 2. Codex/OpenAI — native API preferred; CLI binary is the fallback.
-    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+    if let Some(key) = credential("OPENAI_API_KEY") {
         let p = OpenAiProvider::new("https://api.openai.com", key.clone());
         add!(Runner::Codex, Tier::Fast, p, "openai", "gpt-5.5");
         // Deep tier uses the same latest model by default; override with
@@ -203,7 +210,16 @@ pub async fn build_provider_pool() -> ProviderPool {
     // 3. Kimi (Moonshot) — native API preferred; the kimi CLI binary is the
     //    fallback for Kimi Code subscription users (device-code OAuth) without
     //    a MOONSHOT_API_KEY.
-    if let Some(p_fast) = KimiProvider::detect() {
+    if let Some(key) = credential("MOONSHOT_API_KEY") {
+        let make_kimi = || {
+            if let Ok(url) = std::env::var("MOONSHOT_BASE_URL") {
+                let root = url.trim_end_matches('/').trim_end_matches("/v1");
+                OpenAiCompatProvider::with_base_url(KIMI, root, key.clone())
+            } else {
+                OpenAiCompatProvider::new(KIMI, key.clone())
+            }
+        };
+        let p_fast = make_kimi();
         add!(
             Runner::Kimi,
             Tier::Fast,
@@ -211,9 +227,7 @@ pub async fn build_provider_pool() -> ProviderPool {
             "moonshot",
             "kimi-k2.7-code-highspeed"
         );
-        if let Some(p_deep) = KimiProvider::detect() {
-            add!(Runner::Kimi, Tier::Deep, p_deep, "moonshot", "kimi-k3");
-        }
+        add!(Runner::Kimi, Tier::Deep, make_kimi(), "moonshot", "kimi-k3");
         info!(runner = "moonshot", "provider ready");
     } else if SubprocessProvider::available("kimi") {
         // Same detect TOCTOU as the claude branch: skip on `None`, never panic.
@@ -245,7 +259,7 @@ pub async fn build_provider_pool() -> ProviderPool {
     // When a Moonshot Platform key and a Kimi Code subscription coexist,
     // retain a separately selectable gated CLI path instead of hiding it
     // behind the API-preferred `kimi` runner.
-    if KimiProvider::detect().is_some() && SubprocessProvider::available("kimi") {
+    if credential("MOONSHOT_API_KEY").is_some() && SubprocessProvider::available("kimi") {
         if let Some(p_fast) = KimiCliProvider::detect() {
             add!(
                 Runner::KimiCode,
@@ -268,29 +282,24 @@ pub async fn build_provider_pool() -> ProviderPool {
 
     // 4. Gemini — native API preferred; the gemini CLI binary is the fallback,
     //    driven over ACP so its tool calls are gated like kimi's.
-    if std::env::var("GEMINI_API_KEY").is_ok() {
-        if let (Ok(p_fast), Ok(p_deep)) = (GeminiProvider::from_env(), GeminiProvider::from_env()) {
-            add!(
-                Runner::Gemini,
-                Tier::Fast,
-                p_fast,
-                "google",
-                "gemini-2.5-flash"
-            );
-            add!(
-                Runner::Gemini,
-                Tier::Deep,
-                p_deep,
-                "google",
-                "gemini-2.5-pro"
-            );
-            info!(runner = "google", "provider ready");
-        } else {
-            warn!(
-                runner = "google",
-                "UNAVAILABLE — GEMINI_API_KEY vanished mid-probe"
-            );
-        }
+    if let Some(key) = credential("GEMINI_API_KEY") {
+        let p_fast = GeminiProvider::new(key.clone());
+        let p_deep = GeminiProvider::new(key);
+        add!(
+            Runner::Gemini,
+            Tier::Fast,
+            p_fast,
+            "google",
+            "gemini-2.5-flash"
+        );
+        add!(
+            Runner::Gemini,
+            Tier::Deep,
+            p_deep,
+            "google",
+            "gemini-2.5-pro"
+        );
+        info!(runner = "google", "provider ready");
     } else if SubprocessProvider::available("gemini") {
         // Same detect TOCTOU as the claude branch: skip on `None`, never panic.
         if let Some(p_fast) = AcpProvider::detect(GEMINI_ACP) {
@@ -328,7 +337,9 @@ pub async fn build_provider_pool() -> ProviderPool {
 
     // 8. Minimax — keyed under its own runner so it is routable by name and does
     //    not shadow a local endpoint sharing the (Local, _) key space.
-    if let Some(p) = MinimaxProvider::detect() {
+    if let Some(p) =
+        credential("MINIMAX_API_KEY").map(|key| OpenAiCompatProvider::new(MINIMAX, key))
+    {
         add!(Runner::Minimax, Tier::Fast, p, "minimax", "MiniMax-M2");
         info!(runner = "minimax", "provider ready");
     }
@@ -337,7 +348,8 @@ pub async fn build_provider_pool() -> ProviderPool {
     //    collided with the local rs-llmctl endpoint at (Local, Local): whichever
     //    probed second overwrote the other, so a healthy local endpoint made
     //    Berget dead config. Its own runner key lets both coexist.
-    if let Some(p) = BergetProvider::detect() {
+    if let Some(p) = credential("BERGET_API_KEY").map(|key| OpenAiCompatProvider::new(BERGET, key))
+    {
         add!(Runner::Berget, Tier::Local, p, "berget", "gpt-4o-mini");
         info!(runner = "berget", "provider ready");
     }
@@ -389,7 +401,8 @@ pub async fn build_provider_pool() -> ProviderPool {
             "gpt-oss-120b",
         ),
     ] {
-        if let Some(p_fast) = OpenAiCompatProvider::detect(spec) {
+        if let Some(api_key) = credential(spec.env_var) {
+            let p_fast = OpenAiCompatProvider::new(spec, api_key.clone());
             // `add!` requires static model literals to feed model_default.
             // Build these entries directly for data-driven suppliers.
             for (tier, model, provider) in [
@@ -397,7 +410,7 @@ pub async fn build_provider_pool() -> ProviderPool {
                 (
                     Tier::Deep,
                     deep,
-                    OpenAiCompatProvider::detect(spec).expect("key present"),
+                    OpenAiCompatProvider::new(spec, api_key.clone()),
                 ),
             ] {
                 let key = (runner, tier);
@@ -417,6 +430,48 @@ pub async fn build_provider_pool() -> ProviderPool {
                 }
             }
             info!(runner = name, "provider ready");
+        }
+    }
+
+    // A custom OpenAI-compatible endpoint is opt-in and must declare its model.
+    if let (Some(key), Ok(base_url), Ok(model)) = (
+        credential("SMEDJA_COMPAT_API_KEY"),
+        std::env::var("SMEDJA_COMPAT_BASE_URL"),
+        std::env::var("SMEDJA_COMPAT_MODEL"),
+    ) {
+        if valid_custom_base_url(&base_url) && !model.trim().is_empty() {
+            let spec = smedja_adapter::OpenAiCompatSpec {
+                env_var: "SMEDJA_COMPAT_API_KEY",
+                base_url: "",
+            };
+            let root = base_url.trim_end_matches('/').trim_end_matches("/v1");
+            for tier in [Tier::Fast, Tier::Deep] {
+                let entry_key = (Runner::Custom, tier);
+                entries.insert(
+                    entry_key,
+                    ProviderEntry {
+                        provider: Box::new(OpenAiCompatProvider::with_base_url(
+                            spec,
+                            root,
+                            key.clone(),
+                        )),
+                        runner: Runner::Custom,
+                        tier,
+                        runner_name: "custom",
+                        default_model: model_default("custom", tier, &model),
+                    },
+                );
+                order.push(entry_key);
+                if default.is_none() {
+                    default = Some(entry_key);
+                }
+            }
+            info!(runner = "custom", "provider ready");
+        } else {
+            warn!(
+                runner = "custom",
+                "invalid custom endpoint or model; provider skipped"
+            );
         }
     }
 
@@ -463,5 +518,26 @@ pub async fn build_provider_pool() -> ProviderPool {
         order,
         default,
         local: local_control,
+    }
+}
+
+fn valid_custom_base_url(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+    url.scheme() == "https" || (url.scheme() == "http" && local)
+}
+
+#[cfg(test)]
+mod custom_url_tests {
+    use super::valid_custom_base_url;
+
+    #[test]
+    fn custom_url_requires_https_except_loopback() {
+        assert!(valid_custom_base_url("https://api.example.org"));
+        assert!(valid_custom_base_url("http://127.0.0.1:11434"));
+        assert!(!valid_custom_base_url("http://api.example.org"));
+        assert!(!valid_custom_base_url("file:///tmp/models"));
     }
 }

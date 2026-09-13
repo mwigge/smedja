@@ -136,7 +136,7 @@ pub(crate) async fn token_usage(state: HandlerState, params: Value) -> Result<Va
 /// Infallible in practice; the signature matches the handler contract.
 #[allow(clippy::unused_async)] // uniform handler signature: all handlers are async fns
 pub(crate) async fn runner_list(state: HandlerState, _params: Value) -> Result<Value, RpcError> {
-    let pool = state.provider_pool;
+    let pool = crate::provider_pool::pool_snapshot(&state.provider_pool);
     let runners: Vec<Value> = pool
         .list_all_entries()
         .into_iter()
@@ -153,8 +153,7 @@ pub(crate) async fn runner_models(state: HandlerState, params: Value) -> Result<
         .ok_or_else(|| missing_param("runner"))?;
     let canonical = mutate::parse_runner_name(runner)
         .ok_or_else(|| RpcError::new(codes::INVALID_PARAMS, format!("unknown runner: {runner}")))?;
-    let configured: Vec<String> = state
-        .provider_pool
+    let configured: Vec<String> = crate::provider_pool::pool_snapshot(&state.provider_pool)
         .models_for_runner(canonical)
         .into_iter()
         .map(str::to_owned)
@@ -222,10 +221,24 @@ pub(crate) async fn runner_models(state: HandlerState, params: Value) -> Result<
             "CEREBRAS_API_KEY",
             false,
         )),
+        smedja_assayer::Runner::Custom => std::env::var("SMEDJA_COMPAT_BASE_URL").ok().map(|url| {
+            (
+                format!(
+                    "{}/v1/models",
+                    url.trim_end_matches('/').trim_end_matches("/v1")
+                ),
+                "SMEDJA_COMPAT_API_KEY",
+                false,
+            )
+        }),
         _ => None,
     };
     if let Some((url, env_var, anthropic)) = remote {
-        if let Ok(key) = std::env::var(env_var) {
+        if let Some(key) = saved_provider_keys()?
+            .get(env_var)
+            .cloned()
+            .or_else(|| std::env::var(env_var).ok())
+        {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(8))
                 .build()
@@ -271,6 +284,51 @@ pub(crate) async fn runner_models(state: HandlerState, params: Value) -> Result<
     Ok(json!({"runner": runner, "models": configured, "verified": false}))
 }
 
+/// Rebuilds provider instances from the saved keys and atomically switches
+/// future requests to the new pool. Running turns retain their old snapshot.
+pub(crate) async fn reload_providers(
+    state: HandlerState,
+    _params: Value,
+) -> Result<Value, RpcError> {
+    let keys = saved_provider_keys()?;
+    let replacement =
+        std::sync::Arc::new(crate::provider_pool::build_provider_pool_with_keys(&keys).await);
+    let runners: Vec<Value> = replacement
+        .list_all_entries()
+        .into_iter()
+        .map(|(runner, tier, model)| json!({"runner": runner, "tier": tier, "model": model}))
+        .collect();
+    *state
+        .provider_pool
+        .write()
+        .map_err(|_| RpcError::new(codes::INTERNAL_ERROR, "provider pool lock poisoned"))? =
+        replacement;
+    Ok(json!({"runners": runners}))
+}
+
+fn saved_provider_keys() -> Result<std::collections::HashMap<String, String>, RpcError> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| RpcError::new(codes::INTERNAL_ERROR, "HOME is not set"))?;
+    let path = std::path::PathBuf::from(home).join(".config/smedja/secrets.env");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(RpcError::new(
+                codes::INTERNAL_ERROR,
+                format!("cannot read saved credentials: {e}"),
+            ));
+        }
+    };
+    let keys = contents
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(name, value)| name.ends_with("_API_KEY") && !value.is_empty())
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+    Ok(keys)
+}
+
 /// Checks a newly entered API key before it is saved. The key is used only for
 /// this outbound request and is never included in a response or error string.
 pub(crate) async fn check_provider_key(
@@ -301,6 +359,15 @@ pub(crate) async fn check_provider_key(
         "XAI_API_KEY" => ("https://api.x.ai/v1/models", false),
         "GROQ_API_KEY" => ("https://api.groq.com/openai/v1/models", false),
         "CEREBRAS_API_KEY" => ("https://api.cerebras.ai/v1/models", false),
+        "SMEDJA_COMPAT_API_KEY" => {
+            let url = std::env::var("SMEDJA_COMPAT_BASE_URL").map_err(|_| {
+                RpcError::new(
+                    codes::INVALID_PARAMS,
+                    "set SMEDJA_COMPAT_BASE_URL before connecting",
+                )
+            })?;
+            return check_custom_key(key, &url).await;
+        }
         // These providers do not offer a documented authenticated read-only
         // key check. Do not claim their keys have been verified.
         "OLLAMA_API_KEY" | "MINIMAX_API_KEY" | "BERGET_API_KEY" | "GEMINI_API_KEY" => {
@@ -345,6 +412,59 @@ pub(crate) async fn check_provider_key(
         .flatten()
         .filter_map(|item| item["id"].as_str())
         .collect();
+    Ok(json!({"verified": true, "models": models}))
+}
+
+async fn check_custom_key(key: &str, base_url: &str) -> Result<Value, RpcError> {
+    let root = base_url.trim_end_matches('/').trim_end_matches("/v1");
+    let url = reqwest::Url::parse(&format!("{root}/v1/models"))
+        .map_err(|_| RpcError::new(codes::INVALID_PARAMS, "invalid custom provider URL"))?;
+    let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+    if url.scheme() != "https" && !(url.scheme() == "http" && local) {
+        return Err(RpcError::new(
+            codes::INVALID_PARAMS,
+            "custom provider URL must use HTTPS (HTTP is allowed for localhost)",
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|e| RpcError::new(codes::INTERNAL_ERROR, e.to_string()))?;
+    let response = client.get(url).bearer_auth(key).send().await.map_err(|_| {
+        RpcError::new(
+            codes::INTERNAL_ERROR,
+            "custom provider unreachable; key not saved",
+        )
+    })?;
+    if !response.status().is_success() {
+        return Err(RpcError::new(
+            codes::INVALID_PARAMS,
+            format!(
+                "custom provider rejected key or model request (HTTP {})",
+                response.status()
+            ),
+        ));
+    }
+    let body: Value = response.json().await.map_err(|_| {
+        RpcError::new(
+            codes::INVALID_PARAMS,
+            "custom provider returned invalid model catalog",
+        )
+    })?;
+    let models: Vec<&str> = body["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["id"].as_str())
+        .collect();
+    if let Ok(configured) = std::env::var("SMEDJA_COMPAT_MODEL") {
+        if !models.contains(&configured.as_str()) {
+            return Err(RpcError::new(
+                codes::INVALID_PARAMS,
+                "configured custom model is absent from this account's catalog",
+            ));
+        }
+    }
     Ok(json!({"verified": true, "models": models}))
 }
 

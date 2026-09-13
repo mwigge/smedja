@@ -562,6 +562,29 @@ async fn connect_opens_picker_with_requested_suppliers() {
         .any(|choice| choice == "moonshot  [detected]"));
 }
 
+#[tokio::test]
+async fn login_is_an_alias_for_connect_picker() {
+    let (_dir, sock_path, rx) = spawn_method_capture(serde_json::json!({"runners": []}));
+    let mut client = Client::connect(&sock_path).await.unwrap();
+    let mut state = make_state("sess-login");
+    dispatch_slash("/login", &mut state, &mut client)
+        .await
+        .unwrap();
+    assert_eq!(rx.await.unwrap(), "runner.list");
+    assert!(state.connect_picker_mode);
+}
+
+#[test]
+fn reloaded_provider_matches_canonical_runner_aliases() {
+    let rows = serde_json::json!({"runners": [
+        {"runner": "moonshot"}, {"runner": "anthropic"}, {"runner": "custom"}
+    ]});
+    assert!(crate::input::provider_ready(&rows, "kimi"));
+    assert!(crate::input::provider_ready(&rows, "claude"));
+    assert!(crate::input::provider_ready(&rows, "custom"));
+    assert!(!crate::input::provider_ready(&rows, "groq"));
+}
+
 #[test]
 fn slash_completions_switch_matches_sw_prefix() {
     let completions = filtered_completions("/sw");

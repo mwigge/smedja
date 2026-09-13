@@ -12,7 +12,6 @@ use tokio::sync::Mutex;
 
 use crate::cowork::CoworkGate;
 use crate::price_table::PriceTable;
-use crate::provider_pool::ProviderPool;
 use crate::{embedder_port, handlers, orchestrator, run_turn};
 
 /// Spawns a long-lived background subsystem, logging if it ever panics or exits.
@@ -68,7 +67,7 @@ pub(crate) fn spawn_worker(
     ingot: IngotHandle,
     dispatcher: Arc<Dispatcher>,
     gates: Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
-    pool: Arc<ProviderPool>,
+    pool: crate::provider_pool::PoolHandle,
     assayer: Arc<Assayer>,
     price_table: Arc<PriceTable>,
     vault: Arc<Mutex<Vault>>,
@@ -89,7 +88,7 @@ pub(crate) fn spawn_worker(
             let ig = ingot.clone();
             let dp = Arc::clone(&dispatcher);
             let g = Arc::clone(&gates);
-            let pl = Arc::clone(&pool);
+            let pl = crate::provider_pool::pool_snapshot(&pool);
             let as_ = Arc::clone(&assayer);
             let pt = Arc::clone(&price_table);
             let vt = Arc::clone(&vault);

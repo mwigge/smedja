@@ -146,6 +146,7 @@ pub(crate) fn runner_session_key(runner: Runner) -> &'static str {
         Runner::Xai => "xai",
         Runner::Groq => "groq",
         Runner::Cerebras => "cerebras",
+        Runner::Custom => "custom",
     }
 }
 
@@ -172,6 +173,7 @@ pub(crate) fn parse_runner_str(s: &str) -> Option<Runner> {
         "xai" | "grok" => Some(Runner::Xai),
         "groq" => Some(Runner::Groq),
         "cerebras" => Some(Runner::Cerebras),
+        "custom" => Some(Runner::Custom),
         _ => None,
     }
 }

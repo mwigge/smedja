@@ -56,8 +56,7 @@ use crate::{
     fetch_latest_version, format_gov_list, format_resume_rows, format_token_count, gov_create,
     gov_transition, is_newer, parse_resume_args, parse_review_scope, push_system_message,
     render_findings_summary, resume_blocked_by_pending_turn, resume_into_view, resume_plan,
-    run_upgrade, scan_gov_artifacts, slugify, submit, try_reconnect, AppState, OutputType,
-    HELP_TEXT, VERSION,
+    run_upgrade, scan_gov_artifacts, slugify, submit, AppState, OutputType, HELP_TEXT, VERSION,
 };
 
 mod format;
@@ -174,7 +173,10 @@ pub(crate) async fn dispatch_slash(
         return Ok(false);
     };
     let mut parts = command_line.splitn(2, ' ');
-    let cmd = parts.next().unwrap_or_default();
+    let cmd = match parts.next().unwrap_or_default() {
+        "login" => "connect",
+        other => other,
+    };
     let args = parts.next().unwrap_or_default().trim();
 
     match cmd {
@@ -197,6 +199,7 @@ pub(crate) async fn dispatch_slash(
                 "xai",
                 "groq",
                 "cerebras",
+                "custom",
             ];
             if args.is_empty() {
                 let ready = client.call("runner.list", json!({})).await.ok();
@@ -247,6 +250,7 @@ pub(crate) async fn dispatch_slash(
                 "xai" => Some("XAI_API_KEY"),
                 "groq" => Some("GROQ_API_KEY"),
                 "cerebras" => Some("CEREBRAS_API_KEY"),
+                "custom" => Some("SMEDJA_COMPAT_API_KEY"),
                 _ => None,
             };
             if let Some(var) = key_var {
@@ -272,23 +276,9 @@ pub(crate) async fn dispatch_slash(
                         state.needs_clear = true;
                         match login {
                             Ok(status) if status.success() => {
-                                if cfg!(target_os = "linux")
-                                    && std::process::Command::new("systemctl")
-                                        .args(["--user", "is-active", "--quiet", "smdjad"])
-                                        .status()
-                                        .is_ok_and(|status| status.success())
-                                {
-                                    let restarted = std::process::Command::new("systemctl")
-                                        .args(["--user", "restart", "smdjad"])
-                                        .status()
-                                        .is_ok_and(|status| status.success());
-                                    if restarted {
-                                        if let Some(reconnected) =
-                                            try_reconnect(&state.daemon_sock).await
-                                        {
-                                            *client = reconnected;
-                                        }
-                                    }
+                                if let Err(e) = client.call("provider.reload", json!({})).await {
+                                    push_system_message(state, format!("{binary} authenticated, but provider reload failed: {e}"));
+                                    return Ok(true);
                                 }
                                 match client.call("session.set_runner",
                                     json!({"session_id": state.session_id, "runner": runner})).await {
@@ -296,13 +286,13 @@ pub(crate) async fn dispatch_slash(
                                         let canonical = value["runner"].as_str().unwrap_or(runner);
                                         state.runner = canonical.to_owned();
                                         if let Ok(list) = client.call("runner.list", json!({})).await {
-                                            state.model = runner_default_model(&list, canonical,
-                                                state.tier.as_deref());
+                                            state.model = value["model"].as_str().map(str::to_owned).or_else(||
+                                                runner_default_model(&list, canonical, state.tier.as_deref()));
                                         }
                                         push_system_message(state, format!("{binary} authenticated. Ready for a prompt."));
                                     }
                                     Err(_) => push_system_message(state,
-                                        format!("{binary} authenticated. Restart smdjad, then /switch {runner}.")),
+                                        format!("{binary} authenticated, but provider selection failed. Retry /switch {runner}.")),
                                 }
                             }
                             Ok(_) => push_system_message(
@@ -1227,169 +1217,6 @@ pub(crate) async fn dispatch_slash(
             push_system_message(state, text);
             Ok(true)
         }
-        "login" => {
-            let guidance = if args.is_empty() {
-                // Scan for installed CLIs so the user sees what's found vs missing.
-                let claude_found = std::process::Command::new("which")
-                    .arg("claude")
-                    .output()
-                    .is_ok_and(|o| o.status.success());
-                let codex_found = std::process::Command::new("which")
-                    .arg("codex")
-                    .output()
-                    .is_ok_and(|o| o.status.success());
-                let kimi_found = std::process::Command::new("which")
-                    .arg("kimi")
-                    .output()
-                    .is_ok_and(|o| o.status.success());
-                let gemini_found = std::process::Command::new("which")
-                    .arg("gemini")
-                    .output()
-                    .is_ok_and(|o| o.status.success());
-                let llmctl_found = std::process::Command::new("which")
-                    .arg("llmctl")
-                    .output()
-                    .is_ok_and(|o| o.status.success());
-
-                let mut lines = vec![
-                    "available runners:".to_owned(),
-                    format!(
-                        "  claude   [{}]  — Claude.ai subscription (OAuth, no API key needed)",
-                        if claude_found {
-                            "installed"
-                        } else {
-                            "not found"
-                        }
-                    ),
-                    format!(
-                        "  codex    [{}]  — OpenAI Codex CLI",
-                        if codex_found {
-                            "installed"
-                        } else {
-                            "not found"
-                        }
-                    ),
-                    format!(
-                        "  kimi     [{}]  — Kimi Code subscription (OAuth) or MOONSHOT_API_KEY",
-                        if kimi_found { "installed" } else { "not found" }
-                    ),
-                    format!(
-                        "  gemini   [{}]  — Google Gemini CLI (OAuth) or GEMINI_API_KEY",
-                        if gemini_found {
-                            "installed"
-                        } else {
-                            "not found"
-                        }
-                    ),
-                    format!(
-                        "  local    [{}]  — local model via rs-llmctl",
-                        if llmctl_found {
-                            "installed"
-                        } else {
-                            "not found"
-                        }
-                    ),
-                    "  copilot              — GitHub Copilot".to_owned(),
-                    "  minimax              — Minimax (set MINIMAX_API_KEY)".to_owned(),
-                    "  berget               — Berget AI (set BERGET_API_KEY)".to_owned(),
-                ];
-                if !claude_found {
-                    lines.push(String::new());
-                    lines.push("to install claude CLI: https://claude.ai/download".to_owned());
-                    lines.push("then run: claude login".to_owned());
-                }
-                lines.join("\n")
-            } else {
-                match args {
-                    "claude" => {
-                        let found = std::process::Command::new("which")
-                            .arg("claude")
-                            .output()
-                            .is_ok_and(|o| o.status.success());
-                        if found {
-                            "claude CLI is installed — uses your Claude.ai subscription (OAuth).\n\
-                             if not authenticated yet, run: claude login"
-                                .to_owned()
-                        } else {
-                            "claude CLI not found.\n\
-                             install: https://claude.ai/download\n\
-                             then run: claude login\n\
-                             no API key required — uses your Claude.ai subscription."
-                                .to_owned()
-                        }
-                    }
-                    "codex" => {
-                        let found = std::process::Command::new("which")
-                            .arg("codex")
-                            .output()
-                            .is_ok_and(|o| o.status.success());
-                        if found {
-                            "codex CLI is installed.\n\
-                             set OPENAI_API_KEY in your shell profile to authenticate."
-                                .to_owned()
-                        } else {
-                            "codex CLI not found.\n\
-                             install: npm install -g @openai/codex\n\
-                             then set OPENAI_API_KEY in your shell profile."
-                                .to_owned()
-                        }
-                    }
-                    "kimi" => {
-                        let found = std::process::Command::new("which")
-                            .arg("kimi")
-                            .output()
-                            .is_ok_and(|o| o.status.success());
-                        if found {
-                            "kimi CLI is installed — uses your Kimi Code subscription (device-code OAuth).\n\
-                             if not authenticated yet, run: kimi login"
-                                .to_owned()
-                        } else {
-                            state.secret_var = Some("MOONSHOT_API_KEY".to_owned());
-                            "kimi CLI not found (install: https://moonshotai.github.io/kimi-code/).\n\
-                             paste your Moonshot API key then Enter — input is hidden · Esc to cancel"
-                                .to_owned()
-                        }
-                    }
-                    "gemini" => {
-                        let found = std::process::Command::new("which")
-                            .arg("gemini")
-                            .output()
-                            .is_ok_and(|o| o.status.success());
-                        if found {
-                            "gemini CLI is installed — driven over ACP; uses its own login state.\n\
-                             if not authenticated yet, run: gemini (interactive) and complete /auth"
-                                .to_owned()
-                        } else {
-                            state.secret_var = Some("GEMINI_API_KEY".to_owned());
-                            "gemini CLI not found (install: npm install -g @google/gemini-cli).\n\
-                             paste your Gemini API key then Enter — input is hidden · Esc to cancel"
-                                .to_owned()
-                        }
-                    }
-                    "local" => "local runner uses rs-llmctl and a llama-swap proxy.\n\
-                                install rs-llmctl, then restart smdjad."
-                        .to_owned(),
-                    "copilot" => "copilot runner uses GitHub Copilot.\n\
-                                  authenticate via the copilot CLI or VS Code extension."
-                        .to_owned(),
-                    "minimax" => {
-                        state.secret_var = Some("MINIMAX_API_KEY".to_owned());
-                        "paste your Minimax API key then Enter — input is hidden · Esc to cancel"
-                            .to_owned()
-                    }
-                    "berget" => {
-                        state.secret_var = Some("BERGET_API_KEY".to_owned());
-                        "paste your Berget API key then Enter — input is hidden · Esc to cancel"
-                            .to_owned()
-                    }
-                    other => format!(
-                        "unknown runner: {other}\nvalid: claude, codex, kimi, gemini, local, copilot, minimax, berget"
-                    ),
-                }
-            };
-            push_system_message(state, guidance);
-            Ok(true)
-        }
         "switch" => {
             if args.is_empty() {
                 let result = client.call("runner.list", json!({})).await;
@@ -1448,12 +1275,11 @@ pub(crate) async fn dispatch_slash(
                     // Update the displayed model to the new runner's default
                     // for the current tier (the daemon cleared the old
                     // runner's model pin, so the next turn runs on this).
-                    if let Ok(list) = client.call("runner.list", json!({})).await {
-                        if let Some(m) =
-                            runner_default_model(&list, &canonical, state.tier.as_deref())
-                        {
-                            state.model = Some(m);
-                        }
+                    if let Some(model) = v["model"].as_str() {
+                        state.model = Some(model.to_owned());
+                    } else if let Ok(list) = client.call("runner.list", json!({})).await {
+                        state.model =
+                            runner_default_model(&list, &canonical, state.tier.as_deref());
                     }
                     push_system_message(state, format!("runner switched to {canonical}"));
                     // Show the existing session memory the new runner picks up.

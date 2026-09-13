@@ -484,4 +484,75 @@ mod tests {
         assert_eq!(err.kind(), "context_length_exceeded");
         assert!(err.is_retryable());
     }
+
+    #[tokio::test]
+    #[ignore = "requires a funded Moonshot Platform account"]
+    async fn live_moonshot_k3_stream_and_follow_up() {
+        use futures_util::StreamExt as _;
+
+        let key = std::env::var("MOONSHOT_API_KEY").expect("set MOONSHOT_API_KEY");
+        let base_url =
+            std::env::var("MOONSHOT_BASE_URL").unwrap_or_else(|_| KIMI.base_url.to_owned());
+        let root = base_url.trim_end_matches('/').trim_end_matches("/v1");
+        let catalog: serde_json::Value = reqwest::Client::new()
+            .get(format!("{root}/v1/models"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .expect("model catalog request")
+            .error_for_status()
+            .expect("model catalog authentication")
+            .json()
+            .await
+            .expect("model catalog JSON");
+        assert!(
+            catalog["data"]
+                .as_array()
+                .is_some_and(|models| models.iter().any(|model| model["id"] == "kimi-k3")),
+            "K3 is not available to this account"
+        );
+
+        let provider = OpenAiCompatProvider::with_base_url(KIMI, root, key);
+        let opts = crate::CallOptions {
+            model: "kimi-k3".to_owned(),
+            max_tokens: Some(64),
+            temperature: None,
+            system: None,
+            tools: None,
+            provider_session_id: None,
+            smedja_session_id: None,
+            permission_mode: None,
+            stable_prefix_len: None,
+            cache_strategy: crate::CacheStrategy::None,
+            workspace: None,
+            tool_gate: None,
+        };
+        let first: Vec<_> = provider
+            .stream_chat(&[crate::Message::user("Reply briefly: hello")], &opts)
+            .collect()
+            .await;
+        let first_text: String = first
+            .into_iter()
+            .map(|delta| match delta.expect("first stream") {
+                crate::Delta::Text(text) => text,
+                _ => String::new(),
+            })
+            .collect();
+        assert!(
+            !first_text.trim().is_empty(),
+            "K3 produced no streamed text"
+        );
+        let follow_up = [
+            crate::Message::user("Reply briefly: hello"),
+            crate::Message::assistant(first_text),
+            crate::Message::user("Reply briefly: goodbye"),
+        ];
+        let second: Vec<_> = provider.stream_chat(&follow_up, &opts).collect().await;
+        assert!(
+            second
+                .into_iter()
+                .any(|delta| matches!(delta, Ok(crate::Delta::Text(text)) if !text.is_empty())),
+            "K3 produced no follow-up text"
+        );
+    }
 }

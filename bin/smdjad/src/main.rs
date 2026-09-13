@@ -322,9 +322,9 @@ async fn main() -> anyhow::Result<()> {
         // is configured. build_provider_pool already logged the details.
         error!("starting in a DEGRADED state: no LLM provider configured — turns will fail");
     }
-    let startup_runner: Arc<str> = Arc::from(pool.default_runner_name());
-    let startup_model: Arc<str> = Arc::from(pool.default_model());
     let pool = Arc::new(pool);
+    let live_pool: crate::provider_pool::PoolHandle =
+        Arc::new(std::sync::RwLock::new(Arc::clone(&pool)));
 
     // Load workspace-local routing overrides if .smedja/agents.toml exists.
     // Default to the absolute current directory (deterministic) rather than the
@@ -477,10 +477,8 @@ async fn main() -> anyhow::Result<()> {
         &ingot,
         &dispatcher,
         &gates,
-        &pool,
+        &live_pool,
         &assayer,
-        &startup_runner,
-        &startup_model,
         &price_table,
         &vault,
         &embedder,
@@ -497,7 +495,7 @@ async fn main() -> anyhow::Result<()> {
         ingot.clone(),
         Arc::clone(&dispatcher),
         Arc::clone(&gates),
-        Arc::clone(&pool),
+        Arc::clone(&live_pool),
         Arc::clone(&assayer),
         Arc::clone(&price_table),
         Arc::clone(&vault),
@@ -757,6 +755,9 @@ fn load_saved_provider_keys() {
         "XAI_API_KEY",
         "GROQ_API_KEY",
         "CEREBRAS_API_KEY",
+        "SMEDJA_COMPAT_API_KEY",
+        "SMEDJA_COMPAT_BASE_URL",
+        "SMEDJA_COMPAT_MODEL",
     ];
     let Some(home) = std::env::var_os("HOME") else {
         return;

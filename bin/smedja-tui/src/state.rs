@@ -80,7 +80,6 @@ pub(crate) struct PanelVisibility {
 #[derive(Debug)]
 pub(crate) struct AppState {
     pub(crate) session_id: String,
-    pub(crate) daemon_sock: PathBuf,
     /// Force ratatui to repaint after an external CLI login used the terminal.
     pub(crate) needs_clear: bool,
     pub(crate) mode: Option<String>,

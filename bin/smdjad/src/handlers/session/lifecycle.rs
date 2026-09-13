@@ -13,9 +13,9 @@ use super::*;
 pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, RpcError> {
     let ig = state.ingot;
     let lsp_manager = Arc::clone(&state.lsp_manager);
-    let pool = Arc::clone(&state.provider_pool);
-    let startup_runner = state.startup_runner;
-    let startup_model = state.startup_model;
+    let pool = crate::provider_pool::pool_snapshot(&state.provider_pool);
+    let startup_runner = pool.default_runner_name().to_owned();
+    let startup_model = pool.default_model().to_owned();
     let title = params
         .get("title")
         .and_then(Value::as_str)
@@ -470,8 +470,11 @@ pub(crate) async fn takeover(state: HandlerState, params: Value) -> Result<Value
 
     // Inherit the pinned model only when the takeover stays on the parent's
     // runner (see inherited_takeover_model).
-    let inherited_model =
-        inherited_takeover_model(&parent, canonical, state.startup_runner.as_ref());
+    let inherited_model = inherited_takeover_model(
+        &parent,
+        canonical,
+        crate::provider_pool::pool_snapshot(&state.provider_pool).default_runner_name(),
+    );
 
     {
         ig.create_session(Session {

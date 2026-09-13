@@ -51,6 +51,8 @@ pub enum Runner {
     Groq,
     /// Cerebras Inference API.
     Cerebras,
+    /// User-configured OpenAI-compatible API.
+    Custom,
 }
 
 /// The execution tier that controls latency vs. capability trade-offs.
@@ -340,6 +342,7 @@ mod tests {
             Runner::Xai,
             Runner::Groq,
             Runner::Cerebras,
+            Runner::Custom,
         ] {
             let json = serde_json::to_string(&runner).expect("serialise runner");
             let back: Runner = serde_json::from_str(&json).expect("deserialise runner");

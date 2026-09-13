@@ -23,7 +23,11 @@ pub(crate) async fn set_model(state: HandlerState, params: Value) -> Result<Valu
         .await
         .map_err(|e| ingot_err(&e))?
         .and_then(|s| s.runner_override)
-        .unwrap_or_else(|| state.startup_runner.to_string());
+        .unwrap_or_else(|| {
+            crate::provider_pool::pool_snapshot(&state.provider_pool)
+                .default_runner_name()
+                .to_owned()
+        });
     let catalog = query::runner_models(state, json!({"runner": runner})).await?;
     if catalog["verified"].as_bool() == Some(true)
         && !catalog["models"]
@@ -67,6 +71,7 @@ pub(crate) fn parse_runner_name(s: &str) -> Option<smedja_assayer::Runner> {
         "xai" | "grok" => Some(Runner::Xai),
         "groq" => Some(Runner::Groq),
         "cerebras" => Some(Runner::Cerebras),
+        "custom" => Some(Runner::Custom),
         _ => None,
     }
 }
@@ -95,7 +100,7 @@ pub(crate) fn parse_tier_name(s: &str) -> Option<smedja_assayer::Tier> {
 pub(crate) async fn set_tier(state: HandlerState, params: Value) -> Result<Value, RpcError> {
     let catalog_state = state.clone();
     let ig = state.ingot;
-    let pool = state.provider_pool;
+    let pool = crate::provider_pool::pool_snapshot(&state.provider_pool);
     let session_id = params["session_id"]
         .as_str()
         .ok_or_else(|| missing_param("session_id"))?
@@ -114,7 +119,7 @@ pub(crate) async fn set_tier(state: HandlerState, params: Value) -> Result<Value
         .ok()
         .flatten()
         .and_then(|s| s.runner_override)
-        .unwrap_or_else(|| state.startup_runner.to_string());
+        .unwrap_or_else(|| pool.default_runner_name().to_owned());
     let runner = parse_runner_name(&runner_str).ok_or_else(|| {
         RpcError::new(
             codes::INVALID_PARAMS,
@@ -187,26 +192,66 @@ pub(crate) async fn set_runner(state: HandlerState, params: Value) -> Result<Val
         )
     })?;
     if runner == smedja_assayer::Runner::KimiCode
-        && state.provider_pool.models_for_runner(runner).is_empty()
-        && state
-            .provider_pool
+        && crate::provider_pool::pool_snapshot(&state.provider_pool)
+            .models_for_runner(runner)
+            .is_empty()
+        && crate::provider_pool::pool_snapshot(&state.provider_pool)
             .get(smedja_assayer::Runner::Kimi, smedja_assayer::Tier::Fast)
             .is_some_and(|entry| entry.runner_name == "kimi-cli")
     {
         runner = smedja_assayer::Runner::Kimi;
     }
-    if state.provider_pool.models_for_runner(runner).is_empty() {
+    if crate::provider_pool::pool_snapshot(&state.provider_pool)
+        .models_for_runner(runner)
+        .is_empty()
+    {
         return Err(RpcError::new(
             codes::INVALID_PARAMS,
             format!("{runner_str} is not ready; use /connect to set it up"),
         ));
     }
-    set_runner_with(
+    let selected_model = if runner == smedja_assayer::Runner::Kimi {
+        let catalog = query::runner_models(state.clone(), json!({"runner": runner_str})).await?;
+        if catalog["verified"].as_bool() == Some(true) {
+            let models = catalog["models"].as_array().ok_or_else(|| {
+                RpcError::new(codes::INVALID_PARAMS, "Moonshot returned no model catalog")
+            })?;
+            let selected = choose_moonshot_model(models).ok_or_else(|| {
+                RpcError::new(
+                    codes::INVALID_PARAMS,
+                    "Moonshot account has no available models",
+                )
+            })?;
+            Some(selected.to_owned())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let mut result = set_runner_with(
         &state.ingot,
         &session_id,
         crate::common::runner_session_key(runner),
     )
-    .await
+    .await?;
+    if let Some(model) = selected_model {
+        state
+            .ingot
+            .update_session_model_override(&session_id, &model)
+            .await
+            .map_err(|e| ingot_err(&e))?;
+        result["model"] = json!(model);
+    }
+    Ok(result)
+}
+
+fn choose_moonshot_model(models: &[Value]) -> Option<&str> {
+    models
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|model| *model == "kimi-k3")
+        .or_else(|| models.iter().filter_map(Value::as_str).next())
 }
 
 /// Core of `session.set_runner`, factored out so tests can exercise it
@@ -290,4 +335,18 @@ pub(crate) async fn set_mode(state: HandlerState, params: Value) -> Result<Value
         .await
         .map_err(|e| ingot_err(&e))?;
     Ok(json!({ "session_id": session_id, "mode": mode }))
+}
+
+#[cfg(test)]
+mod moonshot_model_tests {
+    use super::*;
+
+    #[test]
+    fn prefers_k3_only_when_account_catalog_has_it() {
+        let models = vec![json!("kimi-k2.7"), json!("kimi-k3")];
+        assert_eq!(choose_moonshot_model(&models), Some("kimi-k3"));
+        let models = vec![json!("kimi-k2.7")];
+        assert_eq!(choose_moonshot_model(&models), Some("kimi-k2.7"));
+        assert_eq!(choose_moonshot_model(&[]), None);
+    }
 }

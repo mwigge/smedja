@@ -71,6 +71,7 @@ pub(super) fn runner_label(runner: Runner) -> &'static str {
         Runner::Xai => "xai",
         Runner::Groq => "groq",
         Runner::Cerebras => "cerebras",
+        Runner::Custom => "custom",
     }
 }
 

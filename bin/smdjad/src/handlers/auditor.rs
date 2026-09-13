@@ -105,7 +105,7 @@ pub(crate) async fn run(state: HandlerState, params: Value) -> Result<Value, Rpc
     };
 
     let runner = ProviderReviewTurn {
-        pool: Arc::clone(&state.provider_pool),
+        pool: crate::provider_pool::pool_snapshot(&state.provider_pool),
         dispatcher: Arc::clone(&state.dispatcher),
         model_override: None,
     };

@@ -77,7 +77,6 @@ pub(crate) async fn bootstrap() -> Result<Session> {
     let stream_sock_path = stream_socket_path(&sock);
     let mut state = AppState {
         session_id,
-        daemon_sock: sock.clone(),
         needs_clear: false,
         mode: cli.mode.or(resumed_mode),
         tier: cli.tier.or(startup_tier),

@@ -103,6 +103,41 @@ fn models_for_runner_keeps_supplier_models_separate() {
 }
 
 #[test]
+fn swapping_pool_keeps_existing_turn_snapshot() {
+    let old = std::sync::Arc::new(pool_with(vec![(
+        (Runner::Mistral, Tier::Fast),
+        "mistral",
+        "old-model",
+    )]));
+    let shared: super::PoolHandle = std::sync::Arc::new(std::sync::RwLock::new(old));
+    let running_turn = super::pool_snapshot(&shared);
+    *shared.write().unwrap() = std::sync::Arc::new(pool_with(vec![(
+        (Runner::Mistral, Tier::Fast),
+        "mistral",
+        "new-model",
+    )]));
+    assert_eq!(
+        running_turn.models_for_runner(Runner::Mistral),
+        vec!["old-model"]
+    );
+    assert_eq!(
+        super::pool_snapshot(&shared).models_for_runner(Runner::Mistral),
+        vec!["new-model"]
+    );
+}
+
+#[tokio::test]
+async fn saved_key_builds_provider_without_process_env_mutation() {
+    let keys =
+        std::collections::HashMap::from([("MISTRAL_API_KEY".to_owned(), "test-key".to_owned())]);
+    let pool = super::build_provider_pool_with_keys(&keys).await;
+    assert_eq!(
+        pool.models_for_runner(Runner::Mistral),
+        vec!["mistral-small-latest", "mistral-large-latest"]
+    );
+}
+
+#[test]
 fn local_control_exposes_inventory_and_mutable_active_model() {
     let control = LocalControl::new(
         "http://127.0.0.1:9090".to_owned(),

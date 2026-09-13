@@ -22,7 +22,6 @@ use crate::{
 pub(crate) fn make_state(session_id: &str) -> AppState {
     AppState {
         session_id: session_id.to_owned(),
-        daemon_sock: PathBuf::from("/tmp/smdjad-test.sock"),
         needs_clear: false,
         mode: None,
         tier: None,

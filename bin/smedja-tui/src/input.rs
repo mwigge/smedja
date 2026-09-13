@@ -47,6 +47,21 @@ fn filter_model_picker(state: &mut AppState) {
     state.slash_cursor = 0;
 }
 
+pub(crate) fn provider_ready(runners: &Value, runner: &str) -> bool {
+    runners["runners"].as_array().is_some_and(|rows| {
+        rows.iter().any(|row| {
+            let name = row["runner"].as_str().unwrap_or("");
+            match runner {
+                "claude" => matches!(name, "anthropic" | "claude-cli"),
+                "codex" => matches!(name, "openai" | "codex-cli"),
+                "kimi" => matches!(name, "moonshot" | "kimi-cli"),
+                "gemini" => matches!(name, "google" | "gemini-cli"),
+                _ => name == runner,
+            }
+        })
+    })
+}
+
 // dispatch_slash, apply_tier, apply_agent, and their exclusive format helpers
 // (format_model_list, format_local_model_list, format_agents_table,
 // format_metrics, format_approvals_list) have been extracted to src/slash.rs.
@@ -442,22 +457,15 @@ pub(crate) async fn handle_key(
                                     .unwrap_or(&runner_name)
                                     .to_owned();
                                 state.runner.clone_from(&canonical);
-                                // Update displayed model to new runner's default.
-                                if let Ok(list) = client.call("runner.list", json!({})).await {
-                                    if let Some(runners) =
-                                        list.get("runners").and_then(|r| r.as_array())
-                                    {
-                                        if let Some(m) = runners
-                                            .iter()
-                                            .find(|r| {
-                                                r.get("runner").and_then(|n| n.as_str())
-                                                    == Some(&canonical)
-                                            })
-                                            .and_then(|r| r.get("model").and_then(|m| m.as_str()))
-                                        {
-                                            state.model = Some(m.to_owned());
-                                        }
-                                    }
+                                if let Some(model) = v["model"].as_str() {
+                                    state.model = Some(model.to_owned());
+                                } else if let Ok(list) = client.call("runner.list", json!({})).await
+                                {
+                                    state.model = crate::slash::runner_default_model(
+                                        &list,
+                                        &canonical,
+                                        state.tier.as_deref(),
+                                    );
                                 }
                                 push_system_message(
                                     state,
@@ -1123,68 +1131,69 @@ pub(crate) async fn handle_key(
                             "Credential saved; this provider has no read-only key check, so it is not yet verified."
                         },
                     );
-                    if cfg!(target_os = "linux")
-                        && std::process::Command::new("systemctl")
-                            .args(["--user", "is-active", "--quiet", "smdjad"])
-                            .status()
-                            .is_ok_and(|status| status.success())
-                    {
-                        let restarted = std::process::Command::new("systemctl")
-                            .args(["--user", "restart", "smdjad"])
-                            .status()
-                            .is_ok_and(|status| status.success());
-                        if restarted {
-                            if let Some(reconnected) = try_reconnect(&state.daemon_sock).await {
-                                *client = reconnected;
-                                let runner = match var.as_str() {
-                                    "ANTHROPIC_API_KEY" => "claude",
-                                    "OPENAI_API_KEY" => "codex",
-                                    "MOONSHOT_API_KEY" => "kimi",
-                                    "MISTRAL_API_KEY" => "mistral",
-                                    "DEEPSEEK_API_KEY" => "deepseek",
-                                    "OLLAMA_API_KEY" => "ollama-cloud",
-                                    "MINIMAX_API_KEY" => "minimax",
-                                    "BERGET_API_KEY" => "berget",
-                                    "GEMINI_API_KEY" => "gemini",
-                                    "OPENROUTER_API_KEY" => "openrouter",
-                                    "XAI_API_KEY" => "xai",
-                                    "GROQ_API_KEY" => "groq",
-                                    "CEREBRAS_API_KEY" => "cerebras",
-                                    _ => "",
-                                };
-                                if verified && !runner.is_empty() {
-                                    if let Ok(value) = client.call("session.set_runner",
-                                        json!({"session_id": state.session_id, "runner": runner})).await {
+                    match client.call("provider.reload", json!({})).await {
+                        Ok(reloaded) => {
+                            let runner = match var.as_str() {
+                                "ANTHROPIC_API_KEY" => "claude",
+                                "OPENAI_API_KEY" => "codex",
+                                "MOONSHOT_API_KEY" => "kimi",
+                                "MISTRAL_API_KEY" => "mistral",
+                                "DEEPSEEK_API_KEY" => "deepseek",
+                                "OLLAMA_API_KEY" => "ollama-cloud",
+                                "MINIMAX_API_KEY" => "minimax",
+                                "BERGET_API_KEY" => "berget",
+                                "GEMINI_API_KEY" => "gemini",
+                                "OPENROUTER_API_KEY" => "openrouter",
+                                "XAI_API_KEY" => "xai",
+                                "GROQ_API_KEY" => "groq",
+                                "CEREBRAS_API_KEY" => "cerebras",
+                                "SMEDJA_COMPAT_API_KEY" => "custom",
+                                _ => "",
+                            };
+                            let ready = provider_ready(&reloaded, runner);
+                            if ready && verified {
+                                match client
+                                    .call(
+                                        "session.set_runner",
+                                        json!({"session_id": state.session_id, "runner": runner}),
+                                    )
+                                    .await
+                                {
+                                    Ok(value) => {
                                         let canonical = value["runner"].as_str().unwrap_or(runner);
                                         state.runner = canonical.to_owned();
-                                        if let Ok(list) = client.call("runner.list", json!({})).await {
+                                        if let Some(model) = value["model"].as_str() {
+                                            state.model = Some(model.to_owned());
+                                        } else if let Ok(list) =
+                                            client.call("runner.list", json!({})).await
+                                        {
                                             state.model = crate::slash::runner_default_model(
-                                                &list, canonical, state.tier.as_deref());
+                                                &list,
+                                                canonical,
+                                                state.tier.as_deref(),
+                                            );
                                         }
-                                        push_system_message(state, format!("Connected to {canonical}. Ready for a prompt."));
-                                    } else {
-                                        push_system_message(state, "Daemon reloaded. Use /switch to select the provider.");
+                                        push_system_message(
+                                            state,
+                                            format!(
+                                                "Connected to {canonical}. Ready for a prompt."
+                                            ),
+                                        );
                                     }
-                                } else {
-                                    push_system_message(
+                                    Err(e) => push_system_message(
                                         state,
-                                        "Daemon reloaded. Use /switch to select the provider.",
-                                    );
+                                        format!("Provider loaded, but selection failed: {e}"),
+                                    ),
                                 }
+                            } else if ready {
+                                push_system_message(state, "Provider loaded but key is unverified. Use /switch to select it.");
                             } else {
-                                push_system_message(state, "Daemon restarted; reconnect is pending. Restart the TUI if it does not reconnect.");
+                                push_system_message(state, "Saved key did not activate a provider. Check daemon logs and retry /connect.");
                             }
-                        } else {
-                            push_system_message(
-                                state,
-                                "Could not restart smdjad. Restart it to activate the saved key.",
-                            );
                         }
-                    } else {
-                        push_system_message(
-                            state,
-                            "Restart smdjad to activate the saved key, then use /switch.",
-                        );
+                        Err(e) => {
+                            push_system_message(state, format!("Could not reload providers: {e}"))
+                        }
                     }
                 }
                 return Ok(());

@@ -72,7 +72,8 @@ pub use local::{
 pub use openai::OpenAiProvider;
 pub use openai_compat::{
     BergetProvider, KimiProvider, MinimaxProvider, OpenAiCompatProvider, OpenAiCompatSpec,
-    OpenCodeProvider, CEREBRAS, DEEPSEEK, GROQ, MISTRAL, OLLAMA_CLOUD, OPENROUTER, XAI,
+    OpenCodeProvider, BERGET, CEREBRAS, DEEPSEEK, GROQ, KIMI, MINIMAX, MISTRAL, OLLAMA_CLOUD,
+    OPENROUTER, XAI,
 };
 pub use pool_cli::PoolCliProvider;
 pub use provider::{DeltaStream, Provider};

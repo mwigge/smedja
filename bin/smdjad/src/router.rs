@@ -17,7 +17,6 @@ use tokio::sync::Mutex;
 
 use crate::cowork::CoworkGate;
 use crate::price_table::PriceTable;
-use crate::provider_pool::ProviderPool;
 use crate::{embedder_port, handlers, orchestrator};
 
 /// Registers an RPC handler with boilerplate-free cloning.
@@ -44,10 +43,8 @@ pub(crate) fn build_router(
     ingot: &IngotHandle,
     dispatcher: &Arc<Dispatcher>,
     gates: &Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
-    pool: &Arc<ProviderPool>,
+    pool: &crate::provider_pool::PoolHandle,
     assayer: &Arc<Assayer>,
-    startup_runner: &Arc<str>,
-    startup_model: &Arc<str>,
     price_table: &Arc<PriceTable>,
     vault: &Arc<Mutex<Vault>>,
     embedder: &Arc<dyn embedder_port::Embedder>,
@@ -78,8 +75,6 @@ pub(crate) fn build_router(
         provider_sessions: Arc::clone(provider_sessions),
         cache_aligners: Arc::clone(cache_aligners),
         task_set: Arc::clone(task_set),
-        startup_runner: Arc::clone(startup_runner),
-        startup_model: Arc::clone(startup_model),
         lsp_manager: Arc::clone(lsp_manager),
         active_change,
         work_tx,
@@ -164,6 +159,12 @@ pub(crate) fn build_router(
         handlers::cost::active_change
     );
     route!(router, "runner.list", state, handlers::session::runner_list);
+    route!(
+        router,
+        "provider.reload",
+        state,
+        handlers::session::reload_providers
+    );
     route!(
         router,
         "runner.models",

@@ -103,6 +103,7 @@ fn parse_runner(s: &str) -> Option<Runner> {
         "xai" | "grok" => Some(Runner::Xai),
         "groq" => Some(Runner::Groq),
         "cerebras" => Some(Runner::Cerebras),
+        "custom" => Some(Runner::Custom),
         _ => None,
     }
 }

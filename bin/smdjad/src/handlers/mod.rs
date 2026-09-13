@@ -23,7 +23,6 @@ use crate::cowork::CoworkGate;
 use crate::embedder_port::Embedder;
 use crate::orchestrator::ProviderSessions;
 use crate::price_table::PriceTable;
-use crate::provider_pool::ProviderPool;
 
 pub(crate) mod audit;
 pub(crate) mod auditor;
@@ -53,7 +52,7 @@ pub(crate) struct HandlerState {
     pub(crate) ingot: IngotHandle,
     pub(crate) dispatcher: Arc<Dispatcher>,
     pub(crate) gates: Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
-    pub(crate) provider_pool: Arc<ProviderPool>,
+    pub(crate) provider_pool: crate::provider_pool::PoolHandle,
     pub(crate) worktree_pool: Arc<Mutex<WorktreePool>>,
     pub(crate) assayer: Arc<Assayer>,
     pub(crate) price_table: Arc<PriceTable>,
@@ -63,8 +62,6 @@ pub(crate) struct HandlerState {
     pub(crate) provider_sessions: ProviderSessions,
     pub(crate) cache_aligners: crate::orchestrator::CacheAligners,
     pub(crate) task_set: Arc<Mutex<JoinSet<()>>>,
-    pub(crate) startup_runner: Arc<str>,
-    pub(crate) startup_model: Arc<str>,
     /// Shared LSP manager — holds language server processes started at daemon
     /// startup and serves their diagnostic snapshots to `lsp.*` handlers.
     pub(crate) lsp_manager: Arc<smedja_lsp::LspManager>,
