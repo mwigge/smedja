@@ -131,7 +131,7 @@ smedja-tui --session <id>
 
 ## Cowork Approval Gate
 
-In cowork mode, every tool call pauses for approval inline inside the `AgentBlock`. The approval widget (planned roadmap item) will show `y` / `n` / `m` keyboard shortcuts. Currently, approval events display as text lines in the agent block and are confirmed via the TUI's `/approve` command.
+In cowork mode, every tool call pauses for approval inline inside the `AgentBlock`. When a prompt is rendered, `y` approves and `n` denies the pending call; the decision is sent to smdjad as a session-agnostic `cowork.resolve` request (the daemon scans all gates by approval id, so the answer lands even when the prompt belongs to another session's turn). A prompt resolved elsewhere — another pane, the TUI, or a gate timeout — is cleared locally via the daemon's `approval_resolved` notice. The full overlay widget with `m` (modify) and `a` (approve always) lives in the TUI; see `docs/tui.md`.
 
 ---
 
@@ -159,4 +159,4 @@ The terminal handles a subset of OSC sequences beyond the standard set:
 | Shell blocks (Warp-style) | Shipped |
 | AgentBlock with tier/token/trace | Shipped |
 | Background image blit | Roadmap |
-| Inline cowork approval widget (y/n/m) | Roadmap |
+| Inline cowork approval (y/n via `cowork.resolve`) | Shipped |
