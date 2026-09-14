@@ -285,6 +285,7 @@ impl ReviewTurn for ProviderReviewTurn {
                 provider_session_id: None,
                 smedja_session_id: None,
                 permission_mode: None,
+                effort: None,
                 stable_prefix_len: None,
                 cache_strategy: smedja_adapter::CacheStrategy::None,
                 workspace: None,

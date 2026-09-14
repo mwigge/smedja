@@ -82,7 +82,9 @@ pub(crate) fn apply_cowork_decision(
 /// Returns the raw RPC result so the caller can both check the `resolved` flag
 /// (via [`cowork_resolved`]) and surface the appropriate transcript line. The
 /// `session_id` is merged into `params` so call sites pass only the decision
-/// fields (`id`, optional `reason`/`instruction`).
+/// fields (`id`, optional `reason`/`instruction`). Only session-scoped methods
+/// (e.g. `cowork.modify`) go through here — `cowork.resolve` is deliberately
+/// session-agnostic.
 async fn resolve_cowork(
     client: &mut Client,
     session_id: &str,
@@ -95,9 +97,62 @@ async fn resolve_cowork(
     client.call(method, params).await
 }
 
+/// Builds the params for the session-agnostic `cowork.resolve` RPC: the daemon
+/// scans every registered gate by approval id, so no `session_id` is sent.
+/// Both `id` (the contracted name) and `approval_id` (the pre-rename
+/// `approval_response` spelling) are carried so a daemon mid-rename answers
+/// either way; unknown extra params are ignored by the handlers.
+pub(crate) fn cowork_resolve_params(id: &str, approved: bool) -> serde_json::Value {
+    json!({ "id": id, "approval_id": id, "approved": approved })
+}
+
+/// Builds the success line for a `scope: "always"` approval, preferring any
+/// note the daemon returns (e.g. the persistence veto for glob commands) and
+/// otherwise confirming the rule was saved — the daemon persists it whenever
+/// no veto note is returned.
+pub(crate) fn always_approve_message(
+    result: &Result<serde_json::Value, smedja_rpc::RpcError>,
+    tool: &str,
+) -> String {
+    if let Ok(v) = result {
+        for key in ["note", "message"] {
+            if let Some(s) = v
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                // Daemon-controlled text rendered into the panel: strip
+                // terminal control characters before echoing it.
+                return formatting::sanitize_terminal(s).into_owned();
+            }
+        }
+        return format!("approved (always): {tool} — allow rule persisted");
+    }
+    format!("approved: {tool} — allow-always request failed")
+}
+
 // ---------------------------------------------------------------------------
 // Key handler
 // ---------------------------------------------------------------------------
+
+/// Ctrl-C is non-destructive: clear an in-progress input, otherwise require a
+/// SECOND consecutive Ctrl-C to actually quit (so an accidental press never
+/// drops you to a blank terminal). Copy is mouse / v-y.
+///
+/// Shared by the main key dispatch and the cowork-gate interception so the
+/// quit path stays reachable while approvals are pending.
+fn handle_ctrl_c(state: &mut AppState) {
+    if !state.input.is_empty() {
+        state.input.clear();
+        state.input_cursor = 0;
+        state.quit_armed = false;
+    } else if state.quit_armed {
+        state.quit = true;
+    } else {
+        state.quit_armed = true;
+        push_system_message(state, "press Ctrl-C again to exit smedja-tui");
+    }
+}
 
 #[allow(clippy::too_many_lines)] // key dispatch table for TUI; splitting would obscure the flow
 pub(crate) async fn handle_key(
@@ -114,12 +169,97 @@ pub(crate) async fn handle_key(
     }
 
     // ------------------------------------------------------------------
+    // Masked secret entry (API key paste): while `secret_var` is set the
+    // input bar holds an in-progress credential, so only plain typing,
+    // Backspace/Delete, Enter (save), and Esc/Ctrl-C (cancel) are live.
+    // Everything else is a dead key — Ctrl-G would copy the key into a
+    // world-readable $EDITOR temp file, Ctrl-U/Ctrl-K would push it onto the
+    // kill ring (Ctrl-Y yanks it back into a PLAINTEXT prompt), and Up/Down/
+    // Ctrl-P/Ctrl-N would stash it in `saved_input` and later restore it as a
+    // visible, submittable line.
+    //
+    // This block runs BEFORE the cowork interception below: a pending
+    // approval must never hijack API-key entry (the cowork widget would
+    // otherwise swallow every keystroke of the secret).
+    // ------------------------------------------------------------------
+    if state.secret_var.is_some() {
+        match key.code {
+            // Ctrl-C aborts the entry without saving (same as Esc).
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.secret_var = None;
+                state.input.clear();
+                state.input_cursor = 0;
+                state.saved_input.clear();
+                push_system_message(state, "login: cancelled");
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.input.insert(state.input_cursor, c);
+                state.input_cursor += c.len_utf8();
+            }
+            KeyCode::Backspace => {
+                if state.input_cursor > 0 {
+                    let new_pos = prev_char_boundary(&state.input, state.input_cursor);
+                    state.input.drain(new_pos..state.input_cursor);
+                    state.input_cursor = new_pos;
+                }
+            }
+            KeyCode::Delete => {
+                if state.input_cursor < state.input.len() {
+                    let next = next_char_boundary(&state.input, state.input_cursor);
+                    state.input.drain(state.input_cursor..next);
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(var) = state.secret_var.take() {
+                    // `saved_input` can hold a pre-secret stash from history
+                    // browse; never let it survive alongside a credential.
+                    state.saved_input.clear();
+                    let key_material = std::mem::take(&mut state.input);
+                    state.input_cursor = 0;
+                    let msg = if key_material.trim().is_empty() {
+                        "login: empty key — cancelled".to_owned()
+                    } else {
+                        secrets::save_secret(&var, key_material.trim())
+                    };
+                    // A successful save (✓-prefixed) makes the key take effect
+                    // without a daemon restart: ask the daemon to rebuild its
+                    // provider pool (older daemons without the method get a hint).
+                    let saved = msg.starts_with('\u{2713}');
+                    push_system_message(state, msg);
+                    if saved {
+                        slash::rescan_providers(state, client).await;
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                // Cancel masked secret entry; discard whatever was typed and
+                // any stashed line that could restore it into the prompt.
+                state.secret_var = None;
+                state.input.clear();
+                state.input_cursor = 0;
+                state.saved_input.clear();
+                push_system_message(state, "login: cancelled");
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // ------------------------------------------------------------------
     // Cowork gate widget intercepts keys when there are pending approvals.
     // ------------------------------------------------------------------
-    // `y`/`Y` → cowork.approve, `n`/`N` → cowork.deny, `m`/`M` → modify
-    // mode. All other keys are consumed while approvals are pending so that
+    // `y`/`Y` → cowork.resolve approved, `n`/`N` → cowork.resolve denied,
+    // `m`/`M` → modify mode (edit replacement args as JSON), `a`/`A` →
+    // cowork.resolve with scope "always" (asks the daemon to persist an allow
+    // rule), `Esc` → dismiss the head item locally and deny it at the daemon. Ctrl-C is never
+    // eaten: it clears the input / arms quit exactly as without the overlay.
+    // All other keys are consumed while approvals are pending so that
     // accidental keystrokes do not reach the input bar.
     if !state.pending_cowork.is_empty() {
+        if is_ctrl_c {
+            handle_ctrl_c(state);
+            return Ok(());
+        }
         if state.cowork_modify_mode {
             match key.code {
                 KeyCode::Esc => {
@@ -130,6 +270,34 @@ pub(crate) async fn handle_key(
                     if let Some(item) = state.pending_cowork.first() {
                         let id = item.id.clone();
                         let tool = item.tool.clone();
+                        // The daemon REPLACES the tool input with this value,
+                        // so it must be a JSON object of replacement args. A
+                        // display placeholder (`[redacted]` from the daemon's
+                        // scrubbing, `…[truncated]` from its display cap) would
+                        // destroy the real args if submitted, so refuse and
+                        // keep the editor open instead.
+                        let candidate = state.cowork_modify_input.clone();
+                        let refusal = if candidate.contains("[redacted]")
+                            || candidate.contains("[truncated]")
+                        {
+                            Some(
+                                "modify refused: args contain a [redacted]/[truncated] display placeholder — replace it with a real value first"
+                                    .to_owned(),
+                            )
+                        } else if !matches!(
+                            serde_json::from_str::<Value>(&candidate),
+                            Ok(Value::Object(_))
+                        ) {
+                            Some(
+                                "modify refused: replacement args must be a JSON object".to_owned(),
+                            )
+                        } else {
+                            None
+                        };
+                        if let Some(msg) = refusal {
+                            push_system_message(state, msg);
+                            return Ok(());
+                        }
                         let instruction = std::mem::take(&mut state.cowork_modify_input);
                         let session_id = state.session_id.clone();
                         let result = resolve_cowork(
@@ -146,7 +314,7 @@ pub(crate) async fn handle_key(
                             &tool,
                         );
                         if remove {
-                            state.pending_cowork.remove(0);
+                            crate::events::remove_cowork_at(state, 0);
                         }
                         push_system_message(state, message);
                     }
@@ -166,22 +334,17 @@ pub(crate) async fn handle_key(
                     if let Some(item) = state.pending_cowork.first() {
                         let id = item.id.clone();
                         let tool = item.tool.clone();
-                        let session_id = state.session_id.clone();
-                        let result = resolve_cowork(
-                            client,
-                            &session_id,
-                            "cowork.approve",
-                            json!({ "id": id }),
-                        )
-                        .await;
+                        let result = client
+                            .call("cowork.resolve", cowork_resolve_params(&id, true))
+                            .await;
                         let (remove, message) = apply_cowork_decision(
                             &result,
-                            "cowork.approve",
+                            "cowork.resolve",
                             &format!("approved: {tool}"),
                             &tool,
                         );
                         if remove {
-                            state.pending_cowork.remove(0);
+                            crate::events::remove_cowork_at(state, 0);
                         }
                         push_system_message(state, message);
                     }
@@ -190,28 +353,80 @@ pub(crate) async fn handle_key(
                     if let Some(item) = state.pending_cowork.first() {
                         let id = item.id.clone();
                         let tool = item.tool.clone();
-                        let session_id = state.session_id.clone();
-                        let result = resolve_cowork(
-                            client,
-                            &session_id,
-                            "cowork.deny",
-                            json!({ "id": id, "reason": "denied" }),
-                        )
-                        .await;
+                        let result = client
+                            .call("cowork.resolve", cowork_resolve_params(&id, false))
+                            .await;
                         let (remove, message) = apply_cowork_decision(
                             &result,
-                            "cowork.deny",
+                            "cowork.resolve",
                             &format!("denied: {tool}"),
                             &tool,
                         );
                         if remove {
-                            state.pending_cowork.remove(0);
+                            crate::events::remove_cowork_at(state, 0);
                         }
                         push_system_message(state, message);
                     }
                 }
                 KeyCode::Char('m' | 'M') => {
-                    state.cowork_modify_mode = true;
+                    if let Some(item) = state.pending_cowork.first() {
+                        if item.supports_modify {
+                            state.cowork_modify_mode = true;
+                            // Pre-fill with the current args JSON so the user
+                            // edits the real call instead of retyping it.
+                            state.cowork_modify_input = item.args_display.clone();
+                        } else {
+                            push_system_message(
+                                state,
+                                format!("modify not supported for: {}", item.tool),
+                            );
+                        }
+                    }
+                }
+                KeyCode::Char('a' | 'A') => {
+                    if let Some(item) = state.pending_cowork.first() {
+                        let id = item.id.clone();
+                        let tool = item.tool.clone();
+                        let mut params = cowork_resolve_params(&id, true);
+                        params["scope"] = json!("always");
+                        let result = client.call("cowork.resolve", params).await;
+                        // The daemon persists an allow rule for scope "always"
+                        // and returns a veto `note` when it refuses (e.g. glob
+                        // commands) — no note on success means the rule saved.
+                        let success = always_approve_message(&result, &tool);
+                        let (remove, message) =
+                            apply_cowork_decision(&result, "cowork.resolve", &success, &tool);
+                        if remove {
+                            crate::events::remove_cowork_at(state, 0);
+                        }
+                        push_system_message(state, message);
+                    }
+                }
+                KeyCode::Esc => {
+                    // Deny-by-dismissal: drop the head item locally at once so
+                    // the soft-lock is impossible, then tell the daemon. The
+                    // item stays removed even when the gate is already gone
+                    // (resolved:false) or the deny never arrives (transport
+                    // error) — the user dismissed the prompt.
+                    if let Some(item) = state.pending_cowork.first().cloned() {
+                        crate::events::remove_cowork_at(state, 0);
+                        let result = client
+                            .call("cowork.resolve", cowork_resolve_params(&item.id, false))
+                            .await;
+                        let message = match &result {
+                            Ok(_) if cowork_resolved(&result) => {
+                                format!("dismissed (denied): {}", item.tool)
+                            }
+                            Ok(_) => format!(
+                                "dismissed: {} (gate already resolved elsewhere)",
+                                item.tool
+                            ),
+                            Err(e) => {
+                                format!("dismissed: {} (deny failed to send: {e})", item.tool)
+                            }
+                        };
+                        push_system_message(state, message);
+                    }
                 }
                 _ => {}
             }
@@ -404,6 +619,9 @@ pub(crate) async fn handle_key(
                                     state,
                                     format!("runner switched to {canonical}"),
                                 );
+                                if let Some(note) = slash::model_pin_note(&v) {
+                                    push_system_message(state, note);
+                                }
                             }
                             Err(e) => {
                                 push_system_message(
@@ -769,19 +987,7 @@ pub(crate) async fn handle_key(
 
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            // Ctrl-C is non-destructive: clear an in-progress input, otherwise
-            // require a SECOND consecutive Ctrl-C to actually quit (so an accidental
-            // press never drops you to a blank terminal). Copy is mouse / v-y.
-            if !state.input.is_empty() {
-                state.input.clear();
-                state.input_cursor = 0;
-                state.quit_armed = false;
-            } else if state.quit_armed {
-                state.quit = true;
-            } else {
-                state.quit_armed = true;
-                push_system_message(state, "press Ctrl-C again to exit smedja-tui");
-            }
+            handle_ctrl_c(state);
         }
 
         // Ctrl-R: toggle reverse history search (input mode only).
@@ -922,11 +1128,6 @@ pub(crate) async fn handle_key(
         KeyCode::Esc => {
             if state.show_session_peek {
                 state.show_session_peek = false;
-            } else if state.secret_var.take().is_some() {
-                // Cancel masked secret entry; discard whatever was typed.
-                state.input.clear();
-                state.input_cursor = 0;
-                push_system_message(state, "login: cancelled");
             } else if state.panel_search_mode {
                 state.panel_search_mode = false;
                 state.panel_search_query.clear();
@@ -1016,20 +1217,6 @@ pub(crate) async fn handle_key(
         }
 
         KeyCode::Enter => {
-            // Masked secret entry (API key paste): save to the secrets file under
-            // the pending env-var name; never echo or send it as a turn.
-            if let Some(var) = state.secret_var.take() {
-                let key = std::mem::take(&mut state.input);
-                state.input_cursor = 0;
-                let msg = if key.trim().is_empty() {
-                    "login: empty key — cancelled".to_owned()
-                } else {
-                    secrets::save_secret(&var, key.trim())
-                };
-                push_system_message(state, msg);
-                return Ok(());
-            }
-
             // L128: multi-line continuation — trailing `\` means "continue".
             if state.input.ends_with('\\') {
                 // Strip the trailing backslash and append a newline continuation.
@@ -1070,57 +1257,6 @@ pub(crate) async fn handle_key(
                     };
                     state.main_panel.push_line(msg.text.clone());
                     state.push_message(msg);
-                }
-            } else if let Some(arg) = input.trim().strip_prefix("/cowork ") {
-                match arg.trim() {
-                    "on" | "off" => {
-                        let enabled = arg.trim() == "on";
-                        let session_id = state.session_id.clone();
-                        if client
-                            .call(
-                                "cowork.set",
-                                json!({ "session_id": session_id, "enabled": enabled }),
-                            )
-                            .await
-                            .is_ok()
-                        {
-                            let msg = Message {
-                                role: Role::System,
-                                text: format!(
-                                    "cowork mode {}",
-                                    if enabled { "enabled" } else { "disabled" }
-                                ),
-                            };
-                            state.main_panel.push_line(msg.text.clone());
-                            state.push_message(msg);
-                        }
-                    }
-                    "status" => {
-                        let session_id = state.session_id.clone();
-                        match client
-                            .call("session.get", json!({ "id": session_id }))
-                            .await
-                        {
-                            Ok(resp) => {
-                                let cowork_on = resp["cowork_mode"].as_bool().unwrap_or(false);
-                                push_system_message(
-                                    state,
-                                    format!("cowork: {}", if cowork_on { "on" } else { "off" }),
-                                );
-                            }
-                            Err(_) => {
-                                push_system_message(state, "cowork: status unavailable");
-                            }
-                        }
-                    }
-                    _ => {
-                        let msg = Message {
-                            role: Role::System,
-                            text: "usage: /cowork on|off|status".into(),
-                        };
-                        state.main_panel.push_line(msg.text.clone());
-                        state.push_message(msg);
-                    }
                 }
             } else if let Some(rest) = input.trim().strip_prefix("/stage ") {
                 // /stage <tool> <json-args>
@@ -1186,63 +1322,6 @@ pub(crate) async fn handle_key(
                         state.push_message(msg);
                     }
                 }
-            } else if input.trim() == "/agent sre" {
-                state.mode = Some("sre".into());
-                state.tier = Some("deep".into());
-                let session_id = state.session_id.clone();
-                let _ = client
-                    .call(
-                        "session.set_mode",
-                        json!({
-                            "session_id": session_id,
-                            "mode": "sre",
-                        }),
-                    )
-                    .await;
-                let msg = Message {
-                    role: Role::System,
-                    text: "SRE mode activated (tier: deep)".into(),
-                };
-                state.main_panel.push_line(msg.text.clone());
-                state.push_message(msg);
-            } else if input.trim() == "/capabilities" {
-                let text = match client.call("runner.list", json!({})).await {
-                    Ok(v) => {
-                        let runners = v
-                            .get("runners")
-                            .and_then(|r| r.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-                        format_capabilities_table(&runners)
-                    }
-                    Err(e) => format!("capabilities: error — {e}"),
-                };
-                let msg = Message {
-                    role: Role::System,
-                    text,
-                };
-                state.main_panel.push_line(msg.text.clone());
-                state.push_message(msg);
-            } else if input.trim() == "/health" {
-                // Measure RPC round-trip latency by calling session.get.
-                let start = std::time::Instant::now();
-                let session_id = state.session_id.clone();
-                let health_result = client
-                    .call("session.get", json!({ "id": session_id }))
-                    .await;
-                let latency_ms = start.elapsed().as_millis();
-                let text = match health_result {
-                    Ok(_) => {
-                        format!("health: socket=ok session={session_id} latency={latency_ms}ms")
-                    }
-                    Err(e) => format!("health: error — {e}"),
-                };
-                let msg = Message {
-                    role: Role::System,
-                    text,
-                };
-                state.main_panel.push_line(msg.text.clone());
-                state.push_message(msg);
             } else {
                 submit(&input, state, client).await?;
             }

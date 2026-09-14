@@ -42,20 +42,17 @@ fn save_to_path(var: &str, value: &str, path: &Path) -> String {
     }
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     format!(
-        "\u{2713} saved {var} to {} (0600). Activate: {}",
+        "\u{2713} saved {var} to {} (0600). {}",
         path.display(),
         activation_hint()
     )
 }
 
 fn activation_hint() -> &'static str {
-    if cfg!(target_os = "linux") {
-        "add\n  EnvironmentFile=%h/.config/smedja/secrets.env\nto the smdjad unit, then: systemctl --user restart smdjad"
-    } else if cfg!(target_os = "macos") {
-        "restart smdjad with `launchctl kickstart -k gui/$(id -u)/nu.wigge.smedja.smdjad`"
-    } else {
-        "restart smdjad so it inherits the updated environment"
-    }
+    // The daemon loads secrets.env itself and the TUI triggers a
+    // `provider.rescan` after each save — no systemd override or manual
+    // restart is required on any platform.
+    "smdjad loads this file itself (no systemd override needed); the provider pool is rescanned automatically"
 }
 
 fn valid_env_name(var: &str) -> bool {

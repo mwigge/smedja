@@ -198,7 +198,7 @@ pub(crate) async fn run(session: bootstrap::Session) -> Result<()> {
                         break;
                     }
                 };
-                if apply_stream_event(&mut state, event, &mut pending_output_save) {
+                if apply_inbound_event(&mut state, event, &mut pending_output_save) {
                     turn_done = true;
                 }
             }

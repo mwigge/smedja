@@ -63,6 +63,15 @@ impl TurnBuffer {
 /// connection for that turn before it switches to live Bellows events.
 pub type DeltaStore = Arc<Mutex<HashMap<String, TurnBuffer>>>;
 
+/// Buffer key for session-scoped events (a [`TurnEvent::CoworkRequest`] raised
+/// outside any turn — the claude-hook and industry-ACP bridge paths, which have
+/// no turn id). Never collides with a real turn id (those are non-empty). Every
+/// stream connection replays this buffer alongside its turn's, so a pending
+/// approval survives a TUI reconnect; the stranded sweeper keeps it alive while
+/// it holds an unresolved cowork_request and reclaims it once the approval is
+/// resolved and the buffer goes idle.
+pub(crate) const SESSION_BUFFER_KEY: &str = "";
+
 /// Appends `line` to `buf`, enforcing `MAX_BUFFER_PER_TURN`.
 ///
 /// When the buffer is full, the oldest entry is evicted. If no overflow
@@ -237,19 +246,35 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                         step_n,
                         ref args_display,
                         ref reasoning,
+                        ref cwd,
                         ref turn_id,
-                        ..
+                        supports_modify,
+                        ref correlation,
                     } => {
-                        let Some(tid) = turn_id else { continue };
-                        if let Some(buf) = store.get_mut(tid).map(TurnBuffer::touch) {
-                            let line = serde_json::to_string(&StreamEvent::CoworkRequest {
-                                approval_id: approval_id.clone(),
-                                tool: tool.clone(),
-                                step_n,
-                                args_display: args_display.clone(),
-                                reasoning: reasoning.clone(),
-                            })
-                            .unwrap_or_default();
+                        let line = super::wire::cowork_request_line(
+                            approval_id,
+                            tool,
+                            step_n,
+                            args_display,
+                            reasoning,
+                            correlation.agent_name.as_deref(),
+                            cwd.as_deref(),
+                            supports_modify,
+                        );
+                        // Turn-scoped requests join their turn's buffer;
+                        // session-scoped ones (turn_id None — claude hook, ACP
+                        // bridge) go to the shared session buffer so a reconnect
+                        // still replays the pending approval.
+                        let buf = match turn_id {
+                            Some(tid) => store.get_mut(tid).map(TurnBuffer::touch),
+                            None => Some(
+                                store
+                                    .entry(SESSION_BUFFER_KEY.to_owned())
+                                    .or_insert_with(TurnBuffer::new)
+                                    .touch(),
+                            ),
+                        };
+                        if let Some(buf) = buf {
                             evict_and_push(buf, line);
                         }
                     }
@@ -345,6 +370,22 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
                         buf.push_back(serde_json::Value::Object(obj).to_string());
                         cleanup_tid = Some(tid.clone());
                     }
+                    TurnEvent::CoworkResolved {
+                        ref approval_id, ..
+                    } => {
+                        // A resolution retires the pending request: drop the
+                        // matching `cowork_request` line from every buffer (the
+                        // session buffer for hook/ACP requests, the turn buffer
+                        // for native-loop ones) so a reconnecting client no
+                        // longer replays an answered approval. The resolution
+                        // itself is live-only and never buffered.
+                        let needle = format!("\"approval_id\":\"{approval_id}\"");
+                        for buf in store.values_mut() {
+                            buf.lines.retain(|l| {
+                                !(l.contains("\"cowork_request\"") && l.contains(&needle))
+                            });
+                        }
+                    }
                     TurnEvent::HistoryReplaced {
                         ref session_id,
                         ref turn_id,
@@ -374,7 +415,10 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
     // would leak forever. Periodically drop any buffer idle longer than
     // STRANDED_TTL_SECS. Terminal turns are removed far sooner (DELTA_TTL_SECS)
     // by the scheduled GC above, so this only ever reclaims genuinely stranded
-    // buffers.
+    // buffers. A buffer holding an UNRESOLVED cowork_request line is never
+    // stranded: the gate is waiting on a human (up to the 30-min approval
+    // timeout), so evicting it would make the pending approval un-replayable
+    // on reconnect. Keeping it and refreshing last_activity re-arms the TTL.
     let store_sweep = Arc::clone(&store);
     tokio::spawn(async move {
         let ttl = std::time::Duration::from_secs(STRANDED_TTL_SECS);
@@ -383,7 +427,20 @@ pub fn spawn_delta_buffer(dispatcher: &Arc<Dispatcher>) -> DeltaStore {
             let now = tokio::time::Instant::now();
             let mut map = store_sweep.lock().await;
             let before = map.len();
-            map.retain(|_, b| now.saturating_duration_since(b.last_activity) < ttl);
+            map.retain(|_, b| {
+                let idle = now.saturating_duration_since(b.last_activity);
+                if idle < ttl {
+                    return true;
+                }
+                if b.lines.iter().any(|l| l.contains("\"cowork_request\"")) {
+                    // Unresolved approval awaiting a human — keep it alive.
+                    // (CoworkResolved removes the request line, so a resolved
+                    // prompt does not keep the buffer alive.)
+                    b.last_activity = now;
+                    return true;
+                }
+                false
+            });
             let removed = before - map.len();
             drop(map);
             if removed > 0 {
@@ -409,6 +466,25 @@ mod tests {
     use smedja_bellows::event::CorrelationCtx;
     use std::sync::Arc;
 
+    /// Polls until `pred` holds on the delta store, replacing fixed "let the
+    /// background task process" sleeps that flaked under CI load.
+    async fn wait_for_store(
+        store: &DeltaStore,
+        pred: impl Fn(&HashMap<String, TurnBuffer>) -> bool,
+        what: &str,
+    ) {
+        for _ in 0..250 {
+            let guard = store.lock().await;
+            if pred(&guard) {
+                return;
+            }
+            drop(guard);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let guard = store.lock().await;
+        assert!(pred(&guard), "timed out waiting for {what}");
+    }
+
     #[tokio::test]
     async fn delta_buffer_populates_on_assistant_delta() {
         let dispatcher = Arc::new(Dispatcher::new(32));
@@ -425,8 +501,7 @@ mod tests {
             correlation: CorrelationCtx::default(),
         });
 
-        // Give the background task a moment to process.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        wait_for_store(&store, |m| m.contains_key("t1"), "buffered turn t1").await;
 
         let s = store.lock().await;
         let buf = &s.get("t1").expect("buffer entry for t1").lines;
@@ -511,6 +586,180 @@ mod tests {
         assert!(
             !store.lock().await.contains_key("t-ttl"),
             "buffer must be evicted after TTL"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sweeper_keeps_pending_cowork_request_then_evicts_after_resolution() {
+        let dispatcher = Arc::new(Dispatcher::new(32));
+        let store = spawn_delta_buffer(&dispatcher);
+
+        dispatcher.publish(TurnEvent::CoworkRequest {
+            approval_id: "appr-keep".into(),
+            tool: "bash".into(),
+            step_n: 0,
+            args_display: "{\"command\":\"ls\"}".into(),
+            reasoning: "run: ls".into(),
+            cwd: None,
+            turn_id: None,
+            supports_modify: true,
+            correlation: CorrelationCtx::default(),
+        });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            store.lock().await.contains_key(SESSION_BUFFER_KEY),
+            "session buffer must hold the pending approval"
+        );
+
+        // Advance far past the stranded TTL (several sweep intervals): the
+        // buffer must survive — a human may take up to the gate's 30-min
+        // timeout to answer.
+        for _ in 0..8 {
+            tokio::time::advance(std::time::Duration::from_secs(STRANDED_SWEEP_INTERVAL_SECS))
+                .await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            store.lock().await.contains_key(SESSION_BUFFER_KEY),
+            "a buffer holding an unresolved cowork_request must not be swept"
+        );
+
+        // Once resolved, the request line is removed and the idle buffer is
+        // swept like any other.
+        dispatcher.publish(TurnEvent::CoworkResolved {
+            approval_id: "appr-keep".into(),
+            outcome: smedja_bellows::CoworkOutcome::Approved,
+        });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        for _ in 0..(STRANDED_TTL_SECS / STRANDED_SWEEP_INTERVAL_SECS + 2) {
+            tokio::time::advance(std::time::Duration::from_secs(STRANDED_SWEEP_INTERVAL_SECS))
+                .await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !store.lock().await.contains_key(SESSION_BUFFER_KEY),
+            "after resolution the idle session buffer must be swept"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_scoped_cowork_request_buffered_under_session_key() {
+        let dispatcher = Arc::new(Dispatcher::new(32));
+        let store = spawn_delta_buffer(&dispatcher);
+
+        // A CoworkRequest with no turn id (claude hook / ACP bridge) must be
+        // buffered so a reconnecting stream replays the pending approval.
+        dispatcher.publish(TurnEvent::CoworkRequest {
+            approval_id: "appr-buf".into(),
+            tool: "bash".into(),
+            step_n: 0,
+            args_display: "{\"command\":\"ls\"}".into(),
+            reasoning: "run: ls".into(),
+            cwd: None,
+            turn_id: None,
+            supports_modify: true,
+            correlation: CorrelationCtx::default(),
+        });
+        // Turn-scoped requests still join their turn's buffer, not the session's.
+        dispatcher.publish(TurnEvent::Started {
+            session_id: "sess".into(),
+            turn_id: "t-scoped".into(),
+            correlation: CorrelationCtx::default(),
+        });
+        dispatcher.publish(TurnEvent::CoworkRequest {
+            approval_id: "appr-turn".into(),
+            tool: "bash".into(),
+            step_n: 1,
+            args_display: "{\"command\":\"make\"}".into(),
+            reasoning: "run: make".into(),
+            cwd: None,
+            turn_id: Some("t-scoped".into()),
+            supports_modify: true,
+            correlation: CorrelationCtx::default(),
+        });
+
+        wait_for_store(
+            &store,
+            |m| m.contains_key(SESSION_BUFFER_KEY),
+            "session buffer for the cowork request",
+        )
+        .await;
+
+        let s = store.lock().await;
+        let session_buf = &s
+            .get(SESSION_BUFFER_KEY)
+            .expect("session buffer for turn_id-less CoworkRequest")
+            .lines;
+        assert!(
+            session_buf.iter().any(|l| l.contains("appr-buf")),
+            "session-scoped request must be buffered; got: {session_buf:?}"
+        );
+        let turn_buf = &s.get("t-scoped").expect("turn buffer").lines;
+        assert!(
+            turn_buf.iter().any(|l| l.contains("appr-turn")),
+            "turn-scoped request must join the turn buffer; got: {turn_buf:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cowork_resolved_removes_request_from_buffers() {
+        let dispatcher = Arc::new(Dispatcher::new(32));
+        let store = spawn_delta_buffer(&dispatcher);
+
+        dispatcher.publish(TurnEvent::CoworkRequest {
+            approval_id: "appr-res".into(),
+            tool: "bash".into(),
+            step_n: 0,
+            args_display: "{\"command\":\"ls\"}".into(),
+            reasoning: "run: ls".into(),
+            cwd: None,
+            turn_id: None,
+            supports_modify: true,
+            correlation: CorrelationCtx::default(),
+        });
+        wait_for_store(
+            &store,
+            |m| {
+                m.get(SESSION_BUFFER_KEY)
+                    .is_some_and(|b| b.lines.iter().any(|l| l.contains("appr-res")))
+            },
+            "buffered request before the resolution",
+        )
+        .await;
+        assert!(
+            store
+                .lock()
+                .await
+                .get(SESSION_BUFFER_KEY)
+                .is_some_and(|b| b.lines.iter().any(|l| l.contains("appr-res"))),
+            "request must be buffered before the resolution"
+        );
+
+        dispatcher.publish(TurnEvent::CoworkResolved {
+            approval_id: "appr-res".into(),
+            outcome: smedja_bellows::CoworkOutcome::Approved,
+        });
+        wait_for_store(
+            &store,
+            |m| {
+                m.get(SESSION_BUFFER_KEY)
+                    .is_some_and(|b| !b.lines.iter().any(|l| l.contains("appr-res")))
+            },
+            "retired request after the resolution",
+        )
+        .await;
+
+        let s = store.lock().await;
+        let session_buf = &s.get(SESSION_BUFFER_KEY).expect("session buffer").lines;
+        assert!(
+            !session_buf.iter().any(|l| l.contains("appr-res")),
+            "resolution must retire the buffered request; got: {session_buf:?}"
+        );
+        assert!(
+            !session_buf.iter().any(|l| l.contains("cowork_resolved")),
+            "the resolution itself must not be buffered; got: {session_buf:?}"
         );
     }
 

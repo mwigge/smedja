@@ -138,26 +138,67 @@ pub(crate) fn runner_session_key(runner: Runner) -> &'static str {
         Runner::Minimax => "minimax",
         Runner::Berget => "berget",
         Runner::Pool => "pool",
+        Runner::OpenCode => "opencode",
     }
 }
 
+/// The single source of truth for runner name aliases, in display order. The
+/// first alias listed for each runner is its short name (used in error
+/// messages); the remaining aliases cover canonical session keys (`*-cli`),
+/// pool `runner_name`s (`anthropic`, `openai`, `moonshot`, `google`), and
+/// vendor synonyms.
+const RUNNER_ALIASES: &[(&str, Runner)] = &[
+    ("claude", Runner::Claude),
+    ("claude-cli", Runner::Claude),
+    ("anthropic", Runner::Claude),
+    ("codex", Runner::Codex),
+    ("codex-cli", Runner::Codex),
+    ("openai", Runner::Codex),
+    ("kimi", Runner::Kimi),
+    ("kimi-cli", Runner::Kimi),
+    ("moonshot", Runner::Kimi),
+    ("gemini", Runner::Gemini),
+    ("gemini-cli", Runner::Gemini),
+    ("google", Runner::Gemini),
+    ("local", Runner::Local),
+    ("copilot", Runner::Copilot),
+    ("minimax", Runner::Minimax),
+    ("berget", Runner::Berget),
+    ("pool", Runner::Pool),
+    ("poolside", Runner::Pool),
+    ("opencode", Runner::OpenCode),
+];
+
 /// Parses a user-supplied or stored runner string to a [`Runner`] enum value.
 ///
-/// Accepts both canonical keys (`"claude-cli"`) and short aliases (`"claude"`).
+/// The ONE canonical runner parser for the daemon: accepts short aliases
+/// (`"claude"`), canonical session keys (`"claude-cli"`), and pool
+/// `runner_name`s (`"anthropic"`, `"openai"`), case-insensitively. Every RPC
+/// that takes a runner name (`session.set_runner`, `session.set_tier`,
+/// `session.takeover`) and the turn path's `runner_override` resolution go
+/// through this table.
 #[must_use]
 pub(crate) fn parse_runner_str(s: &str) -> Option<Runner> {
-    match s {
-        "claude" | "claude-cli" => Some(Runner::Claude),
-        "codex" | "codex-cli" => Some(Runner::Codex),
-        "kimi" | "kimi-cli" | "moonshot" => Some(Runner::Kimi),
-        "gemini" | "gemini-cli" | "google" => Some(Runner::Gemini),
-        "local" => Some(Runner::Local),
-        "copilot" => Some(Runner::Copilot),
-        "minimax" => Some(Runner::Minimax),
-        "berget" => Some(Runner::Berget),
-        "pool" | "poolside" => Some(Runner::Pool),
-        _ => None,
+    let key = s.trim().to_ascii_lowercase();
+    RUNNER_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == key)
+        .map(|(_, runner)| *runner)
+}
+
+/// Comma-separated list of the short runner names accepted by
+/// [`parse_runner_str`], derived from the alias table so error messages can
+/// never drift from what is actually accepted.
+#[must_use]
+pub(crate) fn valid_runner_names() -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+    for (alias, runner) in RUNNER_ALIASES {
+        if seen.insert(*runner) {
+            names.push(*alias);
+        }
     }
+    names.join(", ")
 }
 
 /// Maximum number of tool-dispatch iterations in a single turn.
@@ -454,6 +495,74 @@ mod tests {
 
     fn error_stream(err: AdapterError) -> smedja_adapter::DeltaStream {
         Box::pin(futures_util::stream::iter(vec![Err(err)]))
+    }
+
+    #[test]
+    fn parse_runner_str_accepts_every_pool_runner_name_and_alias() {
+        // Short aliases, canonical session keys, pool runner_names, and vendor
+        // synonyms must ALL resolve — the /switch picker sends pool
+        // runner_names (anthropic/openai/…) into session.set_runner.
+        for (input, expected) in [
+            ("claude", Runner::Claude),
+            ("claude-cli", Runner::Claude),
+            ("anthropic", Runner::Claude),
+            ("codex", Runner::Codex),
+            ("codex-cli", Runner::Codex),
+            ("openai", Runner::Codex),
+            ("kimi", Runner::Kimi),
+            ("kimi-cli", Runner::Kimi),
+            ("moonshot", Runner::Kimi),
+            ("gemini", Runner::Gemini),
+            ("gemini-cli", Runner::Gemini),
+            ("google", Runner::Gemini),
+            ("local", Runner::Local),
+            ("copilot", Runner::Copilot),
+            ("minimax", Runner::Minimax),
+            ("berget", Runner::Berget),
+            ("pool", Runner::Pool),
+            ("poolside", Runner::Pool),
+            ("opencode", Runner::OpenCode),
+        ] {
+            assert_eq!(parse_runner_str(input), Some(expected), "{input}");
+        }
+        // Case and surrounding whitespace are tolerated.
+        assert_eq!(parse_runner_str("  ANTHROPIC\n"), Some(Runner::Claude));
+        // Unknown values are rejected.
+        assert_eq!(parse_runner_str(""), None);
+        assert_eq!(parse_runner_str("nope"), None);
+    }
+
+    #[test]
+    fn runner_session_key_roundtrips_through_parse_runner_str() {
+        for runner in [
+            Runner::Claude,
+            Runner::Codex,
+            Runner::Kimi,
+            Runner::Gemini,
+            Runner::Local,
+            Runner::Copilot,
+            Runner::Minimax,
+            Runner::Berget,
+            Runner::Pool,
+            Runner::OpenCode,
+        ] {
+            assert_eq!(parse_runner_str(runner_session_key(runner)), Some(runner));
+        }
+    }
+
+    #[test]
+    fn valid_runner_names_lists_each_runner_once() {
+        let names = valid_runner_names();
+        for short in [
+            "claude", "codex", "kimi", "gemini", "local", "copilot", "minimax", "berget", "pool",
+            "opencode",
+        ] {
+            assert!(names.contains(short), "missing {short} in {names}");
+        }
+        // Every listed name must itself parse.
+        for name in names.split(", ") {
+            assert!(parse_runner_str(name).is_some(), "{name} must parse");
+        }
     }
 
     #[test]

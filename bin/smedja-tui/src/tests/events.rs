@@ -438,3 +438,361 @@ fn active_agent_name_captured_from_stream_started_event() {
 }
 
 // --- P4: PanelVisibility default ------------------------------------------
+
+// --- quality gate: no synthetic cowork approval -----------------------------
+
+fn quality_event(score: u8) -> StreamEvent {
+    StreamEvent::Quality {
+        score,
+        tdd_pass: true,
+        clean_pass: true,
+        file_advisories: Vec::new(),
+        skill_advisories: Vec::new(),
+        llm_reviewed: false,
+        suggested_command: None,
+    }
+}
+
+#[test]
+fn low_quality_streak_shows_notice_without_fake_cowork_item() {
+    let mut state = make_state("sess-qgate");
+    let mut save = None;
+    apply_stream_event(&mut state, quality_event(50), &mut save);
+    apply_stream_event(&mut state, quality_event(45), &mut save);
+
+    assert!(
+        state.pending_cowork.is_empty(),
+        "no synthetic cowork item may be queued — approving it would target an id the daemon never registered"
+    );
+    let body = state
+        .main_panel
+        .lines_text(0, state.main_panel.len())
+        .join("\n");
+    assert!(
+        body.contains("quality gate"),
+        "informational notice must be shown; got: {body}"
+    );
+    assert!(
+        body.contains("/quality"),
+        "notice points at /quality: {body}"
+    );
+}
+
+#[test]
+fn quality_notice_fires_once_per_streak() {
+    let mut state = make_state("sess-qgate-once");
+    let mut save = None;
+    apply_stream_event(&mut state, quality_event(50), &mut save);
+    apply_stream_event(&mut state, quality_event(45), &mut save);
+    apply_stream_event(&mut state, quality_event(40), &mut save);
+    let body = state
+        .main_panel
+        .lines_text(0, state.main_panel.len())
+        .join("\n");
+    assert_eq!(
+        body.matches("quality gate").count(),
+        1,
+        "notice fires once per streak, not per turn: {body}"
+    );
+}
+
+// --- cowork wire extras (agent / cwd / risk) --------------------------------
+
+#[test]
+fn cowork_request_is_enriched_with_wire_extras() {
+    let mut state = make_state("sess-cowork-meta");
+    let mut save = None;
+    let inbound = crate::events::InboundStreamEvent {
+        event: StreamEvent::CoworkRequest {
+            approval_id: "ap-1".into(),
+            tool: "bash".into(),
+            step_n: 2,
+            args_display: r#"{"cmd":"ls"}"#.into(),
+            reasoning: "check files".into(),
+        },
+        cowork_meta: Some(crate::events::CoworkMeta {
+            agent: Some("review".into()),
+            cwd: Some("/repo".into()),
+            risk: Some("high".into()),
+            supports_modify: None,
+        }),
+        cowork_resolved: None,
+    };
+    crate::events::apply_inbound_event(&mut state, inbound, &mut save);
+    let item = state.pending_cowork.first().expect("cowork item queued");
+    assert_eq!(item.agent.as_deref(), Some("review"));
+    assert_eq!(item.cwd.as_deref(), Some("/repo"));
+    assert_eq!(item.risk.as_deref(), Some("high"));
+}
+
+#[test]
+fn cowork_request_without_extras_stays_absent() {
+    let mut state = make_state("sess-cowork-plain");
+    let mut save = None;
+    let inbound = crate::events::InboundStreamEvent {
+        event: StreamEvent::CoworkRequest {
+            approval_id: "ap-2".into(),
+            tool: "read".into(),
+            step_n: 1,
+            args_display: "{}".into(),
+            reasoning: String::new(),
+        },
+        cowork_meta: None,
+        cowork_resolved: None,
+    };
+    crate::events::apply_inbound_event(&mut state, inbound, &mut save);
+    let item = state.pending_cowork.first().expect("cowork item queued");
+    assert!(item.agent.is_none() && item.cwd.is_none() && item.risk.is_none());
+}
+
+// --- cowork ingest: sanitization, queue cap, and resolved dismissal --------
+
+fn cowork_request_event(id: &str, tool: &str, args: &str) -> StreamEvent {
+    StreamEvent::CoworkRequest {
+        approval_id: id.into(),
+        tool: tool.into(),
+        step_n: 1,
+        args_display: args.into(),
+        reasoning: String::new(),
+    }
+}
+
+fn inbound(event: StreamEvent) -> crate::events::InboundStreamEvent {
+    crate::events::InboundStreamEvent {
+        event,
+        cowork_meta: None,
+        cowork_resolved: None,
+    }
+}
+
+#[test]
+fn cowork_request_sanitizes_control_characters_at_ingest() {
+    let mut state = make_state("sess-cowork-sanitize");
+    let mut save = None;
+    // OSC 52 clipboard-write attempt embedded in the args display.
+    let dirty = "{\u{1b}]52;c;Zm9v\u{7}\"cmd\":\"ls\"}";
+    crate::events::apply_inbound_event(
+        &mut state,
+        inbound(cowork_request_event("ap-esc", "ba\u{1b}sh", dirty)),
+        &mut save,
+    );
+    let item = state.pending_cowork.first().expect("cowork item queued");
+    let rendered = format!("{} {}", item.tool, item.args_display);
+    assert!(
+        !rendered.contains('\u{1b}') && !rendered.contains('\u{7}'),
+        "no control characters may survive ingestion: {rendered:?}"
+    );
+}
+
+#[test]
+fn cowork_pending_queue_is_capped_and_drops_oldest_with_notice() {
+    let mut state = make_state("sess-cowork-cap");
+    let mut save = None;
+    for i in 0..40 {
+        let id = format!("ap-{i}");
+        crate::events::apply_inbound_event(
+            &mut state,
+            inbound(cowork_request_event(&id, "bash", "{}")),
+            &mut save,
+        );
+    }
+    assert_eq!(
+        state.pending_cowork.len(),
+        32,
+        "queue must be capped at 32 items"
+    );
+    assert_eq!(
+        state.pending_cowork.first().map(|i| i.id.as_str()),
+        Some("ap-8"),
+        "oldest items are dropped first"
+    );
+    let body = state
+        .main_panel
+        .lines_text(0, state.main_panel.len())
+        .join("\n");
+    assert!(
+        body.contains("dropped the oldest"),
+        "dropping must be surfaced: {body}"
+    );
+}
+
+#[test]
+fn cowork_resolved_dismisses_matching_popup() {
+    let mut state = make_state("sess-cowork-resolved");
+    let mut save = None;
+    crate::events::apply_inbound_event(
+        &mut state,
+        inbound(cowork_request_event("ap-x", "bash", "{}")),
+        &mut save,
+    );
+    crate::events::apply_inbound_event(
+        &mut state,
+        inbound(cowork_request_event("ap-y", "read", "{}")),
+        &mut save,
+    );
+    assert_eq!(state.pending_cowork.len(), 2);
+
+    // Denied elsewhere: item dismissed, brief notice shown.
+    let mut notice = inbound(StreamEvent::Unknown);
+    notice.cowork_resolved = Some((
+        "ap-x".to_owned(),
+        Some(smedja_bellows::CoworkOutcome::Denied),
+    ));
+    crate::events::apply_inbound_event(&mut state, notice, &mut save);
+    assert_eq!(state.pending_cowork.len(), 1);
+    assert_eq!(state.pending_cowork[0].id, "ap-y");
+    let body = state
+        .main_panel
+        .lines_text(0, state.main_panel.len())
+        .join("\n");
+    assert!(
+        body.contains("approval resolved elsewhere: denied"),
+        "denied-elsewhere notice; got: {body}"
+    );
+
+    // Approved elsewhere: dismissed silently (no second notice).
+    let before = state.main_panel.len();
+    let mut notice = inbound(StreamEvent::Unknown);
+    notice.cowork_resolved = Some((
+        "ap-y".to_owned(),
+        Some(smedja_bellows::CoworkOutcome::Approved),
+    ));
+    crate::events::apply_inbound_event(&mut state, notice, &mut save);
+    assert!(state.pending_cowork.is_empty());
+    assert_eq!(
+        state.main_panel.len(),
+        before,
+        "approved resolutions stay silent"
+    );
+}
+
+#[test]
+fn cowork_resolved_unknown_id_and_timeout_are_safe() {
+    let mut state = make_state("sess-cowork-resolved-unknown");
+    let mut save = None;
+    crate::events::apply_inbound_event(
+        &mut state,
+        inbound(cowork_request_event("ap-z", "bash", "{}")),
+        &mut save,
+    );
+    // Unknown id: no-op, no notice.
+    let mut notice = inbound(StreamEvent::Unknown);
+    notice.cowork_resolved = Some((
+        "ap-other".to_owned(),
+        Some(smedja_bellows::CoworkOutcome::Denied),
+    ));
+    crate::events::apply_inbound_event(&mut state, notice, &mut save);
+    assert_eq!(state.pending_cowork.len(), 1);
+
+    // Timeout of the known id dismisses with a notice.
+    let mut notice = inbound(StreamEvent::Unknown);
+    notice.cowork_resolved = Some((
+        "ap-z".to_owned(),
+        Some(smedja_bellows::CoworkOutcome::Timeout),
+    ));
+    crate::events::apply_inbound_event(&mut state, notice, &mut save);
+    assert!(state.pending_cowork.is_empty());
+    let body = state
+        .main_panel
+        .lines_text(0, state.main_panel.len())
+        .join("\n");
+    assert!(
+        body.contains("approval resolved elsewhere: timeout"),
+        "timeout notice; got: {body}"
+    );
+}
+
+#[test]
+fn cowork_resolved_clears_modify_state_when_head_dismissed() {
+    let mut state = make_state("sess-cowork-modify-clear");
+    let mut save = None;
+    crate::events::apply_inbound_event(
+        &mut state,
+        inbound(cowork_request_event("ap-head", "bash", "{}")),
+        &mut save,
+    );
+    crate::events::apply_inbound_event(
+        &mut state,
+        inbound(cowork_request_event("ap-tail", "read", "{}")),
+        &mut save,
+    );
+    // User is editing replacement args for the head item.
+    state.cowork_modify_mode = true;
+    state.cowork_modify_input = r#"{"cmd":"ls"}"#.to_owned();
+
+    let mut notice = inbound(StreamEvent::Unknown);
+    notice.cowork_resolved = Some((
+        "ap-head".to_owned(),
+        Some(smedja_bellows::CoworkOutcome::Timeout),
+    ));
+    crate::events::apply_inbound_event(&mut state, notice, &mut save);
+
+    assert_eq!(state.pending_cowork.len(), 1);
+    assert!(
+        !state.cowork_modify_mode && state.cowork_modify_input.is_empty(),
+        "dismissing the head item must clear the modify state it was bound to"
+    );
+
+    // Dismissing a non-head item must NOT disturb an open modify editor.
+    state.cowork_modify_mode = true;
+    state.cowork_modify_input = "x".to_owned();
+    let mut notice = inbound(StreamEvent::Unknown);
+    notice.cowork_resolved = Some((
+        "ap-tail".to_owned(),
+        Some(smedja_bellows::CoworkOutcome::Denied),
+    ));
+    crate::events::apply_inbound_event(&mut state, notice, &mut save);
+    assert!(state.pending_cowork.is_empty());
+    // (head == tail after the first dismissal, so this also clears)
+}
+
+#[test]
+fn cowork_resolved_without_outcome_dismisses_silently() {
+    let mut state = make_state("sess-cowork-no-outcome");
+    let mut save = None;
+    crate::events::apply_inbound_event(
+        &mut state,
+        inbound(cowork_request_event("ap-silent", "bash", "{}")),
+        &mut save,
+    );
+    let before = state.main_panel.len();
+    // A line without a parseable outcome (older/never daemon) dismisses
+    // without a blank "resolved elsewhere: " notice.
+    let mut notice = inbound(StreamEvent::Unknown);
+    notice.cowork_resolved = Some(("ap-silent".to_owned(), None));
+    crate::events::apply_inbound_event(&mut state, notice, &mut save);
+    assert!(state.pending_cowork.is_empty(), "item dismissed");
+    assert_eq!(
+        state.main_panel.len(),
+        before,
+        "no notice for a missing/unknown outcome"
+    );
+}
+
+#[test]
+fn cowork_request_applies_supports_modify_wire_flag() {
+    let mut state = make_state("sess-cowork-supports-modify");
+    let mut save = None;
+    let inbound = crate::events::InboundStreamEvent {
+        event: StreamEvent::CoworkRequest {
+            approval_id: "ap-sm".into(),
+            tool: "bash".into(),
+            step_n: 1,
+            args_display: "{}".into(),
+            reasoning: String::new(),
+        },
+        cowork_meta: Some(crate::events::CoworkMeta {
+            agent: None,
+            cwd: None,
+            risk: None,
+            supports_modify: Some(false),
+        }),
+        cowork_resolved: None,
+    };
+    crate::events::apply_inbound_event(&mut state, inbound, &mut save);
+    let item = state.pending_cowork.first().expect("cowork item queued");
+    assert!(
+        !item.supports_modify,
+        "wire supports_modify:false must reach the item"
+    );
+}

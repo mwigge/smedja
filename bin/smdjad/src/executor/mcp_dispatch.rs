@@ -17,7 +17,7 @@ pub(crate) async fn dispatch_mcp_tool(
     ingot: &IngotHandle,
 ) -> String {
     let store = crate::mcp_oauth::TokenStore::default_store();
-    let env_token = std::env::var("MCP_TOKEN").ok();
+    let env_token = crate::secret_var("MCP_TOKEN");
     dispatch_mcp_tool_with_store(tool_name, input, ingot, &store, env_token.as_deref()).await
 }
 

@@ -112,7 +112,7 @@ pub(crate) async fn refresh(state: HandlerState, params: Value) -> Result<Value,
     };
 
     let store = crate::mcp_oauth::TokenStore::default_store();
-    let env_token = std::env::var("MCP_TOKEN").ok();
+    let env_token = crate::secret_var("MCP_TOKEN");
     let refreshed = refresh_servers(&ig, servers, &store, env_token.as_deref()).await;
 
     Ok(json!({ "refreshed": refreshed }))

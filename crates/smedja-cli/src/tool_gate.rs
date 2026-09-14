@@ -27,6 +27,13 @@ pub(crate) async fn cmd_tool_gate(sock: &std::path::Path) {
         .get("tool_input")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    // Claude's hook payload reports the directory the tool call runs in; the
+    // daemon scopes permission rules per workspace, so thread it through.
+    let cwd = input
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
 
     /// True when `SMEDJA_TOOL_GATE_FALLBACK=open` — reverts the *expected-but-
     /// unavailable* gate case to fail-open behaviour. Default is fail-closed.
@@ -42,40 +49,48 @@ pub(crate) async fn cmd_tool_gate(sock: &std::path::Path) {
     // `updated_input` is only present when the user chose *modify* with a JSON
     // object of replacement arguments; it maps to the PreToolUse hook's
     // `updatedInput` field so claude re-runs the call with the rewritten args.
-    let (decision, reason, updated_input) = match Client::connect(sock).await {
-        Ok(mut client) => match client
-            .call(
-                "cowork.gate_tool",
-                json!({
-                    "session_id": session_id,
-                    "tool_name": tool_name,
-                    "tool_input": tool_input,
-                }),
-            )
-            .await
-        {
-            Ok(v) => (
-                v.get("decision")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("allow")
-                    .to_owned(),
-                v.get("reason")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                v.get("updated_input").filter(|ui| ui.is_object()).cloned(),
-            ),
-            Err(_) => (
-                "deny".to_owned(),
-                "smedja approval interrupted (daemon connection lost) — denied".to_owned(),
-                None,
-            ),
-        },
+    // `note` carries the allow-always persistence veto (rule not written) — it
+    // goes to the user as a top-level `systemMessage`, which Claude surfaces
+    // verbatim.
+    let (decision, reason, updated_input, note) = match Client::connect(sock).await {
+        Ok(mut client) => {
+            let mut params = json!({
+                "session_id": session_id,
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+            });
+            if let Some(cwd) = cwd {
+                params["cwd"] = json!(cwd);
+            }
+            match client.call("cowork.gate_tool", params).await {
+                Ok(v) => (
+                    v.get("decision")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("allow")
+                        .to_owned(),
+                    v.get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    v.get("updated_input").filter(|ui| ui.is_object()).cloned(),
+                    v.get("note")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                ),
+                Err(_) => (
+                    "deny".to_owned(),
+                    "smedja approval interrupted (daemon connection lost) — denied".to_owned(),
+                    None,
+                    None,
+                ),
+            }
+        }
         Err(_) => {
             if fallback_open() {
                 (
                     "allow".to_owned(),
                     "smedja gate unreachable; SMEDJA_TOOL_GATE_FALLBACK=open — allowing".to_owned(),
+                    None,
                     None,
                 )
             } else {
@@ -83,6 +98,7 @@ pub(crate) async fn cmd_tool_gate(sock: &std::path::Path) {
                     "deny".to_owned(),
                     "smedja gate unreachable; denied fail-closed. Set SMEDJA_TOOL_GATE_FALLBACK=open to override."
                         .to_owned(),
+                    None,
                     None,
                 )
             }
@@ -97,6 +113,9 @@ pub(crate) async fn cmd_tool_gate(sock: &std::path::Path) {
     if let Some(updated) = updated_input {
         hook_output["updatedInput"] = updated;
     }
-    let out = json!({ "hookSpecificOutput": hook_output });
+    let mut out = json!({ "hookSpecificOutput": hook_output });
+    if let Some(note) = note {
+        out["systemMessage"] = json!(note);
+    }
     println!("{out}");
 }

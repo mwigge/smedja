@@ -33,7 +33,15 @@ impl Provider for ClaudeCliProvider {
     fn stream_chat(&self, messages: &[Message], opts: &CallOptions) -> DeltaStream {
         match self {
             Self::Cli => stream_claude_cli(messages, opts),
-            Self::Api(p) => p.stream_chat(messages, opts),
+            Self::Api(p) => {
+                if let Some(effort) = opts.effort.as_deref() {
+                    tracing::debug!(
+                        effort,
+                        "reasoning effort is not mapped for the Anthropic HTTP fallback; using provider default"
+                    );
+                }
+                p.stream_chat(messages, opts)
+            }
         }
     }
 }
@@ -243,6 +251,18 @@ fn install_system_prompt(
     Some(TempFileGuard(path))
 }
 
+/// Maps a reasoning-effort level to claude's `MAX_THINKING_TOKENS` budget — the
+/// only thinking control the CLI exposes (there is no `--thinking` flag).
+/// Returns `None` for unknown levels, leaving the CLI's own default.
+fn thinking_budget(effort: &str) -> Option<&'static str> {
+    match effort {
+        "low" => Some("2048"),
+        "medium" => Some("8192"),
+        "high" => Some("32768"),
+        _ => None,
+    }
+}
+
 fn stream_claude_cli(messages: &[Message], opts: &CallOptions) -> DeltaStream {
     // Render the FULL conversation into the prompt and deliver it on stdin.
     // We do NOT use `--resume`: it depends on the CLI's own conversation store,
@@ -253,6 +273,7 @@ fn stream_claude_cli(messages: &[Message], opts: &CallOptions) -> DeltaStream {
     let model = opts.model.clone();
     let session_id = opts.smedja_session_id.clone();
     let permission_mode = opts.permission_mode.clone();
+    let effort = opts.effort.clone();
     let system = opts.system.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
@@ -285,6 +306,12 @@ fn stream_claude_cli(messages: &[Message], opts: &CallOptions) -> DeltaStream {
 
         if !model.is_empty() {
             command.arg("--model").arg(&model);
+        }
+
+        // Reasoning effort → MAX_THINKING_TOKENS budget (the CLI's only
+        // thinking control). Unknown levels and no pin leave claude's default.
+        if let Some(budget) = effort.as_deref().and_then(thinking_budget) {
+            command.env("MAX_THINKING_TOKENS", budget);
         }
 
         // Install the PreToolUse approval hook so claude's own tool calls are
@@ -651,6 +678,14 @@ mod tests {
         assert_eq!(render_conversation(&msgs), "hi");
     }
 
+    #[test]
+    fn thinking_budget_maps_levels_and_rejects_unknown() {
+        assert_eq!(thinking_budget("low"), Some("2048"));
+        assert_eq!(thinking_budget("medium"), Some("8192"));
+        assert_eq!(thinking_budget("high"), Some("32768"));
+        assert_eq!(thinking_budget("turbo"), None);
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the stream to serialize $PATH mutation across concurrent tests
     async fn cli_provider_streams_mock_claude_via_stdin_without_resume() {
@@ -700,6 +735,7 @@ mod tests {
             provider_session_id: Some("resume-123".into()),
             smedja_session_id: None,
             permission_mode: None,
+            effort: None,
             stable_prefix_len: None,
             cache_strategy: crate::types::CacheStrategy::None,
             workspace: None,
@@ -862,6 +898,7 @@ mod tests {
             provider_session_id: None,
             smedja_session_id: None,
             permission_mode: None,
+            effort: None,
             stable_prefix_len: None,
             cache_strategy: crate::types::CacheStrategy::None,
             workspace: None,

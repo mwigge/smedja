@@ -11,15 +11,17 @@ use tracing::warn;
 
 /// Map from `(Runner, Tier)` to a concrete provider instance.
 ///
-/// Built once at daemon start-up; shared across all concurrent turns via
-/// `Arc<ProviderPool>`.
+/// Built at daemon start-up and rebuilt by `provider.rescan`; shared across all
+/// concurrent turns via `Arc<ProviderPool>` snapshots handed out by
+/// [`SharedProviderPool`](crate::provider_pool::SharedProviderPool), so a
+/// rescan swap never affects an in-flight turn.
 pub struct ProviderPool {
-    pub(super) entries: HashMap<(Runner, Tier), ProviderEntry>,
+    pub(crate) entries: HashMap<(Runner, Tier), ProviderEntry>,
     /// Keys in stable insertion/priority order — the same order
     /// [`build_provider_pool`] probes providers, which determines the default
     /// and the rotation-ring priority. A `HashMap` does not preserve insertion
     /// order, so the ordering is tracked explicitly here.
-    pub(super) order: Vec<(Runner, Tier)>,
+    pub(crate) order: Vec<(Runner, Tier)>,
     /// The `(Runner, Tier)` used when the assayer selects a route that has no
     /// entry in the pool.
     pub default: Option<(Runner, Tier)>,

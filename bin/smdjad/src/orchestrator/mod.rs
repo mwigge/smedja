@@ -1624,4 +1624,47 @@ mod tests {
         let content = super::tool_diff_content(r#"{"command":"ls"}"#, tmp.path()).await;
         assert!(content.is_empty());
     }
+
+    /// Records the `CallOptions.effort` of the first call, then replies.
+    struct EffortRecordingProvider {
+        seen: Arc<std::sync::Mutex<Option<String>>>,
+    }
+    impl Provider for EffortRecordingProvider {
+        fn stream_chat(&self, _messages: &[AdapterMessage], opts: &CallOptions) -> DeltaStream {
+            *self
+                .seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = opts.effort.clone();
+            Box::pin(futures_util::stream::iter(vec![Ok(Delta::Text(
+                "done".to_owned(),
+            ))]))
+        }
+    }
+
+    #[tokio::test]
+    async fn session_effort_pin_reaches_call_options() {
+        let (ingot, session_id, turn_id) = seed_session_and_task("do a thing").await;
+        crate::handlers::session::set_effort_with(&session_id, "high").expect("pin effort");
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let pool = ProviderPool::from_entries_for_test(vec![entry(
+            (Runner::Claude, Tier::Fast),
+            "claude-cli",
+            Box::new(EffortRecordingProvider {
+                seen: Arc::clone(&seen),
+            }),
+        )]);
+        let dispatcher = Arc::new(Dispatcher::new(64));
+        let orc = orchestrator_with_pool(ingot, dispatcher, pool);
+        orc.run(session_id, turn_id).await;
+
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            seen.as_deref(),
+            Some("high"),
+            "the session's effort pin must reach CallOptions"
+        );
+    }
 }

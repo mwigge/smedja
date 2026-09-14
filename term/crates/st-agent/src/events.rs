@@ -39,6 +39,15 @@ pub enum PaneEvent {
         tool_name: String,
         args: Value,
         prompt: String,
+        /// Turn this prompt belongs to, when the wire payload carries it.
+        /// Receivers should key their session lookup by this turn (falling
+        /// back to their current turn) so a late or reordered prompt is not
+        /// filed under the wrong turn — or dropped when no turn is open.
+        turn_id: Option<String>,
+        /// Approval identifier to echo back via
+        /// [`SmdjadClient::send_approval`](crate::SmdjadClient::send_approval).
+        /// `None` on pre-v4 wire payloads; such prompts cannot be answered.
+        approval_id: Option<String>,
     },
     /// A tool invocation has completed.
     ToolResult { tool_name: String, outcome: String },
@@ -56,6 +65,14 @@ pub enum PaneEvent {
     },
     /// Incremental text from the model stream.
     StreamDelta { text: String },
+    /// A pending approval was resolved elsewhere (another pane/client, or a
+    /// gate timeout) — the daemon scans all gates by approval id, so this
+    /// notice is session-agnostic. The matching local prompt must stop
+    /// intercepting keys.
+    ApprovalResolved {
+        /// Approval identifier that was resolved.
+        approval_id: String,
+    },
 }
 
 impl PaneEvent {
@@ -72,6 +89,14 @@ impl PaneEvent {
     #[must_use]
     pub fn from_json_line(line: &str) -> Option<Self> {
         use smedja_agent_events::AgentEvent;
+
+        // Check the session-agnostic resolution notice against the raw JSON
+        // first: the typed schema may predate the `ApprovalResolved` variant
+        // (added by the daemon after schema v4), and this receiver must clear
+        // resolved-elsewhere prompts with either build.
+        if let Some(ev) = approval_resolved_from_raw(line) {
+            return Some(ev);
+        }
 
         let Some(envelope) = AgentEventEnvelope::from_json_line(line) else {
             warn!(line, "unparseable or unknown smdjad agent event");
@@ -101,11 +126,26 @@ impl PaneEvent {
                 trace_id: None,
                 span_id: None,
             },
-            AgentEvent::ApprovalPrompt { tool, prompt, .. } => Self::ApprovalPrompt {
-                tool_name: tool.unwrap_or_default(),
-                args: Value::Null,
-                prompt: prompt.unwrap_or_default(),
-            },
+            AgentEvent::ApprovalPrompt {
+                tool,
+                prompt,
+                approval_id,
+                turn_id,
+            } => {
+                let prompt = prompt.unwrap_or_default();
+                // smdjad puts the scrubbed args display in the prompt text;
+                // when it parses as JSON, recover it as the structured args so
+                // renderers (e.g. ApprovalGate) can show real arguments instead
+                // of a hard-dropped Null.
+                let args = serde_json::from_str(&prompt).unwrap_or(Value::Null);
+                Self::ApprovalPrompt {
+                    tool_name: tool.unwrap_or_default(),
+                    args,
+                    prompt,
+                    turn_id,
+                    approval_id,
+                }
+            }
             AgentEvent::ToolResult {
                 tool, summary, ok, ..
             } => Self::ToolResult {
@@ -137,8 +177,33 @@ impl PaneEvent {
             AgentEvent::StreamDelta { content, .. } => Self::StreamDelta {
                 text: content.unwrap_or_default(),
             },
+            // Forward compatibility: variants added to the wire schema after
+            // this build decode here once the typed schema knows them.
+            // `ApprovalResolved` is already caught from the raw line above, so
+            // anything reaching this arm has no rendering yet and is ignored.
+            #[allow(unreachable_patterns)]
+            _ => return None,
         })
     }
+}
+
+/// Extracts an [`PaneEvent::ApprovalResolved`] from a raw wire line.
+///
+/// The daemon emits `{"type":"approval_resolved","approval_id":"…"}` when a
+/// gate resolves session-agnostically. Parsed from the raw JSON so this
+/// receiver copes whether or not the typed `smedja-agent-events` schema
+/// carries the variant yet.
+fn approval_resolved_from_raw(line: &str) -> Option<PaneEvent> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    if v.get("type").and_then(Value::as_str) != Some("approval_resolved") {
+        return None;
+    }
+    let approval_id = v
+        .get("approval_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?
+        .to_owned();
+    Some(PaneEvent::ApprovalResolved { approval_id })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

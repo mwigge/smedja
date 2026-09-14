@@ -410,18 +410,52 @@ async fn resolve_shell(
         tracing::warn!(cmd = %cmd, "executing @shell fragment without cowork gate — enable cowork mode to require human approval");
     }
     if let Some(gate) = gate {
-        let prompt = ApprovalPrompt {
-            step_n: 0,
-            tool: "shell".to_owned(),
-            args_scrubbed: serde_json::json!({ "cmd": cmd }),
-            reasoning: "inline @shell fragment".to_owned(),
-            plan_summary: String::new(),
-        };
-        match gate
-            .intercept(prompt, SHELL_APPROVAL_TIMEOUT_SECS, None)
-            .await
-        {
-            Decision::Approve => {}
+        // Persisted [[permission.rules]] apply here too: an allow rule skips the
+        // prompt, a deny rule blocks the fragment without reaching the gate.
+        let raw_args = serde_json::json!({ "cmd": cmd });
+        match crate::cowork::evaluate_workspace_rules(workspace, "shell", &raw_args) {
+            Some(crate::cowork::PermissionDecision::Allow) => {
+                let output = crate::exec_bash(cmd, workspace).await;
+                return Resolved::Content(output);
+            }
+            Some(crate::cowork::PermissionDecision::Deny) => {
+                return Resolved::Marker("[smedja: @shell denied by permission rule]".to_owned());
+            }
+            Some(crate::cowork::PermissionDecision::Ask) | None => {}
+        }
+        // @shell has no modify channel — an inline fragment has no place to
+        // apply replacement args — so the prompt opts out; cowork.modify then
+        // rejects with an explicit "not supported" error instead of a silent
+        // deny.
+        let mut prompt = ApprovalPrompt::new(0, "shell", &raw_args, "inline @shell fragment");
+        prompt.cwd = Some(workspace.display().to_string());
+        prompt.supports_modify = false;
+        // `intercept_tracked` (not bare `intercept`) so an allow-always
+        // resolution is visible here: persist the matching Allow rule like
+        // every other gate path, and surface the veto note when the command
+        // cannot be persisted (glob char, secret, unscopeable).
+        let (id, decision) = gate
+            .intercept_tracked(prompt, SHELL_APPROVAL_TIMEOUT_SECS, None)
+            .await;
+        match decision {
+            Decision::Approve => {
+                if gate.take_always(&id).await {
+                    let veto = crate::cowork::allow_always_skip_reason(&raw_args)
+                        .map(str::to_owned)
+                        .or(gate.take_always_note(&id).await);
+                    if let Some(reason) = veto {
+                        tracing::info!(cmd = %cmd, "allow-always rule not persisted: {reason}");
+                        let output = crate::exec_bash(cmd, workspace).await;
+                        return Resolved::Content(format!(
+                            "{output}\n[smedja: allow-always not persisted: {reason}]"
+                        ));
+                    }
+                    if let Err(e) = crate::cowork::append_allow_rule(workspace, "shell", &raw_args)
+                    {
+                        tracing::warn!(error = %e, cmd = %cmd, "failed to persist allow-always rule");
+                    }
+                }
+            }
             // A denial or a modify request both mean "do not run this command as
             // submitted"; an inline fragment has no place to apply a modification.
             Decision::Deny(_) | Decision::Modify(_) => {
@@ -754,6 +788,149 @@ mod tests {
         let out = handle.await.unwrap();
         assert_eq!(out, "[smedja: @shell denied]");
         assert!(!out.contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn shell_fragment_honors_persisted_allow_rule_without_prompt() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        crate::cowork::append_allow_rule(&ws, "shell", &serde_json::json!({"cmd": "echo hi"}))
+            .unwrap();
+
+        let gate = Arc::new(CoworkGate::default());
+        let out = expand_with_caps(
+            "@shell echo hi",
+            &ws,
+            Some(&gate),
+            None,
+            caps(1 << 20, 2_000, 1 << 20),
+        )
+        .await;
+        assert!(out.contains("hi"), "rule-allowed @shell runs: {out}");
+        assert!(
+            gate.list_pending().await.is_empty(),
+            "a persisted allow rule must not raise a prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_fragment_honors_persisted_deny_rule() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let dir = ws.join(".smedja");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("workspace.toml"),
+            "[[permission.rules]]\ntool = \"shell\"\ncommand_pattern = \"echo nope\"\nmode = \"deny\"\n",
+        )
+        .unwrap();
+
+        let gate = Arc::new(CoworkGate::default());
+        let out = expand_with_caps(
+            "@shell echo nope",
+            &ws,
+            Some(&gate),
+            None,
+            caps(1 << 20, 2_000, 1 << 20),
+        )
+        .await;
+        assert_eq!(out, "[smedja: @shell denied by permission rule]");
+        assert!(gate.list_pending().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shell_fragment_allow_always_persists_rule() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let gate = Arc::new(CoworkGate::default());
+        let gate2 = Arc::clone(&gate);
+        let ws2 = ws.clone();
+        let handle = tokio::spawn(async move {
+            expand_with_caps(
+                "@shell echo hi",
+                &ws2,
+                Some(&gate2),
+                None,
+                caps(1 << 20, 2_000, 1 << 20),
+            )
+            .await
+        });
+        let id = {
+            let mut found = None;
+            for _ in 0..10_000 {
+                if let Some((id, _)) = gate.list_pending().await.first() {
+                    found = Some(id.clone());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            found.expect("@shell must request approval")
+        };
+        assert!(gate.approve_always(&id).await.0);
+        let out = handle.await.unwrap();
+        assert!(out.contains("hi"), "approved output injected: {out}");
+
+        // The allow-always resolution persisted a rule, so the same fragment
+        // now runs without prompting.
+        let rules = crate::cowork::load_permission_rules(&ws);
+        assert_eq!(rules.len(), 1, "allow-always must persist a shell rule");
+        assert_eq!(rules[0].tool, "shell");
+        let gate = Arc::new(CoworkGate::default());
+        let out = expand_with_caps(
+            "@shell echo hi",
+            &ws,
+            Some(&gate),
+            None,
+            caps(1 << 20, 2_000, 1 << 20),
+        )
+        .await;
+        assert!(out.contains("hi"));
+        assert!(gate.list_pending().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shell_fragment_allow_always_with_glob_command_notes_no_persistence() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let gate = Arc::new(CoworkGate::default());
+        let gate2 = Arc::clone(&gate);
+        let ws2 = ws.clone();
+        let handle = tokio::spawn(async move {
+            expand_with_caps(
+                "@shell ls *",
+                &ws2,
+                Some(&gate2),
+                None,
+                caps(1 << 20, 2_000, 1 << 20),
+            )
+            .await
+        });
+        let id = {
+            let mut found = None;
+            for _ in 0..10_000 {
+                if let Some((id, _)) = gate.list_pending().await.first() {
+                    found = Some(id.clone());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            found.expect("@shell must request approval")
+        };
+        let (found, note) = gate.approve_always(&id).await;
+        assert!(found);
+        assert!(
+            note.as_deref().is_some_and(|n| n.contains("glob")),
+            "globby command must carry a veto note; got {note:?}"
+        );
+        let out = handle.await.unwrap();
+        assert!(
+            out.contains("allow-always not persisted"),
+            "veto note must surface as a trailing marker: {out}"
+        );
+        assert!(
+            crate::cowork::load_permission_rules(&ws).is_empty(),
+            "a globby command must not persist a rule"
+        );
     }
 
     // ── 5. Caps ──────────────────────────────────────────────────────────────

@@ -152,6 +152,7 @@ pub async fn review_turn(diff: &str, tier1_score: u8, reviewer_model: &str) -> Q
         provider_session_id: None,
         smedja_session_id: None,
         permission_mode: None,
+        effort: None,
         stable_prefix_len: None,
         cache_strategy: smedja_adapter::CacheStrategy::None,
         workspace: None,
@@ -175,7 +176,7 @@ pub async fn review_turn(diff: &str, tier1_score: u8, reviewer_model: &str) -> Q
 }
 
 async fn call_anthropic(messages: Vec<Message>, opts: CallOptions) -> (String, u32, u32) {
-    let Ok(key) = std::env::var("ANTHROPIC_API_KEY") else {
+    let Some(key) = crate::secret_var("ANTHROPIC_API_KEY") else {
         warn!("ANTHROPIC_API_KEY not set; Tier-2 review unavailable");
         return (String::new(), 0, 0);
     };
@@ -183,7 +184,7 @@ async fn call_anthropic(messages: Vec<Message>, opts: CallOptions) -> (String, u
 }
 
 async fn call_openai(messages: Vec<Message>, opts: CallOptions) -> (String, u32, u32) {
-    let Ok(key) = std::env::var("OPENAI_API_KEY") else {
+    let Some(key) = crate::secret_var("OPENAI_API_KEY") else {
         warn!("OPENAI_API_KEY not set; Tier-2 review unavailable");
         return (String::new(), 0, 0);
     };

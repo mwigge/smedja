@@ -79,7 +79,17 @@ impl SmdjadClient {
     /// Returns an [`io::Error`] if the socket does not exist or the connection
     /// is refused.
     pub async fn connect() -> Result<Self, io::Error> {
-        let stream = UnixStream::connect(smdjad_socket_path()).await?;
+        Self::connect_to(&smdjad_socket_path()).await
+    }
+
+    /// Opens a connection to the smdjad socket at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`] if the socket does not exist or the connection
+    /// is refused.
+    pub async fn connect_to(path: &Path) -> Result<Self, io::Error> {
+        let stream = UnixStream::connect(path).await?;
         let (read_half, writer) = tokio::io::split(stream);
         let reader = BufReader::new(read_half);
         debug!("connected to smdjad socket");
@@ -97,11 +107,7 @@ impl SmdjadClient {
     /// is refused.
     pub async fn connect_agent() -> Result<Self, io::Error> {
         let path = agent_socket_path(&smdjad_socket_path());
-        let stream = UnixStream::connect(&path).await?;
-        let (read_half, writer) = tokio::io::split(stream);
-        let reader = BufReader::new(read_half);
-        debug!("connected to smdjad agent socket");
-        Ok(Self { reader, writer })
+        Self::connect_to(&path).await
     }
 
     /// Sends a `subscribe_pane` request for the given pane UUID.
@@ -146,28 +152,82 @@ impl SmdjadClient {
 
     /// Sends an approval decision for a pending tool call.
     ///
+    /// This is an associated function, not a method: the answer goes to the
+    /// main RPC socket as a `cowork.resolve` request with an id, because the
+    /// agent-event socket this client is usually connected to is write-only
+    /// from smdjad's side — it never reads past the initial `subscribe_pane`
+    /// line. A short-lived connection is opened per call instead.
+    ///
+    /// Returns `Ok(true)` when the daemon resolved the gate, `Ok(false)` when
+    /// the reply carried `resolved: false` (the gate was already gone —
+    /// answered elsewhere or timed out — so the local prompt must be dropped,
+    /// not re-pended).
+    ///
     /// # Errors
     ///
-    /// Returns an [`io::Error`] if serialisation fails or the write to the
-    /// socket fails.
+    /// Returns an [`io::Error`] if the RPC socket cannot be reached,
+    /// serialisation fails, the write to the socket fails, or no well-formed
+    /// reply arrives.
     pub async fn send_approval(
-        &mut self,
-        pane_id: &str,
+        approval_id: &str,
         decision: ApprovalDecision,
-    ) -> Result<(), io::Error> {
+    ) -> Result<bool, io::Error> {
+        Self::send_approval_to(&smdjad_socket_path(), approval_id, decision).await
+    }
+
+    /// Sends an approval decision to the smdjad RPC socket at `path`.
+    ///
+    /// The frame is built with [`smedja_rpc::Request::new`] (a request WITH an
+    /// id) so the daemon's `{resolved}` reply comes back and the caller can
+    /// tell a resolved gate apart from an already-gone one — the previous
+    /// fire-and-forget `approval_response` notification forced a pessimistic
+    /// re-pend on any failure, including gates that no longer existed. The
+    /// params carry both `id` (the `cowork.resolve` contract) and
+    /// `approval_id` (the pre-rename spelling) so a daemon mid-rename answers
+    /// either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`] if the socket cannot be reached,
+    /// serialisation fails, the write to the socket fails, or the reply
+    /// cannot be read or parsed.
+    pub async fn send_approval_to(
+        path: &Path,
+        approval_id: &str,
+        decision: ApprovalDecision,
+    ) -> Result<bool, io::Error> {
         let approved = decision == ApprovalDecision::Approve;
-        let msg = serde_json::json!({
-            "method": "approval_response",
-            "params": {
-                "pane_id": pane_id,
+        let msg = smedja_rpc::Request::new(
+            "cowork-resolve",
+            "cowork.resolve",
+            serde_json::json!({
+                "id": approval_id,
+                "approval_id": approval_id,
                 "approved": approved,
-            }
-        });
+            }),
+        );
         let mut line = serde_json::to_string(&msg)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         line.push('\n');
-        self.writer.write_all(line.as_bytes()).await?;
-        info!(pane_id, approved, "sent approval response");
-        Ok(())
+        let mut client = Self::connect_to(path).await?;
+        client.writer.write_all(line.as_bytes()).await?;
+        client.writer.flush().await?;
+        let mut reply = String::new();
+        client.reader.read_line(&mut reply).await?;
+        let v: serde_json::Value = serde_json::from_str(reply.trim_end())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if let Some(err) = v.get("error") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("cowork.resolve rejected: {err}"),
+            ));
+        }
+        let resolved = v
+            .get("result")
+            .and_then(|r| r.get("resolved"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        info!(approval_id, approved, resolved, "sent approval response");
+        Ok(resolved)
     }
 }

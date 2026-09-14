@@ -2,6 +2,49 @@
 
 use smedja_bellows::{StreamEvent, TurnEvent};
 
+/// Serialises a `cowork_request` NDJSON line. The required keys match
+/// [`StreamEvent::CoworkRequest`] exactly; `agent`, `cwd` (both omitted when
+/// unknown), `supports_modify` and `risk` (from [`crate::cowork::tool_risk`])
+/// are additive optional fields — older clients ignore them, newer ones render
+/// them.
+///
+/// Hand-built rather than serialising a typed struct on purpose:
+/// [`StreamEvent::CoworkRequest`] is constructed as a struct literal by stream
+/// CLIENTS (the TUI), so adding a field there would break every client at
+/// compile time. The wire line only needs to be a superset of what clients
+/// parse; keeping it hand-built lets the daemon add fields freely.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cowork_request_line(
+    approval_id: &str,
+    tool: &str,
+    step_n: u32,
+    args_display: &str,
+    reasoning: &str,
+    agent: Option<&str>,
+    cwd: Option<&str>,
+    supports_modify: bool,
+) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".into(), serde_json::json!("cowork_request"));
+    obj.insert("approval_id".into(), serde_json::json!(approval_id));
+    obj.insert("tool".into(), serde_json::json!(tool));
+    obj.insert("step_n".into(), serde_json::json!(step_n));
+    obj.insert("args_display".into(), serde_json::json!(args_display));
+    obj.insert("reasoning".into(), serde_json::json!(reasoning));
+    if let Some(agent) = agent {
+        obj.insert("agent".into(), serde_json::json!(agent));
+    }
+    if let Some(cwd) = cwd {
+        obj.insert("cwd".into(), serde_json::json!(cwd));
+    }
+    obj.insert("supports_modify".into(), serde_json::json!(supports_modify));
+    obj.insert(
+        "risk".into(),
+        serde_json::json!(crate::cowork::tool_risk(tool)),
+    );
+    serde_json::Value::Object(obj).to_string()
+}
+
 /// Convert a [`TurnEvent`] to `(turn_id, ndjson_line, is_terminal)`.
 ///
 /// Returns `(None, _, _)` for events where the `turn_id` is unknown or not
@@ -112,16 +155,21 @@ pub(crate) fn turn_event_to_ndjson(
             step_n,
             args_display,
             reasoning,
+            cwd,
             turn_id,
-            ..
+            supports_modify,
+            correlation,
         } => {
-            let line = ser(&StreamEvent::CoworkRequest {
-                approval_id: approval_id.clone(),
-                tool: tool.clone(),
-                step_n: *step_n,
-                args_display: args_display.clone(),
-                reasoning: reasoning.clone(),
-            });
+            let line = cowork_request_line(
+                approval_id,
+                tool,
+                *step_n,
+                args_display,
+                reasoning,
+                correlation.agent_name.as_deref(),
+                cwd.as_deref(),
+                *supports_modify,
+            );
             (turn_id.clone(), line, false)
         }
         TurnEvent::TokenUsage {
@@ -195,6 +243,17 @@ pub(crate) fn turn_event_to_ndjson(
             // Terminal: the audit stream ends once the report is delivered.
             (turn_id.clone(), line, true)
         }
+        TurnEvent::CoworkResolved {
+            approval_id,
+            outcome,
+            ..
+        } => {
+            let line = ser(&StreamEvent::CoworkResolved {
+                approval_id: approval_id.clone(),
+                outcome: *outcome,
+            });
+            (None, line, false)
+        }
         TurnEvent::HistoryReplaced { turn_id, .. } => (Some(turn_id.clone()), String::new(), false),
     }
 }
@@ -203,6 +262,66 @@ pub(crate) fn turn_event_to_ndjson(
 mod tests {
     use super::*;
     use smedja_bellows::event::CorrelationCtx;
+
+    #[test]
+    fn cowork_request_line_has_exact_wire_shape() {
+        let line = cowork_request_line(
+            "appr-1",
+            "bash",
+            2,
+            r#"{"command":"ls"}"#,
+            "run: ls",
+            Some("claude"),
+            Some("/home/u/proj"),
+            false,
+        );
+        let v: serde_json::Value = serde_json::from_str(&line).expect("must be JSON");
+        let obj = v.as_object().expect("must be an object");
+        let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "type",
+                "approval_id",
+                "tool",
+                "step_n",
+                "args_display",
+                "reasoning",
+                "agent",
+                "cwd",
+                "supports_modify",
+                "risk",
+            ]
+            .into_iter()
+            .collect(),
+            "cowork_request wire keys drifted: {keys:?}"
+        );
+        assert_eq!(v["supports_modify"], false);
+        // Optional keys are omitted when unknown, but supports_modify always
+        // ships so the client can render/hide the modify affordance.
+        let line = cowork_request_line("a", "bash", 0, "{}", "r", None, None, true);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(v.get("agent").is_none() && v.get("cwd").is_none());
+        assert_eq!(v["supports_modify"], true);
+    }
+
+    #[test]
+    fn turn_event_to_ndjson_cowork_request_carries_supports_modify() {
+        let event = TurnEvent::CoworkRequest {
+            approval_id: "appr-9".into(),
+            tool: "shell".into(),
+            step_n: 0,
+            args_display: "{}".into(),
+            reasoning: "r".into(),
+            cwd: None,
+            turn_id: None,
+            supports_modify: false,
+            correlation: CorrelationCtx::default(),
+        };
+        let (_, line, terminal) = turn_event_to_ndjson(&event, "t-x");
+        assert!(line.contains(r#""supports_modify":false"#), "got: {line}");
+        assert!(!terminal);
+    }
 
     #[test]
     fn turn_event_to_ndjson_delta_returns_correct_type() {

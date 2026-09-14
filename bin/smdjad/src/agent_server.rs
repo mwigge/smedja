@@ -158,6 +158,8 @@ async fn handle_connection(stream: UnixStream, subs: SubList) {
 /// The mapping is:
 /// - [`TurnEvent::Started`] → [`AgentEvent::TurnStart`]
 /// - [`TurnEvent::ToolCalled`] → [`AgentEvent::ToolCall`]
+/// - [`TurnEvent::CoworkRequest`] → [`AgentEvent::ApprovalPrompt`]
+/// - [`TurnEvent::CoworkResolved`] → [`AgentEvent::ApprovalResolved`]
 /// - [`TurnEvent::AssistantDelta`] → [`AgentEvent::StreamDelta`]
 /// - [`TurnEvent::Completed`] / [`TurnEvent::Failed`] → [`AgentEvent::TurnEnd`]
 fn turn_event_to_agent_event(event: &TurnEvent) -> Option<AgentEvent> {
@@ -225,10 +227,33 @@ fn turn_event_to_agent_event(event: &TurnEvent) -> Option<AgentEvent> {
             latency_ms: None,
             traceparent: None,
         }),
-        // Quality snapshots, cowork requests, streaming-only events, and compaction
+        TurnEvent::CoworkRequest {
+            approval_id,
+            tool,
+            args_display,
+            reasoning,
+            turn_id,
+            ..
+        } => Some(AgentEvent::ApprovalPrompt {
+            turn_id: turn_id.clone(),
+            tool: Some(tool.clone()),
+            // The prompt text is the scrubbed args display when present (so
+            // the terminal shows what will actually run), else the agent's
+            // reasoning. The approval id lets the receiver answer via the
+            // `cowork.resolve` RPC.
+            prompt: Some(if args_display.is_empty() || args_display == "null" {
+                reasoning.clone()
+            } else {
+                args_display.clone()
+            }),
+            approval_id: Some(approval_id.clone()),
+        }),
+        TurnEvent::CoworkResolved { approval_id, .. } => Some(AgentEvent::ApprovalResolved {
+            approval_id: Some(approval_id.clone()),
+        }),
+        // Quality snapshots, streaming-only events, and compaction
         // notifications are not surfaced to agent consumers.
         TurnEvent::QualitySnapshot { .. }
-        | TurnEvent::CoworkRequest { .. }
         | TurnEvent::TokenUsage { .. }
         | TurnEvent::ToolCallChunk { .. }
         | TurnEvent::ToolCallUpdate { .. }
@@ -360,6 +385,82 @@ mod tests {
             AgentEvent::StreamDelta {
                 turn_id: Some("t1".into()),
                 content: Some("hello".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn cowork_resolved_maps_to_approval_resolved() {
+        let event = TurnEvent::CoworkResolved {
+            approval_id: "appr-1".into(),
+            outcome: smedja_bellows::CoworkOutcome::Approved,
+        };
+        let env = AgentEventEnvelope::from_json_line(
+            &turn_event_to_agent_event_line(&event).expect("must produce event"),
+        )
+        .expect("must decode");
+        assert_eq!(
+            env.event,
+            AgentEvent::ApprovalResolved {
+                approval_id: Some("appr-1".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn cowork_request_maps_to_approval_prompt() {
+        let event = TurnEvent::CoworkRequest {
+            approval_id: "appr-1".into(),
+            tool: "bash".into(),
+            step_n: 0,
+            args_display: r#"{"command":"rm -rf /tmp/x"}"#.into(),
+            reasoning: "clean up".into(),
+            cwd: Some("/home/u/proj".into()),
+            turn_id: Some("t1".into()),
+            supports_modify: true,
+            correlation: CorrelationCtx::default(),
+        };
+        let env = AgentEventEnvelope::from_json_line(
+            &turn_event_to_agent_event_line(&event).expect("must produce event"),
+        )
+        .expect("must decode");
+        assert_eq!(
+            env.event,
+            AgentEvent::ApprovalPrompt {
+                turn_id: Some("t1".into()),
+                tool: Some("bash".into()),
+                // The prompt text is the scrubbed args display so the terminal
+                // shows what will actually run.
+                prompt: Some(r#"{"command":"rm -rf /tmp/x"}"#.into()),
+                approval_id: Some("appr-1".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn cowork_request_without_args_display_falls_back_to_reasoning() {
+        let event = TurnEvent::CoworkRequest {
+            approval_id: "appr-2".into(),
+            tool: "bash".into(),
+            step_n: 0,
+            args_display: "null".into(),
+            reasoning: "needs a shell".into(),
+            cwd: None,
+            turn_id: None,
+            supports_modify: true,
+            correlation: CorrelationCtx::default(),
+        };
+        let env = AgentEventEnvelope::from_json_line(
+            &turn_event_to_agent_event_line(&event).expect("must produce event"),
+        )
+        .expect("must decode");
+        assert_eq!(
+            env.event,
+            AgentEvent::ApprovalPrompt {
+                turn_id: None,
+                tool: Some("bash".into()),
+                prompt: Some("needs a shell".into()),
+                approval_id: Some("appr-2".into()),
             }
         );
     }

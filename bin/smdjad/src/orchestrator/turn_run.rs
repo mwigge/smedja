@@ -994,11 +994,15 @@ impl TurnRun {
             let dispatcher = self.orch.dispatcher.clone();
             let session_id = session_id.clone();
             let turn_id = self.turn_id.clone();
+            let agent_name = entry_runner_name.clone();
+            let workspace = workspace_root.clone();
             smedja_adapter::ToolGate::new(move |tool, input| {
                 let gates = gates.clone();
                 let dispatcher = dispatcher.clone();
                 let session_id = session_id.clone();
                 let turn_id = turn_id.clone();
+                let agent_name = agent_name.clone();
+                let workspace = workspace.clone();
                 Box::pin(async move {
                     let gate = gates
                         .lock()
@@ -1012,9 +1016,18 @@ impl TurnRun {
                     // `None` was dropped by both stream delivery paths, which
                     // left the approval invisible and the ACP turn parked on
                     // the gate (the in-process path fixed the same bug).
+                    // Raw args go in; the gate scrubs the display copy. Modify is
+                    // unsupported here: ACP has no channel to hand modified input
+                    // back, so cowork.modify rejects it with an explicit error.
+                    let ctx = crate::cowork::GateContext {
+                        agent: Some(agent_name),
+                        workspace: Some(workspace),
+                        supports_modify: false,
+                    };
                     match gate
-                        .gate_tool(0, &tool, input, "", Some((&dispatcher, Some(turn_id.as_str()))))
+                        .gate_tool(0, &tool, input, "", &ctx, Some((&dispatcher, Some(turn_id.as_str()))))
                         .await
+                        .decision
                     {
                         crate::cowork::Decision::Approve => {
                             smedja_adapter::ToolGateDecision::Allow
@@ -1035,6 +1048,12 @@ impl TurnRun {
             })
         };
 
+        // The session's reasoning-effort pin (if any) — portable level names
+        // each adapter maps to its own mechanism; `None` leaves the provider
+        // default. Kept across runner switches (the names are backend-agnostic).
+        let effort =
+            crate::handlers::session::session_effort(&session_id).map(|e| e.as_str().to_owned());
+
         let opts = CallOptions {
             model: entry_model.clone(),
             max_tokens: Some(2048),
@@ -1048,6 +1067,7 @@ impl TurnRun {
             provider_session_id,
             smedja_session_id: Some(session_id.clone()),
             permission_mode: Some(perm_mode),
+            effort,
             stable_prefix_len,
             cache_strategy,
             workspace: Some(workspace_root.clone()),
@@ -1243,7 +1263,15 @@ impl TurnRun {
                 // TUI (auto-approves in Auto mode); passing `None` here left the
                 // approval invisible and the turn hung on the gate.
                 let push = Some((dispatcher.as_ref(), Some(turn_id.as_str())));
-                let decision = gate.gate_tool(0, name, args_val, "", push).await;
+                let ctx = crate::cowork::GateContext {
+                    agent: Some(role.label().to_owned()),
+                    workspace: Some(workspace_root.clone()),
+                    supports_modify: true,
+                };
+                let decision = gate
+                    .gate_tool(0, name, args_val, "", &ctx, push)
+                    .await
+                    .decision;
                 match decision {
                     Decision::Approve => {
                         execute_tool(
@@ -1260,17 +1288,25 @@ impl TurnRun {
                     }
                     Decision::Deny(reason) => format!("denied: {reason}"),
                     Decision::Modify(new_input) => {
-                        execute_tool(
-                            name,
-                            &new_input,
-                            &workspace_root,
-                            session.as_ref(),
-                            ingot,
-                            vault,
-                            embedder,
-                            Some(lsp_manager),
-                        )
-                        .await
+                        // The modified call was never gated: re-check the
+                        // replacement input against Deny rules before running it.
+                        if let Some(reason) =
+                            crate::cowork::modified_input_denied(&workspace_root, name, &new_input)
+                        {
+                            format!("denied: {reason}")
+                        } else {
+                            execute_tool(
+                                name,
+                                &new_input,
+                                &workspace_root,
+                                session.as_ref(),
+                                ingot,
+                                vault,
+                                embedder,
+                                Some(lsp_manager),
+                            )
+                            .await
+                        }
                     }
                 }
             };
@@ -1422,12 +1458,12 @@ impl TurnRun {
                     .or_insert_with(|| Arc::new(CoworkGate::default())),
             )
         };
-        let args_scrubbed = serde_json::from_str(tool_input).unwrap_or(serde_json::Value::Null);
+        let tool_args =
+            serde_json::from_str(tool_input.as_str()).unwrap_or(serde_json::Value::Null);
 
         // Declarative permission rules take priority over session mode.
-        let perm_rules = crate::cowork::load_permission_rules(&workspace_root);
         let rule_decision =
-            crate::cowork::evaluate_permission_rules(&perm_rules, tool_name, &args_scrubbed);
+            crate::cowork::evaluate_workspace_rules(&workspace_root, tool_name, &tool_args);
 
         if matches!(rule_decision, Some(crate::cowork::PermissionDecision::Deny)) {
             // Deny before reaching the cowork gate; no audit event needed.
@@ -1439,6 +1475,11 @@ impl TurnRun {
         // even in Auto/AcceptEdits — because the ops (apply/destroy) are
         // dangerous and hard to reverse.
         let push = Some((dispatcher.as_ref(), Some(turn_id.as_str())));
+        let ctx = crate::cowork::GateContext {
+            agent: Some(role.label().to_owned()),
+            workspace: Some(workspace_root.clone()),
+            supports_modify: true,
+        };
         let gate_mode = gate.mode().await;
         let decision = if matches!(
             rule_decision,
@@ -1449,10 +1490,13 @@ impl TurnRun {
             && crate::cowork::evaluate(crate::cowork::PermissionMode::Plan, tool_name)
                 == crate::cowork::PermissionDecision::Deny
         {
-            gate.gate_tool_forced_ask(0, tool_name, args_scrubbed, "", push)
+            gate.gate_tool_forced_ask(0, tool_name, tool_args, "", &ctx, push)
                 .await
+                .decision
         } else {
-            gate.gate_tool(0, tool_name, args_scrubbed, "", push).await
+            gate.gate_tool(0, tool_name, tool_args, "", &ctx, push)
+                .await
+                .decision
         };
         // Record auto_approved when Auto mode bypassed a gate that Ask would have
         // held for human approval, so the audit trail shows the bypass.
@@ -1484,6 +1528,13 @@ impl TurnRun {
             Decision::Approve => None,
             Decision::Deny(reason) => Some(format!("denied: {reason}")),
             Decision::Modify(new_input) => {
+                // The modified call was never gated: re-check the replacement
+                // input against Deny rules before adopting it.
+                if let Some(reason) =
+                    crate::cowork::modified_input_denied(&workspace_root, tool_name, &new_input)
+                {
+                    return Some(format!("denied: {reason}"));
+                }
                 *tool_input = new_input;
                 None
             }
@@ -1825,6 +1876,7 @@ impl TurnRun {
             provider_session_id: None,
             smedja_session_id: None,
             permission_mode: None,
+            effort: None,
             stable_prefix_len: None,
             cache_strategy: smedja_adapter::CacheStrategy::None,
             workspace: None,

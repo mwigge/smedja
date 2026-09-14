@@ -63,6 +63,7 @@ pub(super) fn runner_label(runner: Runner) -> &'static str {
         Runner::Minimax => "minimax",
         Runner::Berget => "berget",
         Runner::Pool => "pool",
+        Runner::OpenCode => "opencode",
     }
 }
 

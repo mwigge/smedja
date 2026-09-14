@@ -23,7 +23,6 @@ use crate::cowork::CoworkGate;
 use crate::embedder_port::Embedder;
 use crate::orchestrator::ProviderSessions;
 use crate::price_table::PriceTable;
-use crate::provider_pool::ProviderPool;
 
 pub(crate) mod audit;
 pub(crate) mod auditor;
@@ -35,6 +34,7 @@ pub(crate) mod loops;
 pub(crate) mod lsp;
 pub(crate) mod mcp;
 pub(crate) mod metrics;
+pub(crate) mod provider;
 pub(crate) mod quality;
 pub(crate) mod routing;
 pub(crate) mod savings;
@@ -53,7 +53,7 @@ pub(crate) struct HandlerState {
     pub(crate) ingot: IngotHandle,
     pub(crate) dispatcher: Arc<Dispatcher>,
     pub(crate) gates: Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
-    pub(crate) provider_pool: Arc<ProviderPool>,
+    pub(crate) provider_pool: Arc<crate::provider_pool::SharedProviderPool>,
     pub(crate) worktree_pool: Arc<Mutex<WorktreePool>>,
     pub(crate) assayer: Arc<Assayer>,
     pub(crate) price_table: Arc<PriceTable>,
@@ -64,7 +64,6 @@ pub(crate) struct HandlerState {
     pub(crate) cache_aligners: crate::orchestrator::CacheAligners,
     pub(crate) task_set: Arc<Mutex<JoinSet<()>>>,
     pub(crate) startup_runner: Arc<str>,
-    pub(crate) startup_model: Arc<str>,
     /// Shared LSP manager — holds language server processes started at daemon
     /// startup and serves their diagnostic snapshots to `lsp.*` handlers.
     pub(crate) lsp_manager: Arc<smedja_lsp::LspManager>,
@@ -78,6 +77,9 @@ pub(crate) struct HandlerState {
     /// inserts on spawn; the turn removes itself when it finishes; `turn.cancel`
     /// removes on abort.
     pub(crate) turn_registry: TurnRegistry,
+    /// Serialises `provider.rescan`: a second rescan while one is in flight is
+    /// rejected instead of racing a double pool rebuild.
+    pub(crate) rescan_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Maps an in-flight `turn_id` to the [`tokio::task::AbortHandle`] of its

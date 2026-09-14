@@ -1,7 +1,7 @@
 //! Canonical shared types for the smedja workspace.
 //!
-//! Provides [`Runner`], [`Tier`], and [`Complexity`] as the single source of
-//! truth for all crates that need to interoperate on model routing, plus
+//! Provides [`Runner`], [`Tier`], [`Effort`], and [`Complexity`] as the single
+//! source of truth for all crates that need to interoperate on model routing, plus
 //! domain value types ([`Timestamp`], [`Microdollars`], [`SessionId`],
 //! [`TurnId`], [`ToolOutcome`], [`WorkspaceRoot`]) shared across the workspace.
 
@@ -33,6 +33,8 @@ pub enum Runner {
     Berget,
     /// Poolside (cloud, `pool` CLI).
     Pool,
+    /// `OpenCode` Zen (cloud, `OpenAI`-compatible API).
+    OpenCode,
 }
 
 /// The execution tier that controls latency vs. capability trade-offs.
@@ -63,6 +65,60 @@ impl Tier {
             Self::Local => 0,
             Self::Fast => 1,
             Self::Deep => 2,
+        }
+    }
+}
+
+/// The reasoning-effort level: how much thinking budget a model gets per turn.
+///
+/// A per-session hint (`session.set_effort` / `/effort`), deliberately
+/// backend-agnostic — unlike a pinned model id, the level names are portable
+/// across runners, so the pin survives a runner switch. Each adapter maps the
+/// level to its own mechanism; no override (`None` at the call sites) means the
+/// provider default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    /// Minimal reasoning — lowest latency and cost.
+    Low,
+    /// Balanced reasoning — the middle setting.
+    Medium,
+    /// Maximum reasoning budget — deepest thinking, highest latency and cost.
+    High,
+}
+
+impl Effort {
+    /// The canonical lowercase name of this level (`low`/`medium`/`high`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+impl fmt::Display for Effort {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Effort {
+    type Err = String;
+
+    /// Parses a level name, tolerating surrounding whitespace and case.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the invalid value when it matches no level.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            other => Err(format!("unknown effort: {other}")),
         }
     }
 }
@@ -314,6 +370,7 @@ mod tests {
             Runner::Minimax,
             Runner::Berget,
             Runner::Pool,
+            Runner::OpenCode,
         ] {
             let json = serde_json::to_string(&runner).expect("serialise runner");
             let back: Runner = serde_json::from_str(&json).expect("deserialise runner");
@@ -340,6 +397,44 @@ mod tests {
         assert_eq!(Tier::Local.capability_rank(), 0);
         assert_eq!(Tier::Fast.capability_rank(), 1);
         assert_eq!(Tier::Deep.capability_rank(), 2);
+    }
+
+    #[test]
+    fn effort_serde_roundtrip() {
+        for effort in [Effort::Low, Effort::Medium, Effort::High] {
+            let json = serde_json::to_string(&effort).expect("serialise effort");
+            let back: Effort = serde_json::from_str(&json).expect("deserialise effort");
+            assert_eq!(effort, back);
+        }
+    }
+
+    #[test]
+    fn effort_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&Effort::Medium).expect("serialise"),
+            "\"medium\""
+        );
+    }
+
+    #[test]
+    fn effort_from_str_is_lenient_and_rejects_unknown() {
+        assert_eq!("low".parse(), Ok(Effort::Low));
+        assert_eq!(" Medium ".parse(), Ok(Effort::Medium));
+        assert_eq!("HIGH".parse(), Ok(Effort::High));
+        assert!("turbo".parse::<Effort>().is_err());
+        assert!("".parse::<Effort>().is_err());
+    }
+
+    #[test]
+    fn effort_display_matches_as_str() {
+        for (effort, name) in [
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+        ] {
+            assert_eq!(effort.as_str(), name);
+            assert_eq!(effort.to_string(), name);
+        }
     }
 
     #[test]

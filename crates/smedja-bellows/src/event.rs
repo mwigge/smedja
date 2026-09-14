@@ -84,6 +84,44 @@ pub enum ToolCallContent {
     },
 }
 
+/// How a cowork approval prompt resolved.
+///
+/// Serialises to the stable lowercase wire tokens (`"approved"`, `"denied"`,
+/// `"timeout"`, `"cancelled"`) carried by [`TurnEvent::CoworkResolved`] and
+/// the `cowork_resolved` NDJSON stream line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoworkOutcome {
+    /// The human approved the call (possibly with modified arguments).
+    Approved,
+    /// The human denied the call.
+    Denied,
+    /// No decision arrived before the gate's timeout (fail-closed deny).
+    Timeout,
+    /// The suspended waiter went away without a decision (caller cancelled,
+    /// client disconnected) — the prompt is dropped without resolving.
+    Cancelled,
+}
+
+impl CoworkOutcome {
+    /// Stable lowercase identifier (round-trips with the serde form).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Serde default for additive boolean fields that older daemons omit (`true`
+/// preserves their behaviour).
+fn default_true() -> bool {
+    true
+}
+
 /// Events emitted during the lifecycle of an agent turn.
 ///
 /// Each variant corresponds to a distinct point in the turn's progression —
@@ -301,12 +339,38 @@ pub enum TurnEvent {
         args_display: String,
         /// Agent's reasoning for invoking this tool.
         reasoning: String,
+        /// Workspace root the gated call runs in, when known. Additive:
+        /// absent on events published before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
         /// Turn identifier; used to route the event into the correct stream buffer.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
+        /// Whether the backend that raised this prompt can consume a *modify*
+        /// decision (replacement args); `false` for one-shot backends (@shell)
+        /// and the ACP tool-gate adapter. Additive: absent on events published
+        /// before the field existed — treated as `true` then, matching the old
+        /// behaviour where every prompt was (wrongly) considered modifiable.
+        #[serde(default = "default_true")]
+        supports_modify: bool,
         /// Correlation context (trace, conversation, agent, status).
         #[serde(flatten)]
         correlation: CorrelationCtx,
+    },
+
+    /// A pending cowork approval was resolved: approved, denied, or timed out.
+    ///
+    /// Published by the cowork gate when a [`TurnEvent::CoworkRequest`] is
+    /// answered (or its timeout lapses), so stream clients can dismiss the
+    /// approval overlay without polling and the stream buffer can drop the
+    /// stale request line. Session-scoped by design — no `turn_id` — so every
+    /// stream sees it, exactly like a turn-less `CoworkRequest`.
+    CoworkResolved {
+        /// UUID of the approval request being resolved (matches the earlier
+        /// [`TurnEvent::CoworkRequest`]).
+        approval_id: String,
+        /// How the prompt resolved.
+        outcome: CoworkOutcome,
     },
 
     /// A tool call's status transitioned (`pending → in_progress → completed |
@@ -464,6 +528,79 @@ mod tests {
         } else {
             panic!("wrong variant after roundtrip");
         }
+    }
+
+    #[test]
+    fn cowork_request_cwd_roundtrips_and_defaults_absent() {
+        let ev = TurnEvent::CoworkRequest {
+            approval_id: "appr-1".into(),
+            tool: "bash".into(),
+            step_n: 0,
+            args_display: r#"{"command":"ls"}"#.into(),
+            reasoning: "run: ls".into(),
+            cwd: Some("/home/u/proj".into()),
+            turn_id: Some("t-1".into()),
+            supports_modify: true,
+            correlation: CorrelationCtx::default(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(
+            json.contains("/home/u/proj"),
+            "cwd must appear; got: {json}"
+        );
+        let decoded: TurnEvent = serde_json::from_str(&json).unwrap();
+        if let TurnEvent::CoworkRequest { cwd, .. } = decoded {
+            assert_eq!(cwd.as_deref(), Some("/home/u/proj"));
+        } else {
+            panic!("wrong variant after roundtrip");
+        }
+
+        // A payload published before the field existed decodes with cwd
+        // defaulting to None, and None is omitted from the wire form.
+        let old_json = r#"{"CoworkRequest":{"approval_id":"a","tool":"bash","step_n":0,"args_display":"{}","reasoning":"r"}}"#;
+        let ev: TurnEvent = serde_json::from_str(old_json).unwrap();
+        let TurnEvent::CoworkRequest {
+            ref cwd,
+            supports_modify,
+            ..
+        } = ev
+        else {
+            panic!("wrong variant");
+        };
+        assert!(cwd.is_none(), "missing cwd must default to None");
+        assert!(
+            supports_modify,
+            "missing supports_modify must default to true (old behaviour)"
+        );
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(
+            !json.contains("cwd"),
+            "None cwd must be skipped in JSON; got: {json}"
+        );
+    }
+
+    #[test]
+    fn cowork_resolved_roundtrips_with_snake_case_outcome() {
+        for outcome in [
+            CoworkOutcome::Approved,
+            CoworkOutcome::Denied,
+            CoworkOutcome::Timeout,
+        ] {
+            let ev = TurnEvent::CoworkResolved {
+                approval_id: "appr-1".into(),
+                outcome,
+            };
+            let json = serde_json::to_string(&ev).unwrap();
+            assert!(
+                json.contains(&format!("\"outcome\":\"{}\"", outcome.as_str())),
+                "outcome must serialise snake_case; got: {json}"
+            );
+            let decoded: TurnEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, ev, "CoworkResolved must round-trip");
+        }
+        assert_eq!(CoworkOutcome::Approved.as_str(), "approved");
+        assert_eq!(CoworkOutcome::Denied.as_str(), "denied");
+        assert_eq!(CoworkOutcome::Timeout.as_str(), "timeout");
     }
 
     #[test]

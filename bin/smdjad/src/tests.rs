@@ -597,9 +597,98 @@ fn parse_runner_str_accepts_canonical_keys() {
 #[test]
 fn parse_runner_str_rejects_unknown_values() {
     use crate::common::parse_runner_str;
-    assert!(parse_runner_str("openai").is_none());
     assert!(parse_runner_str("").is_none());
-    assert!(parse_runner_str("anthropic").is_none());
+    assert!(parse_runner_str("nope").is_none());
+    // Pool runner_names and vendor synonyms are accepted: the /switch picker
+    // sends these into session.set_runner.
+    assert!(parse_runner_str("openai").is_some());
+    assert!(parse_runner_str("anthropic").is_some());
+}
+
+// ── secrets.env parsing ─────────────────────────────────────────────────
+
+#[test]
+fn parse_secrets_env_accepts_key_value_lines() {
+    let pairs = crate::parse_secrets_env("ANTHROPIC_API_KEY=sk-ant-123\nOPENAI_API_KEY=sk-4\n");
+    assert_eq!(
+        pairs,
+        vec![
+            ("ANTHROPIC_API_KEY".to_owned(), "sk-ant-123".to_owned()),
+            ("OPENAI_API_KEY".to_owned(), "sk-4".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn parse_secrets_env_skips_comments_blanks_and_malformed_lines() {
+    let body = "# comment\n\n  \nno-equals-sign\n=empty-key\n1BAD_KEY=v\nEMPTY_VALUE=\nlowercase_key=v\nGOOD_KEY = spaced \n";
+    let pairs = crate::parse_secrets_env(body);
+    assert_eq!(
+        pairs,
+        vec![("GOOD_KEY".to_owned(), "spaced".to_owned())],
+        "only the well-formed line survives: {pairs:?}"
+    );
+}
+
+#[test]
+fn secrets_store_allowlist_rotation_revocation_and_env_wins() {
+    // One test for the whole store: it is process-global and the test binary
+    // runs cases in parallel, so all apply_secrets_body assertions live here
+    // where they cannot interleave.
+    let key = "SMEDJA_TEST_ROTATION_API_KEY";
+    assert!(
+        std::env::var_os(key).is_none(),
+        "test key must not exist in the real environment"
+    );
+
+    // Allowlist: *_API_KEY / *_TOKEN load; anything else is skipped + counted.
+    let (loaded, skipped) = crate::apply_secrets_body(&format!("{key}=value-a\nRANDOM_THING=x\n"));
+    assert_eq!((loaded, skipped), (1, 1));
+    assert_eq!(crate::secret_var(key).as_deref(), Some("value-a"));
+    assert_eq!(crate::secret_var("RANDOM_THING"), None);
+
+    // Rotation: a re-load with a new value takes effect without a restart.
+    let (loaded, _) = crate::apply_secrets_body(&format!("{key}=value-b\n"));
+    assert_eq!(loaded, 1);
+    assert_eq!(
+        crate::secret_var(key).as_deref(),
+        Some("value-b"),
+        "rotation must take effect on re-load"
+    );
+
+    // Revocation: a key dropped from the file disappears from the store.
+    crate::apply_secrets_body("SMEDJA_TEST_OTHER_TOKEN=t\n");
+    assert_eq!(
+        crate::secret_var(key),
+        None,
+        "a key removed from the file must be revoked"
+    );
+
+    // The real environment always wins over the file.
+    let env_key = "SMEDJA_TEST_ENV_WINS_API_KEY";
+    std::env::set_var(env_key, "from-env");
+    crate::apply_secrets_body(&format!("{env_key}=from-file\n"));
+    assert_eq!(crate::secret_var(env_key).as_deref(), Some("from-env"));
+    std::env::remove_var(env_key);
+
+    // A present-but-EMPTY env var must NOT shadow the file value — `secret_var`
+    // treats empty as absent, so the loader must too.
+    let empty_key = "SMEDJA_TEST_EMPTY_ENV_API_KEY";
+    std::env::set_var(empty_key, "");
+    let (loaded, _) = crate::apply_secrets_body(&format!("{empty_key}=from-file\n"));
+    assert_eq!(loaded, 1, "an empty env var must not block the file value");
+    assert_eq!(crate::secret_var(empty_key).as_deref(), Some("from-file"));
+    std::env::remove_var(empty_key);
+
+    // Deleting the file revokes everything previously loaded. Drive the
+    // clear directly (the file path is $HOME-global, which tests share).
+    crate::clear_secrets_store();
+    assert_eq!(
+        crate::secret_var(empty_key),
+        None,
+        "a missing secrets.env must revoke previously loaded keys"
+    );
+    assert_eq!(crate::secret_var("SMEDJA_TEST_OTHER_TOKEN"), None);
 }
 
 // ── session.set_runner / session.takeover ─────────────────────────────

@@ -227,7 +227,7 @@ pub(crate) struct AppState {
     /// Timestamp of the last `graph.status` poll (refreshes the right-bar count).
     pub(crate) last_graph_poll: Option<std::time::Instant>,
     /// NDJSON stream receiver for the current in-flight turn.
-    pub(crate) stream_rx: Option<tokio::sync::mpsc::UnboundedReceiver<StreamEvent>>,
+    pub(crate) stream_rx: Option<tokio::sync::mpsc::UnboundedReceiver<events::InboundStreamEvent>>,
     /// Oneshot receiver for a background /upgrade operation.
     pub(crate) upgrade_rx: Option<tokio::sync::oneshot::Receiver<String>>,
     /// Accumulated thinking-token text for the current in-flight turn.
