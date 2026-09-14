@@ -6,6 +6,113 @@ Format: `## [version] — YYYY-MM-DD` / `### Added|Fixed|Changed|Removed|Roadmap
 
 ---
 
+## [0.28.0] — 2026-09-14
+
+### Changed
+- **Breaking:** the `cowork.modify` instruction must be a JSON object of
+  replacement tool args, validated up front with an RPC error instead of a
+  silent deny; the TUI pre-fills the current args JSON for editing.
+- **Breaking:** the `approval_response` RPC is renamed to `cowork.resolve`.
+  It is session-agnostic (the daemon scans every registered gate by approval
+  id), requires the `approved` param, and accepts `scope: "always"` to
+  persist an allow rule — the same semantics as `cowork.approve`.
+
+### Added
+- Reasoning effort, end to end: `low`/`medium`/`high` (plus `default` to
+  clear) pinned per session via the new `session.set_effort` RPC and the
+  TUI's `/effort` command. `session.get` reports the pin, which survives
+  `/switch`. Each adapter maps the level to its own mechanism: codex spawns
+  with `-c model_reasoning_effort=<level>`, claude gets a
+  `MAX_THINKING_TOKENS` budget (2048/8192/32768), ACP agents get a
+  best-effort `session/set_config_option`, and OpenAI-compatible providers
+  get `reasoning_effort`; the rest no-op.
+- New `provider.rescan` RPC: rebuilds the daemon's provider pool atomically
+  and returns the refreshed runner list. The TUI calls it after `/login`
+  saves a key, so a freshly pasted credential is usable without a daemon
+  restart.
+- OpenCode runner: detection via `OPENCODE_API_KEY` with kimi-k2.7-code /
+  kimi-k3 defaults, registered across the alias table, the assayer, and
+  prices.toml.
+- Approval popup `[a]` key: approve-always, persisting a
+  `[[permission.rules]]` allow rule in `.smedja/workspace.toml` regardless of
+  backend. The popup also gained an `agent:`/`cwd:`/`risk:` meta line,
+  `$ <command>` rendering for exec tools, adaptive height, and the richer
+  fields are now carried by `cowork.pending` (with `supports_modify`).
+- `/session` (read-only session info) and `/capabilities` (provider
+  capability table) slash commands; bare `/cowork` lists pending approvals.
+- First-run onboarding: when the daemon's provider pool is empty, the TUI
+  shows a "no providers detected" block with CLI probe results and a `/login`
+  pointer instead of a working-looking dashboard.
+- `/login` masked key paste for anthropic (`ANTHROPIC_API_KEY`) and openai
+  (`OPENAI_API_KEY`), writing `~/.config/smedja/secrets.env`; guidance for
+  pool and opencode. smdjad now loads that file into its own environment at
+  startup (real env wins) — no longer systemd-only.
+
+### Fixed
+- Turn-id-less `CoworkRequest`s (claude-hook and ACP approvals) never reached
+  the TUI: both stream paths dropped turn-less events. They are now forwarded
+  live and buffered under the session scope, so those approval prompts
+  actually pop up.
+- `[[permission.rules]]` are now honoured on every gated path — native loop,
+  claude hook, ACP bridge, and `@shell` fragments — not just the native loop.
+- Displayed and streamed approval args are scrubbed of secret-looking values
+  (`[redacted]`); raw args still drive execution.
+- The modify contract is normalised: an instruction must be a JSON object
+  replacing the tool input, validated up front with an RPC error instead of a
+  silent deny; backends without a modify channel (ACP adapter, `@shell`)
+  return an explicit "not supported" error.
+- kimi ungated prompt mode (`SMEDJA_KIMI_ACP=off`) now additionally requires
+  `SMEDJA_KIMI_UNGATED=1`, warns per spawn, and refuses otherwise; codex
+  spawns in `ask` permission mode log that prompting is impossible and name
+  the sandbox level applied.
+- Gate timeouts publish a stream notice ("approval for '<tool>' timed out —
+  denied") instead of failing silently.
+- term GPU terminal: `AgentEvent::ApprovalPrompt` is now emitted (schema v5
+  with `approval_id`), the `cowork.resolve` RPC resolves gates by id, and
+  st-app's `y`/`n` keys send approvals through st-agent; approval args are no
+  longer dropped. A new `AgentEvent::ApprovalResolved` notice clears prompts
+  in every pane the moment they are answered elsewhere.
+- Canonical runner parsing: one alias table (`parse_runner_str`) shared by
+  session handlers, so `/tier` works on pool sessions and error messages list
+  the real runner names; the duplicate parser in the mutate handler is gone.
+- `session.set_model` validates its input (rejects empty/whitespace, checks
+  against known models where a list exists) and the error names the valid
+  choices; `session.set_runner` now reports `model_pin_cleared` and the new
+  runner's default model, which the `/switch` picker surfaces.
+- gemini-cli defaults corrected: fast is gemini-2.5-flash, deep is
+  gemini-2.5-pro.
+- Allow-always rule persistence hardened: glob metacharacters in paths are
+  escaped, `*` never crosses a path segment, commands containing `*` are
+  refused with an explanatory note in the popup reply, duplicate rules are
+  deduped, concurrent writes are serialised per workspace, and a corrupted
+  `workspace.toml` now fails loudly instead of silently dropping all rules.
+- A persisted `mode = "ask"` rule now suspends for approval even when the
+  session is in auto mode, instead of falling through to the session mode.
+- `session.create` / `set_tier` default runner and model are read from the
+  live provider pool, so `provider.rescan` results apply without a daemon
+  restart; deleting `secrets.env` plus a rescan revokes file-origin keys, and
+  an empty environment variable no longer shadows a real key from the file.
+- Modified tool args are re-checked against `[[permission.rules]]` before
+  execution on every path, so a modify can no longer bypass a deny rule.
+- Cancelled or timed-out approvals now broadcast a `CoworkResolved` outcome,
+  so prompts disappear from every client instead of lingering; a gate
+  resolution after timeout is rejected rather than double-resolving, and the
+  session buffer holding a pending prompt is no longer evicted mid-approval.
+- Permission rules are cached per workspace file (invalidated on change)
+  instead of being re-parsed from disk on every gated tool call.
+- `reasoning_effort` is whitelisted to `low`/`medium`/`high` and only sent to
+  providers known to accept it; `session.set_model` hard-validates only local
+  models (hosted runners get an advisory accept), and a claude hook reporting
+  a `cwd` outside the daemon workspace falls back to the workspace root.
+- TUI: `Esc` dismisses a pending approval (deny-by-dismissal) and Ctrl-C
+  stays reachable, ending the soft-lock where a pending prompt ate every
+  key; API-key paste during `/login` can no longer be hijacked by a pending
+  approval; `/effort` accepts levels case-insensitively; `/login opencode`
+  offers the `OPENCODE_API_KEY` masked paste.
+- term: a broadcast event from another pane's turn no longer hijacks this
+  pane's approval state, and a failed approval send no longer re-pends a
+  prompt the gate already resolved.
+
 ## [0.27.2] — 2026-07-28
 
 ### Fixed
