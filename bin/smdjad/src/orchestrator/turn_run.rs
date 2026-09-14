@@ -1198,6 +1198,7 @@ impl TurnRun {
     /// tools sequentially through the cowork gate (with post-edit diagnostics),
     /// returning the results in the original call order. The caller bounds this
     /// by the shared turn deadline.
+    #[allow(clippy::too_many_lines)] // single batch pipeline: classify, gate, execute, collect
     async fn run_multi_tool_batch(&self, tool_calls: &[(String, String)]) -> Vec<String> {
         let ingot = &self.orch.ingot;
         let dispatcher = &self.orch.dispatcher;

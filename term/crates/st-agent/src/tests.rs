@@ -662,7 +662,11 @@ async fn send_approval_dispatches_through_real_rpc_server() {
     router.register("cowork.resolve", move |params| {
         let tx = std::sync::Arc::clone(&tx);
         async move {
-            if let Some(tx) = tx.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            if let Some(tx) = tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
                 let _ = tx.send(params);
             }
             Ok(serde_json::json!({ "resolved": true }))

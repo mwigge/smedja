@@ -374,7 +374,7 @@ pub(crate) async fn handle_key(
                             state.cowork_modify_mode = true;
                             // Pre-fill with the current args JSON so the user
                             // edits the real call instead of retyping it.
-                            state.cowork_modify_input = item.args_display.clone();
+                            state.cowork_modify_input.clone_from(&item.args_display);
                         } else {
                             push_system_message(
                                 state,

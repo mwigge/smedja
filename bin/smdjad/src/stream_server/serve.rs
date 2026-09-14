@@ -66,6 +66,7 @@ pub async fn serve(listener: UnixListener, store: DeltaStore, dispatcher: Arc<Di
     }
 }
 
+#[allow(clippy::too_many_lines)] // connection lifecycle: replay buffer, subscribe, forward, drain
 async fn handle_stream_connection(
     stream: UnixStream,
     store: DeltaStore,

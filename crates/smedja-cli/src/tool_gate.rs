@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::too_many_lines)] // hook JSON decode + gate RPC + response mapping kept in one pipeline
 pub(crate) async fn cmd_tool_gate(sock: &std::path::Path) {
     use std::io::Read as _;
     let mut raw = String::new();

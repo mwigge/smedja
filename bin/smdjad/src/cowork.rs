@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    fmt::Write as _,
     sync::Arc,
 };
 
@@ -792,21 +793,19 @@ pub fn append_allow_rule(
     }
 
     let mut block = String::from("[[permission.rules]]\n");
-    block.push_str(&format!(
-        "tool = {}\n",
-        toml::Value::String(tool.to_owned())
-    ));
+    writeln!(block, "tool = {}", toml::Value::String(tool.to_owned()))
+        .expect("writing to a String cannot fail");
     if let Some(glob) = &path_glob {
-        block.push_str(&format!(
-            "path_glob = {}\n",
-            toml::Value::String(glob.clone())
-        ));
+        writeln!(block, "path_glob = {}", toml::Value::String(glob.clone()))
+            .expect("writing to a String cannot fail");
     }
     if let Some(pat) = &command_pattern {
-        block.push_str(&format!(
-            "command_pattern = {}\n",
+        writeln!(
+            block,
+            "command_pattern = {}",
             toml::Value::String(pat.clone())
-        ));
+        )
+        .expect("writing to a String cannot fail");
     }
     block.push_str("mode = \"allow\"\n");
 
@@ -1169,6 +1168,11 @@ impl CoworkGate {
     /// silently degrading to a deny; the prompt stays pending for a corrected
     /// decision. Backends without a modify channel reject with
     /// [`ModifyRejection::Unsupported`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModifyRejection`] when the id is unknown, the instruction is
+    /// not a valid JSON-args replacement, or the backend has no modify channel.
     pub async fn modify(&self, id: &str, instruction: String) -> Result<(), ModifyRejection> {
         {
             let pending = self.pending.lock().await;
@@ -1234,7 +1238,7 @@ impl CoworkGate {
         ctx: &GateContext,
         push: Option<(&Dispatcher, Option<&str>)>,
     ) -> GateOutcome {
-        match self.rule_decision(ctx, tool, &args) {
+        match Self::rule_decision(ctx, tool, &args) {
             Some(PermissionDecision::Allow) => {
                 return GateOutcome {
                     decision: Decision::Approve,
@@ -1290,7 +1294,7 @@ impl CoworkGate {
         ctx: &GateContext,
         push: Option<(&Dispatcher, Option<&str>)>,
     ) -> GateOutcome {
-        match self.rule_decision(ctx, tool, &args) {
+        match Self::rule_decision(ctx, tool, &args) {
             Some(PermissionDecision::Allow) => {
                 return GateOutcome {
                     decision: Decision::Approve,
@@ -1316,7 +1320,6 @@ impl CoworkGate {
     /// session mode); an `Ask` rule surfaces as [`PermissionDecision::Ask`] so
     /// the caller can force the interactive gate.
     fn rule_decision(
-        &self,
         ctx: &GateContext,
         tool: &str,
         args: &serde_json::Value,
@@ -2739,7 +2742,7 @@ mod tests {
                     }) if approval_id == id => {
                         break outcome;
                     }
-                    Ok(_) => continue,
+                    Ok(_) => {}
                     Err(e) => panic!("dispatcher closed before cancelled outcome: {e}"),
                 }
             }

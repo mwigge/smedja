@@ -2,6 +2,7 @@
 //! context, and history. Moved verbatim from `session.rs`.
 
 use super::*;
+use smedja_types::Effort;
 
 /// Handles `session.list`.
 ///
@@ -90,7 +91,7 @@ pub(crate) async fn get(state: HandlerState, params: Value) -> Result<Value, Rpc
         "title": session.title,
         "mode": session.mode,
         "runner": session.runner_override,
-        "effort": session_effort(id).map(|e| e.as_str()),
+        "effort": session_effort(id).map(Effort::as_str),
         "created_at": session.created_at,
         "updated_at": session.updated_at,
         "status": session.status,

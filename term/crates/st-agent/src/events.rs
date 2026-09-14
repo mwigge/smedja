@@ -182,7 +182,7 @@ impl PaneEvent {
             // `ApprovalResolved` is already caught from the raw line above, so
             // anything reaching this arm has no rendering yet and is ignored.
             #[allow(unreachable_patterns)]
-            _ => return None,
+            AgentEvent::ApprovalResolved { .. } => return None,
         })
     }
 }
