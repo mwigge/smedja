@@ -81,7 +81,5 @@ pub(crate) fn write_clipboard_text(text: &str) -> bool {
         }
     }
     // Last resort: arboard (works on most setups, flaky on some Wayland ones).
-    arboard::Clipboard::new()
-        .ok()
-        .is_some_and(|mut cb| cb.set_text(text).is_ok())
+    arboard::Clipboard::new().is_ok_and(|mut cb| cb.set_text(text).is_ok())
 }

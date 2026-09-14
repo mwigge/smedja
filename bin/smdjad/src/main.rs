@@ -234,7 +234,7 @@ fn apply_secrets_body(body: &str) -> (usize, usize) {
         // The real environment wins — but only a NON-EMPTY variable, mirroring
         // `secret_var`'s read path; a present-but-empty var must not shadow the
         // file's value.
-        if std::env::var(&key).ok().is_some_and(|v| !v.is_empty()) {
+        if std::env::var(&key).is_ok_and(|v| !v.is_empty()) {
             continue;
         }
         store.insert(key, value);

@@ -10,6 +10,7 @@ struct Recorder {
 }
 
 impl RoleRunner for Recorder {
+    #[allow(clippy::unused_async_trait_impl)] // mock trait impl: signature requires async
     async fn run_role(
         &self,
         role: &LoopRole,
@@ -115,6 +116,7 @@ struct FailingRunner {
     statuses: Mutex<Vec<String>>,
 }
 impl RoleRunner for FailingRunner {
+    #[allow(clippy::unused_async_trait_impl)] // mock trait impl: signature requires async
     async fn run_role(
         &self,
         _role: &LoopRole,
@@ -238,6 +240,7 @@ async fn review_required_blocks_on_reviewer_failure() {
         statuses: Mutex<Vec<String>>,
     }
     impl RoleRunner for ReviewerFailRunner {
+        #[allow(clippy::unused_async_trait_impl)] // mock trait impl: signature requires async
         async fn run_role(
             &self,
             role: &LoopRole,
@@ -417,6 +420,7 @@ async fn shared_workspace_forces_serial_execution() {
         max_seen: AtomicUsize,
     }
     impl RoleRunner for ConcurrencyProbe {
+        #[allow(clippy::unused_async_trait_impl)] // mock trait impl: signature requires async
         async fn run_role(
             &self,
             _role: &LoopRole,
@@ -593,6 +597,7 @@ async fn parallel_one_slice_fails_outcome_is_failed_with_passed_count() {
         statuses: Mutex<Vec<String>>,
     }
     impl RoleRunner for SelectiveFail {
+        #[allow(clippy::unused_async_trait_impl)] // mock trait impl: signature requires async
         async fn run_role(
             &self,
             _role: &LoopRole,
@@ -649,6 +654,7 @@ struct PlanRecorder {
 }
 
 impl RoleRunner for PlanRecorder {
+    #[allow(clippy::unused_async_trait_impl)] // mock trait impl: signature requires async
     async fn run_role(
         &self,
         role: &LoopRole,
@@ -661,6 +667,7 @@ impl RoleRunner for PlanRecorder {
             .push((role.name.clone(), role.tier));
         Ok(())
     }
+    #[allow(clippy::unused_async_trait_impl)] // mock trait impl: signature requires async
     async fn run_plan(&self, _role: &LoopRole, existing: &[String]) -> anyhow::Result<Vec<String>> {
         *self.plan_input.lock().unwrap() = Some(existing.to_vec());
         Ok(self.produced.clone())

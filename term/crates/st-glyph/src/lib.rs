@@ -409,7 +409,7 @@ pub fn decode_png(png_data: &[u8]) -> Option<GlyphAtlasEntry> {
         png::ColorType::Rgb => {
             let rgb = &buf[..info.buffer_size()];
             let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
-            for chunk in rgb.chunks_exact(3) {
+            for chunk in rgb.as_chunks::<3>().0 {
                 rgba.extend_from_slice(chunk);
                 rgba.push(0xFF);
             }

@@ -129,12 +129,12 @@ impl ApprovalGate {
         let args_pretty =
             serde_json::to_string_pretty(&self.args).unwrap_or_else(|_| self.args.to_string());
         vec![
-            format!("┌─ Approval required ─────────────────────────────"),
+            "┌─ Approval required ─────────────────────────────".to_string(),
             format!("│  Tool   : {}", self.tool_name),
             format!("│  Prompt : {}", self.prompt),
             format!("│  Args   : {args_pretty}"),
             format!("│  State  : {state_label}"),
-            format!("└─────────────────────────────────────────────────"),
+            "└─────────────────────────────────────────────────".to_string(),
         ]
     }
 }

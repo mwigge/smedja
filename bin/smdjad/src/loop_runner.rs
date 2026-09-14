@@ -735,6 +735,7 @@ mod tests {
             slices_seen: std::sync::Mutex<Vec<String>>,
         }
         impl RoleRunner for CountingRunner {
+            #[allow(clippy::unused_async_trait_impl)] // mock trait impl: signature requires async
             async fn run_role(
                 &self,
                 _role: &LoopRole,
