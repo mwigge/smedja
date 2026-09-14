@@ -40,6 +40,19 @@ impl Provider for CodexCliProvider {
     }
 }
 
+/// Whitelist of reasoning-effort levels codex accepts for the
+/// `model_reasoning_effort` config override. Returns `None` for anything else
+/// so an unvalidated string never reaches a `-c key=value` argument (defence
+/// in depth, mirroring claude's `thinking_budget`).
+fn reasoning_effort(effort: &str) -> Option<&'static str> {
+    match effort {
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
     let raw_prompt = messages
@@ -58,6 +71,7 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
     let model = opts.model.clone();
     let workspace = opts.workspace.clone();
     let permission_mode = opts.permission_mode.clone();
+    let effort = opts.effort.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::spawn(async move {
@@ -105,6 +119,16 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
             Some("plan") => Some("read-only"),
             _ => Some("workspace-write"),
         };
+        // Ask mode implies per-tool prompting, which `codex exec` cannot do (no
+        // approval hook exists). Say so loudly at spawn — with the sandbox level
+        // the mode is downgraded to — so the downgrade is never silent.
+        if permission_mode.as_deref() == Some("ask") {
+            tracing::warn!(
+                sandbox = sandbox_mode.unwrap_or("none"),
+                "permission mode 'ask' cannot prompt with codex (no approval hook); \
+                 applying sandbox instead of per-tool approvals"
+            );
+        }
         match sandbox_mode {
             // Auto: bypass codex's own bwrap sandbox; the smedja cowork gate and
             // landlock confinement are the boundary for auto-mode runs.
@@ -125,6 +149,27 @@ fn stream_codex_exec(messages: &[Message], opts: &CallOptions) -> DeltaStream {
 
         if !model.is_empty() {
             command.arg("-m").arg(&model);
+        }
+
+        // Reasoning effort rides the same global `-c key=value` config override
+        // as `sandbox_mode` above, so both `exec` and `exec resume` honour it.
+        // The value is whitelisted (defence in depth, like claude's
+        // `thinking_budget`): an unexpected string must never reach a
+        // `key=value` override verbatim.
+        if let Some(raw) = effort.as_deref().filter(|e| !e.is_empty()) {
+            match reasoning_effort(raw) {
+                Some(level) => {
+                    command
+                        .arg("-c")
+                        .arg(format!("model_reasoning_effort={level}"));
+                }
+                None => {
+                    tracing::debug!(
+                        effort = raw,
+                        "unrecognised codex reasoning effort; skipping -c override"
+                    );
+                }
+            }
         }
 
         command
@@ -523,6 +568,16 @@ mod tests {
     // --- parse_codex_line ---
 
     #[test]
+    fn reasoning_effort_whitelists_known_levels_only() {
+        assert_eq!(reasoning_effort("low"), Some("low"));
+        assert_eq!(reasoning_effort("medium"), Some("medium"));
+        assert_eq!(reasoning_effort("high"), Some("high"));
+        assert_eq!(reasoning_effort("turbo"), None);
+        assert_eq!(reasoning_effort("high --foo"), None);
+        assert_eq!(reasoning_effort(""), None);
+    }
+
+    #[test]
     fn parse_codex_line_empty_returns_none() {
         assert!(parse_codex_line("").is_none());
         assert!(parse_codex_line("   ").is_none());
@@ -629,6 +684,7 @@ mod tests {
             provider_session_id: session_id.map(str::to_owned),
             smedja_session_id: None,
             permission_mode: None,
+            effort: None,
             stable_prefix_len: None,
             cache_strategy: crate::types::CacheStrategy::None,
             workspace: None,
@@ -755,6 +811,99 @@ mod tests {
         assert!(
             output.contains("-m") && output.contains("o3-mini"),
             "expected '-m o3-mini' in args; got: {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the stream to serialize $PATH mutation across concurrent tests
+    async fn effort_config_override_forwarded_to_command() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("smedja-codex-effort-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        make_mock_codex(&tmp, "#!/bin/sh\nprintf \"args: $*\\n\"\n");
+
+        let old = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old}", tmp.display()));
+
+        let mut opts = base_opts(None);
+        opts.effort = Some("high".to_owned());
+        let provider = CodexCliProvider::Cli;
+        let mut stream = provider.stream_chat(&[user_msg("hi")], &opts);
+        let mut output = String::new();
+        while let Some(item) = stream.next().await {
+            if let Ok(Delta::Text(t)) = item {
+                output.push_str(&t);
+            }
+        }
+
+        std::env::set_var("PATH", old);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            output.contains("-c") && output.contains("model_reasoning_effort=high"),
+            "expected '-c model_reasoning_effort=high' in args; got: {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the stream to serialize $PATH mutation across concurrent tests
+    async fn no_effort_override_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp =
+            std::env::temp_dir().join(format!("smedja-codex-effort-none-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        make_mock_codex(&tmp, "#!/bin/sh\nprintf \"args: $*\\n\"\n");
+
+        let old = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old}", tmp.display()));
+
+        let provider = CodexCliProvider::Cli;
+        let mut stream = provider.stream_chat(&[user_msg("hi")], &base_opts(None));
+        let mut output = String::new();
+        while let Some(item) = stream.next().await {
+            if let Ok(Delta::Text(t)) = item {
+                output.push_str(&t);
+            }
+        }
+
+        std::env::set_var("PATH", old);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            !output.contains("model_reasoning_effort"),
+            "no effort override must be passed when opts.effort is None; got: {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the stream to serialize $PATH mutation across concurrent tests
+    async fn unknown_effort_override_is_skipped() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp =
+            std::env::temp_dir().join(format!("smedja-codex-effort-bogus-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        make_mock_codex(&tmp, "#!/bin/sh\nprintf \"args: $*\\n\"\n");
+
+        let old = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old}", tmp.display()));
+
+        let mut opts = base_opts(None);
+        opts.effort = Some("turbo; rm -rf /".to_owned());
+        let provider = CodexCliProvider::Cli;
+        let mut stream = provider.stream_chat(&[user_msg("hi")], &opts);
+        let mut output = String::new();
+        while let Some(item) = stream.next().await {
+            if let Ok(Delta::Text(t)) = item {
+                output.push_str(&t);
+            }
+        }
+
+        std::env::set_var("PATH", old);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            !output.contains("model_reasoning_effort"),
+            "an unrecognised effort must not reach a -c override; got: {output:?}"
         );
     }
 

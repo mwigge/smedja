@@ -5,23 +5,170 @@
 
 use super::*;
 
+/// Extra approval-gate fields a newer daemon attaches to a `cowork_request`
+/// line that the typed [`StreamEvent`] does not carry yet: agent/runner name,
+/// cwd, risk class, and the `supports_modify` capability flag. Captured from
+/// the raw JSON so they are not dropped by deserialization; absent on older
+/// daemons.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CoworkMeta {
+    pub(crate) agent: Option<String>,
+    pub(crate) cwd: Option<String>,
+    pub(crate) risk: Option<String>,
+    /// Wire `supports_modify` flag; `None` when the daemon omits it, in which
+    /// case the item keeps its default of `true`.
+    pub(crate) supports_modify: Option<bool>,
+}
+
+impl CoworkMeta {
+    /// Extracts the optional extras from a raw `cowork_request` line. Returns
+    /// `None` when none are present (or all are empty strings). Values are
+    /// sanitised at this trust boundary so daemon-controlled text cannot
+    /// inject terminal escape sequences into the overlay.
+    fn from_value(v: &Value) -> Option<Self> {
+        let pick = |keys: &[&str]| {
+            keys.iter().find_map(|k| {
+                v.get(*k)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| formatting::sanitize_terminal(s).into_owned())
+            })
+        };
+        let meta = Self {
+            agent: pick(&["agent", "agent_name", "runner"]),
+            cwd: pick(&["cwd"]),
+            risk: pick(&["risk", "risk_class"]),
+            supports_modify: v.get("supports_modify").and_then(Value::as_bool),
+        };
+        (meta != Self::default()).then_some(meta)
+    }
+}
+
+/// Parses a session-scoped `cowork_resolved` line (daemon ≥ the gate-dispatch
+/// change): `{"type":"cowork_resolved","approval_id":"…","outcome":"approved"|
+/// "denied"|"timeout"}`. Returns `(approval_id, outcome)`; `None` for any other
+/// line or a missing/empty id — unknown extra fields are ignored so newer
+/// daemons stay compatible. A missing or unrecognised outcome parses to `None`
+/// (treated as a silent dismissal, never as a blank "resolved elsewhere: "
+/// notice).
+fn parse_cowork_resolved(v: &Value) -> Option<(String, Option<CoworkOutcome>)> {
+    if v.get("type").and_then(Value::as_str) != Some("cowork_resolved") {
+        return None;
+    }
+    let id = v
+        .get("approval_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    let outcome = v
+        .get("outcome")
+        .and_then(|o| serde_json::from_value::<CoworkOutcome>(o.clone()).ok());
+    Some((id.to_owned(), outcome))
+}
+
+/// One NDJSON stream line: the typed event plus any cowork-gate extras the
+/// typed event does not model.
+#[derive(Debug)]
+pub(crate) struct InboundStreamEvent {
+    pub(crate) event: StreamEvent,
+    pub(crate) cowork_meta: Option<CoworkMeta>,
+    /// `(approval_id, outcome)` when the line is a `cowork_resolved` notice —
+    /// the approval was resolved elsewhere (another client, or a timeout) and
+    /// the matching pending item must be dismissed. `None` outcome when the
+    /// line omits it or carries an unrecognised token.
+    pub(crate) cowork_resolved: Option<(String, Option<CoworkOutcome>)>,
+}
+
+/// Removes the pending item at `pos`, clearing the modify-mode state when the
+/// removed item was the head (the overlay's modify input edits the head only,
+/// so leaving it armed would target a different approval).
+pub(crate) fn remove_cowork_at(state: &mut AppState, pos: usize) {
+    state.pending_cowork.remove(pos);
+    if pos == 0 {
+        state.cowork_modify_mode = false;
+        state.cowork_modify_input.clear();
+    }
+}
+
+/// Dismisses the pending cowork item for `approval_id` after a
+/// `cowork_resolved` notice (arriving either as the typed event or as the
+/// Value-first fallback when typed deserialization failed). A resolution that
+/// happened elsewhere — or a timeout — gets a brief notice so the overlay
+/// does not vanish silently; `approved` and missing/unknown outcomes are
+/// silent because the approving client already confirmed the decision locally.
+fn dismiss_cowork(state: &mut AppState, approval_id: &str, outcome: Option<CoworkOutcome>) {
+    if let Some(pos) = state
+        .pending_cowork
+        .iter()
+        .position(|i| i.id == approval_id)
+    {
+        remove_cowork_at(state, pos);
+        if let Some(outcome @ (CoworkOutcome::Denied | CoworkOutcome::Timeout)) = outcome {
+            push_system_message(
+                state,
+                format!("approval resolved elsewhere: {}", outcome.as_str()),
+            );
+        }
+    }
+}
+
+/// Applies an inbound stream line: a `cowork_resolved` dismissal first, then
+/// the typed event, then enrichment of a freshly queued cowork item with any
+/// wire extras the typed event dropped.
+/// Returns `true` when the event terminates the turn, like [`apply_stream_event`].
+pub(crate) fn apply_inbound_event(
+    state: &mut AppState,
+    inbound: InboundStreamEvent,
+    pending_output_save: &mut Option<(OutputType, String)>,
+) -> bool {
+    if let Some((id, outcome)) = inbound.cowork_resolved {
+        dismiss_cowork(state, &id, outcome);
+    }
+    let approval_id = match &inbound.event {
+        StreamEvent::CoworkRequest { approval_id, .. } => Some(approval_id.clone()),
+        _ => None,
+    };
+    let done = apply_stream_event(state, inbound.event, pending_output_save);
+    if let (Some(id), Some(meta)) = (approval_id, inbound.cowork_meta) {
+        if let Some(item) = state.pending_cowork.iter_mut().find(|i| i.id == id) {
+            item.agent = item.agent.take().or(meta.agent);
+            item.cwd = item.cwd.take().or(meta.cwd);
+            item.risk = item.risk.take().or(meta.risk);
+            if let Some(supports_modify) = meta.supports_modify {
+                item.supports_modify = supports_modify;
+            }
+            // Meta changes the rendered body — drop the memoised wrap.
+            item.rows_cache.borrow_mut().take();
+        }
+    }
+    done
+}
+
 /// Connects to the smdjad stream socket and forwards NDJSON events to `tx`
 /// until the terminal `done` or `error` event is received.
 pub(crate) async fn start_stream_reader(
     sock_path: PathBuf,
     task_id: String,
-    tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+    tx: tokio::sync::mpsc::UnboundedSender<InboundStreamEvent>,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
+
+    // Wraps a typed event (or a transport failure) for the channel.
+    fn pack(event: StreamEvent) -> InboundStreamEvent {
+        InboundStreamEvent {
+            event,
+            cowork_meta: None,
+            cowork_resolved: None,
+        }
+    }
 
     let stream = match UnixStream::connect(&sock_path).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "stream socket connect failed");
-            let _ = tx.send(StreamEvent::Error {
+            let _ = tx.send(pack(StreamEvent::Error {
                 message: format!("stream unavailable: {e}"),
-            });
+            }));
             return;
         }
     };
@@ -30,9 +177,9 @@ pub(crate) async fn start_stream_reader(
 
     let req = format!("{{\"task_id\":\"{task_id}\"}}\n");
     if writer.write_all(req.as_bytes()).await.is_err() {
-        let _ = tx.send(StreamEvent::Error {
+        let _ = tx.send(pack(StreamEvent::Error {
             message: "stream handshake failed".to_owned(),
-        });
+        }));
         return;
     }
 
@@ -43,11 +190,22 @@ pub(crate) async fn start_stream_reader(
     // trailing snapshot, so stop at once. The window matches the daemon's
     // `QUALITY_GRACE_SECS`.
     const QUALITY_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
+    /// Maximum bytes accepted for one NDJSON line. A runaway or hostile
+    /// daemon writing an unbounded line must not grow the read buffer without
+    /// limit; over-long lines are dropped (and logged) chunk by chunk until
+    /// the newline resyncs the stream.
+    const MAX_LINE_BYTES: u64 = 1024 * 1024;
     let mut line = String::new();
     let mut grace_until: Option<tokio::time::Instant> = None;
     loop {
         line.clear();
-        let read = reader.read_line(&mut line);
+        // Cap each read at MAX_LINE_BYTES + 1 so a newline-free flood stops
+        // growing `line`; a length over the cap means the line is over-long
+        // (or exactly at the cap without its newline) and is dropped. `Take`
+        // wraps the BufReader directly (it implements AsyncBufRead), so no
+        // bytes past the newline are swallowed when the wrapper is dropped.
+        let mut limited = tokio::io::AsyncReadExt::take(&mut reader, MAX_LINE_BYTES + 1);
+        let read = limited.read_line(&mut line);
         let outcome = if let Some(dl) = grace_until {
             let remaining = dl.saturating_duration_since(tokio::time::Instant::now());
             match tokio::time::timeout(remaining, read).await {
@@ -60,23 +218,48 @@ pub(crate) async fn start_stream_reader(
         match outcome {
             Ok(0) | Err(_) => break,
             Ok(_) => {
+                if line.len() as u64 > MAX_LINE_BYTES {
+                    tracing::warn!(
+                        len = line.len(),
+                        "stream line exceeds {MAX_LINE_BYTES} bytes — dropped"
+                    );
+                    continue;
+                }
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
-                if let Ok(ev) = serde_json::from_str::<StreamEvent>(trimmed) {
-                    let is_quality = matches!(ev, StreamEvent::Quality { .. });
-                    let is_error = matches!(ev, StreamEvent::Error { .. });
-                    let is_done = matches!(ev, StreamEvent::Done { .. });
-                    // The `/review` audit stream terminates on its report event.
-                    let is_audit_report = matches!(ev, StreamEvent::AuditReport { .. });
-                    let _ = tx.send(ev);
-                    if is_quality || is_error || is_audit_report {
-                        break;
-                    }
-                    if is_done {
-                        // Hold open briefly for the trailing quality snapshot.
-                        grace_until = Some(tokio::time::Instant::now() + QUALITY_GRACE);
+                if let Ok(raw) = serde_json::from_str::<Value>(trimmed) {
+                    // Capture cowork-gate extras the typed event does not model
+                    // before deserialization drops the unknown fields.
+                    let cowork_meta =
+                        if raw.get("type").and_then(Value::as_str) == Some("cowork_request") {
+                            CoworkMeta::from_value(&raw)
+                        } else {
+                            None
+                        };
+                    // Session-scoped resolution notices dismiss popups whose
+                    // approval was answered elsewhere (or timed out). Absent
+                    // on older daemons; tolerated either way.
+                    let cowork_resolved = parse_cowork_resolved(&raw);
+                    if let Ok(ev) = serde_json::from_value::<StreamEvent>(raw) {
+                        let is_quality = matches!(ev, StreamEvent::Quality { .. });
+                        let is_error = matches!(ev, StreamEvent::Error { .. });
+                        let is_done = matches!(ev, StreamEvent::Done { .. });
+                        // The `/review` audit stream terminates on its report event.
+                        let is_audit_report = matches!(ev, StreamEvent::AuditReport { .. });
+                        let _ = tx.send(InboundStreamEvent {
+                            event: ev,
+                            cowork_meta,
+                            cowork_resolved,
+                        });
+                        if is_quality || is_error || is_audit_report {
+                            break;
+                        }
+                        if is_done {
+                            // Hold open briefly for the trailing quality snapshot.
+                            grace_until = Some(tokio::time::Instant::now() + QUALITY_GRACE);
+                        }
                     }
                 }
             }
@@ -451,19 +634,15 @@ pub(crate) fn apply_stream_event(
             if llm_reviewed {
                 state.quality_review_in_progress = false;
             }
-            // CoworkGate: two consecutive turns below 60.
+            // CoworkGate: two consecutive turns below 60. Informational notice
+            // only — a synthetic approval item would let `y` send a
+            // cowork.resolve for an id the daemon never registered.
             if score < 60 {
                 state.consecutive_low_quality = state.consecutive_low_quality.saturating_add(1);
-                if state.consecutive_low_quality >= 2 {
-                    state.pending_cowork.push(cowork_widget::CoworkItem {
-                        id: format!("quality-gate-{score}"),
-                        tool: "quality-gate".to_owned(),
-                        step_n: 0,
-                        args_display: format!(
-                            "Score {score}/100 for 2 consecutive turns — address findings?"
-                        ),
-                        reasoning: "Quality score below 60 for 2 turns.".to_owned(),
-                    });
+                if state.consecutive_low_quality == 2 {
+                    state.main_panel.push_line(format!(
+                        "\u{26a0} quality gate: score {score}/100 for 2 consecutive turns — run /quality for a Tier-2 review"
+                    ));
                 }
             } else {
                 state.consecutive_low_quality = 0;
@@ -484,12 +663,34 @@ pub(crate) fn apply_stream_event(
         } => {
             let already_known = state.pending_cowork.iter().any(|i| i.id == approval_id);
             if !already_known {
+                // Bounded queue: a daemon spraying requests must not grow this
+                // without limit. Past the cap the oldest item is dropped with a
+                // notice so the overlay never pretends it is still actionable.
+                const PENDING_COWORK_CAP: usize = 32;
+                if state.pending_cowork.len() >= PENDING_COWORK_CAP {
+                    remove_cowork_at(state, 0);
+                    state.main_panel.push_line(
+                        "[cowork] too many pending approvals — dropped the oldest".to_owned(),
+                    );
+                }
+                // Sanitise daemon-controlled display text at ingestion: the
+                // overlay and the /cowork listing render these raw.
                 state.pending_cowork.push(cowork_widget::CoworkItem {
                     id: approval_id,
-                    tool,
+                    tool: formatting::sanitize_terminal(&tool).into_owned(),
                     step_n,
-                    args_display,
-                    reasoning,
+                    args_display: formatting::sanitize_terminal(&args_display).into_owned(),
+                    reasoning: formatting::sanitize_terminal(&reasoning).into_owned(),
+                    // Wire extras (agent/cwd/risk/supports_modify) arrive
+                    // out-of-band via `CoworkMeta` and are merged in by
+                    // `apply_inbound_event`. `supports_modify` defaults to true
+                    // so daemons that predate the field keep the modify
+                    // affordance.
+                    agent: None,
+                    cwd: None,
+                    risk: None,
+                    supports_modify: true,
+                    rows_cache: std::cell::RefCell::new(None),
                 });
             }
         }
@@ -571,6 +772,15 @@ pub(crate) fn apply_stream_event(
         StreamEvent::Unknown
         | StreamEvent::ToolCallChunk { .. }
         | StreamEvent::ToolCallUpdate { .. } => {}
+        StreamEvent::CoworkResolved {
+            approval_id,
+            outcome,
+        } => {
+            // When this arrived over the socket the Value-first payload in
+            // `apply_inbound_event` already dismissed the item; this arm is a
+            // no-op then and the live path otherwise (replay, direct calls).
+            dismiss_cowork(state, &approval_id, Some(outcome));
+        }
     }
     turn_done
 }
@@ -730,5 +940,157 @@ mod echo_tests {
             strip_ok_result_echo("plain text"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod cowork_meta_tests {
+    use super::CoworkMeta;
+    use serde_json::json;
+
+    #[test]
+    fn from_value_captures_agent_cwd_risk() {
+        let v = json!({
+            "type": "cowork_request",
+            "approval_id": "a1",
+            "tool": "bash",
+            "step_n": 1,
+            "args_display": "{}",
+            "reasoning": "",
+            "agent": "review",
+            "cwd": "/repo",
+            "risk": "high"
+        });
+        let meta = CoworkMeta::from_value(&v).expect("extras captured");
+        assert_eq!(meta.agent.as_deref(), Some("review"));
+        assert_eq!(meta.cwd.as_deref(), Some("/repo"));
+        assert_eq!(meta.risk.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn from_value_accepts_alternate_spellings() {
+        let v = json!({"agent_name": "impl", "risk_class": "low"});
+        let meta = CoworkMeta::from_value(&v).expect("extras captured");
+        assert_eq!(meta.agent.as_deref(), Some("impl"));
+        assert_eq!(meta.risk.as_deref(), Some("low"));
+        assert!(meta.cwd.is_none());
+    }
+
+    #[test]
+    fn from_value_returns_none_without_extras() {
+        assert!(CoworkMeta::from_value(&json!({"tool": "bash"})).is_none());
+        // Empty strings count as absent.
+        assert!(CoworkMeta::from_value(&json!({"agent": "", "cwd": ""})).is_none());
+    }
+}
+
+#[cfg(test)]
+mod cowork_resolved_tests {
+    use super::parse_cowork_resolved;
+    use serde_json::json;
+    use smedja_bellows::CoworkOutcome;
+
+    #[test]
+    fn parses_session_scoped_resolution_line() {
+        let v = json!({"type": "cowork_resolved", "approval_id": "a-1", "outcome": "denied"});
+        assert_eq!(
+            parse_cowork_resolved(&v),
+            Some(("a-1".to_owned(), Some(CoworkOutcome::Denied)))
+        );
+    }
+
+    #[test]
+    fn tolerates_unknown_fields_and_missing_outcome() {
+        // Newer daemons may attach extra fields; older lines may lack outcome.
+        let v = json!({
+            "type": "cowork_resolved",
+            "approval_id": "a-2",
+            "outcome": "timeout",
+            "session_id": "s-1",
+            "future_field": {"nested": true}
+        });
+        assert_eq!(
+            parse_cowork_resolved(&v),
+            Some(("a-2".to_owned(), Some(CoworkOutcome::Timeout)))
+        );
+        // Missing or unrecognised outcomes parse to None (silent dismissal).
+        let no_outcome = json!({"type": "cowork_resolved", "approval_id": "a-3"});
+        assert_eq!(
+            parse_cowork_resolved(&no_outcome),
+            Some(("a-3".to_owned(), None))
+        );
+        let bad_outcome =
+            json!({"type": "cowork_resolved", "approval_id": "a-4", "outcome": "mangled"});
+        assert_eq!(
+            parse_cowork_resolved(&bad_outcome),
+            Some(("a-4".to_owned(), None))
+        );
+    }
+
+    #[test]
+    fn ignores_other_types_and_missing_ids() {
+        assert!(parse_cowork_resolved(&json!({"type": "delta", "text": "hi"})).is_none());
+        assert!(parse_cowork_resolved(&json!({"type": "cowork_resolved"})).is_none());
+        assert!(
+            parse_cowork_resolved(&json!({"type": "cowork_resolved", "approval_id": ""})).is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod stream_line_cap_tests {
+    use smedja_bellows::StreamEvent;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    /// A line far over the 1 MiB cap must be dropped (without growing the
+    /// buffer unboundedly) and the reader must resync on the next newline so
+    /// subsequent well-formed events still arrive.
+    #[tokio::test]
+    async fn oversized_line_is_dropped_and_stream_resyncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("stream-cap.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (reader, mut writer) = stream.into_split();
+            // Consume the {"task_id":…} handshake line.
+            let mut handshake = String::new();
+            let _ = BufReader::new(reader).read_line(&mut handshake).await;
+
+            // 2 MiB of newline-free garbage, then a valid delta, then done.
+            let mut flood = "x".repeat(2 * 1024 * 1024);
+            flood.push('\n');
+            let _ = writer.write_all(flood.as_bytes()).await;
+            let _ = writer
+                .write_all(b"{\"type\":\"delta\",\"text\":\"alive\"}\n")
+                .await;
+            let _ = writer
+                .write_all(b"{\"type\":\"done\",\"output_tok\":1}\n")
+                .await;
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        super::start_stream_reader(sock_path, "task-1".to_owned(), tx).await;
+
+        let mut saw_delta = false;
+        let mut saw_done = false;
+        while let Some(inbound) = rx.recv().await {
+            match &inbound.event {
+                StreamEvent::Delta { text } => {
+                    assert!(text.len() < 1024 * 1024, "no giant payload forwarded");
+                    if text == "alive" {
+                        saw_delta = true;
+                    }
+                }
+                StreamEvent::Done { .. } => saw_done = true,
+                _ => {}
+            }
+        }
+        assert!(saw_delta, "delta after the flood must still arrive");
+        assert!(saw_done, "stream terminates on done");
     }
 }

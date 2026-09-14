@@ -16,10 +16,11 @@ use serde_json::{json, Value};
 use smedja_rpc::client::Client;
 
 use crate::{
-    fetch_latest_version, format_gov_list, format_resume_rows, format_token_count, gov_create,
-    gov_transition, is_newer, parse_resume_args, parse_review_scope, push_system_message,
-    render_findings_summary, resume_blocked_by_pending_turn, resume_into_view, resume_plan,
-    run_upgrade, scan_gov_artifacts, slugify, submit, AppState, OutputType, HELP_TEXT, VERSION,
+    fetch_latest_version, format_capabilities_table, format_gov_list, format_resume_rows,
+    format_token_count, gov_create, gov_transition, is_newer, parse_resume_args,
+    parse_review_scope, push_system_message, render_findings_summary,
+    resume_blocked_by_pending_turn, resume_into_view, resume_plan, run_upgrade, scan_gov_artifacts,
+    slugify, submit, AppState, OutputType, HELP_TEXT, VERSION,
 };
 
 mod format;
@@ -73,6 +74,141 @@ pub(crate) fn runner_default_model(
 /// (`parse_session_mode_to_role`), grouped for readability.
 pub(crate) const AGENT_MODE_USAGE: &str =
     "usage: /agent impl|plan|research|debug|ask|review|test|sre|data|iac|orchestrator";
+
+/// Extracts runner names from a `runner.list` response, deduplicated in
+/// first-seen order. The daemon returns one entry per (runner, tier), so a
+/// runner with both a fast and a deep tier would otherwise appear twice in
+/// the `/switch` picker.
+pub(crate) fn runner_names(list: &Value) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    list.get("runners")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| r.get("runner").and_then(Value::as_str))
+                .filter(|n| seen.insert((*n).to_owned()))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extracts the daemon's "model pin was cleared" note from a
+/// `session.set_runner` response. Handles both a boolean flag (current and
+/// planned spellings) and a free-form `note` string, returning `None` when
+/// the response carries neither (older daemons).
+pub(crate) fn model_pin_note(v: &Value) -> Option<String> {
+    for key in ["model_cleared", "model_pin_cleared", "pin_cleared"] {
+        if v.get(key).and_then(Value::as_bool) == Some(true) {
+            return Some(
+                "model pin cleared — next turn uses the runner's default model".to_owned(),
+            );
+        }
+    }
+    v.get("note")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// CLI names probed on `$PATH` — the single list shared by the first-run
+/// onboarding probe in bootstrap and the `/login` overview so the two never
+/// drift apart.
+pub(crate) const PROBED_CLIS: &[&str] = &[
+    "claude", "codex", "kimi", "gemini", "pool", "opencode", "llmctl",
+];
+
+/// Memo for [`probe_cli`] results. A `which` probe spawns a subprocess, and
+/// `/login` probes a handful of CLIs per invocation — the PATH reality does
+/// not change within a TUI session often enough to justify re-probing, so each
+/// name is resolved at most once per process.
+fn probe_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, bool>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Returns whether `name` resolves on `$PATH` (via `which`). Results are
+/// cached per session — see [`probe_cache`].
+pub(crate) fn probe_cli(name: &str) -> bool {
+    if let Some(&cached) = probe_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(name)
+    {
+        return cached;
+    }
+    let found = std::process::Command::new("which")
+        .arg(name)
+        .output()
+        .is_ok_and(|o| o.status.success());
+    probe_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(name.to_owned(), found);
+    found
+}
+
+/// Renders the read-only `/session` view from local TUI state — no RPC.
+pub(crate) fn format_session_info(state: &AppState) -> String {
+    [
+        format!("session: {}", state.session_id),
+        format!("  runner: {}", state.runner),
+        format!(
+            "  model: {}",
+            state.model.as_deref().unwrap_or("(runner default)")
+        ),
+        format!("  tier: {}", state.tier.as_deref().unwrap_or("fast")),
+        format!("  mode: {}", state.mode.as_deref().unwrap_or("(default)")),
+        format!("  permission mode: {}", state.permission_mode),
+        format!("  cowork pending: {}", state.pending_cowork.len()),
+        format!(
+            "  turns: {} · tokens in/out: {}/{}",
+            state.turn_n, state.session_tokens_in, state.session_tokens_out
+        ),
+        format!(
+            "  context: {}/{} tokens",
+            state.context_used, state.context_window
+        ),
+    ]
+    .join("\n")
+}
+
+/// Asks the daemon to rebuild its provider pool (`provider.rescan`) after a
+/// credential changed, then reports the refreshed runner list. An older daemon
+/// without the method gets a restart hint instead of an error.
+pub(crate) async fn rescan_providers(state: &mut AppState, client: &mut Client) {
+    match client.call("provider.rescan", json!({})).await {
+        Ok(v) => {
+            let names = runner_names(&v);
+            if names.is_empty() {
+                push_system_message(
+                    state,
+                    "provider pool rescanned — still no providers detected; run /login to configure one",
+                );
+            } else {
+                push_system_message(
+                    state,
+                    format!(
+                        "provider pool rescanned — {} runner(s): {}",
+                        names.len(),
+                        names.join(", ")
+                    ),
+                );
+            }
+        }
+        Err(e)
+            if e.code == smedja_rpc::codes::METHOD_NOT_FOUND
+                || e.message.contains("method not found") =>
+        {
+            push_system_message(
+                state,
+                "daemon predates provider.rescan — restart smdjad to pick up the new key",
+            );
+        }
+        Err(e) => push_system_message(state, format!("provider.rescan error: {e}")),
+    }
+}
 
 /// Returns whether `mode` is a role the daemon's router accepts. Kept in sync
 /// with `parse_session_mode_to_role` in the daemon (canonical names + aliases).
@@ -130,6 +266,54 @@ pub(crate) async fn dispatch_slash(
     let args = parts.next().unwrap_or_default().trim();
 
     match cmd {
+        "effort" => {
+            // The daemon owns the pin (session.set_effort); the TUI keeps no
+            // local copy, so the no-arg view always reflects daemon truth.
+            if args.is_empty() {
+                let text = match client
+                    .call("session.get", json!({ "id": state.session_id }))
+                    .await
+                {
+                    Ok(v) => {
+                        let current = v
+                            .get("effort")
+                            .and_then(Value::as_str)
+                            .unwrap_or("default (provider chooses)");
+                        format!("effort: {current}\nvalid levels: low | medium | high — /effort default clears the pin")
+                    }
+                    Err(e) => format!("session.get error: {e}"),
+                };
+                push_system_message(state, text);
+                return Ok(true);
+            }
+            // Accept the level case-insensitively (`/effort HIGH`); the daemon
+            // always gets the canonical lowercase token.
+            let level = args.to_ascii_lowercase();
+            match level.as_str() {
+                "low" | "medium" | "high" | "default" => {
+                    let result = client
+                        .call(
+                            "session.set_effort",
+                            json!({ "session_id": state.session_id, "effort": level }),
+                        )
+                        .await;
+                    match result {
+                        Ok(_) if level == "default" => {
+                            push_system_message(state, "effort cleared — provider default applies");
+                        }
+                        Ok(_) => push_system_message(state, format!("effort set to {level}")),
+                        Err(e) => {
+                            push_system_message(state, format!("session.set_effort error: {e}"));
+                        }
+                    }
+                }
+                _ => push_system_message(
+                    state,
+                    format!("unknown effort: {args}\nusage: /effort low|medium|high|default"),
+                ),
+            }
+            Ok(true)
+        }
         "tier" => {
             let text = apply_tier(args, state);
             push_system_message(state, text);
@@ -715,11 +899,13 @@ pub(crate) async fn dispatch_slash(
                 return Ok(true);
             }
             let id = args.to_owned();
-            let session_id = state.session_id.clone();
+            // Session-agnostic resolution: the daemon scans every registered
+            // gate by approval id, so an id pasted from another session's
+            // listing resolves too.
             let result = client
                 .call(
-                    "cowork.approve",
-                    json!({ "session_id": session_id, "id": id }),
+                    "cowork.resolve",
+                    crate::input::cowork_resolve_params(&id, true),
                 )
                 .await;
             match result {
@@ -735,7 +921,7 @@ pub(crate) async fn dispatch_slash(
                     };
                     push_system_message(state, text);
                 }
-                Err(e) => push_system_message(state, format!("cowork.approve error: {e}")),
+                Err(e) => push_system_message(state, format!("cowork.resolve error: {e}")),
             }
             Ok(true)
         }
@@ -995,71 +1181,57 @@ pub(crate) async fn dispatch_slash(
         }
         "login" => {
             let guidance = if args.is_empty() {
-                // Scan for installed CLIs so the user sees what's found vs missing.
-                let claude_found = std::process::Command::new("which")
-                    .arg("claude")
-                    .output()
-                    .is_ok_and(|o| o.status.success());
-                let codex_found = std::process::Command::new("which")
-                    .arg("codex")
-                    .output()
-                    .is_ok_and(|o| o.status.success());
-                let kimi_found = std::process::Command::new("which")
-                    .arg("kimi")
-                    .output()
-                    .is_ok_and(|o| o.status.success());
-                let gemini_found = std::process::Command::new("which")
-                    .arg("gemini")
-                    .output()
-                    .is_ok_and(|o| o.status.success());
-                let llmctl_found = std::process::Command::new("which")
-                    .arg("llmctl")
-                    .output()
-                    .is_ok_and(|o| o.status.success());
-
+                // Scan for installed CLIs so the user sees what's found vs
+                // missing. Shares the probe list with the bootstrap onboarding
+                // probe (`PROBED_CLIS`) so the two never drift apart.
+                let probed: std::collections::HashMap<&str, bool> = PROBED_CLIS
+                    .iter()
+                    .map(|&name| (name, probe_cli(name)))
+                    .collect();
+                let found = |name: &str| {
+                    if probed.get(name).copied().unwrap_or(false) {
+                        "installed"
+                    } else {
+                        "not found"
+                    }
+                };
                 let mut lines = vec![
                     "available runners:".to_owned(),
                     format!(
                         "  claude   [{}]  — Claude.ai subscription (OAuth, no API key needed)",
-                        if claude_found {
-                            "installed"
-                        } else {
-                            "not found"
-                        }
+                        found("claude")
                     ),
+                    "  anthropic          — native Anthropic API: /login anthropic to paste ANTHROPIC_API_KEY".to_owned(),
                     format!(
                         "  codex    [{}]  — OpenAI Codex CLI",
-                        if codex_found {
-                            "installed"
-                        } else {
-                            "not found"
-                        }
+                        found("codex")
                     ),
+                    "  openai             — native OpenAI API: /login openai to paste OPENAI_API_KEY".to_owned(),
                     format!(
                         "  kimi     [{}]  — Kimi Code subscription (OAuth) or MOONSHOT_API_KEY",
-                        if kimi_found { "installed" } else { "not found" }
+                        found("kimi")
                     ),
                     format!(
                         "  gemini   [{}]  — Google Gemini CLI (OAuth) or GEMINI_API_KEY",
-                        if gemini_found {
-                            "installed"
-                        } else {
-                            "not found"
-                        }
+                        found("gemini")
+                    ),
+                    format!(
+                        "  pool     [{}]  — Poolside via `pool` CLI (pool login)",
+                        found("pool")
+                    ),
+                    format!(
+                        "  opencode [{}]  — OpenCode (OpenAI-compatible): /login opencode to paste OPENCODE_API_KEY",
+                        found("opencode")
                     ),
                     format!(
                         "  local    [{}]  — local model via rs-llmctl",
-                        if llmctl_found {
-                            "installed"
-                        } else {
-                            "not found"
-                        }
+                        found("llmctl")
                     ),
                     "  copilot              — GitHub Copilot".to_owned(),
                     "  minimax              — Minimax (set MINIMAX_API_KEY)".to_owned(),
                     "  berget               — Berget AI (set BERGET_API_KEY)".to_owned(),
                 ];
-                if !claude_found {
+                if !probed.get("claude").copied().unwrap_or(false) {
                     lines.push(String::new());
                     lines.push("to install claude CLI: https://claude.ai/download".to_owned());
                     lines.push("then run: claude login".to_owned());
@@ -1068,44 +1240,43 @@ pub(crate) async fn dispatch_slash(
             } else {
                 match args {
                     "claude" => {
-                        let found = std::process::Command::new("which")
-                            .arg("claude")
-                            .output()
-                            .is_ok_and(|o| o.status.success());
-                        if found {
+                        if probe_cli("claude") {
                             "claude CLI is installed — uses your Claude.ai subscription (OAuth).\n\
-                             if not authenticated yet, run: claude login"
+                             if not authenticated yet, run: claude login\n\
+                             or paste an API key instead: /login anthropic"
                                 .to_owned()
                         } else {
                             "claude CLI not found.\n\
                              install: https://claude.ai/download\n\
                              then run: claude login\n\
-                             no API key required — uses your Claude.ai subscription."
+                             or paste an API key instead: /login anthropic"
                                 .to_owned()
                         }
                     }
+                    "anthropic" => {
+                        state.secret_var = Some("ANTHROPIC_API_KEY".to_owned());
+                        "paste your Anthropic API key then Enter — input is hidden · Esc to cancel"
+                            .to_owned()
+                    }
                     "codex" => {
-                        let found = std::process::Command::new("which")
-                            .arg("codex")
-                            .output()
-                            .is_ok_and(|o| o.status.success());
-                        if found {
-                            "codex CLI is installed.\n\
-                             set OPENAI_API_KEY in your shell profile to authenticate."
+                        if probe_cli("codex") {
+                            "codex CLI is installed — uses its own login state.\n\
+                             or paste an API key instead: /login openai"
                                 .to_owned()
                         } else {
                             "codex CLI not found.\n\
                              install: npm install -g @openai/codex\n\
-                             then set OPENAI_API_KEY in your shell profile."
+                             or paste an API key instead: /login openai"
                                 .to_owned()
                         }
                     }
+                    "openai" => {
+                        state.secret_var = Some("OPENAI_API_KEY".to_owned());
+                        "paste your OpenAI API key then Enter — input is hidden · Esc to cancel"
+                            .to_owned()
+                    }
                     "kimi" => {
-                        let found = std::process::Command::new("which")
-                            .arg("kimi")
-                            .output()
-                            .is_ok_and(|o| o.status.success());
-                        if found {
+                        if probe_cli("kimi") {
                             "kimi CLI is installed — uses your Kimi Code subscription (device-code OAuth).\n\
                              if not authenticated yet, run: kimi login"
                                 .to_owned()
@@ -1117,11 +1288,7 @@ pub(crate) async fn dispatch_slash(
                         }
                     }
                     "gemini" => {
-                        let found = std::process::Command::new("which")
-                            .arg("gemini")
-                            .output()
-                            .is_ok_and(|o| o.status.success());
-                        if found {
+                        if probe_cli("gemini") {
                             "gemini CLI is installed — driven over ACP; uses its own login state.\n\
                              if not authenticated yet, run: gemini (interactive) and complete /auth"
                                 .to_owned()
@@ -1138,6 +1305,23 @@ pub(crate) async fn dispatch_slash(
                     "copilot" => "copilot runner uses GitHub Copilot.\n\
                                   authenticate via the copilot CLI or VS Code extension."
                         .to_owned(),
+                    "pool" => {
+                        if probe_cli("pool") {
+                            "pool CLI is installed — auth is handled by the binary.\n\
+                             if not authenticated yet, run: pool login\n\
+                             (credentials live in ~/.config/poolside/credentials.json)"
+                                .to_owned()
+                        } else {
+                            "pool CLI not found — install the Poolside CLI, then run: pool login\n\
+                             (credentials live in ~/.config/poolside/credentials.json)"
+                                .to_owned()
+                        }
+                    }
+                    "opencode" => {
+                        state.secret_var = Some("OPENCODE_API_KEY".to_owned());
+                        "paste your OpenCode API key then Enter — input is hidden · Esc to cancel"
+                            .to_owned()
+                    }
                     "minimax" => {
                         state.secret_var = Some("MINIMAX_API_KEY".to_owned());
                         "paste your Minimax API key then Enter — input is hidden · Esc to cancel"
@@ -1149,7 +1333,7 @@ pub(crate) async fn dispatch_slash(
                             .to_owned()
                     }
                     other => format!(
-                        "unknown runner: {other}\nvalid: claude, codex, kimi, gemini, local, copilot, minimax, berget"
+                        "unknown runner: {other}\nvalid: claude, anthropic, codex, openai, kimi, gemini, local, copilot, pool, opencode, minimax, berget"
                     ),
                 }
             };
@@ -1161,17 +1345,7 @@ pub(crate) async fn dispatch_slash(
                 let result = client.call("runner.list", json!({})).await;
                 match result {
                     Ok(v) => {
-                        let runners: Vec<String> = v
-                            .get("runners")
-                            .and_then(|r| r.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|r| {
-                                        r.get("runner").and_then(|n| n.as_str()).map(str::to_owned)
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
+                        let runners = runner_names(&v);
                         if runners.is_empty() {
                             push_system_message(state, "no runners available from runner.list");
                         } else {
@@ -1222,6 +1396,9 @@ pub(crate) async fn dispatch_slash(
                         }
                     }
                     push_system_message(state, format!("runner switched to {canonical}"));
+                    if let Some(note) = model_pin_note(&v) {
+                        push_system_message(state, note);
+                    }
                     // Show the existing session memory the new runner picks up.
                     if let Ok(hist) = client
                         .call("session.history", json!({ "session_id": session_id }))
@@ -1383,6 +1560,102 @@ pub(crate) async fn dispatch_slash(
                 };
                 let _ = tx.send(msg);
             });
+            Ok(true)
+        }
+        "session" => {
+            push_system_message(state, format_session_info(state));
+            Ok(true)
+        }
+        "capabilities" => {
+            let text = match client.call("runner.list", json!({})).await {
+                Ok(v) => {
+                    let runners = v
+                        .get("runners")
+                        .and_then(|r| r.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    format_capabilities_table(&runners)
+                }
+                Err(e) => format!("capabilities: error — {e}"),
+            };
+            push_system_message(state, text);
+            Ok(true)
+        }
+        "cowork" => {
+            match args {
+                "on" | "off" => {
+                    let enabled = args == "on";
+                    let session_id = state.session_id.clone();
+                    match client
+                        .call(
+                            "cowork.set",
+                            json!({ "session_id": session_id, "enabled": enabled }),
+                        )
+                        .await
+                    {
+                        Ok(_) => push_system_message(
+                            state,
+                            format!(
+                                "cowork mode {}",
+                                if enabled { "enabled" } else { "disabled" }
+                            ),
+                        ),
+                        Err(e) => push_system_message(state, format!("cowork.set error: {e}")),
+                    }
+                }
+                "status" => {
+                    let session_id = state.session_id.clone();
+                    match client
+                        .call("session.get", json!({ "id": session_id }))
+                        .await
+                    {
+                        Ok(resp) => {
+                            let cowork_on = resp["cowork_mode"].as_bool().unwrap_or(false);
+                            push_system_message(
+                                state,
+                                format!("cowork: {}", if cowork_on { "on" } else { "off" }),
+                            );
+                        }
+                        Err(e) => {
+                            push_system_message(state, format!("cowork: status unavailable ({e})"));
+                        }
+                    }
+                }
+                "" => {
+                    let mut lines = vec!["cowork approval gate".to_owned()];
+                    if state.pending_cowork.is_empty() {
+                        lines.push("  no pending approvals".to_owned());
+                    } else {
+                        for item in &state.pending_cowork {
+                            // Fields are sanitised at stream ingestion; strip
+                            // again here so a control character can never reach
+                            // the terminal even if an item arrived by another
+                            // path.
+                            lines.push(format!(
+                                "  [{}] step {} · {} — {}",
+                                crate::formatting::sanitize_terminal(&item.id),
+                                item.step_n,
+                                crate::formatting::sanitize_terminal(&item.tool),
+                                crate::formatting::sanitize_terminal(&item.args_display),
+                            ));
+                        }
+                        lines.push(
+                            "  decide with: [y] approve · [n] deny · [m] modify · [a] always"
+                                .to_owned(),
+                        );
+                    }
+                    lines.push("usage: /cowork on|off|status".to_owned());
+                    push_system_message(state, lines.join("\n"));
+                }
+                other => {
+                    push_system_message(
+                        state,
+                        format!(
+                            "unknown /cowork subcommand: {other}\nusage: /cowork on|off|status"
+                        ),
+                    );
+                }
+            }
             Ok(true)
         }
         _ => Ok(false),

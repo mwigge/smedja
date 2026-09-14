@@ -10,7 +10,8 @@ use crate::governance::{
 use crate::input::{accept_slash_completion, clear_slash_popup, handle_key};
 use crate::slash::{
     apply_agent, apply_tier, dispatch_slash, format_agents_table, format_approvals_list,
-    format_local_model_list, format_metrics, format_model_list, runner_default_model,
+    format_local_model_list, format_metrics, format_model_list, format_session_info,
+    model_pin_note, runner_default_model, runner_names,
 };
 use crate::test_support::{make_state, render_frame};
 use crate::{
@@ -1198,4 +1199,339 @@ fn runner_default_model_prefers_current_tier() {
         Some("kimi-code/k3"),
     );
     assert_eq!(runner_default_model(&list, "nope", None), None);
+}
+
+// --- /switch dedup + model-pin note -----------------------------------------
+
+#[test]
+fn switch_picker_runner_names_dedup_tiers() {
+    let list = json!({
+        "runners": [
+            { "runner": "kimi-cli", "tier": "fast", "model": "kimi-fast" },
+            { "runner": "kimi-cli", "tier": "deep", "model": "kimi-deep" },
+            { "runner": "codex-cli", "tier": "fast", "model": "gpt-5.5" },
+            { "runner": "codex-cli", "tier": "deep", "model": "gpt-5.5" },
+        ]
+    });
+    assert_eq!(
+        runner_names(&list),
+        vec!["kimi-cli".to_owned(), "codex-cli".to_owned()],
+        "one row per runner, first-seen order"
+    );
+    assert!(runner_names(&json!({"runners": []})).is_empty());
+    assert!(runner_names(&json!({})).is_empty());
+}
+
+#[test]
+fn model_pin_note_detects_flag_and_freeform_note() {
+    assert!(
+        model_pin_note(&json!({"runner": "kimi-cli"})).is_none(),
+        "old daemon response carries no note"
+    );
+    let flagged = model_pin_note(&json!({"runner": "x", "model_cleared": true})).unwrap();
+    assert!(flagged.contains("model pin cleared"), "got: {flagged}");
+    let flagged = model_pin_note(&json!({"model_pin_cleared": true})).unwrap();
+    assert!(flagged.contains("model pin cleared"), "got: {flagged}");
+    assert!(model_pin_note(&json!({"model_cleared": false})).is_none());
+    assert_eq!(
+        model_pin_note(&json!({"note": "model pin dropped"})).as_deref(),
+        Some("model pin dropped")
+    );
+    assert!(model_pin_note(&json!({"note": ""})).is_none());
+}
+
+// --- /session ---------------------------------------------------------------
+
+#[test]
+fn format_session_info_covers_core_fields() {
+    let mut state = make_state("sess-info-1234");
+    state.runner = "kimi-cli".to_owned();
+    state.model = Some("k3".to_owned());
+    state.permission_mode = "plan".to_owned();
+    let out = format_session_info(&state);
+    assert!(out.contains("sess-info-1234"), "got: {out}");
+    assert!(out.contains("kimi-cli"), "got: {out}");
+    assert!(out.contains("k3"), "got: {out}");
+    assert!(out.contains("plan"), "got: {out}");
+    assert!(out.contains("cowork pending: 0"), "got: {out}");
+}
+
+#[test]
+fn help_text_documents_session_and_capabilities() {
+    assert!(
+        HELP_TEXT.contains("/session"),
+        "help must document /session"
+    );
+    assert!(
+        HELP_TEXT.contains("/capabilities"),
+        "help must document /capabilities"
+    );
+}
+
+/// A mock daemon that accepts the connection but never answers — for commands
+/// that must complete without any RPC.
+async fn silent_client() -> (tempfile::TempDir, Client) {
+    use tokio::net::UnixListener;
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("silent.sock");
+    let listener = UnixListener::bind(&sock_path).unwrap();
+    tokio::spawn(async move {
+        let _ = listener.accept().await;
+    });
+    let client = Client::connect(&sock_path).await.unwrap();
+    (dir, client)
+}
+
+#[tokio::test]
+async fn session_command_is_consumed_and_shows_info() {
+    let (_dir, mut client) = silent_client().await;
+    let mut state = make_state("sess-cmd-info");
+    let consumed = dispatch_slash("/session", &mut state, &mut client)
+        .await
+        .unwrap();
+    assert!(consumed, "/session must be handled by dispatch_slash");
+    let body = state
+        .main_panel
+        .lines_text(0, state.main_panel.len())
+        .join("\n");
+    assert!(body.contains("sess-cmd-info"), "got: {body}");
+}
+
+#[tokio::test]
+async fn bare_cowork_lists_pending_and_usage_instead_of_leaking_to_model() {
+    let (_dir, mut client) = silent_client().await;
+    let mut state = make_state("sess-cowork-bare");
+    let consumed = dispatch_slash("/cowork", &mut state, &mut client)
+        .await
+        .unwrap();
+    assert!(consumed, "bare /cowork must be handled by dispatch_slash");
+    let body = state
+        .main_panel
+        .lines_text(0, state.main_panel.len())
+        .join("\n");
+    assert!(body.contains("no pending approvals"), "got: {body}");
+    assert!(body.contains("usage: /cowork"), "got: {body}");
+}
+
+#[tokio::test]
+async fn capabilities_command_dispatches_runner_list() {
+    let (_dir, sock_path, rx) = spawn_method_capture(json!({
+        "runners": [ { "runner": "anthropic", "tier": "fast", "model": "claude-haiku" } ]
+    }));
+    let mut client = Client::connect(&sock_path).await.unwrap();
+    let mut state = make_state("sess-caps");
+    let consumed = dispatch_slash("/capabilities", &mut state, &mut client)
+        .await
+        .unwrap();
+    assert!(consumed, "/capabilities must be handled by dispatch_slash");
+    assert_eq!(rx.await.unwrap(), "runner.list");
+    let body = state
+        .main_panel
+        .lines_text(0, state.main_panel.len())
+        .join("\n");
+    assert!(body.contains("anthropic"), "got: {body}");
+}
+
+// --- provider.rescan reporting (post-/login pool rebuild) -------------------
+
+/// Spawns a one-shot mock daemon that replies to the first request with a
+/// JSON-RPC ERROR (code + message), unlike `spawn_method_capture` which
+/// replies with a result. Returns the socket path.
+fn spawn_error_reply(code: i32, message: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader as TokioBufReader};
+    use tokio::net::UnixListener;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("error-reply.sock");
+    let listener = UnixListener::bind(&sock_path).unwrap();
+    let message = message.to_owned();
+
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                return;
+            }
+            let req: serde_json::Value =
+                serde_json::from_str(line.trim_end()).unwrap_or(serde_json::Value::Null);
+            let resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req["id"].clone(),
+                "error": { "code": code, "message": message },
+            });
+            let mut bytes = serde_json::to_vec(&resp).unwrap();
+            bytes.push(b'\n');
+            let _ = reader.get_mut().write_all(&bytes).await;
+        }
+    });
+
+    (dir, sock_path)
+}
+
+#[tokio::test]
+async fn rescan_providers_reports_refreshed_runner_names() {
+    let (_dir, sock_path, rx) = spawn_method_capture(json!({
+        "runners": [
+            { "runner": "claude-cli", "tier": "fast", "model": "claude-haiku" },
+            { "runner": "claude-cli", "tier": "deep", "model": "claude-opus" },
+            { "runner": "codex-cli", "tier": "fast", "model": "gpt-5.5" }
+        ],
+        "runner_names": ["claude-cli", "codex-cli"],
+        "default_runner": "claude-cli",
+        "default_model": "claude-haiku",
+        "empty": false,
+    }));
+    let mut client = Client::connect(&sock_path).await.unwrap();
+    let mut state = make_state("sess-rescan-ok");
+
+    crate::slash::rescan_providers(&mut state, &mut client).await;
+
+    assert_eq!(rx.await.unwrap(), "provider.rescan");
+    let body = state
+        .main_panel
+        .lines_text(0, state.main_panel.len())
+        .join("\n");
+    assert!(body.contains("2 runner(s)"), "got: {body}");
+    assert!(
+        body.contains("claude-cli") && body.contains("codex-cli"),
+        "got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rescan_providers_warns_when_pool_still_empty() {
+    let (_dir, sock_path, _rx) = spawn_method_capture(json!({
+        "runner_names": [],
+        "runners": [],
+        "empty": true,
+    }));
+    let mut client = Client::connect(&sock_path).await.unwrap();
+    let mut state = make_state("sess-rescan-empty");
+
+    crate::slash::rescan_providers(&mut state, &mut client).await;
+
+    let body = state
+        .main_panel
+        .lines_text(0, state.main_panel.len())
+        .join("\n");
+    assert!(
+        body.contains("still no providers") && body.contains("/login"),
+        "empty re-probe must point at /login; got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rescan_providers_hints_restart_for_predating_daemon() {
+    let (_dir, sock_path) =
+        spawn_error_reply(smedja_rpc::codes::METHOD_NOT_FOUND, "method not found");
+    let mut client = Client::connect(&sock_path).await.unwrap();
+    let mut state = make_state("sess-rescan-old");
+
+    crate::slash::rescan_providers(&mut state, &mut client).await;
+
+    let body = state
+        .main_panel
+        .lines_text(0, state.main_panel.len())
+        .join("\n");
+    assert!(
+        body.contains("predates provider.rescan") && body.contains("restart smdjad"),
+        "an old daemon must get the restart hint, not an error; got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rescan_providers_surfaces_other_errors() {
+    let (_dir, sock_path) = spawn_error_reply(smedja_rpc::codes::INTERNAL_ERROR, "boom");
+    let mut client = Client::connect(&sock_path).await.unwrap();
+    let mut state = make_state("sess-rescan-err");
+
+    crate::slash::rescan_providers(&mut state, &mut client).await;
+
+    let body = state
+        .main_panel
+        .lines_text(0, state.main_panel.len())
+        .join("\n");
+    assert!(body.contains("provider.rescan error"), "got: {body}");
+    assert!(
+        !body.contains("predates provider.rescan"),
+        "a non-METHOD_NOT_FOUND error must not trigger the restart hint; got: {body}"
+    );
+}
+
+/// `/effort` accepts the level case-insensitively and forwards the canonical
+/// lowercase token to the daemon.
+#[tokio::test]
+async fn effort_command_accepts_mixed_case() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader as TokioBufReader};
+    use tokio::net::UnixListener;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("effort-test.sock");
+    let listener = UnixListener::bind(&sock_path).unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                return;
+            }
+            let req: serde_json::Value =
+                serde_json::from_str(line.trim_end()).unwrap_or(serde_json::Value::Null);
+            let resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req["id"].clone(),
+                "result": {"ok": true},
+            });
+            let _ = tx.send(req);
+            let mut bytes = serde_json::to_vec(&resp).unwrap();
+            bytes.push(b'\n');
+            let _ = reader.get_mut().write_all(&bytes).await;
+        }
+    });
+
+    let mut client = Client::connect(&sock_path).await.unwrap();
+    let mut state = make_state("sess-effort");
+    dispatch_slash("/effort HIGH", &mut state, &mut client)
+        .await
+        .unwrap();
+
+    let req = rx.await.unwrap();
+    assert_eq!(req["method"].as_str(), Some("session.set_effort"));
+    assert_eq!(
+        req["params"]["effort"].as_str(),
+        Some("high"),
+        "the daemon gets the canonical lowercase token"
+    );
+    let body = state
+        .main_panel
+        .lines_text(0, state.main_panel.len())
+        .join("\n");
+    assert!(body.contains("effort set to high"), "got: {body}");
+}
+
+#[tokio::test]
+async fn effort_command_rejects_unknown_level_case_preserving() {
+    use tokio::net::UnixListener;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("effort-bad.sock");
+    let listener = UnixListener::bind(&sock_path).unwrap();
+    tokio::spawn(async move {
+        let _ = listener.accept().await;
+    });
+    let mut client = Client::connect(&sock_path).await.unwrap();
+    let mut state = make_state("sess-effort-bad");
+    dispatch_slash("/effort EXTREME", &mut state, &mut client)
+        .await
+        .unwrap();
+    let body = state
+        .main_panel
+        .lines_text(0, state.main_panel.len())
+        .join("\n");
+    assert!(
+        body.contains("unknown effort: EXTREME"),
+        "the echo keeps the user's spelling; got: {body}"
+    );
 }

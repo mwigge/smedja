@@ -151,6 +151,13 @@ pub struct CallOptions {
     /// a per-tool gate. `None` leaves the adapter default.
     #[serde(default)]
     pub permission_mode: Option<String>,
+    /// The session's reasoning-effort level (`low`/`medium`/`high`), pinned via
+    /// `session.set_effort`. Each adapter maps it to its own mechanism (codex
+    /// `-c model_reasoning_effort=…`, claude `MAX_THINKING_TOKENS`,
+    /// `OpenAI`-compatible `reasoning_effort`, ACP `session/set_config_option`);
+    /// backends without a knob ignore it. `None` leaves the provider default.
+    #[serde(default)]
+    pub effort: Option<String>,
     /// Number of leading messages (after the system prompt) that form the
     /// stable KV-cache prefix.
     ///
@@ -262,6 +269,7 @@ mod tests {
             provider_session_id: None,
             smedja_session_id: None,
             permission_mode: None,
+            effort: None,
             stable_prefix_len: None,
             cache_strategy: CacheStrategy::None,
             workspace: None,

@@ -236,6 +236,7 @@ async fn wait_response(
 fn stream_acp(spec: AcpAgentSpec, messages: &[Message], opts: &CallOptions) -> DeltaStream {
     let prompt = render_conversation(messages, opts.system.as_deref());
     let model = opts.model.clone();
+    let effort = opts.effort.clone();
     let workspace = opts.workspace.clone();
     let tool_gate = opts.tool_gate.clone();
     let permission_mode = opts.permission_mode.clone();
@@ -282,7 +283,13 @@ fn stream_acp(spec: AcpAgentSpec, messages: &[Message], opts: &CallOptions) -> D
 
         let outcome = tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
-            handshake(&mut conn, workspace.as_deref(), &model, spec),
+            handshake(
+                &mut conn,
+                workspace.as_deref(),
+                &model,
+                effort.as_deref(),
+                spec,
+            ),
         )
         .await;
         let session_id = match outcome {
@@ -337,12 +344,13 @@ fn stream_acp(spec: AcpAgentSpec, messages: &[Message], opts: &CallOptions) -> D
     Box::pin(ReceiverStream::new(rx))
 }
 
-/// `initialize` + `session/new` (+ best-effort model selection). Returns the
-/// ACP session id.
+/// `initialize` + `session/new` (+ best-effort model and effort selection).
+/// Returns the ACP session id.
 async fn handshake(
     conn: &mut AcpConn,
     workspace: Option<&std::path::Path>,
     model: &str,
+    effort: Option<&str>,
     spec: AcpAgentSpec,
 ) -> Result<String, AdapterError> {
     let init_id = conn
@@ -386,53 +394,109 @@ async fn handshake(
         .ok_or_else(|| AdapterError::Request("session/new returned no sessionId".to_owned()))?
         .to_owned();
 
-    // Best-effort model selection: only when the agent advertises a matching
-    // config option whose values include the requested model. A missing
-    // option, unknown value, or agent-side error falls back to the agent's
-    // default model rather than failing the turn.
-    if !model.is_empty() && !spec.model_config_id.is_empty() {
-        let advertised = new_result
-            .get("configOptions")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .find(|opt| opt.get("id").and_then(Value::as_str) == Some(spec.model_config_id));
-        let value_known = advertised.is_some_and(|opt| {
-            opt.get("options")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .any(|v| v.get("value").and_then(Value::as_str) == Some(model))
-        });
-        if value_known {
-            let set_id = conn
-                .send_request(
-                    "session/set_config_option",
-                    json!({
-                        "sessionId": session_id,
-                        "configOptionId": spec.model_config_id,
-                        "value": model,
-                    }),
-                )
-                .await?;
-            if let Err(err) = wait_response(conn, set_id).await? {
-                tracing::warn!(
-                    agent = spec.name,
-                    model,
-                    %err,
-                    "acp model selection failed; using the agent's default model"
-                );
-            }
-        } else {
-            tracing::debug!(
-                agent = spec.name,
-                model,
-                "model not advertised by agent config options; using agent default"
-            );
-        }
+    // Best-effort model selection (kimi/gemini advertise a "model" option).
+    set_config_option_if_advertised(
+        conn,
+        &session_id,
+        &new_result,
+        &[spec.model_config_id],
+        model,
+        spec.name,
+    )
+    .await?;
+
+    // Best-effort reasoning-effort selection: agents that expose an effort/
+    // reasoning option (ids vary by agent) get the session's pinned level the
+    // same way; agents that don't fall back to their default silently.
+    if let Some(effort) = effort {
+        const EFFORT_CONFIG_IDS: &[&str] = &["effort", "reasoning_effort", "reasoning", "thinking"];
+        set_config_option_if_advertised(
+            conn,
+            &session_id,
+            &new_result,
+            EFFORT_CONFIG_IDS,
+            effort,
+            spec.name,
+        )
+        .await?;
     }
 
     Ok(session_id)
+}
+
+/// Best-effort `session/set_config_option`: sends the selection only when the
+/// agent advertised one of `config_ids` whose values include `value`. A missing
+/// option, unknown value, or agent-side error falls back to the agent's default
+/// rather than failing the turn.
+async fn set_config_option_if_advertised(
+    conn: &mut AcpConn,
+    session_id: &str,
+    new_result: &Value,
+    config_ids: &[&str],
+    value: &str,
+    agent_name: &str,
+) -> Result<(), AdapterError> {
+    if value.is_empty() || config_ids.iter().all(|id| id.is_empty()) {
+        return Ok(());
+    }
+    let advertised = new_result
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|opt| {
+            opt.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| config_ids.contains(&id))
+        });
+    let Some(opt) = advertised else {
+        tracing::debug!(
+            agent = agent_name,
+            value,
+            "config option not advertised by agent; using agent default"
+        );
+        return Ok(());
+    };
+    let config_id = opt
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let value_known = opt
+        .get("options")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|v| v.get("value").and_then(Value::as_str) == Some(value));
+    if !value_known {
+        tracing::debug!(
+            agent = agent_name,
+            config_id,
+            value,
+            "value not advertised by agent config options; using agent default"
+        );
+        return Ok(());
+    }
+    let set_id = conn
+        .send_request(
+            "session/set_config_option",
+            json!({
+                "sessionId": session_id,
+                "configOptionId": config_id,
+                "value": value,
+            }),
+        )
+        .await?;
+    if let Err(err) = wait_response(conn, set_id).await? {
+        tracing::warn!(
+            agent = agent_name,
+            config_id,
+            value,
+            %err,
+            "acp config selection failed; using the agent's default"
+        );
+    }
+    Ok(())
 }
 
 /// Streams `session/update` notifications as [`Delta`]s and answers
@@ -994,6 +1058,7 @@ done
             provider_session_id: None,
             smedja_session_id: None,
             permission_mode: Some("ask".into()),
+            effort: None,
             stable_prefix_len: None,
             cache_strategy: crate::types::CacheStrategy::None,
             workspace: None,

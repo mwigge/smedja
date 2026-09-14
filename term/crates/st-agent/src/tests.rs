@@ -13,6 +13,7 @@ fn agent_session_accumulates_lines() {
         text: "hello\nworld".into(),
         done: false,
         approval_required: false,
+        approval_id: None,
     });
     assert_eq!(s.content_lines(), vec!["hello", "world"]);
 }
@@ -25,6 +26,7 @@ fn agent_session_done_stops_streaming() {
         text: "done".into(),
         done: true,
         approval_required: false,
+        approval_id: None,
     });
     assert!(!s.streaming);
 }
@@ -37,8 +39,29 @@ fn agent_session_approval_pending_on_tool_call() {
         text: String::new(),
         done: false,
         approval_required: true,
+        approval_id: Some("appr-1".into()),
     });
     assert_eq!(s.approval, ApprovalState::Pending);
+    assert_eq!(s.pending_approval_id.as_deref(), Some("appr-1"));
+    // Resolving the prompt clears the id; a done chunk clears a stale Pending.
+    s.approve();
+    assert!(s.pending_approval_id.is_none());
+    s.push_chunk(&AgentChunk {
+        block_id: "block1".into(),
+        text: String::new(),
+        done: false,
+        approval_required: true,
+        approval_id: Some("appr-2".into()),
+    });
+    s.push_chunk(&AgentChunk {
+        block_id: "block1".into(),
+        text: String::new(),
+        done: true,
+        approval_required: false,
+        approval_id: None,
+    });
+    assert_eq!(s.approval, ApprovalState::None);
+    assert!(s.pending_approval_id.is_none());
 }
 
 #[test]
@@ -58,6 +81,106 @@ fn agent_session_deny_changes_state() {
 }
 
 #[test]
+fn agent_manager_resolve_pending_approval_returns_id_and_marks_session() {
+    let mut mgr = AgentManager::new();
+    mgr.session_mut("b1", "m").push_chunk(&AgentChunk {
+        block_id: "b1".into(),
+        text: String::new(),
+        done: false,
+        approval_required: true,
+        approval_id: Some("appr-1".into()),
+    });
+    let (block_id, approval_id) = mgr
+        .resolve_pending_approval(true)
+        .expect("pending approval must resolve");
+    assert_eq!(block_id, "b1");
+    assert_eq!(approval_id, "appr-1");
+    assert_eq!(mgr.session("b1").unwrap().approval, ApprovalState::Approved);
+    // A second call finds nothing pending.
+    assert!(mgr.resolve_pending_approval(false).is_none());
+}
+
+#[test]
+fn agent_manager_resolve_pending_approval_skips_idless_prompt() {
+    // A pre-v4 prompt carries no approval id and cannot be answered — the
+    // keystroke must fall through to the PTY rather than being swallowed.
+    let mut mgr = AgentManager::new();
+    let s = mgr.session_mut("b1", "m");
+    s.approval = ApprovalState::Pending;
+    assert!(mgr.resolve_pending_approval(true).is_none());
+    assert_eq!(mgr.session("b1").unwrap().approval, ApprovalState::Pending);
+}
+
+// smdjad fans every event out to every pane, so a manager can hold pending
+// prompts that belong to another pane's session. y/n must resolve only the
+// active (most recently content-fed) session's prompt — a first-pending scan
+// in HashMap order could approve a prompt the user is not looking at.
+#[test]
+fn resolve_pending_approval_scoped_to_active_session() {
+    let mut mgr = AgentManager::new();
+    // Session b1 (another pane's broadcast turn) shows a pending prompt…
+    mgr.session_mut("b1", "m").push_chunk(&AgentChunk {
+        block_id: "b1".into(),
+        text: String::new(),
+        done: false,
+        approval_required: true,
+        approval_id: Some("appr-other".into()),
+    });
+    // …then this pane's own turn streams content and becomes active.
+    mgr.session_mut("b2", "m").push_chunk(&AgentChunk {
+        block_id: "b2".into(),
+        text: "working".into(),
+        done: false,
+        approval_required: false,
+        approval_id: None,
+    });
+
+    // The other pane's prompt is pending but not active: no interception.
+    assert!(
+        mgr.resolve_pending_approval(true).is_none(),
+        "a non-active session's prompt must not intercept keys"
+    );
+    assert_eq!(
+        mgr.session("b1").unwrap().approval,
+        ApprovalState::Pending,
+        "the other prompt stays pending"
+    );
+
+    // When b1's prompt is the one most recently displayed (fresh content
+    // makes it active again), it resolves.
+    mgr.session_mut("b1", "m").push_chunk(&AgentChunk {
+        block_id: "b1".into(),
+        text: "still waiting".into(),
+        done: false,
+        approval_required: false,
+        approval_id: None,
+    });
+    let (block_id, approval_id) = mgr
+        .resolve_pending_approval(false)
+        .expect("b1's prompt is the active session's");
+    assert_eq!(
+        (block_id.as_str(), approval_id.as_str()),
+        ("b1", "appr-other")
+    );
+    assert_eq!(mgr.session("b1").unwrap().approval, ApprovalState::Denied);
+}
+
+#[test]
+fn resolve_pending_approval_none_active_is_noop() {
+    let mut mgr = AgentManager::new();
+    // Push a pending prompt then remove the session; nothing is active.
+    mgr.session_mut("b1", "m").push_chunk(&AgentChunk {
+        block_id: "b1".into(),
+        text: String::new(),
+        done: false,
+        approval_required: true,
+        approval_id: Some("appr-1".into()),
+    });
+    mgr.remove("b1");
+    assert!(mgr.resolve_pending_approval(true).is_none());
+}
+
+#[test]
 fn agent_session_respects_max_lines() {
     let mut s = AgentSession::new("b", "m");
     s.max_lines = 3;
@@ -67,6 +190,7 @@ fn agent_session_respects_max_lines() {
             text: format!("line{i}"),
             done: false,
             approval_required: false,
+            approval_id: None,
         });
     }
     assert!(s.lines.len() <= 3);
@@ -81,6 +205,7 @@ fn agent_manager_creates_and_returns_session() {
         text: "hi".into(),
         done: false,
         approval_required: false,
+        approval_id: None,
     });
     assert_eq!(mgr.len(), 1);
     assert!(!mgr.is_empty());
@@ -192,14 +317,43 @@ fn pane_event_deserialise_approval_prompt() {
         turn_id: Some("t1".into()),
         tool: Some("rm".into()),
         prompt: Some("Allow deletion?".into()),
+        approval_id: Some("appr-9".into()),
     });
     let event = PaneEvent::from_json_line(&line).expect("should parse");
     if let PaneEvent::ApprovalPrompt {
-        tool_name, prompt, ..
+        tool_name,
+        prompt,
+        approval_id,
+        turn_id,
+        args,
     } = event
     {
         assert_eq!(tool_name, "rm");
         assert_eq!(prompt, "Allow deletion?");
+        assert_eq!(approval_id.as_deref(), Some("appr-9"));
+        // The event's own turn id comes through so receivers can key the
+        // session lookup by it rather than their current turn.
+        assert_eq!(turn_id.as_deref(), Some("t1"));
+        // A non-JSON prompt yields no structured args.
+        assert_eq!(args, serde_json::Value::Null);
+    } else {
+        panic!("wrong variant");
+    }
+}
+
+#[test]
+fn pane_event_approval_prompt_recovers_json_args_from_prompt() {
+    // smdjad puts the scrubbed args display in the prompt text; when it parses
+    // as JSON the args must come through instead of being dropped to Null.
+    let line = envelope_line(smedja_agent_events::AgentEvent::ApprovalPrompt {
+        turn_id: Some("t1".into()),
+        tool: Some("bash".into()),
+        prompt: Some(r#"{"command":"rm -rf /tmp/x"}"#.into()),
+        approval_id: None,
+    });
+    let event = PaneEvent::from_json_line(&line).expect("should parse");
+    if let PaneEvent::ApprovalPrompt { args, .. } = event {
+        assert_eq!(args["command"], "rm -rf /tmp/x");
     } else {
         panic!("wrong variant");
     }
@@ -488,4 +642,163 @@ fn pane_agent_state_has_new_token_fields() {
     state.last_traceparent = Some("00-abc-01".to_owned());
     assert_eq!(state.last_input_tokens, Some(412));
     assert_eq!(state.last_output_tokens, Some(88));
+}
+
+// ── cowork.resolve wire frame ───────────────────────────────────────────────
+
+// `send_approval` sends `cowork.resolve` as a request WITH an id (not a
+// fire-and-forget notification) so the `{resolved}` reply comes back and a
+// dead gate (`resolved: false`) is told apart from a transport failure. This
+// test crosses the real socket + codec boundary: a live `smedja_rpc::Server`
+// with a recorded handler must dispatch the request sent via
+// `send_approval_to` and its reply must be read back.
+#[tokio::test]
+async fn send_approval_dispatches_through_real_rpc_server() {
+    use tokio::net::UnixListener;
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
+    let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+    let mut router = smedja_rpc::router::Router::new();
+    router.register("cowork.resolve", move |params| {
+        let tx = std::sync::Arc::clone(&tx);
+        async move {
+            if let Some(tx) = tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = tx.send(params);
+            }
+            Ok(serde_json::json!({ "resolved": true }))
+        }
+    });
+
+    let sock = std::env::temp_dir().join(format!("st-agent-approval-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock).unwrap();
+    tokio::spawn(smedja_rpc::server::Server::new(router).serve(listener));
+
+    let resolved = SmdjadClient::send_approval_to(&sock, "ap-42", ApprovalDecision::Deny)
+        .await
+        .unwrap();
+    assert!(resolved, "the resolved:true reply must be read back");
+
+    let params = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+        .await
+        .expect("server must dispatch the request, not skip it")
+        .unwrap();
+    assert_eq!(params["id"], "ap-42");
+    assert_eq!(params["approval_id"], "ap-42");
+    assert_eq!(params["approved"], false);
+
+    let _ = std::fs::remove_file(&sock);
+}
+
+// A gate that is already gone (answered elsewhere / timed out) replies
+// `resolved: false` — the caller drops the local prompt instead of re-pending.
+#[tokio::test]
+async fn send_approval_reports_unresolved_gate() {
+    use tokio::net::UnixListener;
+
+    let mut router = smedja_rpc::router::Router::new();
+    router.register("cowork.resolve", |_params| async move {
+        Ok(serde_json::json!({ "resolved": false }))
+    });
+
+    let sock = std::env::temp_dir().join(format!(
+        "st-agent-approval-gone-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock).unwrap();
+    tokio::spawn(smedja_rpc::server::Server::new(router).serve(listener));
+
+    let resolved = SmdjadClient::send_approval_to(&sock, "ap-gone", ApprovalDecision::Approve)
+        .await
+        .unwrap();
+    assert!(!resolved, "resolved:false must surface as Ok(false)");
+
+    let _ = std::fs::remove_file(&sock);
+}
+
+// ── cross-pane activation & session-agnostic resolution ─────────────────────
+
+// smdjad broadcasts gate prompts to every pane. A prompt filed under another
+// pane's turn must NOT become the active session, or y/n would resolve a
+// prompt the user is not looking at in this window.
+#[test]
+fn session_mut_passive_files_without_activating() {
+    let mut mgr = AgentManager::new();
+    // The pane's own turn streams content and is active.
+    mgr.session_mut("own-turn", "m").push_chunk(&AgentChunk {
+        block_id: "own-turn".into(),
+        text: "hello".into(),
+        done: false,
+        approval_required: false,
+        approval_id: None,
+    });
+    // A broadcast prompt for a foreign turn is filed passively.
+    mgr.session_mut_passive("foreign-turn", "m")
+        .push_chunk(&AgentChunk {
+            block_id: "foreign-turn".into(),
+            text: "[approval required: bash — rm -rf /] (y/n)".into(),
+            done: false,
+            approval_required: true,
+            approval_id: Some("appr-foreign".into()),
+        });
+    assert_eq!(mgr.len(), 2);
+    assert!(
+        mgr.resolve_pending_approval(true).is_none(),
+        "a passively filed foreign prompt must not intercept y/n"
+    );
+}
+
+#[test]
+fn clear_approval_by_id_clears_whichever_session_holds_it() {
+    let mut mgr = AgentManager::new();
+    mgr.session_mut("b1", "m").push_chunk(&AgentChunk {
+        block_id: "b1".into(),
+        text: String::new(),
+        done: false,
+        approval_required: true,
+        approval_id: Some("appr-1".into()),
+    });
+    // A passively filed foreign session holds the id being resolved elsewhere.
+    mgr.session_mut_passive("b2", "m").push_chunk(&AgentChunk {
+        block_id: "b2".into(),
+        text: String::new(),
+        done: false,
+        approval_required: true,
+        approval_id: Some("appr-2".into()),
+    });
+
+    // Unknown id: no-op.
+    assert!(mgr.clear_approval_by_id("appr-zzz").is_none());
+    // Known id: cleared regardless of which session (or activation) holds it.
+    assert_eq!(mgr.clear_approval_by_id("appr-2").as_deref(), Some("b2"));
+    let s = mgr.session("b2").unwrap();
+    assert_eq!(s.approval, ApprovalState::None);
+    assert!(s.pending_approval_id.is_none());
+    // The active session's own pending prompt is untouched.
+    assert_eq!(mgr.session("b1").unwrap().approval, ApprovalState::Pending);
+}
+
+#[test]
+fn pane_event_parses_approval_resolved_from_raw_line() {
+    // The typed wire schema may predate the variant — the raw fallback must
+    // parse the daemon's session-agnostic notice either way.
+    let event = PaneEvent::from_json_line(
+        r#"{"schema_version":5,"type":"approval_resolved","approval_id":"appr-9"}"#,
+    )
+    .expect("approval_resolved must parse");
+    let PaneEvent::ApprovalResolved { approval_id } = event else {
+        panic!("wrong variant: {event:?}");
+    };
+    assert_eq!(approval_id, "appr-9");
+
+    // Missing/empty ids are not actionable.
+    assert!(PaneEvent::from_json_line(r#"{"type":"approval_resolved"}"#).is_none());
+    assert!(
+        PaneEvent::from_json_line(r#"{"type":"approval_resolved","approval_id":""}"#).is_none()
+    );
 }

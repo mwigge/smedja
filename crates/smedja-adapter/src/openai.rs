@@ -67,7 +67,16 @@ fn role_to_str(role: &Role) -> &'static str {
 /// automatic prompt caching can match a shared prefix across turns. When
 /// [`CacheStrategy::OpenAiAutomatic`] carries a `cache_key`, it is emitted as the
 /// top-level `prompt_cache_key`. No per-message cache flag exists for `OpenAI`.
-fn build_body(messages: &[Message], opts: &CallOptions) -> serde_json::Value {
+///
+/// `reasoning_effort` is emitted only when `allow_reasoning_effort` — the
+/// provider is pointed at the real OpenAI API; OpenAI-compatible backends
+/// (Copilot-API fallbacks etc.) reject or mishandle the field — and the effort
+/// string is whitelisted to the values the API accepts.
+fn build_body(
+    messages: &[Message],
+    opts: &CallOptions,
+    allow_reasoning_effort: bool,
+) -> serde_json::Value {
     let mut msg_array: Vec<serde_json::Value> = Vec::with_capacity(messages.len() + 1);
     if let Some(sys) = &opts.system {
         msg_array.push(json!({"role": "system", "content": sys}));
@@ -90,6 +99,19 @@ fn build_body(messages: &[Message], opts: &CallOptions) -> serde_json::Value {
     if let Some(temp) = opts.temperature {
         body["temperature"] = json!(temp);
     }
+    // Reasoning effort maps onto the chat-completions `reasoning_effort`
+    // parameter. Only the values the OpenAI API accepts are sent, and only to
+    // the real OpenAI API — compatible backends get the field omitted rather
+    // than a value they may reject.
+    if allow_reasoning_effort {
+        if let Some(effort) = opts
+            .effort
+            .as_deref()
+            .filter(|e| matches!(*e, "low" | "medium" | "high"))
+        {
+            body["reasoning_effort"] = json!(effort);
+        }
+    }
     if let crate::types::CacheStrategy::OpenAiAutomatic {
         cache_key: Some(key),
     } = &opts.cache_strategy
@@ -108,7 +130,9 @@ impl Provider for OpenAiProvider {
 
         // Build the request body; the leading stable prefix stays byte-identical
         // and first so OpenAI automatic prompt caching can match it across turns.
-        let body = build_body(messages, opts);
+        // `reasoning_effort` is only sent to the real OpenAI API.
+        let allow_reasoning_effort = self.base_url.starts_with("https://api.openai.com");
+        let body = build_body(messages, opts, allow_reasoning_effort);
 
         // Capture parent context so the LLM span is a child of the agent invoke span.
         let parent_cx = opentelemetry::Context::current();
@@ -349,6 +373,7 @@ mod tests {
             provider_session_id: None,
             smedja_session_id: None,
             permission_mode: None,
+            effort: None,
             stable_prefix_len: None,
             cache_strategy: CacheStrategy::None,
             workspace: None,
@@ -378,7 +403,7 @@ mod tests {
                 content: "fresh".to_owned(),
             },
         ];
-        let body = build_body(&messages, &opts);
+        let body = build_body(&messages, &opts, true);
         assert_eq!(body["prompt_cache_key"], "session-xyz");
         // System leads, then the leading stable prefix in unchanged order.
         let arr = body["messages"].as_array().expect("messages array");
@@ -396,7 +421,7 @@ mod tests {
             role: Role::User,
             content: "hello".to_owned(),
         }];
-        let body = build_body(&messages, &opts);
+        let body = build_body(&messages, &opts, true);
         assert!(
             body.get("prompt_cache_key").is_none(),
             "no prompt_cache_key when strategy is None"
@@ -412,8 +437,55 @@ mod tests {
     fn build_body_automatic_without_key_omits_prompt_cache_key() {
         let mut opts = base_opts();
         opts.cache_strategy = CacheStrategy::OpenAiAutomatic { cache_key: None };
-        let body = build_body(&[], &opts);
+        let body = build_body(&[], &opts, true);
         assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn build_body_emits_reasoning_effort_when_pinned() {
+        let mut opts = base_opts();
+        opts.effort = Some("high".to_owned());
+        let body = build_body(&[], &opts, true);
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn build_body_omits_reasoning_effort_by_default() {
+        let body = build_body(&[], &base_opts(), true);
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "no reasoning_effort when opts.effort is None"
+        );
+    }
+
+    #[test]
+    fn build_body_omits_reasoning_effort_for_compat_backends() {
+        let mut opts = base_opts();
+        opts.effort = Some("high".to_owned());
+        let body = build_body(&[], &opts, false);
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "OpenAI-compatible backends must not receive reasoning_effort"
+        );
+    }
+
+    #[test]
+    fn build_body_whitelists_reasoning_effort_values() {
+        for effort in ["low", "medium", "high"] {
+            let mut opts = base_opts();
+            opts.effort = Some(effort.to_owned());
+            let body = build_body(&[], &opts, true);
+            assert_eq!(body["reasoning_effort"], effort);
+        }
+        for bogus in ["max", "HIGH", "", "low; rm -rf /"] {
+            let mut opts = base_opts();
+            opts.effort = Some(bogus.to_owned());
+            let body = build_body(&[], &opts, true);
+            assert!(
+                body.get("reasoning_effort").is_none(),
+                "unrecognised effort {bogus:?} must be dropped, not forwarded"
+            );
+        }
     }
 
     #[test]

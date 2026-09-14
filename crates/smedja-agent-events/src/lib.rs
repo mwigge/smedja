@@ -20,7 +20,16 @@ use serde::{Deserialize, Serialize};
 /// `traceparent` to [`AgentEvent::TurnEnd`]. All four are optional and
 /// `skip_serializing_if` absent, so the wire form stays byte-compatible with
 /// v2 receivers when the daemon has no figure to report.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+///
+/// Version 4 adds `approval_id` to [`AgentEvent::ApprovalPrompt`] so a
+/// receiver can answer the prompt via the `cowork.resolve` RPC. Optional
+/// and `skip_serializing_if` absent, so the wire form stays byte-compatible
+/// with v3 receivers when the daemon has no id to report.
+///
+/// Version 5 adds [`AgentEvent::ApprovalResolved`] so receivers can dismiss a
+/// prompt when it is answered elsewhere (or times out / is cancelled), and
+/// renames the answering RPC to `cowork.resolve`.
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 /// A single agent event in the push-socket stream.
 ///
@@ -56,6 +65,19 @@ pub enum AgentEvent {
         tool: Option<String>,
         /// Prompt text shown to the user.
         prompt: Option<String>,
+        /// Approval identifier to echo back in the `cowork.resolve` RPC,
+        /// added in schema version 4. `None` on payloads that predate the
+        /// field; such prompts are informational only and cannot be answered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_id: Option<String>,
+    },
+    /// A pending approval prompt was resolved (answered on another client,
+    /// timed out, or cancelled), added in schema version 5. The receiver
+    /// dismisses the matching prompt by `approval_id`.
+    ApprovalResolved {
+        /// Identifier of the approval that resolved (matches the earlier
+        /// [`AgentEvent::ApprovalPrompt::approval_id`]).
+        approval_id: Option<String>,
     },
     /// A tool invocation has returned a result.
     ToolResult {
@@ -195,7 +217,37 @@ mod tests {
             turn_id: Some("t1".to_owned()),
             tool: Some("bash".to_owned()),
             prompt: Some("run rm -rf?".to_owned()),
+            approval_id: Some("appr-1".to_owned()),
         });
+    }
+
+    #[test]
+    fn legacy_approval_prompt_without_approval_id_decodes() {
+        // A pre-v4 ApprovalPrompt carries no approval_id; it must still decode
+        // with the field defaulting to None (informational-only prompt).
+        let line = r#"{"schema_version":3,"type":"approval_prompt","turn_id":"t1","tool":"bash","prompt":"run rm -rf?"}"#;
+        let decoded = AgentEventEnvelope::from_json_line(line).expect("legacy v3 must decode");
+        assert_eq!(
+            decoded.event,
+            AgentEvent::ApprovalPrompt {
+                turn_id: Some("t1".to_owned()),
+                tool: Some("bash".to_owned()),
+                prompt: Some("run rm -rf?".to_owned()),
+                approval_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn approval_prompt_without_id_omits_field_on_wire() {
+        let line = AgentEventEnvelope::new(AgentEvent::ApprovalPrompt {
+            turn_id: Some("t1".to_owned()),
+            tool: Some("bash".to_owned()),
+            prompt: Some("run rm -rf?".to_owned()),
+            approval_id: None,
+        })
+        .to_json_line();
+        assert!(!line.contains("approval_id"));
     }
 
     #[test]
@@ -252,8 +304,23 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_three() {
-        assert_eq!(CURRENT_SCHEMA_VERSION, 3);
+    fn schema_version_is_five() {
+        assert_eq!(CURRENT_SCHEMA_VERSION, 5);
+    }
+
+    #[test]
+    fn approval_resolved_round_trips() {
+        round_trip(AgentEvent::ApprovalResolved {
+            approval_id: Some("appr-9".to_owned()),
+        });
+        let line = AgentEventEnvelope::new(AgentEvent::ApprovalResolved {
+            approval_id: Some("appr-9".to_owned()),
+        })
+        .to_json_line();
+        assert!(
+            line.contains(r#""type":"approval_resolved""#),
+            "snake_case tag must be approval_resolved; got: {line}"
+        );
     }
 
     #[test]

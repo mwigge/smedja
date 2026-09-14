@@ -251,6 +251,7 @@ fn turn_id_of(event: &TurnEvent) -> Option<&str> {
         | TurnEvent::AuditProgress { turn_id, .. }
         | TurnEvent::AuditReport { turn_id, .. }
         | TurnEvent::ToolCallChunk { turn_id, .. } => turn_id.as_deref(),
+        TurnEvent::CoworkResolved { .. } => None,
     }
 }
 
@@ -642,36 +643,73 @@ async fn request_permission(
         )
     };
 
-    // Suspend on the gate; a CoworkRequest is pushed to the TUI so the human sees
-    // the ACP client's ask in the same widget the native loop uses.
-    let (approval_id, decision) = gate
-        .intercept_tracked(
-            ApprovalPrompt {
-                step_n: 0,
-                tool: tool_name.clone(),
-                args_scrubbed: tool_input.clone(),
-                reasoning: String::new(),
-                plan_summary: String::new(),
-            },
-            30 * 60,
-            Some((s.dispatcher.as_ref(), None)),
-        )
-        .await;
-
-    // The always-scope is only meaningful for an approval; consume the flag.
-    let always = matches!(decision, Decision::Approve) && gate.take_always(&approval_id).await;
-    let outcome = map_decision_to_outcome(&decision, always, &body.options);
-
-    // Persist an allow-always rule when the resolved option is allow_always, so
-    // future turns (any backend) consult the allowlist before re-asking.
-    if let AcpOutcome::Selected { kind, .. } = &outcome {
-        if kind == "allow_always" {
-            if let Err(e) = append_allow_rule(&s.workspace, &tool_name, &tool_input) {
-                tracing::warn!(error = %e, tool = %tool_name, "failed to persist allow-always rule");
-            }
+    // Persisted [[permission.rules]] and the session permission mode apply on
+    // this path too: an allow/deny rule (or an auto/plan mode) resolves without
+    // suspending, so repeat prompts stop whichever backend drives the call.
+    let rule_decision =
+        crate::cowork::evaluate_workspace_rules(&s.workspace, &tool_name, &tool_input);
+    let pre = match rule_decision {
+        Some(d) => d,
+        None => crate::cowork::evaluate(gate.mode().await, &tool_name),
+    };
+    let decision = match pre {
+        crate::cowork::PermissionDecision::Allow => Decision::Approve,
+        crate::cowork::PermissionDecision::Deny => {
+            Decision::Deny(format!("blocked by permission policy for {tool_name}"))
         }
-    }
+        crate::cowork::PermissionDecision::Ask => {
+            // Suspend on the gate; a CoworkRequest is pushed to the TUI so the
+            // human sees the ACP client's ask in the same widget the native loop
+            // uses. Raw tool_input goes in; the gate prompt is the scrubbed copy.
+            let mut prompt = ApprovalPrompt::new(0, &tool_name, &tool_input, "");
+            prompt.agent = Some("acp".to_owned());
+            prompt.cwd = Some(s.workspace.display().to_string());
+            prompt.supports_modify = true; // the bridge returns updatedInput
+            let (approval_id, decision) = gate
+                .intercept_tracked(
+                    prompt,
+                    crate::cowork::APPROVAL_TIMEOUT_SECS,
+                    Some((s.dispatcher.as_ref(), None)),
+                )
+                .await;
 
+            // The always-scope is only meaningful for an approval; consume the flag.
+            let always =
+                matches!(decision, Decision::Approve) && gate.take_always(&approval_id).await;
+            let outcome = map_decision_to_outcome(&decision, always, &body.options);
+
+            // Persist an allow-always rule when the resolved option is allow_always,
+            // so future turns (any backend) consult the allowlist before re-asking.
+            // Skipped when there is no command/path to scope the rule to, or when
+            // the payload carries a secret-looking value we must not write to disk
+            // — the approval still applies to this call only.
+            let mut note: Option<String> = None;
+            if let AcpOutcome::Selected { kind, .. } = &outcome {
+                if kind == "allow_always" {
+                    match crate::cowork::allow_always_skip_reason(&tool_input) {
+                        Some(reason) => {
+                            tracing::info!(tool = %tool_name, reason, "skipping allow-always rule persistence");
+                            note = Some(reason.to_owned());
+                        }
+                        None => {
+                            if let Err(e) = append_allow_rule(&s.workspace, &tool_name, &tool_input)
+                            {
+                                tracing::warn!(error = %e, tool = %tool_name, "failed to persist allow-always rule");
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut resp = outcome_to_json(&outcome);
+            if let Some(note) = note {
+                resp["note"] = json!(note);
+            }
+            return Json(resp).into_response();
+        }
+    };
+
+    let outcome = map_decision_to_outcome(&decision, false, &body.options);
     Json(outcome_to_json(&outcome)).into_response()
 }
 
@@ -1684,7 +1722,7 @@ mod tests {
             }
             found.expect("request must suspend")
         };
-        assert!(gate.approve_always(&id).await);
+        assert!(gate.approve_always(&id).await.0);
 
         let resp = call.await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1705,6 +1743,177 @@ mod tests {
                 &serde_json::json!({"command": "git status"})
             ),
             Some(crate::cowork::PermissionDecision::Allow)
+        );
+    }
+
+    #[tokio::test]
+    async fn request_permission_honors_persisted_allow_rule_without_suspending() {
+        // A persisted allow rule must resolve the ACP bridge path outright —
+        // no gate suspension, no TUI prompt — same as the native loop.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state();
+        state.workspace = tmp.path().to_path_buf();
+        crate::cowork::append_allow_rule(
+            tmp.path(),
+            "bash",
+            &serde_json::json!({"command": "git status"}),
+        )
+        .unwrap();
+        let session_id = "acp-perm-rule".to_owned();
+        let gate = {
+            let mut g = state.gates.lock().await;
+            Arc::clone(
+                g.entry(session_id.clone())
+                    .or_insert_with(|| Arc::new(crate::cowork::CoworkGate::default())),
+            )
+        };
+        let app = build_acp_router(state.clone());
+        let body = serde_json::json!({
+            "toolCall": { "toolName": "bash", "rawInput": {"command": "git status"} },
+            "options": [
+                {"optionId": "a1", "kind": "allow_once"},
+                {"optionId": "r1", "kind": "reject_once"}
+            ]
+        });
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/acp/v1/session/{session_id}/request_permission"))
+            .header("Authorization", "Bearer test-token")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        // Resolves immediately (no concurrent approval needed).
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["outcome"]["outcome"], "selected");
+        assert_eq!(json["outcome"]["optionId"], "a1");
+        assert!(
+            gate.list_pending().await.is_empty(),
+            "a rule-allowed request must not suspend on the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_permission_honors_persisted_deny_rule_without_suspending() {
+        // A persisted deny rule must reject outright — no gate suspension, and
+        // the response selects the reject option.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state();
+        state.workspace = tmp.path().to_path_buf();
+        let dir = tmp.path().join(".smedja");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("workspace.toml"),
+            "[[permission.rules]]\ntool = \"bash\"\ncommand_pattern = \"rm *\"\nmode = \"deny\"\n",
+        )
+        .unwrap();
+        let session_id = "acp-perm-deny".to_owned();
+        let gate = {
+            let mut g = state.gates.lock().await;
+            Arc::clone(
+                g.entry(session_id.clone())
+                    .or_insert_with(|| Arc::new(crate::cowork::CoworkGate::default())),
+            )
+        };
+        let app = build_acp_router(state.clone());
+        let body = serde_json::json!({
+            "toolCall": { "toolName": "bash", "rawInput": {"command": "rm -rf /tmp/x"} },
+            "options": [
+                {"optionId": "a1", "kind": "allow_once"},
+                {"optionId": "r1", "kind": "reject_once"}
+            ]
+        });
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/acp/v1/session/{session_id}/request_permission"))
+            .header("Authorization", "Bearer test-token")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["outcome"]["outcome"], "selected");
+        assert_eq!(
+            json["outcome"]["optionId"], "r1",
+            "a deny rule must select the reject option; got: {json}"
+        );
+        assert!(
+            gate.list_pending().await.is_empty(),
+            "a rule-denied request must not suspend on the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_permission_allow_always_tool_only_returns_note() {
+        // allow_always on a payload with no command/path to scope a rule to:
+        // the approval proceeds but the response carries the veto note.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state();
+        state.workspace = tmp.path().to_path_buf();
+        let session_id = "acp-perm-note".to_owned();
+        let gate = {
+            let mut g = state.gates.lock().await;
+            Arc::clone(
+                g.entry(session_id.clone())
+                    .or_insert_with(|| Arc::new(crate::cowork::CoworkGate::default())),
+            )
+        };
+        let app = build_acp_router(state.clone());
+        let body = serde_json::json!({
+            "toolCall": { "toolName": "apply_patch", "rawInput": {"patch": "@@ ..."} },
+            "options": [
+                {"optionId": "a1", "kind": "allow_once"},
+                {"optionId": "a2", "kind": "allow_always"}
+            ]
+        });
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/acp/v1/session/{session_id}/request_permission"))
+            .header("Authorization", "Bearer test-token")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let call = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+
+        let id = {
+            let mut found = None;
+            for _ in 0..10_000 {
+                if let Some((id, _)) = gate.list_pending().await.first() {
+                    found = Some(id.clone());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            found.expect("request must suspend")
+        };
+        assert!(gate.approve_always(&id).await.0);
+
+        let resp = call.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["outcome"]["optionId"], "a2");
+        assert!(
+            json["note"]
+                .as_str()
+                .is_some_and(|n| n.contains("no command/path")),
+            "the veto note must ride the response; got: {json}"
+        );
+        assert!(
+            crate::cowork::load_permission_rules(tmp.path()).is_empty(),
+            "a tool-only allow-always must not persist a blanket rule"
         );
     }
 

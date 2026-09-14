@@ -2,6 +2,7 @@
 //! context, and history. Moved verbatim from `session.rs`.
 
 use super::*;
+use smedja_types::Effort;
 
 /// Handles `session.list`.
 ///
@@ -90,6 +91,7 @@ pub(crate) async fn get(state: HandlerState, params: Value) -> Result<Value, Rpc
         "title": session.title,
         "mode": session.mode,
         "runner": session.runner_override,
+        "effort": session_effort(id).map(Effort::as_str),
         "created_at": session.created_at,
         "updated_at": session.updated_at,
         "status": session.status,
@@ -136,7 +138,7 @@ pub(crate) async fn token_usage(state: HandlerState, params: Value) -> Result<Va
 /// Infallible in practice; the signature matches the handler contract.
 #[allow(clippy::unused_async)] // uniform handler signature: all handlers are async fns
 pub(crate) async fn runner_list(state: HandlerState, _params: Value) -> Result<Value, RpcError> {
-    let pool = state.provider_pool;
+    let pool = state.provider_pool.snapshot();
     let runners: Vec<Value> = pool
         .list_all_entries()
         .into_iter()

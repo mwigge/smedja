@@ -13,9 +13,7 @@ use super::*;
 pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, RpcError> {
     let ig = state.ingot;
     let lsp_manager = Arc::clone(&state.lsp_manager);
-    let pool = Arc::clone(&state.provider_pool);
-    let startup_runner = state.startup_runner;
-    let startup_model = state.startup_model;
+    let pool = state.provider_pool.snapshot();
     let title = params
         .get("title")
         .and_then(Value::as_str)
@@ -46,7 +44,7 @@ pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, 
     // last-used client (codex→codex) and tier (deep→deep) carry across restarts.
     // `list_sessions` is ordered oldest→newest, so the last entry is the most
     // recent. A session that never overrode the defaults leaves these `None`,
-    // which correctly falls back to the startup defaults.
+    // which correctly falls back to the current pool defaults.
     let (inherited_runner, inherited_model) = ig
         .list_sessions()
         .await
@@ -119,9 +117,12 @@ pub(crate) async fn create(state: HandlerState, params: Value) -> Result<Value, 
     // The gate map is owned by build_router; session.create handles the DB flag
     // only here. Callers that need the gate active must also call cowork.set.
 
-    // Effective runner/model = inherited override, else the startup default.
-    let effective_runner = inherited_runner.unwrap_or_else(|| startup_runner.to_string());
-    let effective_model = inherited_model.unwrap_or_else(|| startup_model.to_string());
+    // Effective runner/model = inherited override, else the CURRENT pool
+    // defaults (a provider.rescan may have replaced the pool since startup —
+    // the boot-time runner/model would be stale).
+    let effective_runner =
+        inherited_runner.unwrap_or_else(|| pool.default_runner_name().to_string());
+    let effective_model = inherited_model.unwrap_or_else(|| pool.default_model().to_string());
     // Derive the tier from the provider pool by (runner, model) so the right
     // label (e.g. "deep") follows the inherited model; fall back to the
     // runner's first entry, then to a coarse heuristic.
@@ -268,6 +269,7 @@ pub(crate) async fn delete(state: HandlerState, params: Value) -> Result<Value, 
         .ok_or_else(|| missing_param("id"))?;
 
     ig.delete_session(id).await.map_err(|e| ingot_err(&e))?;
+    super::mutate::clear_effort_override(id);
     Ok(Value::Bool(true))
 }
 
@@ -443,7 +445,10 @@ pub(crate) async fn takeover(state: HandlerState, params: Value) -> Result<Value
         .ok_or_else(|| {
             RpcError::new(
                 codes::INVALID_PARAMS,
-                format!("unknown runner: {runner_str}; valid: claude, codex, local, copilot"),
+                format!(
+                    "unknown runner: {runner_str}; valid: {}",
+                    crate::common::valid_runner_names()
+                ),
             )
         })?;
 

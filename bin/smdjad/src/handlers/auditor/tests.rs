@@ -354,6 +354,7 @@ impl ScriptedRunner {
 }
 
 impl ReviewTurn for ScriptedRunner {
+    #[allow(clippy::unused_async_trait_impl)] // mock trait impl: signature requires async
     async fn run_turn(&self, transcript: &[AdapterMessage]) -> Result<TurnOutput, RpcError> {
         if let Some(last) = transcript.last() {
             self.seen.lock().unwrap().push(last.content.clone());

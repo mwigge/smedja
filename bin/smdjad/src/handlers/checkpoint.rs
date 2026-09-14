@@ -96,7 +96,7 @@ pub(crate) async fn rollback(state: HandlerState, params: Value) -> Result<Value
 #[allow(clippy::too_many_lines)] // single compaction pipeline kept inline
 pub(crate) async fn compact(state: HandlerState, params: Value) -> Result<Value, RpcError> {
     let ig = state.ingot;
-    let pool = state.provider_pool;
+    let pool = state.provider_pool.snapshot();
     let vt = state.vault;
     let embedder = state.embedder;
     let session_id = params
@@ -144,6 +144,7 @@ pub(crate) async fn compact(state: HandlerState, params: Value) -> Result<Value,
         provider_session_id: None,
         smedja_session_id: None,
         permission_mode: None,
+        effort: None,
         stable_prefix_len: None,
         cache_strategy: smedja_adapter::CacheStrategy::None,
         workspace: None,

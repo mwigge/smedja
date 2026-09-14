@@ -99,7 +99,7 @@ fn local_control_exposes_inventory_and_mutable_active_model() {
     };
 
     let local = pool.local_control().expect("local control present");
-    let ids: Vec<&str> = local.inventory.iter().map(|m| m.id.as_str()).collect();
+    let ids: Vec<String> = local.inventory().iter().map(|m| m.id.clone()).collect();
     assert_eq!(
         ids,
         vec!["qwen3-14b", "llama3-8b"],
@@ -111,6 +111,12 @@ fn local_control_exposes_inventory_and_mutable_active_model() {
     let previous = local.set_active_model_id("llama3-8b");
     assert_eq!(previous.as_deref(), Some("qwen3-14b"));
     assert_eq!(local.active_model_id().as_deref(), Some("llama3-8b"));
+
+    // `local.install` appends newly servable models in place, once.
+    local.add_inventory_model("qwen3-32b");
+    local.add_inventory_model("qwen3-32b");
+    let ids: Vec<String> = local.inventory().iter().map(|m| m.id.clone()).collect();
+    assert_eq!(ids, vec!["qwen3-14b", "llama3-8b", "qwen3-32b"]);
 }
 
 #[test]
@@ -484,4 +490,94 @@ fn missing_price_models_is_empty_when_all_priced() {
         ((Runner::Kimi, Tier::Deep), "moonshot", "kimi-k3"),
     ]);
     assert!(pool.missing_price_models(&pt).is_empty());
+}
+
+// ── SharedProviderPool (provider.rescan swap semantics) ─────────────────────
+
+#[test]
+fn shared_pool_replace_preserves_in_flight_snapshots() {
+    // The core provider.rescan safety claim: a consumer holding an Arc
+    // snapshot from BEFORE the swap keeps its providers alive and unchanged,
+    // while new snapshots see the rebuilt pool.
+    let old_pool = pool_with(vec![(
+        (Runner::Claude, Tier::Fast),
+        "claude-cli",
+        "claude-old",
+    )]);
+    let shared = crate::provider_pool::SharedProviderPool::new(old_pool);
+
+    let in_flight = shared.snapshot();
+    shared.replace(pool_with(vec![(
+        (Runner::Codex, Tier::Fast),
+        "codex-cli",
+        "gpt-5.5",
+    )]));
+
+    // The pre-swap snapshot still resolves its entry…
+    assert_eq!(
+        in_flight
+            .get_exact(Runner::Claude, Tier::Fast)
+            .map(|e| e.default_model.as_str()),
+        Some("claude-old"),
+        "an in-flight turn keeps the pool it started with"
+    );
+    assert!(
+        in_flight.get_exact(Runner::Codex, Tier::Fast).is_none(),
+        "…and does NOT see providers added by the rescan"
+    );
+
+    // A fresh snapshot sees only the new pool.
+    let fresh = shared.snapshot();
+    assert!(fresh.get_exact(Runner::Claude, Tier::Fast).is_none());
+    assert_eq!(
+        fresh
+            .get_exact(Runner::Codex, Tier::Fast)
+            .map(|e| e.default_model.as_str()),
+        Some("gpt-5.5"),
+    );
+}
+
+// ── get_exact / models_for_runner ────────────────────────────────────────────
+
+#[test]
+fn get_exact_skips_the_pool_default_fallback() {
+    // `get` falls back to the pool default for a missing (runner, tier);
+    // `get_exact` must not — session.set_runner uses it to decide whether the
+    // new runner actually has a default model to report.
+    let pool = pool_with(vec![(
+        (Runner::Claude, Tier::Fast),
+        "claude-cli",
+        "claude-x",
+    )]);
+    assert!(
+        pool.get(Runner::Codex, Tier::Fast).is_some(),
+        "get falls back to the pool default"
+    );
+    assert!(
+        pool.get_exact(Runner::Codex, Tier::Fast).is_none(),
+        "get_exact must answer for exactly the requested pair"
+    );
+    assert!(pool.get_exact(Runner::Claude, Tier::Fast).is_some());
+}
+
+#[test]
+fn models_for_runner_filters_blank_defaults_in_probe_order() {
+    // CLI agents that self-select register blank/whitespace default models;
+    // those must be filtered so session.set_model does not validate against
+    // empty names, and the survivors keep probe order (Fast before Deep).
+    let pool = pool_with(vec![
+        ((Runner::Kimi, Tier::Fast), "kimi-cli", "kimi-for-coding"),
+        ((Runner::Kimi, Tier::Deep), "kimi-cli", "  "),
+        ((Runner::Kimi, Tier::Local), "kimi-cli", ""),
+        ((Runner::Codex, Tier::Fast), "codex-cli", "gpt-5.5"),
+    ]);
+    assert_eq!(
+        pool.models_for_runner(Runner::Kimi),
+        vec!["kimi-for-coding"]
+    );
+    assert_eq!(pool.models_for_runner(Runner::Codex), vec!["gpt-5.5"]);
+    assert!(
+        pool.models_for_runner(Runner::Gemini).is_empty(),
+        "a runner absent from the pool has no known models"
+    );
 }

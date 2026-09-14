@@ -64,6 +64,8 @@ Or, to use a local model via an OpenAI-compatible server (Ollama, llama-swap, et
 export SMEDJA_LOCAL_ENDPOINT=http://127.0.0.1:11434/v1
 ```
 
+You can also paste keys from inside the TUI: `/login anthropic` or `/login openai` opens a masked paste prompt and saves the key to `~/.config/smedja/secrets.env` (mode 0600). The daemon loads that file itself at startup — a real environment variable wins over a file entry — so it works whether smdjad runs under systemd or directly. After saving a key, `/login` calls `provider.rescan` and the daemon rebuilds its provider pool immediately; no restart needed. CLI-based runners (claude, codex, kimi, gemini, pool, opencode) authenticate with their own login flows instead (`/login` prints the right command for each).
+
 smdjad will automatically detect and use a configured provider. If no provider is configured, turns will fail with a DEGRADED status — check `smj status` or the TUI status bar for provider health.
 
 ---
@@ -93,6 +95,8 @@ smedja          # opens smedja-tui as its default app
 ```
 
 The TUI creates a fresh session and connects to the daemon. You'll see the status bar at the bottom showing `[tier] [mode] [session-id] [runner]`.
+
+If the daemon's provider pool is empty (no provider configured yet), the TUI shows an onboarding block instead of a working-looking dashboard: a "no providers detected" warning, the result of probing for installed agent CLIs, and a pointer to `/login` (e.g. `/login anthropic`, `/login openai`, `/login kimi`) to configure one.
 
 ### Flags
 

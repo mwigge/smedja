@@ -23,7 +23,9 @@
 //! * Prompt mode auto-approves kimi's own tool calls (`--prompt` rejects
 //!   `--yolo`/`--auto` because it already implies them) and exposes no hook
 //!   mechanism, so smedja's PreToolUse approval gate cannot be installed.
-//!   The trust model is therefore "same as running `kimi -p` by hand".
+//!   The trust model is therefore "same as running `kimi -p` by hand" — which
+//!   is why selecting it (`SMEDJA_KIMI_ACP=off`) additionally requires the
+//!   explicit `SMEDJA_KIMI_UNGATED=1` acknowledgment before any spawn.
 
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -37,8 +39,10 @@ use crate::{
 ///
 /// The CLI path drives `kimi acp` by default — the Agent Client Protocol
 /// surfaces the agent's `session/request_permission` so its tool calls are
-/// gated through smedja's approval flow. Set `SMEDJA_KIMI_ACP=off` to revert
-/// to the ungated one-shot `kimi -p … --output-format stream-json` path.
+/// gated through smedja's approval flow. `SMEDJA_KIMI_ACP=off` selects the
+/// ungated one-shot `kimi -p … --output-format stream-json` path, which spawns
+/// only when `SMEDJA_KIMI_UNGATED=1` also acknowledges the self-approving trust
+/// model.
 pub enum KimiCliProvider {
     /// Drives the locally installed `kimi` binary as an ACP agent (gated).
     Acp(AcpProvider),
@@ -58,6 +62,19 @@ fn acp_disabled() -> bool {
     })
 }
 
+/// True when `SMEDJA_KIMI_UNGATED` explicitly acknowledges running `kimi -p`
+/// with NO approval gate (kimi self-approves all its tool calls in prompt
+/// mode). Required in addition to `SMEDJA_KIMI_ACP=off` so the ungated path is
+/// always a deliberate double opt-in.
+fn ungated_acknowledged() -> bool {
+    std::env::var("SMEDJA_KIMI_UNGATED").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 impl KimiCliProvider {
     /// Selects the CLI (ACP by default) if the `kimi` binary is on `$PATH`,
     /// otherwise uses the environment API key (`MOONSHOT_API_KEY` /
@@ -68,10 +85,20 @@ impl KimiCliProvider {
     pub fn detect() -> Option<Self> {
         if SubprocessProvider::available("kimi") {
             if acp_disabled() {
-                tracing::warn!(
-                    "SMEDJA_KIMI_ACP=off: kimi runs in one-shot prompt mode, which \
-                     auto-approves its own tool calls WITHOUT the smedja gate"
-                );
+                if ungated_acknowledged() {
+                    tracing::warn!(
+                        "SMEDJA_KIMI_ACP=off + SMEDJA_KIMI_UNGATED acknowledged: kimi runs in \
+                         one-shot prompt mode, which auto-approves its own tool calls WITHOUT \
+                         the smedja gate"
+                    );
+                } else {
+                    tracing::warn!(
+                        "SMEDJA_KIMI_ACP=off selects ungated prompt mode, which auto-approves \
+                         kimi's tool calls WITHOUT the smedja gate; spawns will fail until \
+                         SMEDJA_KIMI_UNGATED=1 acknowledges this (or unset SMEDJA_KIMI_ACP for \
+                         the gated ACP default)"
+                    );
+                }
                 Some(Self::Prompt)
             } else {
                 Some(Self::Acp(AcpProvider::new(KIMI_ACP)))
@@ -102,6 +129,24 @@ fn stream_kimi_cli(messages: &[Message], opts: &CallOptions) -> DeltaStream {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::spawn(async move {
+        // Prompt mode bypasses the smedja approval gate entirely (kimi
+        // self-approves). Refuse to spawn unless the operator acknowledged the
+        // ungated trust model explicitly; warn on every acknowledged spawn.
+        if !ungated_acknowledged() {
+            let _ = tx
+                .send(Err(AdapterError::Request(
+                    "kimi prompt mode (SMEDJA_KIMI_ACP=off) auto-approves every tool call \
+                     without the smedja gate; set SMEDJA_KIMI_UNGATED=1 to acknowledge the \
+                     ungated trust model, or unset SMEDJA_KIMI_ACP to use the gated ACP default"
+                        .to_owned(),
+                )))
+                .await;
+            return;
+        }
+        tracing::warn!(
+            "spawning ungated `kimi -p` (SMEDJA_KIMI_UNGATED acknowledged): tool approvals are bypassed"
+        );
+
         let mut command = tokio::process::Command::new("kimi");
         command
             .arg("-p")
@@ -424,6 +469,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ungated_prompt_mode_requires_explicit_acknowledgment() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SMEDJA_KIMI_UNGATED");
+        assert!(!ungated_acknowledged());
+        std::env::set_var("SMEDJA_KIMI_UNGATED", "1");
+        assert!(ungated_acknowledged());
+        std::env::remove_var("SMEDJA_KIMI_UNGATED");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the stream to serialize env mutation across concurrent tests
+    async fn prompt_mode_spawn_refused_without_ungated_acknowledgment() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SMEDJA_KIMI_UNGATED");
+        let provider = KimiCliProvider::Prompt;
+        let opts = CallOptions {
+            model: "kimi-mock".into(),
+            max_tokens: None,
+            temperature: None,
+            system: None,
+            tools: None,
+            provider_session_id: None,
+            smedja_session_id: None,
+            permission_mode: None,
+            effort: None,
+            stable_prefix_len: None,
+            cache_strategy: crate::types::CacheStrategy::None,
+            workspace: None,
+            tool_gate: None,
+        };
+        let messages = vec![Message {
+            role: crate::Role::User,
+            content: "hi".into(),
+        }];
+        let mut stream = provider.stream_chat(&messages, &opts);
+        let first = stream.next().await.expect("stream yields the refusal");
+        let Err(e) = first else {
+            panic!("ungated spawn without SMEDJA_KIMI_UNGATED must error, got {first:?}");
+        };
+        let msg = e.to_string();
+        assert!(
+            msg.contains("SMEDJA_KIMI_UNGATED"),
+            "refusal must name the acknowledgment env; got: {msg}"
+        );
+        assert!(
+            msg.contains("SMEDJA_KIMI_ACP"),
+            "refusal must point at the gated ACP default; got: {msg}"
+        );
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the stream to serialize $PATH mutation across concurrent tests
     async fn cli_provider_streams_mock_kimi_via_prompt_argv() {
@@ -460,6 +556,8 @@ mod tests {
 
         let old_path = std::env::var("PATH").unwrap_or_default();
         std::env::set_var("PATH", format!("{}:{old_path}", temp_dir.display()));
+        // Prompt mode refuses to spawn without the explicit ungated ack.
+        std::env::set_var("SMEDJA_KIMI_UNGATED", "1");
 
         // Exercise the legacy prompt path directly — ACP is detection's
         // default, but the one-shot mode remains the SMEDJA_KIMI_ACP=off
@@ -474,6 +572,7 @@ mod tests {
             provider_session_id: Some("resume-123".into()),
             smedja_session_id: None,
             permission_mode: None,
+            effort: None,
             stable_prefix_len: None,
             cache_strategy: crate::types::CacheStrategy::None,
             workspace: None,
@@ -491,6 +590,7 @@ mod tests {
         }
 
         std::env::set_var("PATH", old_path);
+        std::env::remove_var("SMEDJA_KIMI_UNGATED");
 
         assert!(deltas.contains(&Delta::SessionId("mock-session".into())));
         assert!(deltas.contains(&Delta::Text("hello".into())));

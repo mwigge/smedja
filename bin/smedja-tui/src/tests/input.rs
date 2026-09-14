@@ -6,7 +6,7 @@ use smedja_rpc::client::Client;
 
 use crate::clipboard::push_kill;
 use crate::editor::resolve_editor;
-use crate::input::handle_key;
+use crate::input::{always_approve_message, handle_key};
 use crate::main_panel;
 use crate::test_support::make_state;
 use crate::{
@@ -671,4 +671,747 @@ fn ctrl_k_on_empty_input_opens_palette() {
     assert!(state.slash_popup_visible);
     assert_eq!(state.slash_completions.len(), SLASH_COMPLETIONS.len());
     assert!(state.command_palette_mode);
+}
+
+// --- cowork gate: [a] always ------------------------------------------------
+
+#[test]
+fn always_approve_message_prefers_daemon_note() {
+    let ok = Ok(serde_json::json!({"id": "x", "resolved": true, "note": "rule saved: bash *"}));
+    assert_eq!(always_approve_message(&ok, "bash"), "rule saved: bash *");
+}
+
+#[test]
+fn always_approve_message_marks_persisted_rule() {
+    let ok = Ok(serde_json::json!({"id": "x", "resolved": true, "rule_persisted": true}));
+    let msg = always_approve_message(&ok, "bash");
+    assert!(msg.contains("approved (always): bash"), "got: {msg}");
+    assert!(msg.contains("persisted"), "got: {msg}");
+}
+
+#[test]
+fn always_approve_message_confirms_persistence_without_note() {
+    // A resolved reply with no veto note means the daemon persisted the rule.
+    let ok = Ok(serde_json::json!({"id": "x", "resolved": true}));
+    assert_eq!(
+        always_approve_message(&ok, "bash"),
+        "approved (always): bash — allow rule persisted"
+    );
+}
+
+#[test]
+fn always_approve_message_sanitizes_daemon_note() {
+    // The daemon's note is echoed into the panel — terminal control characters
+    // in it must be stripped before display.
+    let ok = Ok(serde_json::json!({"note": "rule saved \u{1b}]52;c;eWV5\u{7} done"}));
+    let msg = always_approve_message(&ok, "bash");
+    assert!(!msg.contains('\u{1b}'), "ESC stripped: {msg:?}");
+    assert!(!msg.contains('\u{7}'), "BEL stripped: {msg:?}");
+    assert!(
+        msg.contains("rule saved") && msg.contains("done"),
+        "{msg:?}"
+    );
+}
+
+#[test]
+fn always_approve_message_ignores_empty_note() {
+    // An empty note must fall through to the persisted/plain confirmation
+    // rather than printing a blank line.
+    let ok = Ok(serde_json::json!({"note": "", "rule_persisted": true}));
+    let msg = always_approve_message(&ok, "bash");
+    assert!(msg.contains("approved (always): bash"), "got: {msg}");
+    assert!(msg.contains("persisted"), "got: {msg}");
+}
+
+// Pressing `a` at the cowork gate must send cowork.resolve with scope "always"
+// and drop the item once the daemon resolves it.
+#[tokio::test]
+async fn cowork_always_key_sends_scope_always_and_confirms() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+    use tokio::net::UnixListener;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("cowork-always.sock");
+    let listener = UnixListener::bind(&sock_path).unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
+
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            let mut reader = TokioBufReader::new(stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                return;
+            }
+            let req: serde_json::Value =
+                serde_json::from_str(line.trim_end()).unwrap_or(serde_json::Value::Null);
+            let _ = tx.send(req.clone());
+            let resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req["id"].clone(),
+                "result": { "id": "ap-1", "resolved": true, "rule_persisted": true },
+            });
+            let mut bytes = serde_json::to_vec(&resp).unwrap();
+            bytes.push(b'\n');
+            let _ = reader.get_mut().write_all(&bytes).await;
+        }
+    });
+
+    let mut client = Client::connect(&sock_path).await.unwrap();
+    let mut editor = rustyline::DefaultEditor::new().unwrap();
+    let mut state = make_state("sess-always");
+    state.pending_cowork.push(crate::cowork_widget::CoworkItem {
+        id: "ap-1".into(),
+        tool: "bash".into(),
+        step_n: 1,
+        args_display: r#"{"cmd":"rm -rf build/"}"#.into(),
+        reasoning: String::new(),
+        agent: None,
+        cwd: None,
+        risk: None,
+        supports_modify: true,
+        rows_cache: std::cell::RefCell::new(None),
+    });
+
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('a'),
+        crossterm::event::KeyModifiers::empty(),
+    );
+    handle_key(key, &mut state, &mut client, &mut editor)
+        .await
+        .unwrap();
+
+    let req = rx.await.unwrap();
+    assert_eq!(req["method"].as_str(), Some("cowork.resolve"));
+    assert_eq!(req["params"]["id"].as_str(), Some("ap-1"));
+    assert_eq!(req["params"]["approved"].as_bool(), Some(true));
+    assert_eq!(
+        req["params"]["scope"].as_str(),
+        Some("always"),
+        "always key must send scope=always; params: {}",
+        req["params"]
+    );
+    assert!(
+        state.pending_cowork.is_empty(),
+        "resolved item must leave the queue"
+    );
+    let body = state
+        .main_panel
+        .lines_text(0, state.main_panel.len())
+        .join("\n");
+    assert!(
+        body.contains("persisted"),
+        "panel must confirm the persisted rule; got: {body}"
+    );
+}
+
+// --- masked secret entry: leak-proofing -------------------------------------
+//
+// While `secret_var` is set the input bar holds an in-progress credential.
+// Only Char/Backspace/Delete/Enter/Esc may act; editor hand-off, the kill
+// ring, and history browse are dead keys so the key cannot escape into a
+// temp file, the kill ring, or the plaintext prompt.
+
+mod secret_mode {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::net::UnixListener;
+
+    /// A client connected to a socket whose peer never answers; the
+    /// secret-mode keys under test never issue an RPC.
+    async fn dummy_client(dir_name: &str) -> (tempfile::TempDir, Client) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join(format!("{dir_name}.sock"));
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let client = Client::connect(&sock_path).await.unwrap();
+        (dir, client)
+    }
+
+    fn secret_state(session: &str) -> crate::state::AppState {
+        let mut state = make_state(session);
+        state.secret_var = Some("SMEDJA_TEST_KEY".to_owned());
+        state.input = "sk-live-secret".to_owned();
+        state.input_cursor = state.input.len();
+        state
+    }
+
+    async fn press(
+        code: KeyCode,
+        mods: KeyModifiers,
+        state: &mut crate::state::AppState,
+        client: &mut Client,
+    ) {
+        let mut editor = rustyline::DefaultEditor::new().unwrap();
+        handle_key(KeyEvent::new(code, mods), state, client, &mut editor)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ctrl_g_does_not_hand_secret_to_editor() {
+        let (_dir, mut client) = dummy_client("secret-ctrlg").await;
+        let mut state = secret_state("sess-secret-g");
+        let scratch = std::env::temp_dir().join(format!("smedja-edit-{}.md", std::process::id()));
+        let _ = std::fs::remove_file(&scratch);
+
+        press(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+            &mut state,
+            &mut client,
+        )
+        .await;
+
+        assert_eq!(state.input, "sk-live-secret", "input untouched by Ctrl-G");
+        assert!(
+            !scratch.exists(),
+            "no editor scratch file may be written while a secret is in progress"
+        );
+        assert!(state.secret_var.is_some(), "still in secret mode");
+    }
+
+    #[tokio::test]
+    async fn ctrl_u_and_ctrl_k_do_not_push_secret_to_kill_ring() {
+        let (_dir, mut client) = dummy_client("secret-kill").await;
+        let mut state = secret_state("sess-secret-kill");
+
+        press(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+            &mut state,
+            &mut client,
+        )
+        .await;
+        press(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL,
+            &mut state,
+            &mut client,
+        )
+        .await;
+
+        assert_eq!(state.input, "sk-live-secret", "kill keys are dead");
+        assert!(
+            state.kill_ring.is_empty(),
+            "secret must never reach the kill ring"
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_y_does_not_yank_into_secret_prompt() {
+        let (_dir, mut client) = dummy_client("secret-yank").await;
+        let mut state = secret_state("sess-secret-yank");
+        push_kill(&mut state.kill_ring, "stale-kill".to_owned());
+
+        press(
+            KeyCode::Char('y'),
+            KeyModifiers::CONTROL,
+            &mut state,
+            &mut client,
+        )
+        .await;
+
+        assert_eq!(state.input, "sk-live-secret", "yank is dead in secret mode");
+        // The ring is untouched either (a later plaintext yank keeps the
+        // pre-existing entry, never the secret).
+        assert_eq!(
+            state.kill_ring.back().map(String::as_str),
+            Some("stale-kill")
+        );
+    }
+
+    #[tokio::test]
+    async fn up_arrow_does_not_stash_secret_into_saved_input() {
+        let (_dir, mut client) = dummy_client("secret-history").await;
+        let mut state = secret_state("sess-secret-hist");
+        state.prompt_history.push("previous prompt".to_owned());
+
+        press(KeyCode::Up, KeyModifiers::empty(), &mut state, &mut client).await;
+
+        assert_eq!(state.input, "sk-live-secret", "history browse is dead");
+        assert!(
+            state.saved_input.is_empty(),
+            "the in-progress key must not be stashed for later restore"
+        );
+        assert!(state.history_idx.is_none());
+    }
+
+    #[tokio::test]
+    async fn esc_cancel_clears_input_and_saved_input() {
+        let (_dir, mut client) = dummy_client("secret-esc").await;
+        let mut state = secret_state("sess-secret-esc");
+        state.saved_input = "sk-stash".to_owned();
+
+        press(KeyCode::Esc, KeyModifiers::empty(), &mut state, &mut client).await;
+
+        assert!(state.secret_var.is_none(), "secret mode cancelled");
+        assert!(state.input.is_empty(), "typed key discarded");
+        assert!(
+            state.saved_input.is_empty(),
+            "stash cleared so Up/Down cannot restore the key"
+        );
+        let body = state
+            .main_panel
+            .lines_text(0, state.main_panel.len())
+            .join("\n");
+        assert!(body.contains("login: cancelled"), "cancel notice: {body}");
+    }
+
+    #[tokio::test]
+    async fn enter_on_empty_secret_cancels_and_clears_saved_input() {
+        let (_dir, mut client) = dummy_client("secret-enter").await;
+        let mut state = secret_state("sess-secret-enter");
+        state.input.clear();
+        state.input_cursor = 0;
+        state.saved_input = "sk-stash".to_owned();
+
+        press(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+            &mut state,
+            &mut client,
+        )
+        .await;
+
+        assert!(state.secret_var.is_none());
+        assert!(
+            state.saved_input.is_empty(),
+            "save path also drops the stash"
+        );
+        let body = state
+            .main_panel
+            .lines_text(0, state.main_panel.len())
+            .join("\n");
+        assert!(
+            body.contains("login: empty key"),
+            "empty-key notice: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn typing_and_editing_still_work_in_secret_mode() {
+        let (_dir, mut client) = dummy_client("secret-typing").await;
+        let mut state = secret_state("sess-secret-typing");
+
+        press(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+            &mut state,
+            &mut client,
+        )
+        .await;
+        assert_eq!(state.input, "sk-live-secretx");
+
+        press(
+            KeyCode::Backspace,
+            KeyModifiers::empty(),
+            &mut state,
+            &mut client,
+        )
+        .await;
+        assert_eq!(state.input, "sk-live-secret");
+
+        state.input_cursor = 0;
+        press(
+            KeyCode::Delete,
+            KeyModifiers::empty(),
+            &mut state,
+            &mut client,
+        )
+        .await;
+        assert_eq!(state.input, "k-live-secret");
+    }
+}
+
+// --- cowork gate: dismissal, quit reachability, modify UX -------------------
+//
+// Regression coverage for the round-2 review fixes: Esc dismisses the head
+// item (deny-by-dismissal via the session-agnostic cowork.resolve), Ctrl-C
+// quit stays reachable while approvals are pending, masked secret entry runs
+// before the cowork interception, and modify mode edits JSON replacement
+// args.
+
+mod cowork_gate {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+    use tokio::net::UnixListener;
+
+    fn gate_item(id: &str) -> crate::cowork_widget::CoworkItem {
+        crate::cowork_widget::CoworkItem {
+            id: id.into(),
+            tool: "bash".into(),
+            step_n: 1,
+            args_display: r#"{"cmd":"ls -la"}"#.into(),
+            reasoning: String::new(),
+            agent: None,
+            cwd: None,
+            risk: None,
+            supports_modify: true,
+            rows_cache: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// A client whose peer records the first request, then replies with
+    /// `reply` as the RPC result.
+    async fn respondent_client(
+        dir_name: &str,
+        reply: serde_json::Value,
+    ) -> (
+        tempfile::TempDir,
+        Client,
+        tokio::sync::oneshot::Receiver<serde_json::Value>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join(format!("{dir_name}.sock"));
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let mut reader = TokioBufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let req: serde_json::Value =
+                    serde_json::from_str(line.trim_end()).unwrap_or(serde_json::Value::Null);
+                let resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req["id"].clone(),
+                    "result": reply,
+                });
+                let _ = tx.send(req);
+                let mut bytes = serde_json::to_vec(&resp).unwrap();
+                bytes.push(b'\n');
+                let _ = reader.get_mut().write_all(&bytes).await;
+            }
+        });
+        let client = Client::connect(&sock_path).await.unwrap();
+        (dir, client, rx)
+    }
+
+    /// A client connected to a socket whose peer never answers; the keys
+    /// under test must not issue an RPC.
+    async fn dummy_client(dir_name: &str) -> (tempfile::TempDir, Client) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join(format!("{dir_name}.sock"));
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let client = Client::connect(&sock_path).await.unwrap();
+        (dir, client)
+    }
+
+    async fn press(
+        code: KeyCode,
+        mods: KeyModifiers,
+        state: &mut crate::state::AppState,
+        client: &mut Client,
+    ) {
+        let mut editor = rustyline::DefaultEditor::new().unwrap();
+        handle_key(KeyEvent::new(code, mods), state, client, &mut editor)
+            .await
+            .unwrap();
+    }
+
+    fn panel_text(state: &crate::state::AppState) -> String {
+        state
+            .main_panel
+            .lines_text(0, state.main_panel.len())
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn esc_dismisses_head_and_sends_deny() {
+        let (_dir, mut client, rx) = respondent_client(
+            "cowork-esc",
+            serde_json::json!({"id": "ap-1", "resolved": true}),
+        )
+        .await;
+        let mut state = make_state("sess-esc");
+        state.pending_cowork.push(gate_item("ap-1"));
+
+        press(KeyCode::Esc, KeyModifiers::empty(), &mut state, &mut client).await;
+
+        let req = rx.await.unwrap();
+        assert_eq!(req["method"].as_str(), Some("cowork.resolve"));
+        assert_eq!(req["params"]["id"].as_str(), Some("ap-1"));
+        assert_eq!(req["params"]["approved"].as_bool(), Some(false));
+        assert!(
+            state.pending_cowork.is_empty(),
+            "Esc must dismiss the head item locally"
+        );
+        let body = panel_text(&state);
+        assert!(
+            body.contains("dismissed (denied): bash"),
+            "dismissal confirmed; got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn esc_dismiss_removes_item_even_when_gate_gone() {
+        // resolved:false (gate timed out / resolved elsewhere) must not
+        // re-pend the dismissed item.
+        let (_dir, mut client, rx) = respondent_client(
+            "cowork-esc-stale",
+            serde_json::json!({"id": "ap-1", "resolved": false}),
+        )
+        .await;
+        let mut state = make_state("sess-esc-stale");
+        state.pending_cowork.push(gate_item("ap-1"));
+
+        press(KeyCode::Esc, KeyModifiers::empty(), &mut state, &mut client).await;
+
+        let _ = rx.await.unwrap();
+        assert!(
+            state.pending_cowork.is_empty(),
+            "a resolved:false reply must not keep the dismissed item"
+        );
+        let body = panel_text(&state);
+        assert!(
+            body.contains("already resolved"),
+            "stale-gate dismissal noted; got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_quit_stays_reachable_with_pending_cowork() {
+        let (_dir, mut client) = dummy_client("cowork-ctrlc").await;
+        let mut state = make_state("sess-ctrlc");
+        state.pending_cowork.push(gate_item("ap-1"));
+
+        // Non-empty input: first Ctrl-C clears the input only.
+        state.input = "draft".into();
+        state.input_cursor = 5;
+        press(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            &mut state,
+            &mut client,
+        )
+        .await;
+        assert!(state.input.is_empty(), "Ctrl-C clears the input first");
+        assert!(!state.quit && !state.quit_armed);
+
+        // Empty input: two consecutive Ctrl-C presses arm, then quit.
+        press(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            &mut state,
+            &mut client,
+        )
+        .await;
+        assert!(state.quit_armed, "first bare Ctrl-C arms the quit");
+        assert!(!state.quit);
+        assert_eq!(state.pending_cowork.len(), 1, "Ctrl-C must not decide");
+        press(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            &mut state,
+            &mut client,
+        )
+        .await;
+        assert!(state.quit, "second consecutive Ctrl-C quits");
+    }
+
+    #[tokio::test]
+    async fn secret_entry_runs_before_cowork_interception() {
+        // A pending approval must not hijack API-key entry: with BOTH
+        // secret_var set and a cowork item pending, plain keys go into the
+        // masked input, not to the approval widget.
+        let (_dir, mut client) = dummy_client("cowork-secret-order").await;
+        let mut state = make_state("sess-secret-order");
+        state.secret_var = Some("SMEDJA_TEST_KEY".to_owned());
+        state.pending_cowork.push(gate_item("ap-1"));
+
+        press(
+            KeyCode::Char('y'),
+            KeyModifiers::empty(),
+            &mut state,
+            &mut client,
+        )
+        .await;
+        assert_eq!(state.input, "y", "'y' must type into the secret input");
+        assert_eq!(state.pending_cowork.len(), 1, "no approval decided");
+        assert!(state.secret_var.is_some(), "still in secret mode");
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_aborts_secret_entry() {
+        let (_dir, mut client) = dummy_client("cowork-secret-ctrlc").await;
+        let mut state = make_state("sess-secret-ctrlc");
+        state.secret_var = Some("SMEDJA_TEST_KEY".to_owned());
+        state.input = "sk-partial".to_owned();
+        state.input_cursor = state.input.len();
+
+        press(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            &mut state,
+            &mut client,
+        )
+        .await;
+        assert!(state.secret_var.is_none(), "Ctrl-C aborts secret entry");
+        assert!(state.input.is_empty(), "partial key discarded");
+        assert!(!state.quit, "aborting secret entry is not a quit");
+        assert!(panel_text(&state).contains("login: cancelled"));
+    }
+
+    #[tokio::test]
+    async fn y_sends_session_agnostic_cowork_resolve() {
+        let (_dir, mut client, rx) = respondent_client(
+            "cowork-y",
+            serde_json::json!({"id": "ap-1", "resolved": true}),
+        )
+        .await;
+        let mut state = make_state("sess-y");
+        state.pending_cowork.push(gate_item("ap-1"));
+
+        press(
+            KeyCode::Char('y'),
+            KeyModifiers::empty(),
+            &mut state,
+            &mut client,
+        )
+        .await;
+
+        let req = rx.await.unwrap();
+        assert_eq!(req["method"].as_str(), Some("cowork.resolve"));
+        assert_eq!(req["params"]["id"].as_str(), Some("ap-1"));
+        assert_eq!(req["params"]["approved"].as_bool(), Some(true));
+        assert!(
+            req["params"].get("session_id").is_none(),
+            "cowork.resolve is session-agnostic; params: {}",
+            req["params"]
+        );
+        assert!(state.pending_cowork.is_empty());
+        assert!(panel_text(&state).contains("approved: bash"));
+    }
+
+    #[tokio::test]
+    async fn modify_mode_prefills_current_args_json() {
+        let (_dir, mut client) = dummy_client("cowork-modify-prefill").await;
+        let mut state = make_state("sess-modify-prefill");
+        state.pending_cowork.push(gate_item("ap-1"));
+
+        press(
+            KeyCode::Char('m'),
+            KeyModifiers::empty(),
+            &mut state,
+            &mut client,
+        )
+        .await;
+        assert!(state.cowork_modify_mode);
+        assert_eq!(
+            state.cowork_modify_input, r#"{"cmd":"ls -la"}"#,
+            "modify input is pre-filled with the current args JSON"
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_mode_refused_when_backend_cannot_modify() {
+        let (_dir, mut client) = dummy_client("cowork-modify-unsupported").await;
+        let mut state = make_state("sess-modify-unsupported");
+        let mut item = gate_item("ap-1");
+        item.supports_modify = false;
+        state.pending_cowork.push(item);
+
+        press(
+            KeyCode::Char('m'),
+            KeyModifiers::empty(),
+            &mut state,
+            &mut client,
+        )
+        .await;
+        assert!(
+            !state.cowork_modify_mode,
+            "no modify mode for supports_modify:false"
+        );
+        assert!(panel_text(&state).contains("modify not supported"));
+    }
+
+    #[tokio::test]
+    async fn modify_submit_refuses_placeholders_and_non_json() {
+        let (_dir, mut client) = dummy_client("cowork-modify-refuse").await;
+        let mut state = make_state("sess-modify-refuse");
+        state.pending_cowork.push(gate_item("ap-1"));
+        state.cowork_modify_mode = true;
+
+        // A redacted display placeholder would destroy the real args.
+        state.cowork_modify_input = r#"{"cmd":"run","token":"[redacted]"}"#.into();
+        press(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+            &mut state,
+            &mut client,
+        )
+        .await;
+        assert!(state.cowork_modify_mode, "refusal keeps the editor open");
+        assert!(panel_text(&state).contains("modify refused"));
+        assert_eq!(state.pending_cowork.len(), 1, "no RPC, item stays");
+
+        // Same for the daemon's truncation marker.
+        state.cowork_modify_input = r#"{"cmd":"lo…[truncated]"#.to_owned();
+        press(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+            &mut state,
+            &mut client,
+        )
+        .await;
+        assert!(state.cowork_modify_mode);
+        assert!(panel_text(&state).contains("placeholder"));
+
+        // A non-JSON-object instruction is refused too.
+        state.cowork_modify_input = "just run it".to_owned();
+        press(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+            &mut state,
+            &mut client,
+        )
+        .await;
+        assert!(state.cowork_modify_mode);
+        assert!(panel_text(&state).contains("must be a JSON object"));
+        assert_eq!(state.pending_cowork.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn modify_submit_sends_json_object_instruction() {
+        let (_dir, mut client, rx) = respondent_client(
+            "cowork-modify-send",
+            serde_json::json!({"id": "ap-1", "resolved": true}),
+        )
+        .await;
+        let mut state = make_state("sess-modify-send");
+        state.pending_cowork.push(gate_item("ap-1"));
+
+        press(
+            KeyCode::Char('m'),
+            KeyModifiers::empty(),
+            &mut state,
+            &mut client,
+        )
+        .await;
+        press(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+            &mut state,
+            &mut client,
+        )
+        .await;
+
+        let req = rx.await.unwrap();
+        assert_eq!(req["method"].as_str(), Some("cowork.modify"));
+        assert_eq!(
+            req["params"]["instruction"].as_str(),
+            Some(r#"{"cmd":"ls -la"}"#),
+            "the (edited) args JSON goes as the instruction"
+        );
+        assert!(state.pending_cowork.is_empty(), "resolved item removed");
+        assert!(!state.cowork_modify_mode);
+    }
 }

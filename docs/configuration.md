@@ -92,6 +92,54 @@ Reads always pass. Read-only roles and high-risk `iac` mutations override the
 mode (always read-only / always-confirm respectively). Disable the claude
 PreToolUse approval hook with `SMEDJA_TOOL_GATE=off`.
 
+### `[[permission.rules]]`
+
+Declarative per-tool rules in `.smedja/workspace.toml` that decide a gated call
+without prompting:
+
+```toml
+[[permission.rules]]
+tool = "bash"
+command_pattern = "cargo test*"
+mode = "allow"
+
+[[permission.rules]]
+tool = "write_*"
+mode = "ask"
+```
+
+| Field | Meaning |
+|-------|---------|
+| `tool` | Tool name or glob pattern (e.g. `"bash"`, `"write_*"`) |
+| `path_glob` | Glob matched against the `path` field of file-tool inputs |
+| `command_pattern` | Matched against the `command` field of bash inputs. **Exact by default** (`cmd == pattern`); a trailing `*` opts into prefix semantics (`"rm *"` covers `rm -rf …`). Exact-by-default keeps an allow-always on `git status` from also covering `git status && rm -rf ~` |
+| `mode` | `ask` (prompt), `allow` (pass silently), or `deny` (block outright) |
+
+Rules are honoured on **every** gated path — the native tool loop, the claude
+PreToolUse hook, the ACP bridge, and `@shell` fragments — whichever runner
+drives the turn. Approving a prompt with `a` (allow always) appends an `allow`
+rule here, so the decision sticks across sessions and backends.
+
+### kimi ungated prompt mode
+
+`SMEDJA_KIMI_ACP=off` reverts the kimi CLI path from gated ACP to one-shot
+`kimi -p` prompt mode, where kimi self-approves its own tool calls. Because
+that bypasses the smedja gate entirely, the spawn now also requires an explicit
+`SMEDJA_KIMI_UNGATED=1` acknowledgment; without it the daemon refuses to spawn
+and names the missing variable. Each acknowledged spawn logs a warning.
+
+### Reasoning effort
+
+`/effort <low|medium|high>` in the TUI (or the `session.set_effort` RPC) pins a
+per-session reasoning-effort level, held in memory by the daemon for the
+session's lifetime and kept across `/switch`. Each adapter maps the level to
+its own mechanism: codex gets `-c model_reasoning_effort=<level>`, claude gets
+a `MAX_THINKING_TOKENS` budget (2048/8192/32768), ACP agents get a best-effort
+`session/set_config_option`, and OpenAI-compatible providers get
+`reasoning_effort`. Backends without a knob ignore the pin. `/effort default`
+(or `"default"` via RPC) clears it. There is no env-var equivalent; model pins
+remain `SMEDJA_MODEL_<RUNNER>_<TIER>`.
+
 ---
 
 ## `.smedja/loop.json`
@@ -260,6 +308,8 @@ Sandbox read defaults: `/usr /bin /sbin /lib /lib64 /etc /opt` (plus `/System /L
 ## `~/.config/smedja/config.toml` — user config
 
 The user-level config is read on every TUI startup from `~/.config/smedja/config.toml`.  All sections are optional; missing keys fall back to built-in defaults.
+
+A sibling file, `~/.config/smedja/secrets.env`, holds API keys pasted via the TUI `/login` flow (`KEY=VALUE` lines, mode 0600). The daemon keeps these in an **in-process store** (not the process environment) that provider detection consults via `secret_var()`: a real, non-empty environment variable always wins over the file value. The file is loaded at daemon startup **and re-loaded on every `provider.rescan`** (which the TUI triggers after each `/login` save), so keys take effect without a daemon restart; re-loading replaces the store wholesale, so keys deleted from the file are revoked. Only allowlisted names (`*_API_KEY`, `*_TOKEN`, plus the `MOONSHOT_BASE_URL`/`OPENCODE_BASE_URL` overrides) are accepted.
 
 ---
 

@@ -8,7 +8,7 @@ mod types;
 
 pub use detection::build_provider_pool;
 pub use pool::{tier_compatible, ProviderPool};
-pub use types::{model_default, LocalControl, ProviderEntry};
+pub use types::{model_default, LocalControl, ProviderEntry, SharedProviderPool};
 
 #[cfg(test)]
 pub(crate) use detection::{

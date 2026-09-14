@@ -10,6 +10,7 @@ repository.workspace = true
 anyhow              = { workspace = true }
 serde_json          = { workspace = true }
 smedja-agent-events = { path = "../../../crates/smedja-agent-events" }
-tokio               = { workspace = true, features = ["net", "io-util", "sync"] }
+smedja-rpc          = { path = "../../../crates/smedja-rpc" }
+tokio               = { workspace = true, features = ["net", "io-util", "sync", "macros", "rt"] }
 tracing             = { workspace = true }
 uuid                = { workspace = true, features = ["v4"] }

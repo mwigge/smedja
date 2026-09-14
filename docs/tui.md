@@ -71,10 +71,12 @@ Type a `/` in the input bar to open the autocomplete popup. Commands are filtere
 |---------|-------------|
 | `/model` | List available models with GPU fit annotations (local runner) or runner's model list |
 | `/model <name>` | Hot-swap to the named model; local runner: calls `local.swap`, not a relabel |
-| `/switch` | Open an interactive runner picker |
-| `/switch <runner>` | Switch to the named runner immediately |
+| `/switch` | Open an interactive runner picker (one entry per runner) |
+| `/switch <runner>` | Switch to the named runner immediately. Any pinned session model is cleared — a notice tells you and names the new runner's default model |
 | `/takeover <runner>` | Fork the current session to a new runner (keeps history) |
 | `/tier <t>` | Set the routing tier: `local`, `fast`, or `deep`. Resolves the runner's model for that tier and pins it as the session model; the last runner + tier persist across restarts |
+| `/effort` | Show the session's reasoning-effort pin and the valid levels |
+| `/effort <level>` | Pin reasoning effort for the session: `low`, `medium`, or `high`. `default` clears the pin (provider chooses). Survives `/switch`; each runner maps the level to its own mechanism where it has one |
 | `/login` | Authenticate with the current runner (OAuth / API key flow) |
 
 ### Loop Engine
@@ -92,11 +94,12 @@ Type a `/` in the input bar to open the autocomplete popup. Commands are filtere
 |---------|-------------|
 | `/agent` | List roles |
 | `/agent <role>` | Set the active role: `code`/`impl`, `plan`, `research`, `debug`, `ask`, `review`, `test`, `sre`, `data`, `iac`, `orchestrator`. Each routes to a default `(client, tier)` and auto-loads `.smedja/roles/<role>.md` |
+| `/cowork` | List pending approvals for the session |
 | `/cowork on\|off\|status` | Toggle / inspect cowork approval mode |
 | `/approve` | List pending approvals |
-| `/approve <id>` | Approve a pending approval (or use the inline `y`/`n`/`m` widget) |
+| `/approve <id>` | Approve a pending approval (or use the inline `y`/`n`/`m`/`a` widget) |
 
-**Approval** — mutating tool calls gate by default (ask-on-mutation) for every client. A pending approval shows an inline widget: `y` approve, `n` deny, `m` modify. Reads always pass; read-only roles can never mutate; `iac` always confirms.
+**Approval** — mutating tool calls gate by default (ask-on-mutation) for every client. A pending approval shows an overlay widget: `y` approve, `n` deny, `m` modify, `a` approve always (persists a `[[permission.rules]]` allow rule — see Cowork Mode below). Reads always pass; read-only roles can never mutate; `iac` always confirms.
 
 **Permission mode** — cycle with **Shift-Tab**: `ask → accept_edits → plan → auto`.
 
@@ -138,6 +141,7 @@ IDs auto-increment within their kind (WI-001, WI-002…; RFC-001…; ADR-001…)
 | Command | Description |
 |---------|-------------|
 | `/help` | Show the full help text (commands + keybindings) |
+| `/capabilities` | List provider capabilities per runner (thinking, subprocess, model) |
 | `/health` | Check daemon connectivity (calls `session.list`) |
 | `/metrics` | Show token usage and cost rollup by runner |
 | `/quota` | Show daily token usage vs. `SMEDJA_DAILY_TOKEN_LIMIT` |
@@ -320,12 +324,17 @@ The status bar is TOML-configurable. Format: Starship-compatible module format.
 
 Enable with `/cowork on` (or `smj session start --cowork`). While active, every tool call from the agent pauses for approval before execution.
 
-Approval prompts appear in the main panel as text lines. Press:
+Approval prompts appear as a centred overlay whose height adapts to its content. The body shows the agent's reasoning (derived as `run: <cmd>` / `<tool>: <path>` when the agent supplies none), a meta line with `agent:` / `cwd:` / `risk:` when the daemon carries them, and — for exec-class tools — the command on its own `$ <command>` lines with the full args below. Secret-looking values in the displayed args are redacted (`[redacted]`); execution still uses the raw args. Press:
+
 - `y` — approve and execute the tool call
 - `n` — deny (the reason is fed back to the agent as a tool error)
-- `m` — enter modify mode and rewrite the arguments before execution
+- `m` — enter modify mode and rewrite the arguments before execution. **Breaking change:** the modify instruction is no longer free-form text — it must be a JSON object of *replacement args* that replaces the tool input (the input is pre-filled with the current args JSON for editing; values still showing the daemon's `[redacted]` / `…[truncated]` display placeholders are refused). Backends with no modify channel (wire `supports_modify: false`, e.g. the ACP adapter, `@shell` fragments) hide the `m` affordance and reject the request with an explicit "not supported" error
+- `a` — approve always: approves now and persists a `[[permission.rules]]` allow rule in `.smedja/workspace.toml`, honoured on every runner's gated path from then on
+- `Esc` — dismiss the prompt (deny-by-dismissal: the denial is sent to the daemon via `cowork.resolve`, and the item leaves the queue even if the gate is already gone)
 
-Each decision is recorded in `smedja-ingot` as an audit event.
+Decisions are session-agnostic: `y`/`n`/`a`/`Esc` all call `cowork.resolve` with just the approval id, and the daemon scans every registered gate — a prompt that arrived from another session's turn is answered the same way.
+
+An unanswered prompt times out and is denied; the denial is announced as a stream notice. Each decision is recorded in `smedja-ingot` as an audit event.
 
 ---
 

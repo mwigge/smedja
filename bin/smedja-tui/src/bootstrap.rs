@@ -230,6 +230,34 @@ pub(crate) async fn bootstrap() -> Result<Session> {
         "type a message or /help for commands",
     );
 
+    // First-run onboarding: an empty provider pool means every turn will fail,
+    // so say so up front instead of presenting a working-looking TUI.
+    if let Ok(list) = client.call("runner.list", json!({})).await {
+        if slash::runner_names(&list).is_empty() {
+            let probed = slash::PROBED_CLIS
+                .iter()
+                .map(|name| {
+                    if slash::probe_cli(name) {
+                        format!("{name} \u{2713}")
+                    } else {
+                        format!("{name} \u{2717}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("  ");
+            crate::push_chrome_line(&mut state.main_panel, String::new());
+            crate::push_chrome_line(
+                &mut state.main_panel,
+                "\u{26a0} no providers detected — the daemon's pool is empty, so turns will fail",
+            );
+            crate::push_chrome_line(&mut state.main_panel, format!("probed CLIs: {probed}"));
+            crate::push_chrome_line(
+                &mut state.main_panel,
+                "run /login to configure a provider (e.g. /login anthropic, /login openai, /login kimi)",
+            );
+        }
+    }
+
     // On resume, optionally rewind to --turn and replay history into the view
     // before the event loop starts. Done before terminal setup so a transport
     // failure surfaces as a normal panel line rather than mid-frame.

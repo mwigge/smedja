@@ -3,15 +3,30 @@
 use std::collections::HashMap;
 
 use smedja_adapter::{
-    AcpProvider, AnthropicProvider, BergetProvider, ClaudeCliProvider, CodexCliProvider,
-    CopilotProvider, GeminiProvider, KimiCliProvider, KimiProvider, LocalProvider, MinimaxProvider,
-    OpenAiProvider, PoolCliProvider, SubprocessProvider, GEMINI_ACP,
+    openai_compat::{BERGET, KIMI, MINIMAX, OPENCODE},
+    AcpProvider, AnthropicProvider, ClaudeCliProvider, CodexCliProvider, CopilotProvider,
+    GeminiProvider, KimiCliProvider, LocalProvider, OpenAiCompatProvider, OpenAiProvider,
+    PoolCliProvider, SubprocessProvider, GEMINI_ACP,
 };
 use smedja_assayer::{Runner, Tier};
 use tracing::{error, info, warn};
 
 use super::pool::ProviderPool;
 use super::types::{model_default, LocalControl, ProviderEntry};
+
+/// Builds an OpenAI-compatible provider for `spec`, honouring the vendor's
+/// `<VENDOR>_BASE_URL` override from the secrets store (env first) exactly as
+/// the adapter's own `detect` does.
+fn build_compat(
+    spec: smedja_adapter::openai_compat::OpenAiCompatSpec,
+    base_url_var: &str,
+    key: &str,
+) -> OpenAiCompatProvider {
+    match crate::secret_var(base_url_var) {
+        Some(base_url) => OpenAiCompatProvider::with_base_url(spec, base_url, key.to_owned()),
+        None => OpenAiCompatProvider::new(spec, key.to_owned()),
+    }
+}
 
 /// Returns the preferred runner name for Claude given availability.
 /// Native API wins over subprocess binary — API key users get native HTTP
@@ -113,7 +128,7 @@ pub async fn build_provider_pool() -> ProviderPool {
 
     // 1. Claude — native API preferred; CLI binary is the fallback for
     //    subscription users without an ANTHROPIC_API_KEY.
-    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").ok();
+    let anthropic_key = crate::secret_var("ANTHROPIC_API_KEY");
     if let Some(key) = anthropic_key {
         let p_fast = AnthropicProvider::new(key.clone());
         let p_deep = AnthropicProvider::new(key);
@@ -168,7 +183,7 @@ pub async fn build_provider_pool() -> ProviderPool {
     }
 
     // 2. Codex/OpenAI — native API preferred; CLI binary is the fallback.
-    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+    if let Some(key) = crate::secret_var("OPENAI_API_KEY") {
         let p = OpenAiProvider::new("https://api.openai.com", key.clone());
         add!(Runner::Codex, Tier::Fast, p, "openai", "gpt-5.5");
         // Deep tier uses the same latest model by default; override with
@@ -201,18 +216,20 @@ pub async fn build_provider_pool() -> ProviderPool {
 
     // 3. Kimi (Moonshot) — native API preferred; the kimi CLI binary is the
     //    fallback for Kimi Code subscription users (device-code OAuth) without
-    //    a MOONSHOT_API_KEY.
-    if let Some(p_fast) = KimiProvider::detect() {
+    //    a MOONSHOT_API_KEY. Keys come from the secrets store (env first), with
+    //    the same MOONSHOT_BASE_URL override the adapter's detect honoured.
+    let kimi_key =
+        crate::secret_var("MOONSHOT_API_KEY").or_else(|| crate::secret_var("KIMI_API_KEY"));
+    if let Some(key) = kimi_key {
+        let build = || build_compat(KIMI, "MOONSHOT_BASE_URL", &key);
         add!(
             Runner::Kimi,
             Tier::Fast,
-            p_fast,
+            build(),
             "moonshot",
             "kimi-k2.7-code-highspeed"
         );
-        if let Some(p_deep) = KimiProvider::detect() {
-            add!(Runner::Kimi, Tier::Deep, p_deep, "moonshot", "kimi-k3");
-        }
+        add!(Runner::Kimi, Tier::Deep, build(), "moonshot", "kimi-k3");
         info!(runner = "moonshot", "provider ready");
     } else if SubprocessProvider::available("kimi") {
         // Same detect TOCTOU as the claude branch: skip on `None`, never panic.
@@ -243,37 +260,44 @@ pub async fn build_provider_pool() -> ProviderPool {
 
     // 4. Gemini — native API preferred; the gemini CLI binary is the fallback,
     //    driven over ACP so its tool calls are gated like kimi's.
-    if std::env::var("GEMINI_API_KEY").is_ok() {
-        if let (Ok(p_fast), Ok(p_deep)) = (GeminiProvider::from_env(), GeminiProvider::from_env()) {
+    if let Some(key) = crate::secret_var("GEMINI_API_KEY") {
+        add!(
+            Runner::Gemini,
+            Tier::Fast,
+            GeminiProvider::new(key.clone()),
+            "google",
+            "gemini-2.5-flash"
+        );
+        add!(
+            Runner::Gemini,
+            Tier::Deep,
+            GeminiProvider::new(key),
+            "google",
+            "gemini-2.5-pro"
+        );
+        info!(runner = "google", "provider ready");
+    } else if SubprocessProvider::available("gemini") {
+        // Same detect TOCTOU as the claude branch: skip on `None`, never panic.
+        if let Some(p_fast) = AcpProvider::detect(GEMINI_ACP) {
+            // Real model ids (matching the native `google` branch above) so
+            // /tier and runner.list report the actual default; ACP model
+            // selection is best-effort — an unadvertised id falls back to the
+            // agent's own default (see acp_client::handshake).
             add!(
                 Runner::Gemini,
                 Tier::Fast,
                 p_fast,
-                "google",
+                "gemini-cli",
                 "gemini-2.5-flash"
             );
-            add!(
-                Runner::Gemini,
-                Tier::Deep,
-                p_deep,
-                "google",
-                "gemini-2.5-pro"
-            );
-            info!(runner = "google", "provider ready");
-        } else {
-            warn!(
-                runner = "google",
-                "UNAVAILABLE — GEMINI_API_KEY vanished mid-probe"
-            );
-        }
-    } else if SubprocessProvider::available("gemini") {
-        // Same detect TOCTOU as the claude branch: skip on `None`, never panic.
-        if let Some(p_fast) = AcpProvider::detect(GEMINI_ACP) {
-            // Empty model literals: gemini's ACP mode uses the agent's own
-            // configured default model; pins go via SMEDJA_MODEL_GEMINI_<TIER>.
-            add!(Runner::Gemini, Tier::Fast, p_fast, "gemini-cli", "");
             if let Some(p_deep) = AcpProvider::detect(GEMINI_ACP) {
-                add!(Runner::Gemini, Tier::Deep, p_deep, "gemini-cli", "");
+                add!(
+                    Runner::Gemini,
+                    Tier::Deep,
+                    p_deep,
+                    "gemini-cli",
+                    "gemini-2.5-pro"
+                );
             }
             info!(runner = "gemini-cli", "provider ready");
         } else {
@@ -289,8 +313,16 @@ pub async fn build_provider_pool() -> ProviderPool {
         );
     }
 
-    // 5. Copilot
-    if let Some(p) = CopilotProvider::detect() {
+    // 5. Copilot — the `gh` CLI path reads no key; the HTTP fallback takes
+    //    GITHUB_TOKEN from the secrets store (env first).
+    let copilot = if which::which("gh").is_ok() {
+        CopilotProvider::detect()
+    } else {
+        crate::secret_var("GITHUB_TOKEN").map(|key| {
+            CopilotProvider::Api(OpenAiProvider::new("https://api.githubcopilot.com", key))
+        })
+    };
+    if let Some(p) = copilot {
         add!(Runner::Copilot, Tier::Fast, p, "copilot", "gpt-5.5");
         info!(runner = "copilot", "provider ready");
     }
@@ -303,17 +335,45 @@ pub async fn build_provider_pool() -> ProviderPool {
 
     // 8. Minimax — keyed under its own runner so it is routable by name and does
     //    not shadow a local endpoint sharing the (Local, _) key space.
-    if let Some(p) = MinimaxProvider::detect() {
-        add!(Runner::Minimax, Tier::Fast, p, "minimax", "MiniMax-M2");
+    if let Some(key) = crate::secret_var("MINIMAX_API_KEY") {
+        add!(
+            Runner::Minimax,
+            Tier::Fast,
+            OpenAiCompatProvider::new(MINIMAX, key),
+            "minimax",
+            "MiniMax-M2"
+        );
         info!(runner = "minimax", "provider ready");
+    }
+
+    // 8b. OpenCode Zen — OpenAI-compatible gateway (OPENCODE_API_KEY). Defaults
+    //     use Zen's chat-completions model ids; both tiers are overridable via
+    //     SMEDJA_MODEL_OPENCODE_<TIER>. OPENCODE_BASE_URL overrides the endpoint.
+    if let Some(key) = crate::secret_var("OPENCODE_API_KEY") {
+        let build = || build_compat(OPENCODE, "OPENCODE_BASE_URL", &key);
+        add!(
+            Runner::OpenCode,
+            Tier::Fast,
+            build(),
+            "opencode",
+            "kimi-k2.7-code"
+        );
+        add!(Runner::OpenCode, Tier::Deep, build(), "opencode", "kimi-k3");
+        info!(runner = "opencode", "provider ready");
     }
 
     // 9. Berget — keyed under Runner::Berget. Registering it under Runner::Local
     //    collided with the local rs-llmctl endpoint at (Local, Local): whichever
     //    probed second overwrote the other, so a healthy local endpoint made
     //    Berget dead config. Its own runner key lets both coexist.
-    if let Some(p) = BergetProvider::detect() {
-        add!(Runner::Berget, Tier::Local, p, "berget", "gpt-4o-mini");
+    if let Some(key) = crate::secret_var("BERGET_API_KEY") {
+        add!(
+            Runner::Berget,
+            Tier::Local,
+            OpenAiCompatProvider::new(BERGET, key),
+            "berget",
+            "gpt-4o-mini"
+        );
         info!(runner = "berget", "provider ready");
     }
 

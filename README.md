@@ -675,7 +675,8 @@ Fragments are expanded into your message before the turn runs:
 | `SMEDJA_MODEL_<RUNNER>_<TIER>` | *(built-in default)* | Pin a tier's model so new releases need no rebuild — e.g. `SMEDJA_MODEL_CLAUDE_DEEP=claude-opus-5`, `SMEDJA_MODEL_CODEX_FAST=gpt-6`, `SMEDJA_MODEL_MOONSHOT_DEEP=kimi-k3`. `<RUNNER>` is the registered runner name: use `CLAUDE`/`CODEX`/`KIMI` for the CLI paths, `ANTHROPIC`/`OPENAI`/`MOONSHOT` for the native API paths, `GOOGLE` for the Gemini API path, `GEMINI` for the `gemini-cli` path, `COPILOT`/`MINIMAX`/`BERGET`/`POOL`/`LOCAL`; `<TIER>` ∈ `FAST`/`DEEP`/`LOCAL` |
 | `MINIMAX_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `MOONSHOT_API_KEY` / `GEMINI_API_KEY` / `GITHUB_TOKEN` / `BERGET_API_KEY` | *(unset)* | Provider keys (in `~/.config/smedja/secrets.env`) — enable the minimax/openai/anthropic-API/moonshot(kimi)/google(gemini)/copilot/berget runners when their CLI isn't installed |
 | `MOONSHOT_BASE_URL` | `https://api.moonshot.ai` | Kimi API endpoint override (API root, without trailing `/v1`) — set `https://api.moonshot.cn` for a mainland-China platform key |
-| `SMEDJA_KIMI_ACP` | `on` | Set to `off` to revert the kimi CLI path from gated ACP to one-shot `kimi -p` prompt mode (kimi then self-approves its own tool calls) |
+| `SMEDJA_KIMI_ACP` | `on` | Set to `off` to revert the kimi CLI path from gated ACP to one-shot `kimi -p` prompt mode (kimi then self-approves its own tool calls) — requires `SMEDJA_KIMI_UNGATED=1` as an explicit acknowledgment |
+| `SMEDJA_KIMI_UNGATED` | *(unset)* | Set to `1` to acknowledge that `SMEDJA_KIMI_ACP=off` bypasses all tool approvals; without it the prompt-mode spawn is refused |
 | `SMEDJA_DAILY_TOKEN_LIMIT` | *(unset — no limit)* | Daily token budget; shown in the `/quota` panel as a usage bar |
 | `SMEDJA_SANDBOX_MODE` | `auto` | Sandbox fallback: `auto \| required \| off` |
 | `SMEDJA_SANDBOX_NETWORK` | `none` | Subprocess network policy: `none \| allowlist \| open` |

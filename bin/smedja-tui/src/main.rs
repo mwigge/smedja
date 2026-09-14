@@ -42,7 +42,7 @@ mod state;
 // them from (their defining module) and have been dropped.
 pub(crate) use clipboard::{emit_osc9, paste_from_clipboard, push_kill, yank_to_clipboard};
 pub(crate) use editor::open_in_editor;
-pub(crate) use events::{apply_stream_event, start_stream_reader};
+pub(crate) use events::{apply_inbound_event, start_stream_reader};
 pub(crate) use governance::{format_gov_list, gov_create, gov_transition, scan_gov_artifacts};
 pub(crate) use input::handle_key;
 pub(crate) use render::render;
@@ -75,7 +75,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Terminal;
 use serde_json::{json, Value};
-use smedja_bellows::StreamEvent;
+use smedja_bellows::{CoworkOutcome, StreamEvent};
 use smedja_rpc::client::Client;
 
 /// Returns the largest byte index `<= max` that lies on a UTF-8 char boundary of
@@ -186,8 +186,9 @@ const SLASH_COMMAND_DESCRIPTIONS: &[(&str, &str)] = &[
         "list provider capabilities (thinking, subprocess, model)",
     ),
     ("/clear", "clear message display"),
-    ("/cowork", "toggle cowork approval mode"),
+    ("/cowork", "toggle cowork approval mode / list pending"),
     ("/drawio", "generate draw.io diagram"),
+    ("/effort", "show or set reasoning effort"),
     ("/gov", "govctl artifacts"),
     ("/health", "check daemon connectivity"),
     ("/help", "show help"),
@@ -203,7 +204,7 @@ const SLASH_COMMAND_DESCRIPTIONS: &[(&str, &str)] = &[
     ("/quota", "show usage quota"),
     ("/resume", "resume a session"),
     ("/review", "send git diff for review"),
-    ("/session", "manage sessions"),
+    ("/session", "show current session info"),
     ("/skills", "list loaded skills"),
     ("/spec", "author/validate/archive OpenSpec changes"),
     ("/switch", "switch active session"),
@@ -223,6 +224,7 @@ const SLASH_COMPLETIONS: &[&str] = &[
     "/clear",
     "/cowork",
     "/drawio",
+    "/effort",
     "/gov",
     "/health",
     "/help",
@@ -255,9 +257,11 @@ slash commands:
   /agent [role]      — set the session role (impl|plan|research|debug|ask|review|test|sre|data|iac|orchestrator); omit to list runners
   /approve [id]      — approve a cowork item (omit id to list pending approvals)
   /briefing          — show session briefing
+  /capabilities      — list provider capabilities (thinking, subprocess, model)
   /clear             — clear message display (keeps session data)
-  /cowork on|off|status — toggle or query cowork approval mode
+  /cowork [on|off|status] — toggle or query cowork approval mode; bare lists pending approvals
   /drawio <slug>     — generate draw.io diagram
+  /effort [level]    — show or set reasoning effort (low|medium|high; 'default' clears)
   /gov [list|show <id>|create work-item|rfc|adr <title>|transition <id> <status>] — govctl artifacts
   /health            — check daemon connectivity
   /help              — show this message
@@ -275,6 +279,7 @@ slash commands:
   /quota             — show usage quota
   /resume [id [turn]] — resume a session (omit id for interactive picker; turn rewinds)
   /review            — send git diff for review
+  /session           — show current session info (runner, model, tier, mode, tokens)
   /spec [list|status [name]|new <name>|validate <name>|show <name>|diff <name>|archive <name>]
   /skills [add <dir>] — list skills (~/.claude/skills + .smedja/skills) or add a directory
   /switch [runner]   — switch AI runner (omit for interactive picker)
@@ -847,7 +852,7 @@ fn runner_is_subprocess(runner: &str) -> bool {
 ///
 /// Each row shows runner name, tier, model, and derived capability flags
 /// (thinking support, subprocess mode).
-fn format_capabilities_table(runners: &[serde_json::Value]) -> String {
+pub(crate) fn format_capabilities_table(runners: &[serde_json::Value]) -> String {
     if runners.is_empty() {
         return "no runners available".to_owned();
     }

@@ -43,7 +43,7 @@ use crate::render::render_cell;
 use crate::split::{SplitDirection, SplitLayout};
 use crate::status::{build_window_title, status_bar_height_for_font, tier_badge_text};
 use crate::tab::TabBar;
-use st_agent::{SharedAgentManager, SharedPaneState};
+use st_agent::{AgentChunk, ApprovalDecision, SharedAgentManager, SharedPaneState};
 
 // ── User events (sent from async tasks to the event loop) ────────────────────
 
@@ -289,8 +289,122 @@ impl App {
         self.launch_menu_open = false;
     }
 
-    // ── Modifier helpers ──────────────────────────────────────────────────────
+    // ── Cowork approval ───────────────────────────────────────────────────────
 
+    /// Answers a pending cowork approval prompt (y/n key binding). Returns
+    /// `true` when a prompt was actually pending and resolved, so the caller
+    /// swallows the keystroke instead of forwarding it to the PTY.
+    ///
+    /// The decision goes to smdjad as a `cowork.resolve` request (with an id,
+    /// so the reply's `resolved` flag is read back) on a short-lived RPC
+    /// connection from a helper thread — the winit event loop has no tokio
+    /// runtime of its own. A `resolved: false` reply means the gate is already
+    /// gone (answered elsewhere or timed out): the local item stays dropped
+    /// and a note is pushed instead of re-pending a dead prompt. Only a
+    /// transport failure re-pends — and only while the turn is still running
+    /// (a turn that already ended took its gate with it), so the UI never
+    /// shows a bare `[approved]` for a decision that never arrived.
+    fn resolve_pending_approval(&mut self, approved: bool) -> bool {
+        let (block_id, approval_id) = {
+            let mut mgr = self
+                .agent_manager
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some((block_id, approval_id)) = mgr.resolve_pending_approval(approved) else {
+                return false;
+            };
+            let label = if approved { "approved" } else { "denied" };
+            mgr.session_mut(&block_id, "").push_chunk(&AgentChunk {
+                block_id: block_id.clone(),
+                text: format!("[{label}]"),
+                done: false,
+                approval_required: false,
+                approval_id: None,
+            });
+            (block_id, approval_id)
+        };
+        let decision = if approved {
+            ApprovalDecision::Approve
+        } else {
+            ApprovalDecision::Deny
+        };
+        let manager = self.agent_manager.clone();
+        std::thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("failed to build runtime: {e}"))
+                .and_then(|rt| {
+                    rt.block_on(st_agent::SmdjadClient::send_approval(
+                        &approval_id,
+                        decision,
+                    ))
+                    .map_err(|e| e.to_string())
+                });
+            match result {
+                Ok(true) => {}
+                Ok(false) => {
+                    // The daemon no longer holds the gate: it was resolved
+                    // elsewhere or timed out. Do NOT re-pend — the prompt is
+                    // dead and an answer can never land.
+                    let mut mgr = manager
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    mgr.session_mut_passive(&block_id, "")
+                        .push_chunk(&AgentChunk {
+                            block_id: block_id.clone(),
+                            text: "[gate already resolved elsewhere or timed out]".to_owned(),
+                            done: false,
+                            approval_required: false,
+                            approval_id: None,
+                        });
+                }
+                Err(e) => {
+                    error!("cowork.resolve send failed: {e}");
+                    let mut mgr = manager
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let session = mgr.session_mut_passive(&block_id, "");
+                    // Revert the optimistic resolution only when the gate can
+                    // still be live: the turn must still be streaming (a ended
+                    // turn's gate is gone) and the prompt must not have been
+                    // cleared concurrently (an ApprovalResolved notice).
+                    let repend = session.streaming
+                        && matches!(
+                            session.approval,
+                            st_agent::ApprovalState::Approved | st_agent::ApprovalState::Denied
+                        );
+                    if repend {
+                        session.approval = st_agent::ApprovalState::Pending;
+                        session.pending_approval_id = Some(approval_id.clone());
+                    }
+                    let note = if repend {
+                        format!(
+                            "[approval send failed: {e} — gate still pending, press y/n to retry]"
+                        )
+                    } else {
+                        format!("[approval send failed: {e} — gate already closed]")
+                    };
+                    session.push_chunk(&AgentChunk {
+                        block_id: block_id.clone(),
+                        text: note,
+                        done: false,
+                        approval_required: false,
+                        approval_id: None,
+                    });
+                }
+            }
+        });
+        if let Some(pty) = &self.pty {
+            pty.dirty.store(true, Ordering::Release);
+        }
+        true
+    }
+
+    // ── Modifier helpers ──────────────────────────────────────────────────────
     fn ctrl(&self) -> bool {
         self.modifiers.state().control_key()
     }

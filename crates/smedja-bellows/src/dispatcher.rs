@@ -9,6 +9,11 @@ use crate::event::TurnEvent;
 /// subscription is established.  The dispatcher is intentionally fire-and-forget:
 /// [`publish`](Dispatcher::publish) never returns an error even when there are
 /// no active receivers.
+///
+/// `Clone` shares the underlying broadcast channel: a clone publishes to (and
+/// subscribes from) the same event stream. The cowork gate stores a clone so a
+/// later resolution can be broadcast on the same channel the request went out on.
+#[derive(Clone)]
 pub struct Dispatcher {
     sender: broadcast::Sender<TurnEvent>,
 }
@@ -44,5 +49,12 @@ impl Dispatcher {
     #[allow(clippy::must_use_candidate)] // fire-and-forget: receiver count is advisory, callers routinely ignore it
     pub fn publish(&self, event: TurnEvent) -> usize {
         self.sender.send(event).unwrap_or(0)
+    }
+
+    /// Number of live subscribers. Tests poll this to wait until a background
+    /// forwarder has subscribed before publishing, instead of fixed sleeps.
+    #[must_use]
+    pub fn subscriber_count(&self) -> usize {
+        self.sender.receiver_count()
     }
 }

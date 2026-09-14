@@ -129,12 +129,12 @@ impl ApprovalGate {
         let args_pretty =
             serde_json::to_string_pretty(&self.args).unwrap_or_else(|_| self.args.to_string());
         vec![
-            format!("┌─ Approval required ─────────────────────────────"),
+            "┌─ Approval required ─────────────────────────────".to_string(),
             format!("│  Tool   : {}", self.tool_name),
             format!("│  Prompt : {}", self.prompt),
             format!("│  Args   : {args_pretty}"),
             format!("│  State  : {state_label}"),
-            format!("└─────────────────────────────────────────────────"),
+            "└─────────────────────────────────────────────────".to_string(),
         ]
     }
 }
@@ -154,6 +154,10 @@ pub struct AgentChunk {
     pub done: bool,
     /// Non-zero if the agent is requesting approval for a tool call.
     pub approval_required: bool,
+    /// Approval identifier from smdjad, set when `approval_required` is true;
+    /// echoed back via `SmdjadClient::send_approval`. `None` on pre-v4 wire
+    /// payloads — such prompts are informational only.
+    pub approval_id: Option<String>,
 }
 
 /// The approval state for an agent action.
@@ -180,6 +184,9 @@ pub struct AgentSession {
     pub lines: VecDeque<String>,
     /// Current approval state.
     pub approval: ApprovalState,
+    /// Approval id of the pending tool call, while `approval` is
+    /// [`ApprovalState::Pending`]. Cleared on resolution and on turn end.
+    pub pending_approval_id: Option<String>,
     /// True while the agent is still streaming.
     pub streaming: bool,
     /// Maximum lines to keep in memory (oldest are discarded).
@@ -201,6 +208,7 @@ impl AgentSession {
             model: model.into(),
             lines: VecDeque::new(),
             approval: ApprovalState::None,
+            pending_approval_id: None,
             streaming: true,
             max_lines: 1000,
             suppress_pty_output: false,
@@ -220,9 +228,16 @@ impl AgentSession {
         }
         if chunk.approval_required {
             self.approval = ApprovalState::Pending;
+            self.pending_approval_id.clone_from(&chunk.approval_id);
         }
         if chunk.done {
             self.streaming = false;
+            // The turn ended: any approval still pending was resolved or timed
+            // out at the gate, so stale prompts must stop intercepting keys.
+            if self.approval == ApprovalState::Pending {
+                self.approval = ApprovalState::None;
+                self.pending_approval_id = None;
+            }
             info!(block_id = %chunk.block_id, "agent block complete");
         }
     }
@@ -230,11 +245,13 @@ impl AgentSession {
     /// Approves the pending tool call.
     pub fn approve(&mut self) {
         self.approval = ApprovalState::Approved;
+        self.pending_approval_id = None;
     }
 
     /// Denies the pending tool call.
     pub fn deny(&mut self) {
         self.approval = ApprovalState::Denied;
+        self.pending_approval_id = None;
     }
 
     /// Returns the collected lines as a `Vec<String>`.
@@ -250,10 +267,17 @@ impl AgentSession {
 
 /// Multi-session manager.
 ///
-/// Keeps a map of active [`AgentSession`]s indexed by block ID.
+/// Keeps a map of active [`AgentSession`]s indexed by block ID. `active`
+/// tracks the session that most recently received content — the one whose
+/// output the user is looking at — so key interception can be scoped to its
+/// pending approval instead of an arbitrary (possibly another pane's) prompt:
+/// smdjad fans every event out to every pane, so this manager can hold
+/// sessions whose prompts belong elsewhere.
 #[derive(Debug, Default)]
 pub struct AgentManager {
     sessions: std::collections::HashMap<String, AgentSession>,
+    /// Block id of the session that most recently received a chunk.
+    active: Option<String>,
 }
 
 impl AgentManager {
@@ -264,8 +288,21 @@ impl AgentManager {
     }
 
     /// Returns a mutable reference to the session for `block_id`, creating it
-    /// if it does not exist.
+    /// if it does not exist. Marks it as the active session: content flowing
+    /// into a session is what makes it the one the user is watching.
     pub fn session_mut(&mut self, block_id: &str, model: &str) -> &mut AgentSession {
+        self.active = Some(block_id.to_owned());
+        self.sessions
+            .entry(block_id.to_owned())
+            .or_insert_with(|| AgentSession::new(block_id, model))
+    }
+
+    /// Like [`session_mut`](Self::session_mut) but does NOT mark the session
+    /// active. For chunks filed under a turn that belongs to another pane:
+    /// smdjad fans gate prompts out to every pane, and activating a foreign
+    /// turn's session here would hijack the y/n interception away from the
+    /// prompt actually rendered in this window.
+    pub fn session_mut_passive(&mut self, block_id: &str, model: &str) -> &mut AgentSession {
         self.sessions
             .entry(block_id.to_owned())
             .or_insert_with(|| AgentSession::new(block_id, model))
@@ -279,6 +316,9 @@ impl AgentManager {
 
     /// Removes and returns the session for `block_id`.
     pub fn remove(&mut self, block_id: &str) -> Option<AgentSession> {
+        if self.active.as_deref() == Some(block_id) {
+            self.active = None;
+        }
         self.sessions.remove(block_id)
     }
 
@@ -297,6 +337,50 @@ impl AgentManager {
     /// Returns an iterator over all active sessions.
     pub fn sessions(&self) -> impl Iterator<Item = &AgentSession> {
         self.sessions.values()
+    }
+
+    /// Resolves the pending approval of the *active* session — the one that
+    /// most recently received content, i.e. the prompt the user is looking
+    /// at. Marks it approved/denied and returns its `(block_id, approval_id)`
+    /// so the caller can echo the decision to smdjad. Returns `None` when the
+    /// active session has nothing pending, when its pending prompt carries no
+    /// id (a pre-v4 informational prompt, which cannot be answered), or when
+    /// only *other* sessions are pending — smdjad broadcasts every event to
+    /// every pane, so a first-pending scan in HashMap order could resolve a
+    /// prompt that belongs to another pane and that the user may not even see.
+    pub fn resolve_pending_approval(&mut self, approve: bool) -> Option<(String, String)> {
+        let active = self.active.clone()?;
+        let session = self.sessions.get_mut(&active)?;
+        if session.approval != ApprovalState::Pending {
+            return None;
+        }
+        let approval_id = session.pending_approval_id.clone()?;
+        if approve {
+            session.approve();
+        } else {
+            session.deny();
+        }
+        Some((session.block_id.clone(), approval_id))
+    }
+
+    /// Clears the pending approval carrying `approval_id`, whichever session
+    /// holds it — approvals are session-agnostic (the daemon resolves gates by
+    /// id across all sessions, e.g. when another client answered the prompt).
+    /// Returns the block id of the cleared session so the caller can append a
+    /// note to it.
+    pub fn clear_approval_by_id(&mut self, approval_id: &str) -> Option<String> {
+        let block_id = self
+            .sessions
+            .iter()
+            .find(|(_, s)| {
+                s.approval == ApprovalState::Pending
+                    && s.pending_approval_id.as_deref() == Some(approval_id)
+            })
+            .map(|(id, _)| id.clone())?;
+        let session = self.sessions.get_mut(&block_id)?;
+        session.approval = ApprovalState::None;
+        session.pending_approval_id = None;
+        Some(block_id)
     }
 }
 

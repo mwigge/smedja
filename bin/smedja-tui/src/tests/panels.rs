@@ -56,6 +56,11 @@ fn cowork_item(id: &str, tool: &str) -> cowork_widget::CoworkItem {
         step_n: 1,
         args_display: String::new(),
         reasoning: String::new(),
+        agent: None,
+        cwd: None,
+        risk: None,
+        supports_modify: true,
+        rows_cache: std::cell::RefCell::new(None),
     }
 }
 
@@ -88,7 +93,7 @@ fn apply_cowork_decision_approve_resolved_removes_and_confirms() {
         Ok(json!({ "id": "a", "resolved": true }));
     let item = cowork_item("a", "bash");
     let (remove, message) =
-        apply_cowork_decision(&result, "cowork.approve", "approved: bash", &item.tool);
+        apply_cowork_decision(&result, "cowork.resolve", "approved: bash", &item.tool);
     assert!(remove, "resolved:true must remove the item");
     assert_eq!(message, "approved: bash");
 }
@@ -99,7 +104,7 @@ fn apply_cowork_decision_unresolved_retains_and_reports_not_found() {
         Ok(json!({ "id": "a", "resolved": false }));
     let item = cowork_item("a", "bash");
     let (remove, message) =
-        apply_cowork_decision(&result, "cowork.approve", "approved: bash", &item.tool);
+        apply_cowork_decision(&result, "cowork.resolve", "approved: bash", &item.tool);
     assert!(!remove, "resolved:false must retain the item");
     assert_eq!(message, "item not found: bash");
 }
@@ -110,7 +115,7 @@ fn apply_cowork_decision_deny_resolved_removes_and_confirms() {
         Ok(json!({ "id": "a", "resolved": true }));
     let item = cowork_item("a", "edit_file");
     let (remove, message) =
-        apply_cowork_decision(&result, "cowork.deny", "denied: edit_file", &item.tool);
+        apply_cowork_decision(&result, "cowork.resolve", "denied: edit_file", &item.tool);
     assert!(remove, "resolved:true must remove the item");
     assert_eq!(message, "denied: edit_file");
 }
@@ -121,10 +126,10 @@ fn apply_cowork_decision_rpc_error_retains_and_reports_error() {
         Err(smedja_rpc::RpcError::new(-32603, "boom"));
     let item = cowork_item("a", "bash");
     let (remove, message) =
-        apply_cowork_decision(&result, "cowork.approve", "approved: bash", &item.tool);
+        apply_cowork_decision(&result, "cowork.resolve", "approved: bash", &item.tool);
     assert!(!remove, "rpc error must retain the item");
     assert!(
-        message.contains("cowork.approve error"),
+        message.contains("cowork.resolve error"),
         "error message must name the method; got: {message}"
     );
 }

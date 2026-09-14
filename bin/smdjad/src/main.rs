@@ -58,7 +58,7 @@ mod turn_wait;
 pub(crate) use turn_wait::{await_turn_terminal, run_turn};
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
 use smedja_adapter::types::Message as AdapterMessage;
 use smedja_assayer::Assayer;
@@ -104,6 +104,147 @@ pub(crate) fn missing_param(name: &str) -> RpcError {
     )
 }
 
+/// Parses `KEY=VALUE` lines from a `secrets.env` body, skipping blank lines,
+/// `#` comments, and malformed entries (no `=`, empty or non-shell-style key,
+/// empty value). Keys and values are trimmed of surrounding whitespace;
+/// surrounding quotes are NOT stripped (the TUI `/login` writer stores raw
+/// single-line values).
+fn parse_secrets_env(body: &str) -> Vec<(String, String)> {
+    body.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim();
+            let value = value.trim();
+            let mut chars = key.chars();
+            let valid_key = chars
+                .next()
+                .is_some_and(|c| c == '_' || c.is_ascii_uppercase())
+                && chars.all(|c| c == '_' || c.is_ascii_uppercase() || c.is_ascii_digit());
+            if valid_key && !value.is_empty() {
+                Some((key.to_owned(), value.to_owned()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Loads `~/.config/smedja/secrets.env` into the daemon's in-process secrets
+/// store (NOT the process environment — `set_var` would leak keys to every
+/// child process and freeze rotation).
+///
+/// The TUI `/login` flow writes pasted API keys to that file (mode 0600);
+/// under systemd the unit's `EnvironmentFile=` directive loads it, but a
+/// directly-run smdjad never saw those keys. Variables already present in the
+/// real environment win. Only allowlisted key names (`*_API_KEY`, `*_TOKEN`,
+/// and the base-URL overrides) are accepted — an arbitrary `secrets.env` must
+/// not be able to inject e.g. `LD_PRELOAD` into the daemon. Malformed lines
+/// are ignored, and only counts are logged — never values. Re-loading replaces
+/// the store wholesale, so keys removed from the file are revoked.
+pub(crate) fn load_secrets_env() {
+    let Some(home) = dirs_home() else {
+        return;
+    };
+    let path = home.join(".config").join("smedja").join("secrets.env");
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // The file is gone (deleted after /login, or never created): any
+            // previously loaded keys must be revoked, not kept stale.
+            clear_secrets_store();
+            return;
+        }
+        Err(e) => {
+            warn!(error = %e, path = %path.display(), "secrets.env unreadable; keeping previous keys");
+            return;
+        }
+    };
+    let (loaded, skipped) = apply_secrets_body(&body);
+    if loaded > 0 {
+        info!(loaded, path = %path.display(), "loaded provider keys from secrets.env");
+    }
+    if skipped > 0 {
+        warn!(
+            skipped,
+            path = %path.display(),
+            "secrets.env contained keys outside the allowlist; ignored"
+        );
+    }
+}
+
+/// Drops every stored secret (file deleted between loads revokes all keys).
+fn clear_secrets_store() {
+    SECRETS
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+}
+
+/// In-process store for secrets loaded from `secrets.env`, keyed by variable
+/// name. Real environment variables always win over the store (see
+/// [`secret_var`]); the store exists so a directly-run daemon sees `/login`
+/// keys without mutating the process environment.
+static SECRETS: LazyLock<RwLock<HashMap<String, String>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Resolves a provider secret: the real environment first (non-empty values
+/// only), then the in-process store populated from `secrets.env`.
+pub(crate) fn secret_var(key: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(key) {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    SECRETS
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(key)
+        .cloned()
+}
+
+/// Only these names may be loaded from `secrets.env`: provider API keys and
+/// tokens by suffix, plus the base-URL overrides `/login` writes.
+fn secret_key_allowed(key: &str) -> bool {
+    key.ends_with("_API_KEY")
+        || key.ends_with("_TOKEN")
+        || matches!(key, "MOONSHOT_BASE_URL" | "OPENCODE_BASE_URL")
+}
+
+/// Applies one `secrets.env` body to the store. Returns `(loaded, skipped)`,
+/// where `skipped` counts keys rejected by the allowlist. The store is
+/// replaced wholesale with the file's allowlisted keys, so a re-load both
+/// rotates changed values and revokes keys deleted from the file. Keys also
+/// present in the real environment are tracked but not stored — the
+/// environment wins at read time.
+fn apply_secrets_body(body: &str) -> (usize, usize) {
+    let mut loaded = 0usize;
+    let mut skipped = 0usize;
+    let mut file_keys = std::collections::HashSet::new();
+    let mut store = SECRETS.write().unwrap_or_else(PoisonError::into_inner);
+    for (key, value) in parse_secrets_env(body) {
+        if !secret_key_allowed(&key) {
+            skipped += 1;
+            continue;
+        }
+        file_keys.insert(key.clone());
+        // The real environment wins — but only a NON-EMPTY variable, mirroring
+        // `secret_var`'s read path; a present-but-empty var must not shadow the
+        // file's value.
+        if std::env::var(&key).is_ok_and(|v| !v.is_empty()) {
+            continue;
+        }
+        store.insert(key, value);
+        loaded += 1;
+    }
+    // Keys removed from the file since the last load are revoked.
+    store.retain(|k, _| file_keys.contains(k));
+    (loaded, skipped)
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)] // startup is one linear wiring sequence; the length is the subsystem fan-out, not complexity
 async fn main() -> anyhow::Result<()> {
@@ -124,6 +265,13 @@ async fn main() -> anyhow::Result<()> {
         .as_deref()
         .and_then(otel::build_logger_provider);
     init_tracing(logger_provider);
+
+    // Load API keys pasted via the TUI `/login` flow (~/.config/smedja/secrets.env)
+    // into the daemon's secrets store BEFORE the provider pool is built — the
+    // systemd unit does this via EnvironmentFile=, but a directly-run smdjad
+    // would otherwise never see those keys. Real environment variables win over
+    // file entries. Runs after tracing init so the load/skip counts are logged.
+    load_secrets_env();
 
     // Validate SMEDJA_COMPACT_THRESHOLD at startup — reject invalid values early.
     if let Ok(val) = std::env::var("SMEDJA_COMPACT_THRESHOLD") {
@@ -314,6 +462,9 @@ async fn main() -> anyhow::Result<()> {
     let gates: Arc<Mutex<HashMap<String, Arc<CoworkGate>>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // Build the provider pool and assayer once at startup; thread through Arc.
+    // The pool lives in a SharedProviderPool so `provider.rescan` can swap in a
+    // freshly probed pool at runtime without disturbing in-flight turns (each
+    // consumer works on an Arc snapshot taken when its operation starts).
     let pool = build_provider_pool().await;
     if pool.is_empty() {
         // Loud degraded state: the daemon stays up (so config can be fixed
@@ -322,8 +473,7 @@ async fn main() -> anyhow::Result<()> {
         error!("starting in a DEGRADED state: no LLM provider configured — turns will fail");
     }
     let startup_runner: Arc<str> = Arc::from(pool.default_runner_name());
-    let startup_model: Arc<str> = Arc::from(pool.default_model());
-    let pool = Arc::new(pool);
+    let pool = Arc::new(crate::provider_pool::SharedProviderPool::new(pool));
 
     // Load workspace-local routing overrides if .smedja/agents.toml exists.
     // Default to the absolute current directory (deterministic) rather than the
@@ -364,7 +514,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Surface models that will report $0.00 cost at startup so missing pricing
     // data is never a silent surprise.
-    pool.warn_missing_prices(&price_table);
+    pool.snapshot().warn_missing_prices(&price_table);
 
     let vault = Arc::new(Mutex::new(open_vault()));
 
@@ -479,7 +629,6 @@ async fn main() -> anyhow::Result<()> {
         &pool,
         &assayer,
         &startup_runner,
-        &startup_model,
         &price_table,
         &vault,
         &embedder,
@@ -520,6 +669,16 @@ async fn main() -> anyhow::Result<()> {
                     Ok(n) if n > 0 => info!(pruned = n, "pruned old terminated sessions"),
                     Ok(_) => {}
                     Err(e) => warn!(error = %e, "session prune failed"),
+                }
+                // Keep the in-memory effort override map in step with the ingot:
+                // pins for sessions pruned above (or otherwise gone) are dropped.
+                match ingot_for_vacuum.list_sessions().await {
+                    Ok(sessions) => {
+                        let valid: std::collections::HashSet<String> =
+                            sessions.into_iter().map(|s| s.id.to_string()).collect();
+                        crate::handlers::session::prune_effort_overrides(&valid);
+                    }
+                    Err(e) => warn!(error = %e, "effort override sweep failed"),
                 }
                 if let Err(e) = ingot_for_vacuum.vacuum().await {
                     warn!(error = %e, "database vacuum failed");

@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 
-use smedja_bellows::Dispatcher;
+use smedja_bellows::{Dispatcher, TurnEvent};
 
 use super::buffer::DeltaStore;
 use super::wire::turn_event_to_ndjson;
@@ -66,6 +66,7 @@ pub async fn serve(listener: UnixListener, store: DeltaStore, dispatcher: Arc<Di
     }
 }
 
+#[allow(clippy::too_many_lines)] // connection lifecycle: replay buffer, subscribe, forward, drain
 async fn handle_stream_connection(
     stream: UnixStream,
     store: DeltaStore,
@@ -95,14 +96,23 @@ async fn handle_stream_connection(
     // event if the turn completed before this connection was established. Capture
     // the buffer's age too: it bounds how long we wait for a trailing quality
     // snapshot on the replay path (see below).
-    let (buffered, buf_age): (VecDeque<String>, std::time::Duration) = {
+    let (buffered, session_buffered, buf_age): (
+        VecDeque<String>,
+        VecDeque<String>,
+        std::time::Duration,
+    ) = {
         let s = store.lock().await;
+        let session_lines = s
+            .get(super::buffer::SESSION_BUFFER_KEY)
+            .map(|b| b.lines.clone())
+            .unwrap_or_default();
         match s.get(&task_id) {
             Some(b) => (
                 b.lines.clone(),
+                session_lines,
                 tokio::time::Instant::now().saturating_duration_since(b.last_activity),
             ),
-            None => (VecDeque::new(), std::time::Duration::ZERO),
+            None => (VecDeque::new(), session_lines, std::time::Duration::ZERO),
         }
     };
 
@@ -123,6 +133,15 @@ async fn handle_stream_connection(
             saw_done = true;
         } else if event_line.contains(r#""type":"error""#) {
             saw_error = true;
+        }
+    }
+
+    // Replay session-scoped buffered lines (turn_id-less CoworkRequests from the
+    // claude hook / ACP bridge) after the turn's own buffer. They carry no
+    // terminal events, so they don't affect the done/quality bookkeeping above.
+    for event_line in &session_buffered {
+        if write_line(&mut writer, event_line).await.is_err() {
+            return;
         }
     }
 
@@ -186,12 +205,24 @@ async fn handle_stream_connection(
 
         let (event_turn_id, ndjson_line, is_terminal) = turn_event_to_ndjson(&event, &task_id);
 
+        // Session-scoped CoworkRequests (turn_id None — the claude hook and
+        // industry-ACP bridge raise approvals outside any turn) are forwarded to
+        // every stream: they carry an approval_id, and the TUI keys its pending
+        // overlay off approval ids, not turns. CoworkResolved is likewise
+        // session-scoped (never carries a turn_id) and must reach every stream
+        // so all clients retire the pending prompt. All other turn_id-less
+        // non-terminal events are still dropped.
+        let session_cowork = matches!(
+            &event,
+            TurnEvent::CoworkRequest { turn_id: None, .. } | TurnEvent::CoworkResolved { .. }
+        );
+
         // Skip events that belong to a different turn.
         if let Some(tid) = &event_turn_id {
             if tid != &task_id {
                 continue;
             }
-        } else if !is_terminal {
+        } else if !is_terminal && !session_cowork {
             continue;
         }
 
@@ -241,6 +272,41 @@ mod tests {
     use smedja_bellows::TurnEvent;
     use std::sync::Arc;
 
+    /// Polls until the dispatcher has at least `n` subscribers (the delta-buffer
+    /// forwarder plus any stream handlers). Replaces fixed "give the handler a
+    /// moment to subscribe" sleeps that flaked under CI load.
+    async fn wait_for_subscribers(dispatcher: &Dispatcher, n: usize) {
+        for _ in 0..250 {
+            if dispatcher.subscriber_count() >= n {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            dispatcher.subscriber_count() >= n,
+            "timed out waiting for {n} dispatcher subscribers"
+        );
+    }
+
+    /// Polls until `pred` holds on the delta store (e.g. a buffered turn key),
+    /// replacing fixed "let the forwarder catch up" sleeps.
+    async fn wait_for_store(
+        store: &crate::stream_server::DeltaStore,
+        pred: impl Fn(&std::collections::HashMap<String, crate::stream_server::TurnBuffer>) -> bool,
+        what: &str,
+    ) {
+        for _ in 0..250 {
+            let guard = store.lock().await;
+            if pred(&guard) {
+                return;
+            }
+            drop(guard);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let guard = store.lock().await;
+        assert!(pred(&guard), "timed out waiting for {what}");
+    }
+
     #[tokio::test]
     async fn second_client_can_replay_completed_turn_within_ttl() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -279,7 +345,7 @@ mod tests {
             turn_id: Some("t-replay".into()),
             correlation: CorrelationCtx::default(),
         });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        wait_for_store(&store, |m| m.contains_key("t-replay"), "buffered turn").await;
         assert!(
             store.lock().await.contains_key("t-replay"),
             "completed buffer must persist within TTL"
@@ -333,10 +399,60 @@ mod tests {
         );
     }
 
-    // Regression: the Tier-1 quality snapshot is published a beat *after* the
-    // turn's `done`. `done` is terminal, so before the grace window the stream
-    // closed on `done` and the trailing snapshot was lost — leaving the quality
-    // and value panels perpetually empty. A live connection must stay open long
+    // A `cowork_resolved` event is session-scoped (no turn_id) and must be
+    // forwarded live to every open stream so all clients retire the pending
+    // prompt, not just the one that raised the request.
+    #[tokio::test]
+    async fn live_stream_receives_cowork_resolved() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let dispatcher = Arc::new(Dispatcher::new(64));
+        let store = spawn_delta_buffer(&dispatcher);
+
+        let (mut client, server) = UnixStream::pair().expect("socketpair");
+        let store_c = Arc::clone(&store);
+        let dispatcher_c = Arc::clone(&dispatcher);
+        let handle = tokio::spawn(async move {
+            handle_stream_connection(server, store_c, dispatcher_c).await;
+        });
+        client
+            .write_all(b"{\"task_id\":\"t-cw\"}\n")
+            .await
+            .expect("write request");
+
+        // Wait until the handler has subscribed before events are published
+        // (buffer forwarder + stream handler = 2 subscribers).
+        wait_for_subscribers(&dispatcher, 2).await;
+        dispatcher.publish(TurnEvent::CoworkResolved {
+            approval_id: "appr-live".into(),
+            outcome: smedja_bellows::CoworkOutcome::Denied,
+        });
+        // Terminal event for the requested turn closes the stream.
+        dispatcher.publish(TurnEvent::Failed {
+            session_id: "sess".into(),
+            turn_id: "t-cw".into(),
+            reason: "done".into(),
+            correlation: CorrelationCtx::default(),
+        });
+
+        let mut out = String::new();
+        client
+            .read_to_string(&mut out)
+            .await
+            .expect("read response");
+        handle.await.expect("handler task");
+        assert!(
+            out.contains(
+                r#"{"type":"cowork_resolved","approval_id":"appr-live","outcome":"denied"}"#
+            ),
+            "stream must forward the cowork_resolved line; got: {out}"
+        );
+    }
+
+    // The quality snapshot is published asynchronously a beat after the turn's
+    // `done`. `done` is terminal, so before the grace window the stream closed
+    // on `done` and the trailing snapshot was lost — leaving the quality and
+    // value panels perpetually empty. A live connection must stay open long
     // enough to forward the snapshot that arrives after `done`.
     #[tokio::test]
     async fn live_stream_delivers_quality_snapshot_after_done() {
@@ -356,8 +472,9 @@ mod tests {
             .await
             .expect("write request");
 
-        // Give the handler a moment to subscribe before events are published.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Wait until the handler has subscribed before events are published
+        // (buffer forwarder + stream handler = 2 subscribers).
+        wait_for_subscribers(&dispatcher, 2).await;
         dispatcher.publish(TurnEvent::Completed {
             session_id: "sess".into(),
             turn_id: "t-live".into(),
@@ -393,6 +510,125 @@ mod tests {
         assert!(
             out.contains(r#""type":"quality""#),
             "must forward the quality snapshot published after done; got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_stream_forwards_session_scoped_cowork_request() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let dispatcher = Arc::new(Dispatcher::new(64));
+        let store = spawn_delta_buffer(&dispatcher);
+
+        let (mut client, server) = UnixStream::pair().expect("socketpair");
+        let store_c = Arc::clone(&store);
+        let dispatcher_c = Arc::clone(&dispatcher);
+        let handle = tokio::spawn(async move {
+            handle_stream_connection(server, store_c, dispatcher_c).await;
+        });
+        client
+            .write_all(b"{\"task_id\":\"t-hook\"}\n")
+            .await
+            .expect("write request");
+        wait_for_subscribers(&dispatcher, 2).await;
+
+        // The claude-hook path publishes CoworkRequests with no turn id; they
+        // must still reach the open stream (the TUI keys off approval ids).
+        dispatcher.publish(TurnEvent::CoworkRequest {
+            approval_id: "appr-1".into(),
+            tool: "bash".into(),
+            step_n: 0,
+            args_display: "{\"command\":\"ls\"}".into(),
+            reasoning: "run: ls".into(),
+            cwd: None,
+            turn_id: None,
+            supports_modify: true,
+            correlation: CorrelationCtx::default(),
+        });
+        // A terminal event for THIS turn still closes the stream normally.
+        dispatcher.publish(TurnEvent::Failed {
+            session_id: "sess".into(),
+            turn_id: "t-hook".into(),
+            reason: "denied".into(),
+            correlation: CorrelationCtx::default(),
+        });
+
+        let mut out = String::new();
+        client
+            .read_to_string(&mut out)
+            .await
+            .expect("read response");
+        handle.await.expect("handler task");
+
+        assert!(
+            out.contains(r#""type":"cowork_request""#),
+            "session-scoped CoworkRequest must be forwarded; got: {out}"
+        );
+        assert!(
+            out.contains("appr-1"),
+            "approval id must appear; got: {out}"
+        );
+        assert!(
+            out.contains(r#""type":"error""#),
+            "terminal event must still close the stream; got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_delivers_buffered_session_scoped_cowork_request() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let dispatcher = Arc::new(Dispatcher::new(64));
+        let store = spawn_delta_buffer(&dispatcher);
+
+        // The approval is raised BEFORE any client connects — it must land in
+        // the session buffer so a late-connecting stream replays it.
+        dispatcher.publish(TurnEvent::CoworkRequest {
+            approval_id: "appr-replay".into(),
+            tool: "write_file".into(),
+            step_n: 0,
+            args_display: "{\"path\":\"x\"}".into(),
+            reasoning: "write_file: x".into(),
+            cwd: None,
+            turn_id: None,
+            supports_modify: false,
+            correlation: CorrelationCtx::default(),
+        });
+        wait_for_store(
+            &store,
+            |m| m.contains_key(crate::stream_server::buffer::SESSION_BUFFER_KEY),
+            "session-buffered cowork request",
+        )
+        .await;
+
+        let (mut client, server) = UnixStream::pair().expect("socketpair");
+        let store_c = Arc::clone(&store);
+        let dispatcher_c = Arc::clone(&dispatcher);
+        let handle = tokio::spawn(async move {
+            handle_stream_connection(server, store_c, dispatcher_c).await;
+        });
+        client
+            .write_all(b"{\"task_id\":\"t-any\"}\n")
+            .await
+            .expect("write request");
+        wait_for_subscribers(&dispatcher, 2).await;
+        dispatcher.publish(TurnEvent::Failed {
+            session_id: "sess".into(),
+            turn_id: "t-any".into(),
+            reason: "done".into(),
+            correlation: CorrelationCtx::default(),
+        });
+
+        let mut out = String::new();
+        client
+            .read_to_string(&mut out)
+            .await
+            .expect("read response");
+        handle.await.expect("handler task");
+
+        assert!(
+            out.contains("appr-replay"),
+            "replayed session buffer must contain the pending approval; got: {out}"
         );
     }
 }

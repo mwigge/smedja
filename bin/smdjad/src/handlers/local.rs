@@ -54,13 +54,11 @@ fn gpu_json(gpu: &GpuSnapshot) -> Value {
 /// was detected at startup.
 #[allow(clippy::unused_async)] // uniform handler signature: all handlers are async fns
 pub(crate) async fn models(state: HandlerState, _params: Value) -> Result<Value, RpcError> {
-    let local = state
-        .provider_pool
-        .local_control()
-        .ok_or_else(unavailable)?;
+    let pool = state.provider_pool.snapshot();
+    let local = pool.local_control().ok_or_else(unavailable)?;
     let active = local.active_model_id();
     let models: Vec<Value> = local
-        .inventory
+        .inventory()
         .iter()
         .map(|m| model_json(m, &local.gpu, active.as_deref()))
         .collect();
@@ -79,10 +77,8 @@ pub(crate) async fn models(state: HandlerState, _params: Value) -> Result<Value,
 /// was detected at startup.
 #[allow(clippy::unused_async)] // uniform handler signature: all handlers are async fns
 pub(crate) async fn gpu(state: HandlerState, _params: Value) -> Result<Value, RpcError> {
-    let local = state
-        .provider_pool
-        .local_control()
-        .ok_or_else(unavailable)?;
+    let pool = state.provider_pool.snapshot();
+    let local = pool.local_control().ok_or_else(unavailable)?;
     Ok(gpu_json(&local.gpu))
 }
 
@@ -98,10 +94,8 @@ pub(crate) async fn gpu(state: HandlerState, _params: Value) -> Result<Value, Rp
 /// exists, `INVALID_PARAMS` when `model` is missing, and `INTERNAL_ERROR` when
 /// the swap proxy is unreachable.
 pub(crate) async fn swap(state: HandlerState, params: Value) -> Result<Value, RpcError> {
-    let local = state
-        .provider_pool
-        .local_control()
-        .ok_or_else(unavailable)?;
+    let pool = state.provider_pool.snapshot();
+    let local = pool.local_control().ok_or_else(unavailable)?;
     let model = params
         .get("model")
         .and_then(Value::as_str)
@@ -150,11 +144,9 @@ pub(crate) async fn swap(state: HandlerState, params: Value) -> Result<Value, Rp
 /// exists or the installer binary cannot be spawned, and `INVALID_PARAMS` when
 /// `model` is missing.
 pub(crate) async fn install(state: HandlerState, params: Value) -> Result<Value, RpcError> {
+    let pool = state.provider_pool.snapshot();
     let endpoint = {
-        let local = state
-            .provider_pool
-            .local_control()
-            .ok_or_else(unavailable)?;
+        let local = pool.local_control().ok_or_else(unavailable)?;
         local.endpoint.clone()
     };
     let model = params
@@ -165,6 +157,15 @@ pub(crate) async fn install(state: HandlerState, params: Value) -> Result<Value,
     let outcome = smedja_adapter::install_model(&endpoint, model)
         .await
         .map_err(|_| unavailable())?;
+
+    // The endpoint confirms the model is servable — record it in the in-place
+    // inventory so `session.set_model` and `local.models` see it without a
+    // daemon restart or pool rebuild.
+    if outcome.installed && outcome.present_in_inventory {
+        if let Some(local) = pool.local_control() {
+            local.add_inventory_model(model);
+        }
+    }
 
     Ok(json!({
         "model": model,
@@ -189,7 +190,7 @@ pub(crate) mod logic {
     pub(crate) fn models_body(local: &LocalControl) -> Value {
         let active = local.active_model_id();
         let models: Vec<Value> = local
-            .inventory
+            .inventory()
             .iter()
             .map(|m| model_json(m, &local.gpu, active.as_deref()))
             .collect();

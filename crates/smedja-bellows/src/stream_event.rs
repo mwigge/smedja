@@ -75,6 +75,18 @@ pub enum StreamEvent {
         reasoning: String,
     },
 
+    /// A pending cowork approval was resolved (approved / denied / timeout).
+    ///
+    /// The TUI dismisses the approval overlay keyed by `approval_id`; the
+    /// stream buffer drops the matching `cowork_request` line so a reconnecting
+    /// client never replays an already-resolved prompt.
+    CoworkResolved {
+        /// UUID of the approval request being resolved.
+        approval_id: String,
+        /// How the prompt resolved: `approved` | `denied` | `timeout`.
+        outcome: crate::event::CoworkOutcome,
+    },
+
     /// Mid-stream token usage update (informational; Done still carries final totals).
     Usage { input_tok: u32, output_tok: u32 },
 
@@ -311,6 +323,21 @@ mod tests {
         assert!(json.contains(r#""type":"cowork_request""#));
         assert!(json.contains("uuid-123"));
         assert!(json.contains("bash"));
+    }
+
+    #[test]
+    fn cowork_resolved_wire_shape_is_exact() {
+        let ev = StreamEvent::CoworkResolved {
+            approval_id: "uuid-456".into(),
+            outcome: crate::event::CoworkOutcome::Timeout,
+        };
+        assert_eq!(roundtrip(&ev), ev);
+        let json = serde_json::to_string(&ev).unwrap();
+        // The contract the TUI keys off — field set and values must not drift.
+        assert_eq!(
+            json,
+            r#"{"type":"cowork_resolved","approval_id":"uuid-456","outcome":"timeout"}"#
+        );
     }
 
     #[test]

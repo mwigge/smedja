@@ -79,6 +79,33 @@ pub(crate) fn history_search<'a>(history: &'a [String], query: &str) -> Option<(
         .map(|(i, s)| (i, s.as_str()))
 }
 
+/// Strips terminal control characters from daemon/agent-supplied text before
+/// it is rendered.
+///
+/// ratatui writes cell symbols to the terminal raw, so an escape sequence
+/// embedded in a stream payload (OSC 52 clipboard writes, CSI cursor moves,
+/// …) would otherwise execute in the user's terminal. Newlines are kept
+/// (multi-line rendering depends on them), tabs expand to four spaces, and
+/// every other C0/C1 control character is dropped — a stripped escape
+/// sequence degrades to inert visible text instead of executing. Borrows
+/// when there is nothing to strip.
+#[must_use]
+pub(crate) fn sanitize_terminal(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(|c| c.is_control() && c != '\n') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' => out.push('\n'),
+            '\t' => out.push_str("    "),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Maps a turn-error message to `(short_label, hint)` for user-facing display.
 #[must_use]
 /// Formats a stream error for display, prefixing the runner name when known.
@@ -202,6 +229,40 @@ mod tests {
     fn history_search_empty_query_returns_none() {
         let history: Vec<String> = vec!["foo".into()];
         assert!(history_search(&history, "").is_none());
+    }
+
+    #[test]
+    fn sanitize_terminal_strips_escape_and_osc_sequences() {
+        // OSC 52 clipboard-write attempt: ESC ] 52 ; c ; <base64> BEL.
+        let dirty = "hello \u{1b}]52;c;Zm9v\u{7} world";
+        let clean = sanitize_terminal(dirty);
+        assert!(!clean.contains('\u{1b}'), "ESC stripped: {clean:?}");
+        assert!(!clean.contains('\u{7}'), "BEL stripped: {clean:?}");
+        // The sequence body degrades to inert visible text.
+        assert!(
+            clean.contains("]52;c;Zm9v"),
+            "payload left inert: {clean:?}"
+        );
+        assert!(clean.contains("hello") && clean.contains("world"));
+
+        // CSI cursor movement and C1 single-char controls go too.
+        let csi = "a\u{1b}[2Ab\u{9b}c";
+        let clean = sanitize_terminal(csi);
+        assert_eq!(clean, "a[2Abc");
+    }
+
+    #[test]
+    fn sanitize_terminal_keeps_newlines_and_expands_tabs() {
+        let clean = sanitize_terminal("one\ntwo\tthree");
+        assert_eq!(clean, "one\ntwo    three");
+    }
+
+    #[test]
+    fn sanitize_terminal_borrows_clean_input() {
+        assert!(matches!(
+            sanitize_terminal("plain text"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]

@@ -94,6 +94,9 @@ fn parse_runner(s: &str) -> Option<Runner> {
         "kimi" => Some(Runner::Kimi),
         "gemini" => Some(Runner::Gemini),
         "copilot" => Some(Runner::Copilot),
+        "minimax" => Some(Runner::Minimax),
+        "berget" => Some(Runner::Berget),
+        "opencode" => Some(Runner::OpenCode),
         "pool" | "poolside" => Some(Runner::Pool),
         _ => None,
     }
@@ -139,6 +142,22 @@ mod tests {
         assert_eq!(parse_role("iac"), Some(AgentRole::Iac));
         assert_eq!(parse_role("infra"), Some(AgentRole::Iac));
         assert_eq!(parse_role("bogus"), None);
+    }
+
+    #[test]
+    fn parse_runner_covers_the_canonical_alias_set() {
+        assert_eq!(parse_runner("claude"), Some(Runner::Claude));
+        assert_eq!(parse_runner("codex"), Some(Runner::Codex));
+        assert_eq!(parse_runner("kimi"), Some(Runner::Kimi));
+        assert_eq!(parse_runner("gemini"), Some(Runner::Gemini));
+        assert_eq!(parse_runner("local"), Some(Runner::Local));
+        assert_eq!(parse_runner("copilot"), Some(Runner::Copilot));
+        assert_eq!(parse_runner("minimax"), Some(Runner::Minimax));
+        assert_eq!(parse_runner("berget"), Some(Runner::Berget));
+        assert_eq!(parse_runner("opencode"), Some(Runner::OpenCode));
+        assert_eq!(parse_runner("pool"), Some(Runner::Pool));
+        assert_eq!(parse_runner("poolside"), Some(Runner::Pool));
+        assert_eq!(parse_runner("bogus"), None);
     }
 
     #[test]

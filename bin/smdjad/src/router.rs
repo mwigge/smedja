@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 
 use crate::cowork::CoworkGate;
 use crate::price_table::PriceTable;
-use crate::provider_pool::ProviderPool;
+use crate::provider_pool::SharedProviderPool;
 use crate::{embedder_port, handlers, orchestrator};
 
 /// Registers an RPC handler with boilerplate-free cloning.
@@ -44,10 +44,9 @@ pub(crate) fn build_router(
     ingot: &IngotHandle,
     dispatcher: &Arc<Dispatcher>,
     gates: &Arc<Mutex<HashMap<String, Arc<CoworkGate>>>>,
-    pool: &Arc<ProviderPool>,
+    pool: &Arc<SharedProviderPool>,
     assayer: &Arc<Assayer>,
     startup_runner: &Arc<str>,
-    startup_model: &Arc<str>,
     price_table: &Arc<PriceTable>,
     vault: &Arc<Mutex<Vault>>,
     embedder: &Arc<dyn embedder_port::Embedder>,
@@ -79,11 +78,11 @@ pub(crate) fn build_router(
         cache_aligners: Arc::clone(cache_aligners),
         task_set: Arc::clone(task_set),
         startup_runner: Arc::clone(startup_runner),
-        startup_model: Arc::clone(startup_model),
         lsp_manager: Arc::clone(lsp_manager),
         active_change,
         work_tx,
         turn_registry,
+        rescan_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     router.register("ping", |_| async { Ok(json!("pong")) });
@@ -117,6 +116,12 @@ pub(crate) fn build_router(
         "session.set_tier",
         state,
         handlers::session::set_tier
+    );
+    route!(
+        router,
+        "session.set_effort",
+        state,
+        handlers::session::set_effort
     );
     route!(
         router,
@@ -164,6 +169,9 @@ pub(crate) fn build_router(
         handlers::cost::active_change
     );
     route!(router, "runner.list", state, handlers::session::runner_list);
+    // Re-probes all providers and atomically swaps the pool (picks up keys
+    // pasted via /login without a daemon restart).
+    route!(router, "provider.rescan", state, handlers::provider::rescan);
     route!(router, "turn.submit", state, handlers::turn::submit);
     route!(router, "turn.cancel", state, handlers::turn::cancel);
     // Blocks until terminal status or 60 s deadline; event-driven, no poll.
@@ -203,6 +211,9 @@ pub(crate) fn build_router(
     route!(router, "cowork.deny", state, handlers::audit::deny);
     route!(router, "cowork.modify", state, handlers::audit::modify);
     route!(router, "cowork.pending", state, handlers::audit::pending);
+    // The terminal's (st-agent) answer to a pushed approval prompt; resolves
+    // against the same cowork gates by approval id alone.
+    route!(router, "cowork.resolve", state, handlers::audit::resolve);
     route!(router, "mcp.register", state, handlers::mcp::register);
     route!(router, "mcp.list", state, handlers::mcp::list);
     route!(router, "mcp.remove", state, handlers::mcp::remove);

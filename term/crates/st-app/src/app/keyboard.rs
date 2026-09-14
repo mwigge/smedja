@@ -39,6 +39,23 @@ impl App {
             }
         }
 
+        // y / n (no modifiers) while a cowork approval prompt is pending →
+        // answer the smdjad gate instead of typing into the PTY. Only when
+        // the approval overlay is actually visible: on the alt screen (vim,
+        // less, smedja-tui) the overlay is suppressed (see redraw.rs), so the
+        // user cannot see the prompt and the keystroke must reach the PTY
+        // instead of silently approving a hidden gate.
+        let approval_overlay_visible = self.pty.as_ref().is_some_and(|p| !p.grid.lock().alt_screen);
+        if approval_overlay_visible && !self.ctrl() && !self.alt() && !self.superkey() {
+            if let Key::Character(s) = &logical_key {
+                match s.to_lowercase().as_str() {
+                    "y" if self.resolve_pending_approval(true) => return,
+                    "n" if self.resolve_pending_approval(false) => return,
+                    _ => {}
+                }
+            }
+        }
+
         // Ctrl+V (no shift) → paste from clipboard.
         // Mirrors Ctrl+Shift+V so both common conventions work.
         if self.ctrl() && !self.shift() {

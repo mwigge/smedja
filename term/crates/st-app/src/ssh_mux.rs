@@ -26,6 +26,7 @@ struct KnownHostsHandler {
 impl client::Handler for KnownHostsHandler {
     type Error = anyhow::Error;
 
+    #[allow(clippy::unused_async_trait_impl)] // russh Handler signature requires async
     async fn check_server_key(
         &mut self,
         server_public_key: &russh::keys::ssh_key::PublicKey,

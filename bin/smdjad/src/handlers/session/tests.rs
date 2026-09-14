@@ -5,20 +5,26 @@ use super::*;
 use smedja_ingot::{Ingot, IngotHandle};
 
 #[test]
-fn parse_runner_name_tolerates_cli_suffix_and_rejects_unknown() {
+fn canonical_runner_parser_tolerates_cli_suffix_and_rejects_unknown() {
     use smedja_assayer::Runner;
-    assert_eq!(parse_runner_name("claude"), Some(Runner::Claude));
-    assert_eq!(parse_runner_name("claude-cli"), Some(Runner::Claude));
-    assert_eq!(parse_runner_name("codex-cli"), Some(Runner::Codex));
-    assert_eq!(parse_runner_name("kimi"), Some(Runner::Kimi));
-    assert_eq!(parse_runner_name("kimi-cli"), Some(Runner::Kimi));
-    assert_eq!(parse_runner_name("moonshot"), Some(Runner::Kimi));
-    assert_eq!(parse_runner_name("gemini"), Some(Runner::Gemini));
-    assert_eq!(parse_runner_name("gemini-cli"), Some(Runner::Gemini));
-    assert_eq!(parse_runner_name("google"), Some(Runner::Gemini));
-    assert_eq!(parse_runner_name("LOCAL"), Some(Runner::Local));
-    assert_eq!(parse_runner_name("minimax"), Some(Runner::Minimax));
-    assert_eq!(parse_runner_name("nope"), None);
+
+    use crate::common::parse_runner_str;
+    assert_eq!(parse_runner_str("claude"), Some(Runner::Claude));
+    assert_eq!(parse_runner_str("claude-cli"), Some(Runner::Claude));
+    assert_eq!(parse_runner_str("anthropic"), Some(Runner::Claude));
+    assert_eq!(parse_runner_str("codex-cli"), Some(Runner::Codex));
+    assert_eq!(parse_runner_str("openai"), Some(Runner::Codex));
+    assert_eq!(parse_runner_str("kimi"), Some(Runner::Kimi));
+    assert_eq!(parse_runner_str("kimi-cli"), Some(Runner::Kimi));
+    assert_eq!(parse_runner_str("moonshot"), Some(Runner::Kimi));
+    assert_eq!(parse_runner_str("gemini"), Some(Runner::Gemini));
+    assert_eq!(parse_runner_str("gemini-cli"), Some(Runner::Gemini));
+    assert_eq!(parse_runner_str("google"), Some(Runner::Gemini));
+    assert_eq!(parse_runner_str("LOCAL"), Some(Runner::Local));
+    assert_eq!(parse_runner_str("minimax"), Some(Runner::Minimax));
+    assert_eq!(parse_runner_str("pool"), Some(Runner::Pool));
+    assert_eq!(parse_runner_str("opencode"), Some(Runner::OpenCode));
+    assert_eq!(parse_runner_str("nope"), None);
 }
 
 #[test]
@@ -30,8 +36,222 @@ fn parse_tier_name_maps_known_tiers() {
     assert_eq!(parse_tier_name("ultra"), None);
 }
 
+// ── session.set_effort ─────────────────────────────────────────────────────
+
+#[test]
+fn parse_effort_name_maps_known_levels() {
+    use smedja_types::Effort;
+    assert_eq!(parse_effort_name("low"), Some(Effort::Low));
+    assert_eq!(parse_effort_name("medium"), Some(Effort::Medium));
+    assert_eq!(parse_effort_name("high"), Some(Effort::High));
+    assert_eq!(parse_effort_name(" HIGH "), Some(Effort::High));
+    assert_eq!(parse_effort_name("max"), None);
+}
+
+#[test]
+fn set_effort_pins_and_default_clears() {
+    let id = Uuid::new_v4().to_string();
+    assert_eq!(session_effort(&id), None, "no pin before set_effort");
+
+    let resp = set_effort_with(&id, "high").unwrap();
+    assert_eq!(resp["effort"].as_str().unwrap(), "high");
+    assert_eq!(session_effort(&id), Some(smedja_types::Effort::High));
+
+    let resp = set_effort_with(&id, "default").unwrap();
+    assert!(resp["effort"].is_null(), "default clears the pin");
+    assert_eq!(session_effort(&id), None);
+}
+
+#[test]
+fn set_effort_rejects_unknown_level() {
+    let id = Uuid::new_v4().to_string();
+    let err = set_effort_with(&id, "ultra").unwrap_err();
+    assert_eq!(err.code, smedja_rpc::codes::INVALID_PARAMS);
+    assert_eq!(session_effort(&id), None, "a rejected level must not pin");
+}
+
+#[tokio::test]
+async fn set_effort_rejects_unknown_session() {
+    let ig = handle();
+    let err = ensure_session_exists(&ig, "no-such-session")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, smedja_rpc::codes::INVALID_PARAMS);
+    assert!(err.message.contains("unknown session"), "got: {err:?}");
+}
+
+#[test]
+fn effort_override_cap_rejects_new_sessions_but_allows_repins() {
+    let mut map = std::collections::HashMap::new();
+    for i in 0..1024 {
+        insert_capped(&mut map, &format!("sess-{i}"), smedja_types::Effort::Low).unwrap();
+    }
+    let err = insert_capped(&mut map, "one-too-many", smedja_types::Effort::Low).unwrap_err();
+    assert!(
+        err.message.contains("too many effort overrides"),
+        "got: {err:?}"
+    );
+    // Re-pinning an existing session is not a new entry and stays allowed.
+    insert_capped(&mut map, "sess-0", smedja_types::Effort::High).unwrap();
+    assert_eq!(map["sess-0"], smedja_types::Effort::High);
+}
+
+#[test]
+fn prune_effort_overrides_drops_unknown_sessions() {
+    let kept = Uuid::new_v4().to_string();
+    let dropped = Uuid::new_v4().to_string();
+    set_effort_with(&kept, "low").unwrap();
+    set_effort_with(&dropped, "low").unwrap();
+
+    let valid = std::collections::HashSet::from([kept.clone()]);
+    prune_effort_overrides(&valid);
+
+    assert_eq!(session_effort(&kept), Some(smedja_types::Effort::Low));
+    assert_eq!(
+        session_effort(&dropped),
+        None,
+        "pruned session must lose its pin"
+    );
+    clear_effort_override(&kept);
+}
+
 fn handle() -> IngotHandle {
     IngotHandle::new(Ingot::open_in_memory().unwrap())
+}
+
+// ── session.set_model validation ───────────────────────────────────────────
+
+struct NullProvider;
+impl smedja_adapter::Provider for NullProvider {
+    fn stream_chat(
+        &self,
+        _messages: &[smedja_adapter::Message],
+        _opts: &smedja_adapter::CallOptions,
+    ) -> smedja_adapter::DeltaStream {
+        Box::pin(futures_util::stream::empty())
+    }
+}
+
+fn pool_with(
+    entries: Vec<(
+        (smedja_assayer::Runner, smedja_assayer::Tier),
+        &'static str,
+        &'static str,
+    )>,
+) -> crate::provider_pool::ProviderPool {
+    use smedja_assayer::{Runner, Tier};
+    let mut map = std::collections::HashMap::new();
+    let mut order = Vec::new();
+    let mut default: Option<(Runner, Tier)> = None;
+    for (key, runner_name, default_model) in entries {
+        if default.is_none() {
+            default = Some(key);
+        }
+        if map
+            .insert(
+                key,
+                crate::provider_pool::ProviderEntry {
+                    provider: Box::new(NullProvider),
+                    runner: key.0,
+                    tier: key.1,
+                    runner_name,
+                    default_model: default_model.to_owned(),
+                },
+            )
+            .is_none()
+        {
+            order.push(key);
+        }
+    }
+    crate::provider_pool::ProviderPool {
+        entries: map,
+        order,
+        default,
+        local: None,
+    }
+}
+
+#[test]
+fn set_model_advisory_for_api_and_cli_runners() {
+    use smedja_assayer::{Runner, Tier};
+    // CLI/API runners: an unknown model id is advisory-accepted — providers
+    // ship new models faster than the pool config tracks them.
+    let cli_pool = pool_with(vec![(
+        (Runner::Kimi, Tier::Fast),
+        "kimi-cli",
+        "kimi-code/kimi-for-coding-highspeed",
+    )]);
+    let known = known_models_for_runner(&cli_pool, "kimi-cli");
+    assert!(!known.is_empty());
+    assert_eq!(set_model_rejection("kimi-cli", "kimi-k99", &known), None);
+
+    let api_pool = pool_with(vec![((Runner::Kimi, Tier::Fast), "moonshot", "kimi-k3")]);
+    let known = known_models_for_runner(&api_pool, "moonshot");
+    assert_eq!(set_model_rejection("moonshot", "kimi-k99", &known), None);
+
+    // The local inventory IS authoritative: unknown local models are rejected.
+    let local_known = vec!["qwen3-14b".to_owned()];
+    assert!(set_model_rejection("local", "fresh-model", &local_known).is_some());
+    assert_eq!(
+        set_model_rejection("local", "qwen3-14b", &local_known),
+        None
+    );
+    // A local endpoint with no known inventory accepts (nothing to check against).
+    assert_eq!(set_model_rejection("local", "anything", &[]), None);
+}
+
+#[test]
+fn set_model_local_inventory_updates_after_install() {
+    use crate::provider_pool::LocalControl;
+    use smedja_adapter::{GpuSnapshot, LocalModel};
+    let control = LocalControl::new(
+        "http://127.0.0.1:9090".to_owned(),
+        "http://127.0.0.1:9090".to_owned(),
+        vec![LocalModel {
+            id: "qwen3-14b".to_owned(),
+            est_vram_mb: Some(9000),
+        }],
+        GpuSnapshot::none(),
+        Some("qwen3-14b".to_owned()),
+    );
+    let mut pool = pool_with(vec![]);
+    pool.local = Some(control);
+
+    let known = known_models_for_runner(&pool, "local");
+    assert_eq!(known, vec!["qwen3-14b".to_owned()]);
+    assert!(
+        !known.contains(&"fresh-model".to_owned()),
+        "an uninstalled local model is rejected by set_model"
+    );
+
+    // After local.install confirms the model is servable it joins the
+    // inventory, so the same pin is now valid.
+    pool.local_control()
+        .expect("local control")
+        .add_inventory_model("fresh-model");
+    let known = known_models_for_runner(&pool, "local");
+    assert!(known.contains(&"fresh-model".to_owned()));
+}
+
+#[test]
+fn known_models_for_runner_covers_pool_unknown_and_absent_runners() {
+    use smedja_assayer::{Runner, Tier};
+    let pool = pool_with(vec![
+        ((Runner::Codex, Tier::Fast), "codex-cli", "gpt-5.5"),
+        ((Runner::Codex, Tier::Deep), "codex-cli", "gpt-5.5-pro"),
+    ]);
+    // A pooled non-local runner yields its per-tier defaults in probe order.
+    assert_eq!(
+        known_models_for_runner(&pool, "codex"),
+        vec!["gpt-5.5".to_owned(), "gpt-5.5-pro".to_owned()]
+    );
+    // An unparseable runner string has no known models (set_model then
+    // accepts any value rather than rejecting against an empty list).
+    assert!(known_models_for_runner(&pool, "nope").is_empty());
+    // A parseable runner absent from the pool likewise has no known models.
+    assert!(known_models_for_runner(&pool, "gemini").is_empty());
+    // `local` without local control (no endpoint detected) has no inventory.
+    assert!(known_models_for_runner(&pool, "local").is_empty());
 }
 
 fn sample_session(id: Uuid, title: &str) -> Session {
@@ -292,12 +512,31 @@ async fn set_runner_clears_stale_model_override() {
 
     let resp = set_runner_with(&ig, &id.to_string(), "kimi").await.unwrap();
     assert_eq!(resp["runner"].as_str().unwrap(), "kimi-cli");
+    assert_eq!(
+        resp["model_pin_cleared"].as_bool(),
+        Some(true),
+        "a pinned model must report as cleared"
+    );
 
     let sess = ig.get_session(&id.to_string()).await.unwrap().unwrap();
     assert_eq!(sess.runner_override.as_deref(), Some("kimi-cli"));
     assert_eq!(
         sess.model_override, None,
         "a model pinned for the old runner must not leak onto the new one"
+    );
+}
+
+#[tokio::test]
+async fn set_runner_without_pin_reports_not_cleared() {
+    let ig = handle();
+    let id = Uuid::new_v4();
+    ig.create_session(sample_session(id, "s")).await.unwrap();
+
+    let resp = set_runner_with(&ig, &id.to_string(), "kimi").await.unwrap();
+    assert_eq!(
+        resp["model_pin_cleared"].as_bool(),
+        Some(false),
+        "no pin existed — the client must not claim one was cleared"
     );
 }
 

@@ -588,7 +588,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, state: &mut AppState) {
 
     // -- Cowork gate overlay --------------------------------------------------
     if !state.pending_cowork.is_empty() {
-        let cw_rect = cowork_widget::overlay_rect(body_area);
+        let cw_rect = cowork_widget::overlay_rect(body_area, &state.pending_cowork);
         frame.render_widget(
             cowork_widget::CoworkWidget {
                 items: &state.pending_cowork,
